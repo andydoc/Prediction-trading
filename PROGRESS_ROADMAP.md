@@ -77,10 +77,10 @@
 
 ## Go-Live Procedure
 1. Deposit $100+ USDC to funder address on Polygon
-2. Run: `wsl bash /mnt/c/Users/andyd/ai-workspace/GO_LIVE.sh`
-3. Script checks balance, health, confirms, updates config, restarts
+2. Run: `wsl bash /mnt/c/Users/andyd/ai-workspace/prediction-trader/scripts/mode.sh live`
+3. Script checks balance, health, confirms, updates config, restarts L4+dashboard
 4. Monitor: http://localhost:5556 (badge changes to DUAL)
-5. Emergency stop: `wsl bash /mnt/c/Users/andyd/ai-workspace/STOP_LIVE.sh`
+5. Emergency stop: `wsl bash /mnt/c/Users/andyd/ai-workspace/prediction-trader/scripts/mode.sh stop`
 
 ## Features Implemented
 1. ✅ **4-layer architecture**: market data → constraints → arb math → paper trading
@@ -111,6 +111,9 @@
 26. ✅ **Shadow tab**: Shows would-trade signals, rejection breakdown, recent shadow trades
 27. ✅ **Control panel tab**: Mode buttons, parameter inputs (max positions, capital per trade, min profit, drift)
 28. ✅ **Badge fix**: Shows SHADOW when live_trading.enabled=true + shadow_only=true (was showing LIVE)
+29. ✅ **Auto-refresh logic**: refreshBehaviourNormal boolean, pauses when content expanded, resume/pause toggle
+30. ✅ **Script rationalisation**: 21 scripts → 8 (merged overlapping start/stop/mode/status/reset scripts)
+31. ✅ **Git repo**: https://github.com/andydoc/Prediction-trading (code, scripts, docs, .gitignore)
 
 ## TODO / Roadmap
 ### Done
@@ -152,21 +155,39 @@
 ### Key notes
 - **CRITICAL**: venv must be activated — bare `python` won't work
 - All state persists in `data/system_state/execution_state.json`
-- **Check status**: `wsl bash /mnt/c/Users/andyd/ai-workspace/status.sh`
+- **Check status**: `wsl bash /mnt/c/Users/andyd/ai-workspace/prediction-trader/scripts/status.sh`
+- **Full health**: `wsl bash /mnt/c/Users/andyd/ai-workspace/prediction-trader/scripts/status.sh --full`
 
-### Control Scripts (all in `C:\Users\andyd\ai-workspace\`)
+### Control Scripts (all in `prediction-trader/scripts/`)
 | Script | Purpose |
 |--------|---------|
-| `START_TRADER.bat` | Manual start (with console) |
-| `START_TRADER_SILENT.bat` | Silent start |
-| `START_TRADER_HIDDEN.vbs` | Boot auto-start (in Windows Startup) |
-| `GO_LIVE.sh` | Activate live trading (checks balance, health, confirms) |
-| `STOP_LIVE.sh` | Emergency revert to paper-only |
-| `status.sh` | Quick status check |
-| `restart_dash.sh` | Restart dashboard only |
+| `restart.sh [--clean]` | Kill all + restart system. `--clean` purges stale L2/L3 data |
+| `stop.sh [--dash\|--l4]` | Kill processes: all (default), dashboard only, or L4 only |
+| `mode.sh paper\|shadow\|live\|stop` | Switch trading mode (live includes pre-flight + confirmation) |
+| `status.sh [--full]` | Quick status (default) or full health check with P&L breakdown |
+| `accounting.py` | Capital accounting breakdown |
+| `reset.py [--soft\|--hard]` | Soft: return deployed to cash. Hard: full wipe to $100 |
+| `START_TRADER.bat` | Manual Windows start (with console) |
+| `START_TRADER_SILENT.bat` | Silent start for Task Scheduler |
+| `START_TRADER_HIDDEN.vbs` | Boot auto-start (in Windows Startup folder) |
 
 ## Useful Commands
 ```bash
+# === SCRIPTS (from Windows, all in prediction-trader/scripts/) ===
+S="prediction-trader/scripts"
+wsl bash /mnt/c/Users/andyd/ai-workspace/$S/restart.sh          # Restart system
+wsl bash /mnt/c/Users/andyd/ai-workspace/$S/restart.sh --clean   # Restart + purge stale data
+wsl bash /mnt/c/Users/andyd/ai-workspace/$S/stop.sh              # Kill all
+wsl bash /mnt/c/Users/andyd/ai-workspace/$S/stop.sh --dash       # Kill dashboard only
+wsl bash /mnt/c/Users/andyd/ai-workspace/$S/stop.sh --l4         # Kill L4 only
+wsl bash /mnt/c/Users/andyd/ai-workspace/$S/mode.sh shadow       # Switch to shadow
+wsl bash /mnt/c/Users/andyd/ai-workspace/$S/mode.sh live         # Go live (with checks)
+wsl bash /mnt/c/Users/andyd/ai-workspace/$S/mode.sh paper        # Back to paper
+wsl bash /mnt/c/Users/andyd/ai-workspace/$S/mode.sh stop         # Emergency stop + cancel orders
+wsl bash /mnt/c/Users/andyd/ai-workspace/$S/status.sh            # Quick status
+wsl bash /mnt/c/Users/andyd/ai-workspace/$S/status.sh --full     # Full health + P&L
+
+# === MANUAL ===
 # Start system
 wsl bash -c "cd /home/andydoc/prediction-trader && rm -f *.pid && nohup python main.py > logs/main.log 2>&1 &"
 
@@ -193,11 +214,29 @@ wsl bash -c "kill \$(ps aux|grep 'main.py\|layer[1-4]_runner\|dashboard_server'|
 
 # Dashboard
 http://localhost:5556
+
+# Git (from Windows cmd/powershell)
+cd C:\Users\andyd\ai-workspace\prediction-trader
+git add -A
+git commit -m "description of changes"
+git push
+
+# Git - check status
+git status
+git log --oneline -5
 ```
 
+## Git Repository
+- **Remote**: https://github.com/andydoc/Prediction-trading
+- **Local**: `C:\Users\andyd\ai-workspace\prediction-trader\`
+- **Branch**: `main`
+- **Excludes** (via .gitignore): secrets.yaml, data/, logs/, __pycache__, *.pid, *.zip, *.tar.gz
+- **Push from**: Windows PowerShell or CMD (WSL git lacks credential helper)
+
 ---
-*Last updated: 2026-02-24 17:15 UTC*
-*Mode: SHADOW | 11 positions open, 441+ closed | USDC: $1.65 (waiting for deposit)*
-*Dashboard: Tabbed (Paper/Shadow/Live/Control), Score column, Descriptive layers, SHADOW badge*
-*Session 7: Badge fix (SHADOW not LIVE), text fixes (cash=, Starting Capital), score column, descriptive layer names, tab structure added (2a shell done, 2b content builders in progress)*
-*Live trading engine ready — run GO_LIVE.sh after depositing $100+ USDC*
+*Last updated: 2026-03-01 15:35 UTC*
+*Mode: SHADOW | 13 positions open, 922+ closed | USDC: $1.65 (waiting for deposit)*
+*Dashboard: Tabbed (Paper/Shadow/Live/Control), auto-refresh with refreshBehaviourNormal logic*
+*Scripts: 8 rationalised (restart, stop, mode, status, accounting, reset + 3 Windows launchers)*
+*Git: https://github.com/andydoc/Prediction-trading*
+*Live trading engine ready — run `mode.sh live` after depositing $100+ USDC*
