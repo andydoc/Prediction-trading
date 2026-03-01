@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 sys.path.append(str(Path(__file__).parent))
-from paper_trading_complete import CompletePaperTradingEngine
+from paper_trading import PaperTradingEngine
 from live_trading_engine import LiveTradingEngine
 from layer1_market_data.market_data import MarketData
 
@@ -108,7 +108,7 @@ async def main():
     check_interval = 30
     replacement_cooldown_secs = 60   # Min 60s between replacement rounds
 
-    engine = CompletePaperTradingEngine(config, WORKSPACE)
+    engine = PaperTradingEngine(config, WORKSPACE)
     if EXEC_STATE.exists():
         try:
             engine.load_state(EXEC_STATE)

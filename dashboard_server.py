@@ -29,7 +29,7 @@ def load_json(p):
     except:
         return {}
 
-def fmt_dt(iso_str):
+def format_datetime(iso_str):
     """Format ISO datetime string to dd/mm/yyyy hh:mm"""
     if not iso_str:
         return '?'
@@ -39,7 +39,7 @@ def fmt_dt(iso_str):
     except:
         return str(iso_str)[:16]
 
-def esc(text):
+def escape_html(text):
     """HTML-escape text for safe attribute use"""
     return html_mod.escape(str(text), quote=True)
 
@@ -176,7 +176,7 @@ def make_html():
         exp_profit = p.get('expected_profit', 0)
         exp_pct = p.get('expected_profit_pct', 0) * 100
         n_mkts = len(p.get('markets', {}))
-        entry_ts = fmt_dt(p.get('entry_timestamp', ''))
+        entry_ts = format_datetime(p.get('entry_timestamp', ''))
         status = p.get('status', '?')
         mkt_vals = list(p.get('markets', {}).values())
         short_name = mkt_vals[0].get('name', '?')[:40] if mkt_vals else '?'
@@ -230,7 +230,7 @@ def make_html():
                 shares = bet / no_price if no_price > 0 else 0
                 legs_html += (f'<div class="leg">'
                              f'<span class="amt">${bet:.2f}</span> buying NO '
-                             f'<span class="mkt">{esc(mname)}</span> '
+                             f'<span class="mkt">{escape_html(mname)}</span> '
                              f'(NO @ {no_price:.3f}, {shares:.1f} shares) '
                              f'&rarr; payout <span class="win">${shares:.2f}</span>'
                              f'</div>')
@@ -238,7 +238,7 @@ def make_html():
                 shares = bet / ep if ep > 0 else 0
                 legs_html += (f'<div class="leg">'
                              f'<span class="amt">${bet:.2f}</span> buying '
-                             f'<span class="mkt">{esc(mname)}</span> '
+                             f'<span class="mkt">{escape_html(mname)}</span> '
                              f'(YES @ {ep:.3f}, {shares:.1f} shares) '
                              f'&rarr; payout <span class="win">${shares:.2f}</span>'
                              f'</div>')
@@ -260,7 +260,7 @@ def make_html():
                 parts = ' + '.join(f'<span style="color:#4c4">${s:.2f}</span>' for _, s in winners)
                 css = 'color:#4c4' if profit >= 0 else 'color:#f55'
                 legs_html += (f'<div class="leg" style="font-size:11px">'
-                             f'If <b>{esc(wname)}</b> wins: {parts}'
+                             f'If <b>{escape_html(wname)}</b> wins: {parts}'
                              f' = <span style="{css}">${payout:.2f}</span>'
                              f' (<span style="{css}">{profit:+.2f}</span>)</div>')
                 scenario_payouts.append(payout)
@@ -286,7 +286,7 @@ def make_html():
                              f'</div>')
 
         row_html = (f'<tr id="pos-{pos_idx}" class="pos-row" onclick="togglePos({pos_idx})">'
-                   f'<td>{pos_idx}</td><td title="{esc(full_names)}">{esc(short_name)}</td><td>{pos_strategy}</td><td>{pos_score:.2f}</td>'
+                   f'<td>{pos_idx}</td><td title="{escape_html(full_names)}">{escape_html(short_name)}</td><td>{pos_strategy}</td><td>{pos_score:.2f}</td>'
                    f'<td>${total_cap:.2f}</td><td>${exp_profit:.2f} ({exp_pct:.1f}%)</td>'
                    f'<td>{pos_resolve}</td><td>{status}</td><td>{entry_ts}</td></tr>\n'
                    f'<tr id="detail-{pos_idx}" class="detail-row"><td colspan="9">{legs_html}</td></tr>\n')
@@ -320,7 +320,7 @@ def make_html():
             payout = a['total_bet'] / avg_price if avg_price > 0 else 0
             side = 'YES'
         dup_flag = ''
-        agg_rows_html += (f'<tr><td>{esc(a["name"])}</td>'
+        agg_rows_html += (f'<tr><td>{escape_html(a["name"])}</td>'
                          f'<td>{side}</td>'
                          f'<td>${a["total_bet"]:.2f}</td>'
                          f'<td>{avg_price:.3f}</td>'
@@ -348,7 +348,7 @@ def make_html():
         opp_rows_html += (f'<tr class="pos-row {css}" onclick="toggleOpp({opp_idx})">' 
                           f'<td>{opp_idx}</td><td>{pct:.1f}%</td><td>{res}</td>'
                           f'<td>{strategy}</td>'
-                          f'<td>{score*10000:.2f}</td><td title="{esc(full_names)}">{esc(short_name)}{dup_label}</td></tr>\n')
+                          f'<td>{score*10000:.2f}</td><td title="{escape_html(full_names)}">{escape_html(short_name)}{dup_label}</td></tr>\n')
         # Build detail row
         opp_legs = ''
         method = opp_dict.get('metadata', {}).get('method', '')
@@ -367,14 +367,14 @@ def make_html():
                 oshares = obet / no_p if no_p > 0 else 0
                 opp_legs += (f'<div class="leg">'
                             f'<span class="amt">${obet:.2f}</span> buying NO '
-                            f'<span class="mkt">{esc(omname)}</span> '
+                            f'<span class="mkt">{escape_html(omname)}</span> '
                             f'(NO @ {no_p:.3f}, {oshares:.1f} shares) '
                             f'&rarr; payout <span class="win">${oshares:.2f}</span></div>')
             else:
                 oshares = obet / oprice if oprice > 0 else 0
                 opp_legs += (f'<div class="leg">'
                             f'<span class="amt">${obet:.2f}</span> buying YES '
-                            f'<span class="mkt">{esc(omname)}</span> '
+                            f'<span class="mkt">{escape_html(omname)}</span> '
                             f'(YES @ {oprice:.3f}, {oshares:.1f} shares) '
                             f'&rarr; payout <span class="win">${oshares:.2f}</span></div>')
         # Scenario lines for sell-all
@@ -392,7 +392,7 @@ def make_html():
                 sparts = ' + '.join(f'<span style="color:#4c4">${s:.2f}</span>' for _, s in winners)
                 scss = 'color:#4c4' if sprofit >= 0 else 'color:#f55'
                 opp_legs += (f'<div class="leg" style="font-size:11px">'
-                            f'If <b>{esc(wname)}</b> wins: {sparts}'
+                            f'If <b>{escape_html(wname)}</b> wins: {sparts}'
                             f' = <span style="{scss}">{spayout:.2f}</span>'
                             f' (<span style="{scss}">{sprofit:+.2f}</span>)</div>')
         # Guaranteed payout
@@ -443,7 +443,7 @@ def make_html():
             except:
                 pass
         pnl_class = 'good' if actual > 0.01 else ('bad' if actual < -0.01 else '')
-        row = (f'<tr class="{pnl_class}"><td title="{esc(full_names)}">{esc(short_name)}</td>'
+        row = (f'<tr class="{pnl_class}"><td title="{escape_html(full_names)}">{escape_html(short_name)}</td>'
                f'<td>${cl_deployed:.2f}</td><td>${actual:+.2f}</td>'
                f'<td>{hold_str}</td></tr>\n')
         if reason in ('resolved', 'expired'):
@@ -522,7 +522,7 @@ def make_html():
     layer_html = ''
     for name, info in layers.items():
         st = info.get('status', '?')
-        ts = fmt_dt(info.get('timestamp', ''))
+        ts = format_datetime(info.get('timestamp', ''))
         extra = ''
         if name == 'layer4':
             extra = f' | cash=${info.get("capital",0):.2f} | pos={info.get("open_positions",0)}'

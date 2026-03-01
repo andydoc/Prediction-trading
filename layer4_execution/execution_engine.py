@@ -95,7 +95,7 @@ class Position:
         }
 
 
-class PaperTradingEngine:
+class LegacyPaperTradingEngine:
     """
     Simulates trading without real money.
     Critical for testing before going live.
@@ -104,7 +104,7 @@ class PaperTradingEngine:
     def __init__(self, config: Dict, workspace_root: Path):
         self.config = config.get('paper_trading', {})
         self.workspace_root = Path(workspace_root)
-        self.logger = logging.getLogger('PaperTradingEngine')
+        self.logger = logging.getLogger('LegacyPaperTradingEngine')
         
         # Paper trading state
         self.initial_capital = self.config.get('initial_capital', 10000)
@@ -404,7 +404,7 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     
     async def test():
-        engine = PaperTradingEngine(
+        engine = LegacyPaperTradingEngine(
             {'paper_trading': {'initial_capital': 10000}},
             Path('../')
         )

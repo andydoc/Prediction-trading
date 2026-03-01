@@ -94,7 +94,7 @@ class PaperPosition:
         }
 
 
-class CompletePaperTradingEngine:
+class PaperTradingEngine:
     """
     Complete paper trading engine that:
     - Validates prices before entry
@@ -722,7 +722,7 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     
     async def test():
-        engine = CompletePaperTradingEngine(
+        engine = PaperTradingEngine(
             {'paper_trading': {'initial_capital': 10000}},
             Path('../')
         )
