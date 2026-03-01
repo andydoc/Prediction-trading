@@ -114,6 +114,7 @@
 29. ✅ **Auto-refresh logic**: refreshBehaviourNormal boolean, pauses when content expanded, resume/pause toggle
 30. ✅ **Script rationalisation**: 21 scripts → 8 (merged overlapping start/stop/mode/status/reset scripts)
 31. ✅ **Git repo**: https://github.com/andydoc/Prediction-trading (code, scripts, docs, .gitignore)
+32. ✅ **Naming standardisation**: Handler→DashboardHandler, _closed_sub→_render_closed_subsection, opp_overlaps_held→opportunity_overlaps_held, live_trading_engine.py→live_trading.py, deleted dead layer4_execution/
 
 ## TODO / Roadmap
 ### Done
@@ -234,9 +235,9 @@ git log --oneline -5
 - **Push from**: Windows PowerShell or CMD (WSL git lacks credential helper)
 
 ---
-*Last updated: 2026-03-01 15:35 UTC*
-*Mode: SHADOW | 13 positions open, 922+ closed | USDC: $1.65 (waiting for deposit)*
+*Last updated: 2026-03-01 17:30 UTC*
+*Mode: SHADOW | 14 positions open, 989 closed (65 resolved, 100% win rate, $47.35 profit) | USDC: $1.65*
 *Dashboard: Tabbed (Paper/Shadow/Live/Control), auto-refresh with refreshBehaviourNormal logic*
-*Scripts: 8 rationalised (restart, stop, mode, status, accounting, reset + 3 Windows launchers)*
-*Git: https://github.com/andydoc/Prediction-trading*
+*Scripts: 8 rationalised | Naming standardised (DashboardHandler, live_trading.py, dead code removed)*
+*Git: https://github.com/andydoc/Prediction-trading (4 commits)*
 *Live trading engine ready — run `mode.sh live` after depositing $100+ USDC*
