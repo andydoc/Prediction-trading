@@ -1,0 +1,129 @@
+arbitrage:
+  capital_per_trade: 10.0
+  fees:
+    crypto_15min_fee: 0.001
+    fee_on_winnings: false
+    polymarket_global_fee: 0.0
+    polymarket_maker_fee: 0.0
+    polymarket_taker_fee: 0.0001
+    trading_fee: 0.0001
+    withdrawal_fee: 0.0
+  max_concurrent_positions: 20
+  max_exposure_per_market: 500
+  max_position_size: 1000
+  max_profit_threshold: 0.3
+  min_profit_threshold: 0.03
+  optimization:
+    algorithm: frank_wolfe
+    max_iterations: 100
+    tolerance: 0.0001
+communication:
+  auto_retry:
+    backoff_factor: 2
+    enabled: true
+    max_retries: 3
+  task_check_interval: 30
+  urgency_levels:
+    high: 60
+    low: 3600
+    medium: 600
+    urgent: 10
+constraint_detection:
+  detect_types:
+  - logical_implication
+  - mutual_exclusivity
+  - complementary
+  - correlated
+  max_markets: 5
+  min_confidence: 0.7
+  min_markets: 2
+  rebuild_interval: 300
+debug: true
+execution:
+  max_retries: 3
+  max_slippage: 0.005
+  order_timeout: 60
+  retry_delay: 5
+  strategy: limit_orders
+fees:
+  min_profit_threshold: 0.03
+live_trading:
+  capital_per_trade: 10
+  enabled: true
+  fill_check_interval_secs: 2
+  low_balance_pause_usd: 20
+  max_capital: 100
+  max_positions: 11
+  max_price_drift_pct: 0.05
+  min_orderbook_depth_usd: 50
+  min_profit_after_fees: 0.03
+  min_resolution_time_secs: 3600
+  order_timeout_secs: 60
+  shadow_only: true
+market_data:
+  enabled_markets:
+  - polymarket
+  poll_interval: 30
+  polymarket:
+    api_url: https://gamma-api.polymarket.com
+    rate_limit: 10
+  storage:
+    compress: true
+    format: json
+    retention_days: 30
+max_open_positions: 6
+mode: dual
+monitoring:
+  alerts:
+    error_count_threshold: 5
+    high_exposure_threshold: 0.8
+    low_balance_threshold: 1000
+  heartbeat_interval: 60
+  logging:
+    format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level: INFO
+    retention: 30
+    rotation: daily
+ollama:
+  api_key: ollama-local
+  base_url: http://127.0.0.1:11434/v1
+  context_window: 128000
+  max_tokens: 8192
+  model: lfm2.5-thinking:1.2b
+paper_trading:
+  initial_capital: 100
+  max_position_age_hours: 24
+  max_price_drift_pct: 0.1
+  simulated_fill_rate: 0.95
+  simulated_latency: 0.5
+  track_metrics:
+  - total_trades
+  - win_rate
+  - avg_profit_per_trade
+  - prediction_accuracy
+  - max_drawdown
+performance:
+  cache:
+    enabled: true
+    max_size_mb: 500
+    ttl: 300
+  db_pool_size: 10
+  worker_threads: 4
+risk:
+  max_daily_loss: 500
+  max_daily_loss_pct: 0.05
+  volatility:
+    enabled: true
+    lookback_period: 3600
+    max_volatility: 0.15
+  whale_detection:
+    enabled: true
+    price_impact_threshold: 0.05
+    volume_threshold: 10000
+workspace:
+  brain_inbox: /mnt/c/Users/andyd/ai-workspace/brain-inbox
+  data: /home/andydoc/prediction-trader/data
+  logs: /home/andydoc/prediction-trader/logs
+  results: /mnt/c/Users/andyd/ai-workspace/results
+  root: /home/andydoc/prediction-trader
+  tasks: /mnt/c/Users/andyd/ai-workspace/tasks
