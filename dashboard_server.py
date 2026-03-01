@@ -456,7 +456,7 @@ def make_html():
             cat_repl_even.append(row)
 
     # Build subsection HTML for each category
-    def _closed_sub(title, rows, collapsed=False):
+    def _render_closed_subsection(title, rows, collapsed=False):
         if not rows:
             return ''
         css_cls = 'collapsed' if collapsed else ''
@@ -468,10 +468,10 @@ def make_html():
         return hdr + tbl
 
     closed_html = ''
-    closed_html += _closed_sub('Resolved', cat_resolved, collapsed=False)
-    closed_html += _closed_sub('Replaced with Profit', cat_repl_profit, collapsed=False)
-    closed_html += _closed_sub('Replaced with Loss', cat_repl_loss, collapsed=False)
-    closed_html += _closed_sub('Replaced at Breakeven', cat_repl_even, collapsed=True)
+    closed_html += _render_closed_subsection('Resolved', cat_resolved, collapsed=False)
+    closed_html += _render_closed_subsection('Replaced with Profit', cat_repl_profit, collapsed=False)
+    closed_html += _render_closed_subsection('Replaced with Loss', cat_repl_loss, collapsed=False)
+    closed_html += _render_closed_subsection('Replaced at Breakeven', cat_repl_even, collapsed=True)
 
     # Annualized: total portfolio return / calendar days since first trade
     annualized_ret = 0.0
@@ -1197,7 +1197,7 @@ function saveParams() {{
 </body></html>'''
     return html
 
-class Handler(BaseHTTPRequestHandler):
+class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/status':
             self.send_response(200)

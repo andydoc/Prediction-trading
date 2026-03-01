@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.append(str(Path(__file__).parent))
 from paper_trading import PaperTradingEngine
-from live_trading_engine import LiveTradingEngine
+from live_trading import LiveTradingEngine
 from layer1_market_data.market_data import MarketData
 
 WORKSPACE    = Path('/home/andydoc/prediction-trader')
@@ -94,7 +94,7 @@ def get_held_constraint_ids(engine) -> set:
             held.add(cid)
     return held
 
-def opp_overlaps_held(opp_dict, held_market_ids) -> bool:
+def opportunity_overlaps_held(opp_dict, held_market_ids) -> bool:
     """Check if opportunity shares any market_id with held positions."""
     for mid in opp_dict.get('market_ids', []):
         if str(mid) in held_market_ids:
@@ -188,7 +188,7 @@ async def main():
                             cid = opp_d.get('constraint_id', '')
                             if cid in held_cids:
                                 continue
-                            if opp_overlaps_held(opp_d, held_mids):
+                            if opportunity_overlaps_held(opp_d, held_mids):
                                 continue
                             best_new = (score, hours, opp_d)
                             break
@@ -306,7 +306,7 @@ async def main():
                         if constraint_id in held_cids:
                             continue
                         # Skip if any market_id already held
-                        if opp_overlaps_held(opp_dict, held_mids):
+                        if opportunity_overlaps_held(opp_dict, held_mids):
                             log.debug(f'  Skip market overlap: {constraint_id}')
                             continue
 
