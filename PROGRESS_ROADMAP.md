@@ -14,8 +14,18 @@ Automated system that detects and exploits pricing inefficiencies across Polymar
 | L4 Execution | `layer4_runner.py` → `paper_trading.py` + `live_trading.py` | Continuous | Executes trades (paper/shadow/live), monitors positions, handles resolution |
 
 ### Supervisor
-- `main.py` — Starts all 4 layers as subprocesses, monitors health, restarts failed components
+- `main.py` — Starts all 4 layers + dashboard + exec_ctrl as subprocesses, monitors health, restarts failed components
 - `dashboard_server.py` — Flask web UI on port 5556 with tabs (Paper/Shadow/Live/Control)
+- `execution_control.py` — Flask API on port 5557 for multi-machine leader election
+
+### Multi-Machine Architecture
+Only ONE machine may run L4 execution at a time. The execution control server (Flask, port 5557) manages this:
+- **Endpoints**: `GET /status`, `POST /claim`, `POST /release`, `POST /heartbeat`, `GET /health`
+- **L4 integration**: `layer4_runner.py` imports `ExecutionLock` from `execution_control_client.py`, checks lock before every trade cycle
+- **Fail-open**: If control server is unreachable, L4 allows execution (avoids blocking if server is down)
+- **TTL**: Leader must heartbeat every 300s or lock auto-expires — prevents stuck locks if a machine crashes
+- **Config**: `execution_control.enabled` and `execution_control.url` in config.yaml
+- **Remote claim**: From laptop: `curl -X POST http://desktop-ip:5557/claim -d '{"machine":"laptop"}'`
 
 ### Trading Modes
 | Mode | Config | Behaviour |
@@ -29,6 +39,8 @@ Automated system that detects and exploits pricing inefficiencies across Polymar
 /home/andydoc/prediction-trader/          ← Running code (WSL)
 ├── main.py                               ← Supervisor (starts L1-L4)
 ├── dashboard_server.py                   ← Web dashboard (port 5556)
+├── execution_control.py                  ← Multi-machine lock server (port 5557)
+├── execution_control_client.py           ← Lock client (imported by L4)
 ├── paper_trading.py                      ← Paper/shadow trading engine
 ├── live_trading.py                       ← Live CLOB trading engine
 ├── layer1_runner.py                      ← L1 process entry point
@@ -45,7 +57,8 @@ Automated system that detects and exploits pricing inefficiencies across Polymar
 │   ├── config.yaml                       ← Trading parameters (in git)
 │   └── secrets.yaml                      ← Polymarket API keys (NOT in git)
 ├── data/system_state/
-│   └── execution_state.json              ← All positions, capital, trade history
+│   ├── execution_state.json              ← All positions, capital, trade history
+│   └── execution_lock.json               ← Multi-machine leader lock
 ├── logs/
 │   ├── layer1_YYYYMMDD.log
 │   ├── layer2_YYYYMMDD.log
@@ -241,14 +254,11 @@ http://localhost:5556
 
 ## Git Repository
 - **Remote**: https://github.com/andydoc/Prediction-trading
-- **Local**: `C:\Users\andyd\ai-workspace\prediction-trader\`
+- **Local (laptop)**: `C:\Users\andyd\ai-workspace\prediction-trader\`
+- **Local (desktop)**: `\\wsl$\Ubuntu\home\andydoc\prediction-trader\` (WSL)
 - **Branch**: `main`
 - **Excludes** (via .gitignore): secrets.yaml, data/, logs/, __pycache__, *.pid, *.zip, *.tar.gz, .env
-- **Push from**: Windows PowerShell (WSL git lacks credential helper)
-```powershell
-cd C:\Users\andyd\ai-workspace\prediction-trader
-git add -A; git commit -m "description"; git push
-```
+- **Sync workflow**: Edit on either machine → `git push` → other machine does `git pull`
 
 ## Performance (as of 2026-03-02)
 - **Initial capital**: $100.00
@@ -260,9 +270,11 @@ git add -A; git commit -m "description"; git push
 - **Backtested optimal**: 30-50% cash per trade would have returned 57-71% vs actual 30%
 
 ---
-*Last updated: 2026-03-02 08:00 UTC*
+*Last updated: 2026-03-02 10:00 UTC*
 *Mode: SHADOW | 14 positions open, 989 closed (65 resolved, 100% win rate, $47.35 profit)*
-*Dashboard: Tabbed (Paper/Shadow/Live/Control), auto-refresh with refreshBehaviourNormal logic*
-*Scripts: 8 rationalised | Naming standardised | Single doc (SETUP_INSTRUCTIONS merged in)*
-*Git: https://github.com/andydoc/Prediction-trading (5 commits)*
+*Dashboard: port 5556 | Execution Control: port 5557*
+*Multi-machine: Leader election via execution_control.py (L4 checks lock before trading)*
+*Machines: Laptop (andyd/andydoc) + Desktop HP-800G2 (Andrew Thompson/andydoc)*
+*Scripts: 8 rationalised | Naming standardised | Single doc*
+*Git: https://github.com/andydoc/Prediction-trading (12 commits)*
 *Live trading engine ready — run `mode.sh live` after depositing $100+ USDC*
