@@ -45,6 +45,9 @@ execution:
   order_timeout: 60
   retry_delay: 5
   strategy: limit_orders
+execution_control:
+  enabled: true
+  url: http://localhost:5557
 fees:
   min_profit_threshold: 0.03
 live_trading:
