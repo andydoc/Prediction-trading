@@ -1,146 +1,194 @@
-# Prediction Trader - Progress & Roadmap
+# Prediction Market Arbitrage Trading System — Progress & Roadmap
 
-## System Architecture
-- **Location**: `/home/andydoc/prediction-trader/` (WSL, local)
-- **Python env**: `/home/andydoc/prediction-trader-env/`
-- **Supervisor**: `main.py` → starts L1-L4 + dashboard as subprocesses
-- **Quick start**: `cd /home/andydoc/prediction-trader && nohup python main.py > logs/main.log 2>&1 &`
-- **Dashboard**: http://localhost:5556 (standalone `dashboard_server.py`, managed by supervisor)
+## Overview
+Automated system that detects and exploits pricing inefficiencies across Polymarket prediction markets using mathematical arbitrage (marginal polytope construction, Bregman projection, Frank-Wolfe optimization). Runs on WSL (Ubuntu) with a multi-process supervisor architecture.
 
-## Layer Structure
-| Layer | Runner | Purpose | Status |
-|-------|--------|---------|--------|
-| L1 | layer1_runner.py | Pulls ~10K markets from Polymarket API → `data/latest_markets.json` | ✅ Working |
-| L2 | layer2_runner.py | Detects constraints via negRiskMarketID ONLY → `layer2_.../data/latest_constraints.json` | ✅ Working |
-| L3 | layer3_runner.py | Arbitrage math → `layer3_.../data/latest_opportunities.json` (~88 opps/scan, ~11s) | ✅ Working |
-| L4 | layer4_runner.py | Paper + Live trading: dynamic capital, resolution ranking, position replacement | ✅ Working |
-| Dash | dashboard_server.py | Real-time dashboard on port 5556 | ✅ Working |
-| Live | live_trading_engine.py | Polymarket CLOB API: orders, fills, liquidation, shadow mode | ✅ Ready |
+## Architecture
 
-## Key Files
-- `config/config.yaml` — main config (fees, thresholds, capital, max positions, live_trading section)
-- `config/secrets.yaml` — Polymarket private key, funder address, API host (gitignored)
-- `live_trading_engine.py` — CLOB client wrapper (825 lines): auth, balance, tokens, orderbook, orders, fills, liquidation, shadow
-- `layer3_arbitrage_math/arbitrage_engine.py` — arb math (mutex direct + polytope)
-- `paper_trading_complete.py` — position management, state persistence, liquidation
-- `dashboard_server.py` — standalone dashboard on port 5556 with mode badge
-- `data/system_state/execution_state.json` — live trading state (positions, capital)
+### Four-Layer Design
+| Layer | File | Frequency | Purpose |
+|-------|------|-----------|---------|
+| L1 Market Data | `layer1_runner.py` → `layer1_market_data/market_data.py` | Every 30s | Collects market prices from Polymarket API |
+| L2 Constraints | `layer2_runner.py` → `layer2_constraint_detection/constraint_detector.py` | Every 5min | Detects logical relationships (mutex groups) between markets |
+| L3 Arbitrage | `layer3_runner.py` → `layer3_arbitrage_math/arbitrage_engine.py` | Continuous | Scans for pricing inconsistencies, calculates optimal bets via CVXPY LP |
+| L4 Execution | `layer4_runner.py` → `paper_trading.py` + `live_trading.py` | Continuous | Executes trades (paper/shadow/live), monitors positions, handles resolution |
 
-## Live Trading Architecture
-### CLOB Integration (live_trading_engine.py)
-- **Auth**: Email/Magic signature (type=1), API key derived from private key
-- **Token resolution**: L1 metadata `clobTokenIds` → YES/NO token IDs (91% success rate)
-- **Fallback**: Gamma API slug lookup for missing tokens
-- **Balance**: `get_balance_allowance(COLLATERAL)` → raw/1e6 = USDC
-- **Prices**: `get_midpoint(token_id)` for live executable prices
-- **Orderbook**: Depth check before placing orders (min $50 liquidity)
-- **Fees**: Dynamic `get_fee_rate()` per token (0% most markets, up to 3% crypto)
-- **Orders**: GTC limit orders at midpoint, batch placement for multi-leg arbs
-- **Fill monitoring**: Poll every 2s for 60s, handle partial fills
-- **Shadow mode**: Full validation without placing orders (skip balance check)
+### Supervisor
+- `main.py` — Starts all 4 layers as subprocesses, monitors health, restarts failed components
+- `dashboard_server.py` — Flask web UI on port 5556 with tabs (Paper/Shadow/Live/Control)
 
-### L4 Integration
-- L4 imports LiveTradingEngine based on config `mode` and `live_trading.enabled`
-- **Paper mode**: Existing paper trading only
-- **Shadow mode**: Paper trades + shadow validation logged
-- **Dual mode**: Paper trades + real CLOB orders in parallel
-- **Live mode**: Real CLOB orders only (not yet implemented, dual recommended)
-- Live metadata stored in position for later liquidation tracking
-- Replacement liquidation also executes live CLOB sell if position has live metadata
+### Trading Modes
+| Mode | Config | Behaviour |
+|------|--------|-----------|
+| PAPER | `live_trading.enabled: false` | Paper trades only, no CLOB interaction |
+| SHADOW | `live_trading.enabled: true, shadow_only: true` | Paper trades + validates against live orderbook |
+| LIVE | `live_trading.enabled: true, shadow_only: false` | Real money trades via Polymarket CLOB |
 
-### Validation Pipeline (6 checks)
-1. Token IDs resolvable for all markets
-2. Live midpoint prices available
-3. Price drift < 5% from L3 calculation
-4. Orderbook depth > $50 within 2% of midpoint
-5. Net profit > 3% after estimated fees
-6. USDC balance sufficient (skipped in shadow mode)
+## File Structure (WSL — authoritative source)
+```
+/home/andydoc/prediction-trader/          ← Running code (WSL)
+├── main.py                               ← Supervisor (starts L1-L4)
+├── dashboard_server.py                   ← Web dashboard (port 5556)
+├── paper_trading.py                      ← Paper/shadow trading engine
+├── live_trading.py                       ← Live CLOB trading engine
+├── layer1_runner.py                      ← L1 process entry point
+├── layer2_runner.py                      ← L2 process entry point
+├── layer3_runner.py                      ← L3 process entry point
+├── layer4_runner.py                      ← L4 process entry point
+├── layer1_market_data/
+│   └── market_data.py                    ← MarketDataManager, PolymarketCollector
+├── layer2_constraint_detection/
+│   └── constraint_detector.py            ← ConstraintDetector (mutex groups)
+├── layer3_arbitrage_math/
+│   └── arbitrage_engine.py               ← ArbitrageMathEngine, MarginalPolytope
+├── config/
+│   ├── config.yaml                       ← Trading parameters (in git)
+│   └── secrets.yaml                      ← Polymarket API keys (NOT in git)
+├── data/system_state/
+│   └── execution_state.json              ← All positions, capital, trade history
+├── logs/
+│   ├── layer1_YYYYMMDD.log
+│   ├── layer2_YYYYMMDD.log
+│   ├── layer3_YYYYMMDD.log
+│   └── layer4_YYYYMMDD.log
+├── test_clob_connect.py                  ← CLOB connectivity test
+├── requirements.txt
+├── PROGRESS_ROADMAP.md                   ← This file
+└── HEARTBEAT.md                          ← Agent instruction file
 
-## Config Summary (config/config.yaml)
-- **mode**: `dual` (paper + live), `paper_trading`, `live_trading`
-- **live_trading.enabled**: true/false
-- **live_trading.shadow_only**: true = validate but don't place orders
-- Fee model: ~1bp per leg (polymarket_taker_fee: 0.0001)
-- Max profit cap: 30%, Min threshold: 3%
-- Capital per trade: `max(10, min(balance*0.1, 1000))` — dynamic
-- Starting capital: $100 (paper), max 20 concurrent positions
-- Position replacement: 20% improvement threshold, skip positions <24h to resolve
+/home/andydoc/prediction-trader-env/      ← Python venv (all dependencies)
 
-## Current State (2026-02-24 17:00 UTC)
-- **Mode**: SHADOW (validates live but doesn't place orders)
-- **Paper capital**: $6.40 cash, ~$110 deployed, ~$116 total value
-- **USDC balance**: $1.65 (insufficient for live — waiting for deposit)
-- **Open positions**: 11 (all slots full)
-- **Closed positions**: 441+ (21+ resolved, rest replaced at breakeven)
-- **CLOB API**: ✅ Authenticated, healthy, token resolution working
-- **Dashboard**: Tabbed UI (Paper/Shadow/Live/Control Panel), SHADOW badge, score column, descriptive layer names
+C:\Users\andyd\ai-workspace\prediction-trader\  ← Git repo mirror
+├── scripts/
+│   ├── restart.sh [--clean]              ← Kill all + restart (--clean purges stale L2/L3)
+│   ├── stop.sh [--dash|--l4]            ← Kill processes (all/dashboard/L4)
+│   ├── mode.sh paper|shadow|live|stop    ← Switch trading mode
+│   ├── status.sh [--full]                ← Quick status or full health check
+│   ├── accounting.py                     ← Capital breakdown
+│   ├── reset.py [--soft|--hard]          ← Soft: return deployed. Hard: wipe to $100
+│   ├── START_TRADER.bat                  ← Manual Windows start (with console)
+│   ├── START_TRADER_SILENT.bat           ← Silent start for Task Scheduler
+│   └── START_TRADER_HIDDEN.vbs           ← Boot auto-start (Windows Startup folder)
+└── (all .py files mirrored from WSL)
+```
+
+## Setup from Scratch
+
+### Prerequisites
+- Windows PC with WSL2 (Ubuntu) installed
+- Python 3.10+ in WSL
+- Polymarket account with API credentials
+
+### Step 1: Create project structure
+```bash
+# In WSL
+mkdir -p ~/prediction-trader/{config,data/system_state,logs}
+mkdir -p ~/prediction-trader/{layer1_market_data,layer2_constraint_detection,layer3_arbitrage_math}
+```
+
+### Step 2: Python virtual environment
+```bash
+python3 -m venv ~/prediction-trader-env
+source ~/prediction-trader-env/bin/activate
+pip install pyyaml aiohttp requests numpy scipy cvxpy flask py-clob-client
+```
+
+### Step 3: Configure secrets
+```bash
+cat > ~/prediction-trader/config/secrets.yaml << 'EOF'
+polymarket:
+  host: "https://clob.polymarket.com"
+  chain_id: 137
+  private_key: "0xYOUR_PRIVATE_KEY"
+  funder_address: "0xYOUR_FUNDER_ADDRESS"
+  signature_type: 0
+EOF
+chmod 600 ~/prediction-trader/config/secrets.yaml
+```
+
+### Step 4: Deploy code
+Copy all `.py` files to `~/prediction-trader/` (from git repo or previous backup).
+
+### Step 5: Test CLOB connectivity
+```bash
+source ~/prediction-trader-env/bin/activate
+cd ~/prediction-trader
+python test_clob_connect.py
+```
+
+### Step 6: Start the system
+```bash
+source ~/prediction-trader-env/bin/activate
+cd ~/prediction-trader
+rm -f *.pid
+nohup python main.py > logs/main.log 2>&1 &
+```
+
+### Step 7: Verify
+- Open http://localhost:5556 (dashboard)
+- Check: `tail -20 logs/layer4_$(date +%Y%m%d).log`
+- All 4 layers should show "running" within ~60 seconds
+
+### Step 8: Windows auto-start (optional)
+Place `START_TRADER_HIDDEN.vbs` in Windows Startup folder:
+`C:\Users\andyd\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\`
 
 ## Go-Live Procedure
-1. Deposit $100+ USDC to funder address on Polygon
-2. Run: `wsl bash /mnt/c/Users/andyd/ai-workspace/prediction-trader/scripts/mode.sh live`
-3. Script checks balance, health, confirms, updates config, restarts L4+dashboard
-4. Monitor: http://localhost:5556 (badge changes to DUAL)
-5. Emergency stop: `wsl bash /mnt/c/Users/andyd/ai-workspace/prediction-trader/scripts/mode.sh stop`
+1. Deposit $100+ USDC to your Polymarket wallet
+2. Verify balance: `test_clob_connect.py` or dashboard
+3. Switch mode: `scripts/mode.sh live` (runs pre-flight checks + confirmation)
+4. Monitor: dashboard Live tab, L4 logs
+5. Emergency stop: `scripts/mode.sh stop` (reverts to paper + cancels all CLOB orders)
 
-## Features Implemented
-1. ✅ **4-layer architecture**: market data → constraints → arb math → paper trading
-2. ✅ **Direct mutex check**: O(N) buy-all/sell-all before polytope
-3. ✅ **Memory-safe polytope**: N≤12 guard, per-constraint 5s timeout
-4. ✅ **Dynamic capital**: `max(10, min(balance*0.1, 1000))`
-5. ✅ **Resolution ranking**: opportunities scored by `profit_pct / hours_to_resolution`
-6. ✅ **Position replacement**: worst open vs best available, 20%+ improvement threshold
-7. ✅ **Liquidation engine**: paper + live CLOB liquidation
-8. ✅ **Dashboard**: capital, return, positions, opps, layers, tooltips, mode badge
-9. ✅ **Expandable positions**: click for leg-by-leg breakdown + scenario analysis
-10. ✅ **Expandable opportunities**: detail rows with legs, scenarios, guaranteed payout
-11. ✅ **Closed position subcategories**: Resolved/Profit/Loss/Breakeven
-12. ✅ **Duplicate opportunity greying**: [HELD] label for already-held opps
-13. ✅ **Auto-start on boot**: VBS in Windows Startup folder
-14. ✅ **Live trading engine**: 825-line CLOB wrapper with full order lifecycle
-15. ✅ **Shadow mode**: Validates opportunities against live orderbooks without trading
+## Completed Features
+1. ✅ **L1 market data**: Polymarket API with pagination, 30s refresh
+2. ✅ **L2 constraint detection**: Mutex group identification from neg-risk markets
+3. ✅ **L3 arbitrage engine**: CVXPY LP for marginal polytope, buy+sell strategies
+4. ✅ **L4 paper trading**: Position lifecycle (open→monitor→replace/resolve→close)
+5. ✅ **Dashboard**: Flask web UI with Paper/Shadow/Live/Control tabs
+6. ✅ **Multi-process supervisor**: main.py manages L1-L4 with health monitoring
+7. ✅ **Market-based dedup**: Prevents re-trading same market groups
+8. ✅ **Position replacement**: Better opportunities replace weaker ones (scored by %/hr)
+9. ✅ **Profit caps & price guards**: Prevent phantom arbitrage from bad data
+10. ✅ **Resolution detection**: Monitors markets for expiry, calculates actual P&L
+11. ✅ **CLOB integration**: py-clob-client auth, token resolution, orderbook depth
+12. ✅ **Shadow mode**: Validates trades against live orderbook without placing orders
+13. ✅ **Live trading engine**: Multi-leg order placement, fill monitoring, liquidation
+14. ✅ **Dynamic capital**: Adjusts trade size based on available balance
+15. ✅ **Dashboard tabs**: Paper/Shadow/Live/Control Panel with mode badge
 16. ✅ **L4 live integration**: Shadow/dual/live paths, live liquidation on replacements
 17. ✅ **Dashboard mode badge**: PAPER/SHADOW/LIVE/DUAL with color coding
 18. ✅ **Dashboard USDC balance**: Shows live balance when in dual/live mode
 19. ✅ **Fee correction**: 0.0001 taker fee (was 0.02)
 20. ✅ **Annualized return fix**: Uses total hold time
-21. ✅ **Replacement bug fix**: Normalized position scores to %/hr (was $/hr, caused 10x inflation)
-22. ✅ **Shadow balance fix**: shadow_trade() skips balance check (was rejecting all with $1.65)
+21. ✅ **Replacement bug fix**: Normalized position scores to %/hr (was $/hr)
+22. ✅ **Shadow balance fix**: shadow_trade() skips balance check
 23. ✅ **Dashboard tabs**: Paper/Shadow/Live/Control Panel tabbed interface
-24. ✅ **Score column**: Replaced #Mkts with score (profit_pct/hours * 10000) in positions + opportunities
+24. ✅ **Score column**: profit_pct/hours * 10000 in positions + opportunities
 25. ✅ **Descriptive layer names**: "1 Market Data", "2 Constraint Detection", etc.
-26. ✅ **Shadow tab**: Shows would-trade signals, rejection breakdown, recent shadow trades
-27. ✅ **Control panel tab**: Mode buttons, parameter inputs (max positions, capital per trade, min profit, drift)
-28. ✅ **Badge fix**: Shows SHADOW when live_trading.enabled=true + shadow_only=true (was showing LIVE)
-29. ✅ **Auto-refresh logic**: refreshBehaviourNormal boolean, pauses when content expanded, resume/pause toggle
-30. ✅ **Script rationalisation**: 21 scripts → 8 (merged overlapping start/stop/mode/status/reset scripts)
-31. ✅ **Git repo**: https://github.com/andydoc/Prediction-trading (code, scripts, docs, .gitignore)
-32. ✅ **Naming standardisation**: Handler→DashboardHandler, _closed_sub→_render_closed_subsection, opp_overlaps_held→opportunity_overlaps_held, live_trading_engine.py→live_trading.py, deleted dead layer4_execution/
+26. ✅ **Shadow tab**: Would-trade signals, rejection breakdown, recent shadow trades
+27. ✅ **Control panel tab**: Mode buttons, parameter inputs
+28. ✅ **Badge fix**: Shows SHADOW when live_trading.enabled=true + shadow_only=true
+29. ✅ **Auto-refresh logic**: refreshBehaviourNormal toggle, pauses when content expanded
+30. ✅ **Script rationalisation**: 21 scripts → 8 (merged overlapping scripts)
+31. ✅ **Git repo**: https://github.com/andydoc/Prediction-trading
+32. ✅ **Naming standardisation**: DashboardHandler, _render_closed_subsection, opportunity_overlaps_held, live_trading.py, deleted dead layer4_execution/
+33. ✅ **Merged SETUP_INSTRUCTIONS into PROGRESS_ROADMAP** (single source of truth)
 
 ## TODO / Roadmap
-### Done
-- [x] All paper trading features (L1-L4, dashboard, replacement, liquidation)
-- [x] CLOB auth & connectivity (secrets.yaml, ClobClient, API key derivation)
-- [x] Token resolution (L1 metadata clobTokenIds + Gamma fallback)
-- [x] Live price feeds (midpoints, orderbook depth)
-- [x] Shadow mode (validates without placing orders)
-- [x] L4 integration (shadow/dual/live paths)
-- [x] Dashboard mode indicator (PAPER/SHADOW/LIVE/DUAL badge)
-- [x] Dashboard USDC balance display
-- [x] Go-live script (GO_LIVE.sh with balance/health checks)
-- [x] Emergency stop script (STOP_LIVE.sh)
-
 ### Pending (waiting for USDC deposit)
-- [ ] **First live trade**: Deposit $100 USDC, run GO_LIVE.sh
+- [ ] **First live trade**: Deposit $100 USDC, run `mode.sh live`
 - [ ] **Live P&L tracking**: Dashboard shows live fills, actual fees, real P&L
 - [ ] **Position reconciliation**: Verify CLOB positions match paper positions
 
 ### Future
-- [ ] **Wire control panel**: Mode switching, parameter save, restart/stop via dashboard API endpoints
+- [ ] **Wire control panel**: Mode switching, parameter save, restart/stop via dashboard API
 - [ ] **Fix supervisor double-instance**: L4 sometimes spawns twice (rare)
 - [ ] **Ollama resolution estimation**: Use LLM for unknown resolve dates
 - [ ] **VPS migration**: For 24/7 operation
 - [ ] **WA notifications**: Alert on new trades, position resolutions, errors
 - [ ] **Scale up**: Increase capital/positions after live validation
+- [ ] **Trade size optimisation**: Increase from 10% to 30-50% per trade (backtested)
 
 ## How to Resume After Crash / PC Reboot
 ### Automatic (on login)
@@ -149,28 +197,14 @@
 - Open http://localhost:5556 to verify
 
 ### Manual (if auto-start fails)
-1. Double-click **`C:\Users\andyd\ai-workspace\START_TRADER.bat`** — OR:
+1. Double-click **`C:\Users\andyd\ai-workspace\prediction-trader\scripts\START_TRADER.bat`** — OR:
 2. WSL: `wsl bash -c "source /home/andydoc/prediction-trader-env/bin/activate && cd /home/andydoc/prediction-trader && rm -f *.pid && nohup python main.py > logs/main.log 2>&1 &"`
 3. Wait ~15s, open http://localhost:5556
 
 ### Key notes
 - **CRITICAL**: venv must be activated — bare `python` won't work
 - All state persists in `data/system_state/execution_state.json`
-- **Check status**: `wsl bash /mnt/c/Users/andyd/ai-workspace/prediction-trader/scripts/status.sh`
-- **Full health**: `wsl bash /mnt/c/Users/andyd/ai-workspace/prediction-trader/scripts/status.sh --full`
-
-### Control Scripts (all in `prediction-trader/scripts/`)
-| Script | Purpose |
-|--------|---------|
-| `restart.sh [--clean]` | Kill all + restart system. `--clean` purges stale L2/L3 data |
-| `stop.sh [--dash\|--l4]` | Kill processes: all (default), dashboard only, or L4 only |
-| `mode.sh paper\|shadow\|live\|stop` | Switch trading mode (live includes pre-flight + confirmation) |
-| `status.sh [--full]` | Quick status (default) or full health check with P&L breakdown |
-| `accounting.py` | Capital accounting breakdown |
-| `reset.py [--soft\|--hard]` | Soft: return deployed to cash. Hard: full wipe to $100 |
-| `START_TRADER.bat` | Manual Windows start (with console) |
-| `START_TRADER_SILENT.bat` | Silent start for Task Scheduler |
-| `START_TRADER_HIDDEN.vbs` | Boot auto-start (in Windows Startup folder) |
+- Check status: `scripts/status.sh` or `scripts/status.sh --full`
 
 ## Useful Commands
 ```bash
@@ -190,7 +224,7 @@ wsl bash /mnt/c/Users/andyd/ai-workspace/$S/status.sh --full     # Full health +
 
 # === MANUAL ===
 # Start system
-wsl bash -c "cd /home/andydoc/prediction-trader && rm -f *.pid && nohup python main.py > logs/main.log 2>&1 &"
+wsl bash -c "cd /home/andydoc/prediction-trader && source ~/prediction-trader-env/bin/activate && rm -f *.pid && nohup python main.py > logs/main.log 2>&1 &"
 
 # L4 log tail
 wsl tail -30 /home/andydoc/prediction-trader/logs/layer4_$(date +%Y%m%d).log
@@ -198,46 +232,37 @@ wsl tail -30 /home/andydoc/prediction-trader/logs/layer4_$(date +%Y%m%d).log
 # Check state
 wsl python3 -c "import json; d=json.load(open('/home/andydoc/prediction-trader/data/system_state/execution_state.json')); print(f'Cap=\${d[\"current_capital\"]:.2f} Open={len(d[\"open_positions\"])} Closed={len(d[\"closed_positions\"])}')"
 
-# Check USDC balance
-wsl bash -c "source /home/andydoc/prediction-trader-env/bin/activate && cd /home/andydoc/prediction-trader && python3 -c \"
-import yaml
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-with open('config/secrets.yaml') as f: s=yaml.safe_load(f)['polymarket']
-c=ClobClient(s['host'],key=s['private_key'],chain_id=s['chain_id'],signature_type=s['signature_type'],funder=s['funder_address'])
-cr=c.create_or_derive_api_creds();c.set_api_creds(cr)
-b=c.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-print(f'USDC: \${float(b[\\\"balance\\\"])/1e6:.2f}')
-\""
-
 # Kill everything
 wsl bash -c "kill \$(ps aux|grep 'main.py\|layer[1-4]_runner\|dashboard_server'|grep -v grep|awk '{print \$2}')"
 
 # Dashboard
 http://localhost:5556
-
-# Git (from Windows cmd/powershell)
-cd C:\Users\andyd\ai-workspace\prediction-trader
-git add -A
-git commit -m "description of changes"
-git push
-
-# Git - check status
-git status
-git log --oneline -5
 ```
 
 ## Git Repository
 - **Remote**: https://github.com/andydoc/Prediction-trading
 - **Local**: `C:\Users\andyd\ai-workspace\prediction-trader\`
 - **Branch**: `main`
-- **Excludes** (via .gitignore): secrets.yaml, data/, logs/, __pycache__, *.pid, *.zip, *.tar.gz
-- **Push from**: Windows PowerShell or CMD (WSL git lacks credential helper)
+- **Excludes** (via .gitignore): secrets.yaml, data/, logs/, __pycache__, *.pid, *.zip, *.tar.gz, .env
+- **Push from**: Windows PowerShell (WSL git lacks credential helper)
+```powershell
+cd C:\Users\andyd\ai-workspace\prediction-trader
+git add -A; git commit -m "description"; git push
+```
+
+## Performance (as of 2026-03-02)
+- **Initial capital**: $100.00
+- **Resolved trades**: 65 (100% win rate)
+- **Total resolved profit**: $47.35
+- **Avg return per trade**: 7.3% (range 3.0%–23.9%)
+- **Avg hold time**: 27 hours
+- **Replacement churn**: 927 swaps at ~$0.001 each ($0.92 total cost)
+- **Backtested optimal**: 30-50% cash per trade would have returned 57-71% vs actual 30%
 
 ---
-*Last updated: 2026-03-01 17:30 UTC*
-*Mode: SHADOW | 14 positions open, 989 closed (65 resolved, 100% win rate, $47.35 profit) | USDC: $1.65*
+*Last updated: 2026-03-02 08:00 UTC*
+*Mode: SHADOW | 14 positions open, 989 closed (65 resolved, 100% win rate, $47.35 profit)*
 *Dashboard: Tabbed (Paper/Shadow/Live/Control), auto-refresh with refreshBehaviourNormal logic*
-*Scripts: 8 rationalised | Naming standardised (DashboardHandler, live_trading.py, dead code removed)*
-*Git: https://github.com/andydoc/Prediction-trading (4 commits)*
+*Scripts: 8 rationalised | Naming standardised | Single doc (SETUP_INSTRUCTIONS merged in)*
+*Git: https://github.com/andydoc/Prediction-trading (5 commits)*
 *Live trading engine ready — run `mode.sh live` after depositing $100+ USDC*
