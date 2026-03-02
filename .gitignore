@@ -1,19 +1,38 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.so
 venv/
 env/
 .venv/
+
+# Secrets & runtime data
 config/secrets.yaml
 secrets.yaml
 data/
 logs/
 *.log
 *.pid
+
+# OS files
 .DS_Store
 Thumbs.db
+
+# IDE
 .vscode/
 .idea/
+
+# Testing & linting
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
+
+# Environment files
+.env
+
+# Archives & backups
 *.tar.gz
 *.zip
 *.bak
