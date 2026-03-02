@@ -250,6 +250,29 @@ wsl bash -c "kill \$(ps aux|grep 'main.py\|layer[1-4]_runner\|dashboard_server'|
 
 # Dashboard
 http://localhost:5556
+
+# === EXECUTION CONTROL ===
+wsl bash /home/andydoc/prediction-trader/scripts/exec_claim.sh status
+wsl bash /home/andydoc/prediction-trader/scripts/exec_claim.sh claim laptop
+wsl bash /home/andydoc/prediction-trader/scripts/exec_claim.sh release --force
+# Remote (from laptop hitting desktop/oracle):
+EXEC_CTRL_URL=http://<server-ip>:5557 ./scripts/exec_claim.sh claim laptop
+
+# === GIT SYNC (all repos) ===
+# From desktop (WSL → push → pull Windows clone):
+wsl bash /home/andydoc/prediction-trader/scripts/sync.sh "commit message"
+# From laptop (WSL):
+cd /home/andydoc/prediction-trader && git add -A && git commit -m "msg" && git push
+# From laptop (Windows PowerShell):
+cd C:\Users\andyd\ai-workspace\prediction-trader; git pull origin main
+
+# === EXPORT STATE (for migration / new machine setup) ===
+# Copy secrets + state to Windows Desktop for transfer:
+cp /home/andydoc/prediction-trader/config/secrets.yaml /mnt/c/Users/andyd/Desktop/
+cp /home/andydoc/prediction-trader/data/system_state/execution_state.json /mnt/c/Users/andyd/Desktop/
+# On target machine, place them back:
+cp secrets.yaml /home/andydoc/prediction-trader/config/
+cp execution_state.json /home/andydoc/prediction-trader/data/system_state/
 ```
 
 ## Git Repository
@@ -259,6 +282,28 @@ http://localhost:5556
 - **Branch**: `main`
 - **Excludes** (via .gitignore): secrets.yaml, data/, logs/, __pycache__, *.pid, *.zip, *.tar.gz, .env
 - **Sync workflow**: Edit on either machine → `git push` → other machine does `git pull`
+
+## TODO / Roadmap
+### Immediate
+- [ ] **API key auth for execution_control.py** — Add `X-API-Key` header check before deploying to public IP. ~10 lines, update client + exec_claim.sh to send key.
+- [ ] **Oracle Cloud setup script** — Provision Always Free AMD instance, install Python/Flask, deploy execution_control.py, open port 5557. Write `scripts/oracle_setup.sh` for one-command deploy.
+- [ ] **Desktop: copy secrets.yaml + execution_state.json** — Files exported to `C:\Users\andyd\Desktop\`, email to `andydoc1@gmail.com` or transfer via USB. Place into desktop WSL at:
+  ```
+  /home/andydoc/prediction-trader/config/secrets.yaml
+  /home/andydoc/prediction-trader/data/system_state/execution_state.json
+  ```
+- [ ] **Deposit USDC** — Fund Polymarket wallet ($100+ minimum) to go live
+
+### Short-term
+- [ ] Migrate execution control server from desktop to Oracle Cloud instance
+- [ ] Update `execution_control.url` in config.yaml on all machines to Oracle public IP
+- [ ] Set up WhatsApp (OpenClaw) control integration
+- [ ] Increase capital_per_trade once live trading is verified
+
+### Medium-term
+- [ ] VPS migration — move full trading system to always-on cloud server
+- [ ] Historical performance analytics dashboard
+- [ ] Multi-exchange support (Kalshi, etc.)
 
 ## Performance (as of 2026-03-02)
 - **Initial capital**: $100.00
@@ -270,11 +315,12 @@ http://localhost:5556
 - **Backtested optimal**: 30-50% cash per trade would have returned 57-71% vs actual 30%
 
 ---
-*Last updated: 2026-03-02 10:00 UTC*
+*Last updated: 2026-03-02 11:00 UTC*
 *Mode: SHADOW | 14 positions open, 989 closed (65 resolved, 100% win rate, $47.35 profit)*
 *Dashboard: port 5556 | Execution Control: port 5557*
 *Multi-machine: Leader election via execution_control.py (L4 checks lock before trading)*
 *Machines: Laptop (andyd/andydoc) + Desktop HP-800G2 (Andrew Thompson/andydoc)*
-*Scripts: 8 rationalised | Naming standardised | Single doc*
-*Git: https://github.com/andydoc/Prediction-trading (12 commits)*
-*Live trading engine ready — run `mode.sh live` after depositing $100+ USDC*
+*Repos synced: Laptop WSL + Laptop Win + Desktop WSL + Desktop Win (all @ main)*
+*Scripts: 9 (+ exec_claim.sh, sync.sh) | Naming standardised | Single doc*
+*Git: https://github.com/andydoc/Prediction-trading (14 commits)*
+*Next: API key auth → Oracle Cloud deploy → go live*
