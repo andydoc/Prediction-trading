@@ -21,6 +21,7 @@ LAYERS = [
     {'name': 'layer3', 'script': WORKSPACE / 'layer3_runner.py', 'restart_delay': 10},
     {'name': 'layer4', 'script': WORKSPACE / 'layer4_runner.py', 'restart_delay': 10},
     {'name': 'dashboard', 'script': WORKSPACE / 'dashboard_server.py', 'restart_delay': 5},
+    {'name': 'exec_ctrl', 'script': WORKSPACE / 'execution_control.py', 'restart_delay': 5},
 ]
 processes = {}
 running = True

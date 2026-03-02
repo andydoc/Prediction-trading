@@ -13,6 +13,7 @@ sys.path.append(str(Path(__file__).parent))
 from paper_trading import PaperTradingEngine
 from live_trading import LiveTradingEngine
 from layer1_market_data.market_data import MarketData
+from execution_control_client import ExecutionLock
 
 WORKSPACE    = Path('/home/andydoc/prediction-trader')
 CONFIG_PATH  = WORKSPACE / 'config' / 'config.yaml'
@@ -144,6 +145,17 @@ async def main():
     
     log.info(f'Layer 4 started [{mode_str.upper()}] (dynamic capital + resolution ranking + replacement)')
     write_status('starting')
+
+    # Execution lock — only the leader machine may trade
+    exec_lock_url = config.get('execution_control', {}).get('url', 'http://localhost:5557')
+    exec_lock_enabled = config.get('execution_control', {}).get('enabled', True)
+    exec_lock = ExecutionLock(server_url=exec_lock_url, ttl=300)
+    if not exec_lock_enabled:
+        exec_lock.disable()
+        log.info('Execution lock DISABLED (single-machine mode)')
+    else:
+        log.info(f'Execution lock enabled, server={exec_lock_url}')
+
     iteration = 0
     last_replacement_time = 0.0  # Unix timestamp of last replacement
 
@@ -163,6 +175,23 @@ async def main():
             if engine.open_positions:
                 log.debug(f'[iter {iteration}] Monitoring {len(engine.open_positions)} open positions')
                 await engine.monitor_positions(markets)
+
+            # --- EXECUTION LOCK CHECK ---
+            if not exec_lock.can_execute():
+                leader = (exec_lock.last_status or {}).get('leader', '?')
+                if iteration % 10 == 1:
+                    log.info(f'[iter {iteration}] Execution locked by {leader} — monitoring only')
+                # Still save state and monitor, just don't trade
+                STATE_DIR.mkdir(parents=True, exist_ok=True)
+                engine.save_state(EXEC_STATE)
+                metrics = engine.get_performance_metrics() if hasattr(engine, 'get_performance_metrics') else {}
+                write_status('locked', metrics.get('current_capital', 0), len(engine.open_positions))
+                await asyncio.sleep(check_interval)
+                continue
+
+            # Send heartbeat if we're the leader
+            if exec_lock._enabled:
+                exec_lock.heartbeat()
 
             # --- POSITION REPLACEMENT (loop: replace ALL underperformers each round) ---
             now_ts = _time.time()
