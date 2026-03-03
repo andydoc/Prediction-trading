@@ -32,7 +32,11 @@ Thumbs.db
 # Environment files
 .env
 
+# Debug/investigation scripts (one-off, not production)
+scripts/debug/
+
 # Archives & backups
 *.tar.gz
 *.zip
-*.bak*.backup*
+*.bak
+*.backup*
