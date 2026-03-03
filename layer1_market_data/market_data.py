@@ -135,8 +135,9 @@ class PolymarketCollector(MarketDataCollector):
             all_markets = []
             url = f"{self.api_url}/markets"
             
-            # Fetch 100 pages of 100 markets each = 10000 total
-            for page in range(100):
+            # Paginate until ALL markets collected (no hard cap)
+            page = 0
+            while True:
                 params = {
                     'active': 'true',
                     'closed': 'false',
@@ -154,8 +155,14 @@ class PolymarketCollector(MarketDataCollector):
                         break
                     
                     all_markets.extend(data)
+                    
+                    # If we got fewer than limit, we've reached the end
+                    if len(data) < 100:
+                        break
+                    
+                    page += 1
             
-            self.logger.info(f"Fetched {len(all_markets)} markets via pagination")
+            self.logger.info(f"Fetched {len(all_markets)} markets across {page + 1} pages")
             return self._parse_polymarket_data(all_markets)
         
         except Exception as e:

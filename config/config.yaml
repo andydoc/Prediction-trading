@@ -9,6 +9,11 @@ arbitrage:
     trading_fee: 0.0001
     withdrawal_fee: 0.0
   max_concurrent_positions: 20
+  resolution_validation:
+    enabled: true
+    anthropic_api_key: ${ANTHROPIC_API_KEY}
+    cache_ttl_hours: 168
+  max_days_to_resolution: 60
   max_exposure_per_market: 500
   max_position_size: 1000
   max_profit_threshold: 0.3

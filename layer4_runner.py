@@ -14,9 +14,21 @@ from paper_trading import PaperTradingEngine
 from live_trading import LiveTradingEngine
 from layer1_market_data.market_data import MarketData
 from execution_control_client import ExecutionLock
+from resolution_validator import get_validated_resolution_date, get_full_validation, _load_cache as load_resolution_cache
+import os
+
+# Load .env file for API keys (bashrc interactive guard blocks non-interactive shells)
+_env_file = Path(__file__).parent / '.env'
+if _env_file.exists():
+    for line in _env_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith('#') and '=' in line:
+            k, v = line.split('=', 1)
+            os.environ.setdefault(k.strip(), v.strip())
 
 WORKSPACE    = Path('/home/andydoc/prediction-trader')
 CONFIG_PATH  = WORKSPACE / 'config' / 'config.yaml'
+SECRETS_PATH = WORKSPACE / 'config' / 'secrets.yaml'
 OPP_PATH     = WORKSPACE / 'layer3_arbitrage_math' / 'data' / 'latest_opportunities.json'
 MARKETS_PATH = WORKSPACE / 'data' / 'latest_markets.json'
 STATUS_PATH  = WORKSPACE / 'data' / 'layer4_status.json'
@@ -57,8 +69,10 @@ def get_resolution_hours(opp_dict: dict, market_lookup: dict) -> float:
         return -1
     return max_delta / 3600
 
-def rank_opportunities(opps: list, market_lookup: dict, min_resolution_secs: int = 300) -> list:
+def rank_opportunities(opps: list, market_lookup: dict, min_resolution_secs: int = 300,
+                       max_days_to_resolution: int = 60) -> list:
     scored = []
+    max_hours = max_days_to_resolution * 24
     for opp in opps:
         hours = get_resolution_hours(opp, market_lookup)
         if hours is None:
@@ -67,6 +81,9 @@ def rank_opportunities(opps: list, market_lookup: dict, min_resolution_secs: int
             log.debug(f"  Filtered out {opp.get('opportunity_id','?')}: end_date in past")
             continue
         if hours * 3600 < min_resolution_secs:
+            continue
+        if hours > max_hours:
+            log.debug(f"  Filtered out {opp.get('opportunity_id','?')}: {hours/24:.0f}d > {max_days_to_resolution}d max")
             continue
         profit_pct = opp.get('expected_profit_pct', 0)
         score = profit_pct / max(hours, 0.01)
@@ -105,7 +122,21 @@ def opportunity_overlaps_held(opp_dict, held_market_ids) -> bool:
 async def main():
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
+    # Load secrets (Polymarket keys, Anthropic key, etc.)
+    secrets = {}
+    if SECRETS_PATH.exists():
+        with open(SECRETS_PATH) as f:
+            secrets = yaml.safe_load(f) or {}
     max_positions = config.get('arbitrage', {}).get('max_concurrent_positions', 20)
+    max_days_to_resolution = config.get('arbitrage', {}).get('max_days_to_resolution', 60)
+    res_val_cfg = config.get('arbitrage', {}).get('resolution_validation', {})
+    # Anthropic key: secrets.yaml > config.yaml > env var
+    anthropic_api_key = (
+        secrets.get('resolution_validation', {}).get('anthropic_api_key', '')
+        or os.path.expandvars(res_val_cfg.get('anthropic_api_key', ''))
+        or os.environ.get('ANTHROPIC_API_KEY', '')
+    )
+    resolution_validation_enabled = res_val_cfg.get('enabled', True)
     check_interval = 30
     replacement_cooldown_secs = 60   # Min 60s between replacement rounds
 
@@ -202,7 +233,7 @@ async def main():
                     if not opp_text.strip():
                         raise ValueError("Empty opportunities file (L3 writing)")
                     opps_for_replace = json.loads(opp_text).get('opportunities', [])
-                    ranked_for_replace = rank_opportunities(opps_for_replace, market_lookup, min_resolution_secs=300)
+                    ranked_for_replace = rank_opportunities(opps_for_replace, market_lookup, min_resolution_secs=300, max_days_to_resolution=max_days_to_resolution)
                     now_utc = datetime.now(timezone.utc)
                     replacements_made = 0
                     max_replacements_per_round = 5
@@ -219,6 +250,23 @@ async def main():
                                 continue
                             if opportunity_overlaps_held(opp_d, held_mids):
                                 continue
+                            # AI resolution date + outcome check for replacement candidates
+                            if resolution_validation_enabled and anthropic_api_key:
+                                try:
+                                    mids = opp_d.get('market_ids', [])
+                                    val = get_full_validation(mids, market_lookup, anthropic_api_key, cid)
+                                    if val:
+                                        if val.get('has_unrepresented_outcome', False):
+                                            continue  # Skip — broken mutual exclusivity
+                                        try:
+                                            vd = datetime.strptime(val['latest_resolution_date'], '%Y-%m-%d').replace(
+                                                hour=23, minute=59, second=59, tzinfo=timezone.utc)
+                                            if (vd - datetime.now(timezone.utc)).days > max_days_to_resolution:
+                                                continue
+                                        except (ValueError, KeyError):
+                                            pass
+                                except Exception:
+                                    pass  # Fail open
                             best_new = (score, hours, opp_d)
                             break
 
@@ -226,23 +274,37 @@ async def main():
                             break
                         best_score, best_hours, best_opp = best_new
 
-                        # Score all open positions, find worst (skip <24h)
+                        # Score all open positions, find worst
+                        # Positions whose validated resolution date is <24h away are PROTECTED
                         worst_pos = None
                         worst_remaining_score = float('inf')
                         for pid, pos in engine.open_positions.items():
+                            # 1. Try validated resolution date from AI cache
                             pos_latest_end = None
-                            for mid_str in pos.markets.keys():
-                                md = market_lookup.get(str(mid_str))
-                                if md:
-                                    ed = md.end_date
-                                    if ed.tzinfo is None:
-                                        ed = ed.replace(tzinfo=timezone.utc)
-                                    if pos_latest_end is None or ed > pos_latest_end:
-                                        pos_latest_end = ed
+                            cid = pos.metadata.get('constraint_id', '')
+                            if cid and resolution_validation_enabled:
+                                cached = load_resolution_cache(cid)
+                                if cached and 'latest_resolution_date' in cached:
+                                    try:
+                                        pos_latest_end = datetime.strptime(cached['latest_resolution_date'], '%Y-%m-%d').replace(tzinfo=timezone.utc)
+                                    except (ValueError, TypeError):
+                                        pass
+
+                            # 2. Fallback to API end_date if no validated date
+                            if pos_latest_end is None:
+                                for mid_str in pos.markets.keys():
+                                    md = market_lookup.get(str(mid_str))
+                                    if md:
+                                        ed = md.end_date
+                                        if ed.tzinfo is None:
+                                            ed = ed.replace(tzinfo=timezone.utc)
+                                        if pos_latest_end is None or ed > pos_latest_end:
+                                            pos_latest_end = ed
                             if pos_latest_end is None:
                                 continue
                             hours_remaining = (pos_latest_end - now_utc).total_seconds() / 3600
                             if hours_remaining < 24:
+                                log.debug(f'  Position {pid[:30]} protected: resolves in {hours_remaining:.1f}h')
                                 continue
                             liq_value = 0.0
                             for mid_str, mkt_info in pos.markets.items():
@@ -316,7 +378,7 @@ async def main():
                 opps = json.loads(OPP_PATH.read_text()).get('opportunities', [])
                 if opps:
                     cap = dynamic_capital(engine.current_capital)
-                    ranked = rank_opportunities(opps, market_lookup, min_resolution_secs=300)
+                    ranked = rank_opportunities(opps, market_lookup, min_resolution_secs=300, max_days_to_resolution=max_days_to_resolution)
                     log.info(f'[iter {iteration}] {len(opps)} raw opps -> {len(ranked)} ranked, cap=${cap:.2f}')
 
                     if ranked:
@@ -338,6 +400,42 @@ async def main():
                         if opportunity_overlaps_held(opp_dict, held_mids):
                             log.debug(f'  Skip market overlap: {constraint_id}')
                             continue
+
+                        # --- AI Resolution Date + Outcome Validation ---
+                        if resolution_validation_enabled and anthropic_api_key:
+                            try:
+                                market_ids = opp_dict.get('market_ids', [])
+                                validation = get_full_validation(
+                                    market_ids=market_ids,
+                                    market_lookup=market_lookup,
+                                    api_key=anthropic_api_key,
+                                    group_id=constraint_id
+                                )
+                                if validation:
+                                    # Check for unrepresented outcomes (e.g. "Other")
+                                    if validation.get('has_unrepresented_outcome', False):
+                                        reason = validation.get('unrepresented_outcome_reason', '')[:100]
+                                        log.info(f'  SKIP (unrepresented outcome): {constraint_id} — {reason}')
+                                        continue
+
+                                    # Check resolution date
+                                    try:
+                                        validated_date = datetime.strptime(
+                                            validation['latest_resolution_date'], '%Y-%m-%d'
+                                        ).replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+                                        days_until = (validated_date - datetime.now(timezone.utc)).days
+                                        if days_until > max_days_to_resolution:
+                                            log.info(f'  SKIP (AI date): {constraint_id} '
+                                                     f'resolves in {days_until}d > {max_days_to_resolution}d max')
+                                            continue
+                                        elif days_until != int(hours / 24):
+                                            log.debug(f'  AI date: {validated_date.date()} '
+                                                      f'({days_until}d vs API {hours/24:.0f}d)')
+                                    except (ValueError, KeyError):
+                                        pass  # Date parse failed, continue without
+                            except Exception as ve:
+                                log.warning(f'  Resolution validation error: {ve}')
+                                # Fail open — proceed without validation
 
                         # Scale to dynamic capital
                         opp_dict['total_capital_required'] = cap

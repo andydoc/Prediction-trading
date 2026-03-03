@@ -1298,4 +1298,4 @@ class DashboardHandler(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     port = 5556
     print(f'Dashboard starting on http://localhost:{port}')
-    HTTPServer(('127.0.0.1', port), Handler).serve_forever()
+    HTTPServer(('127.0.0.1', port), DashboardHandler).serve_forever()

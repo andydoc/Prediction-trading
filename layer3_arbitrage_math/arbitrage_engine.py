@@ -557,6 +557,16 @@ class ArbitrageMathEngine:
             self.logger.debug(f"  Skipping polytope: {n} markets > {MAX_POLYTOPE_MARKETS} max")
             return None
 
+        # SAFETY: For mutex groups, price_sum must be near 1.0
+        # If sum << 1.0, the group may be incomplete (missing outcomes)
+        price_sum = float(p_vec.sum())
+        if constraint_type in ('mutual_exclusivity', 'mutex'):
+            if price_sum < 0.90:
+                self.logger.debug(
+                    f"  SKIP incomplete mutex in polytope: sum={price_sum:.3f} < 0.90, "
+                    f"missing ~{(1.0-price_sum)*100:.1f}% of outcomes")
+                return None
+
         # ── 1. Build marginal polytope ────────────────────────────────────────
         polytope = MarginalPolytope(market_ids, constraint_type,
                                     implications=implications)

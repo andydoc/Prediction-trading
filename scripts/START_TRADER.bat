@@ -1,4 +1,6 @@
 @echo off
+echo Pulling latest code...
+wsl bash -c "cd /home/andydoc/prediction-trader && git pull --ff-only origin main 2>&1 || echo 'WARNING: git pull failed'"
 echo Starting Prediction Trader...
 wsl bash -c "source /home/andydoc/prediction-trader-env/bin/activate && cd /home/andydoc/prediction-trader && rm -f *.pid && nohup python main.py > logs/main.log 2>&1 &"
 timeout /t 12 /nobreak >nul

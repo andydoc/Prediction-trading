@@ -315,9 +315,11 @@ class PaperTradingEngine:
     async def monitor_positions(self, current_market_data: List):
         """
         Check all open positions for:
-        1. Market resolution (outcome determined)
-        2. Expiration (position too old)
-        3. Price drift monitoring
+        1. Group resolution (ALL markets in group resolved or removed)
+        2. Price drift monitoring
+        No time-based expiry — capital stays locked until actual resolution.
+        max_position_age_hours is used ONLY by L4 to protect near-resolution
+        positions from replacement.
         """
         if not self.open_positions:
             return
@@ -329,48 +331,75 @@ class PaperTradingEngine:
         
         for position_id, position in list(self.open_positions.items()):
             
-            # Check for expiration
-            age_hours = (datetime.now(timezone.utc) - position.entry_timestamp).total_seconds() / 3600
-            if age_hours > self.max_position_age_hours:
-                self.logger.warning(f"Position {position_id} expired after {age_hours:.1f} hours")
-                await self._expire_position(position)
-                continue
+            # Check for GROUP resolution: all markets resolved or removed
+            group_resolved, winning_market_id = self._check_group_resolved(
+                position, market_lookup
+            )
             
-            # Check for resolution
-            for market_id in position.markets.keys():
-                market_data = market_lookup.get(market_id)
-                
-                if not market_data:
-                    continue
-                
-                # Check if market has resolved
-                is_resolved = self._check_if_resolved(market_data)
-                
-                if is_resolved:
-                    winning_outcome = self._get_winning_outcome(market_data)
-                    self.logger.info(
-                        f"Market {market_id} resolved! "
-                        f"Outcome: {winning_outcome}"
-                    )
-                    await self._close_position_on_resolution(
-                        position,
-                        market_id,
-                        winning_outcome
-                    )
-                    break  # Position closed
+            if group_resolved and winning_market_id:
+                winning_outcome = 'Yes'  # Winner has Yes >= 0.95
+                self.logger.info(
+                    f"Group RESOLVED for position {position_id[:40]}! "
+                    f"Winner: market {winning_market_id}"
+                )
+                await self._close_position_on_resolution(
+                    position,
+                    winning_market_id,
+                    winning_outcome
+                )
+                continue
             
             # Update price drift monitoring
             if position.status == PositionStatus.MONITORING:
                 self._update_price_drift(position, market_lookup)
                 position.last_check = datetime.now(timezone.utc)
     
-    def _check_if_resolved(self, market_data) -> bool:
+    def _check_group_resolved(self, position, market_lookup) -> tuple:
         """
-        In paper trading we cannot reliably detect real resolution from price alone
-        (arb markets have low prices by definition, triggering false positives).
-        Positions are closed via expiry after max_position_age_hours instead.
+        Check if ALL markets in a position's group have resolved.
+        A market is resolved if:
+          - max(outcome_prices) >= 0.95, OR
+          - market no longer in API data (removed after settlement)
+        Returns (all_resolved: bool, winning_market_id: str or None)
         """
-        return False
+        resolved_count = 0
+        missing_count = 0
+        winning_market_id = None
+        total_markets = len(position.markets)
+        
+        for market_id in position.markets.keys():
+            market_data = market_lookup.get(market_id)
+            
+            if not market_data:
+                # Market removed from API — treat as resolved
+                missing_count += 1
+                resolved_count += 1
+                continue
+            
+            # Check outcome prices
+            max_price = 0
+            max_outcome = None
+            for outcome, price in market_data.outcome_prices.items():
+                p = float(price)
+                if p > max_price:
+                    max_price = p
+                    max_outcome = outcome
+            
+            if max_price >= 0.95:
+                resolved_count += 1
+                # The winner is the market where YES >= 0.95
+                if max_outcome and max_outcome.lower() == 'yes' and max_price >= 0.95:
+                    winning_market_id = market_id
+            
+        all_resolved = resolved_count == total_markets
+        
+        if resolved_count > 0 and not all_resolved:
+            self.logger.debug(
+                f"  Partial resolution: {resolved_count}/{total_markets} "
+                f"(missing={missing_count})"
+            )
+        
+        return all_resolved, winning_market_id
     
     def _get_winning_outcome(self, market_data) -> str:
         """
@@ -454,47 +483,10 @@ class PaperTradingEngine:
             f"  New capital:     ${self.current_capital:.2f}"
         )
     
-    async def _expire_position(self, position: PaperPosition):
-        """
-        Expire a position after max_position_age_hours.
-        In arbitrage, profit is locked at entry (we bought all outcomes).
-        On expiry we realise the expected arb profit.
-        """
-        position.status = PositionStatus.CLOSED
-        position.resolved_at = datetime.now(timezone.utc)
-        position.close_timestamp = time.time()
+    # _expire_position REMOVED - positions close only on actual resolution
+    # max_position_age_hours is used solely by L4 to protect near-resolution
+    # positions from replacement, NOT to expire/close positions.
 
-        # Arb profit is guaranteed at entry - realise it on expiry
-        payout = position.total_capital + position.expected_profit
-        actual_profit = position.expected_profit
-        total_invested = position.total_capital + position.fees_paid
-
-        position.actual_payout = payout
-        position.actual_profit = actual_profit
-        position.actual_profit_pct = actual_profit / total_invested if total_invested > 0 else 0
-        position.profit_delta = 0.0
-        position.profit_accuracy = 1.0
-        position.metadata['close_reason'] = 'expired'
-
-        self.current_capital += payout
-        self.total_actual_profit += actual_profit
-
-        if actual_profit > 0:
-            self.winning_trades += 1
-        else:
-            self.losing_trades += 1
-
-        self.prediction_errors.append(0.0)
-
-        del self.open_positions[position.position_id]
-        self.closed_positions.append(position)
-
-        self.logger.info(
-            f"✓ Position {position.position_id} CLOSED (expired/matured)\n"
-            f"  Arb profit realised: ${actual_profit:.2f}\n"
-            f"  New capital:         ${self.current_capital:.2f}"
-        )
-    
     async def liquidate_position(self, position_id: str, market_lookup: Dict) -> Dict:
         """
         Close a position early by selling at current market prices.

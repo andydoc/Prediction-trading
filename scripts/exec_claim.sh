@@ -21,6 +21,16 @@ case "$ACTION" in
         curl -s "$EXEC_CTRL_URL/status" | python3 -m json.tool
         ;;
     claim)
+        echo "Pulling latest code and restarting before claiming..."
+        cd /home/andydoc/prediction-trader
+        git pull --ff-only origin main 2>&1 || echo "  WARNING: git pull failed — continuing with local code"
+        source /home/andydoc/prediction-trader-env/bin/activate
+        kill $(ps aux | grep 'main.py\|layer[1-4]_runner\|dashboard_server' | grep -v grep | awk '{print $2}') 2>/dev/null
+        sleep 3
+        rm -f *.pid
+        nohup python main.py > logs/main.log 2>&1 &
+        echo "Restarted PID: $!"
+        sleep 12
         echo "Claiming execution for '$MACHINE' at $EXEC_CTRL_URL..."
         curl -s -X POST "$EXEC_CTRL_URL/claim" \
             -H "Content-Type: application/json" \
