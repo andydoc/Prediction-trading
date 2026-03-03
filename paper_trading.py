@@ -106,8 +106,12 @@ class PaperTradingEngine:
     
     def __init__(self, config: Dict, workspace_root: Path):
         self.config = config.get('paper_trading', {})
+        self.full_config = config
         self.workspace_root = Path(workspace_root)
         self.logger = logging.getLogger('CompletePaperTrading')
+        
+        # Fee rate — read from arbitrage.fees (single source of truth)
+        self.taker_fee = config.get('arbitrage', {}).get('fees', {}).get('polymarket_taker_fee', 0.0001)
         
         # Capital tracking
         self.initial_capital = self.config.get('initial_capital', 10000)
@@ -250,7 +254,7 @@ class PaperTradingEngine:
         
         # Calculate fees on current prices
         total_cost = sum(m['bet_amount'] for m in markets.values())
-        fees = total_cost * self.config.get('trading_fee', 0.0001)
+        fees = total_cost * self.taker_fee
         
         # Create position
         position = PaperPosition(
@@ -519,7 +523,7 @@ class PaperTradingEngine:
             liquidation_value += shares * current_price
         
         # Apply exit fee (same as entry fee)
-        fee_rate = self.config.get('polymarket_taker_fee', 0.0001)
+        fee_rate = self.taker_fee
         exit_fee = liquidation_value * fee_rate
         net_liquidation = liquidation_value - exit_fee
         

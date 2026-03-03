@@ -237,6 +237,7 @@ async def main():
                     now_utc = datetime.now(timezone.utc)
                     replacements_made = 0
                     max_replacements_per_round = 5
+                    used_opp_cids = set()  # Prevent same opp liquidating multiple positions
 
                     while replacements_made < max_replacements_per_round:
                         held_cids = get_held_constraint_ids(engine)
@@ -248,6 +249,8 @@ async def main():
                             cid = opp_d.get('constraint_id', '')
                             if cid in held_cids:
                                 continue
+                            if cid in used_opp_cids:
+                                continue  # Already used this opp to replace something this round
                             if opportunity_overlaps_held(opp_d, held_mids):
                                 continue
                             # AI resolution date + outcome check for replacement candidates
@@ -359,6 +362,7 @@ async def main():
                                         except Exception as le:
                                             log.error(f'  LIVE liquidation error: {le}')
                                 replacements_made += 1
+                                used_opp_cids.add(best_opp.get('constraint_id', ''))  # Don't reuse same opp
                             else:
                                 log.warning(f'  Liquidation failed: {result.get("reason")}')
                                 break
