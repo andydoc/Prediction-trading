@@ -1,9 +1,9 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: 0.3.1 (pre-release, paper trading)
-> **Last updated**: 2026-03-03 15:30 UTC
-> **Mode**: PAPER | Capital: ~$9.87 | 9 open, 1208 closed
+> **Version**: 0.3.2 (pre-release, paper trading)
+> **Last updated**: 2026-03-03 18:00 UTC
+> **Mode**: PAPER | Capital: ~$9.99 | 9 open, 138 closed
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
 
 ---
@@ -302,6 +302,13 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
 
 ## 7. Changelog
 
+### v0.3.2 (2026-03-03) — Replacement Loop Fix & Fee Config
+- **FIXED** Replacement loop bug: same opportunity could liquidate multiple positions in one round (T20 World Cup replaced 5 positions at once). Added `used_opp_cids` set to prevent reuse within a round.
+- **FIXED** Fee config mismatch: `paper_trading.py` read `polymarket_taker_fee` from wrong config section (always fell back to hardcoded default). Now reads from `arbitrage.fees.polymarket_taker_fee` via `self.taker_fee` set during init.
+- **FIXED** Performance counters: reset stale `total_trades` (was 1304, now matches actual position count of 147)
+- **MOVED** 57 one-off investigation scripts to `scripts/debug/` (gitignored)
+- **NOTED** Caracas FC churn: position replaced/re-entered 14+ times due to score hovering near replacement threshold — not a bug, but highlights need for hysteresis or cooldown on re-entry
+
 ### v0.3.1 (2026-03-03) — Replacement Protection & Validator Verification
 - **ADDED** 24h replacement protection: positions whose AI-validated resolution date is <24h away are immune from replacement scoring (prevents last-minute swaps before payout)
 - **FIXED** Replacement scoring now uses AI-validated resolution date from cache (not raw API `end_date`) for the 24h protection window
@@ -416,16 +423,16 @@ git push -u origin dev
 After cleaning Somaliland + Japan, with Arkansas and TX-31 identified but not yet cleaned:
 - **Closed positions**: 1,208
 - **Open positions**: 9 (including 1 confirmed-legitimate Trump Truth Social arb)
-- **Legitimately profitable** (>$0.01): 5 positions, $2.04 total
-- **Phantom profit still in system**: ~$1.74 (Arkansas $0.89 + TX-31 $0.85) — all from pre-validator `_expire_position()` era
-- **Current capital**: ~$9.87 (includes phantom; true capital ~$8.13 after cleanup)
-- **Replacement churn**: ~1,200 positions closed via "replaced" at ~$0.001 each
+- **Legitimately profitable** (>$0.01): 5 positions, $2.04 total (pre-reset)
+- **Phantom profit cleaned**: Somaliland $0.93, Arkansas $0.89, TX-31 $0.85 — all from pre-validator `_expire_position()` era
+- **Current capital**: ~$9.99 (after state reset, performance counters corrected)
+- **Open positions**: 9 | **Closed positions**: 138
 
-### Key Metrics
+### Key Metrics (post-reset)
 - **Initial capital**: $100.00
-- **Net P&L**: -$99.35 (dominated by Japan $10 loss + replacement churn + Somaliland cleanup)
-- **Win rate on resolved arbs**: 100% (5/5 legitimate)
-- **Avg return per resolved arb**: ~$0.41
+- **Net P&L**: -$90.01 (dominated by Japan $10 loss + replacement churn + incident cleanups)
+- **Win rate on resolved arbs**: 100% (5/5 legitimate, pre-reset)
+- **Avg return per resolved arb**: ~$0.41 (pre-reset)
 
 ### Lessons
 - Replacement churn ($0.001/swap × ~1200 swaps ≈ $1.20) is negligible individually but adds up
@@ -452,7 +459,7 @@ After cleaning Somaliland + Japan, with Arkansas and TX-31 identified but not ye
 
 ---
 
-*Last updated: 2026-03-03 15:30 UTC*
+*Last updated: 2026-03-03 18:00 UTC*
 *System: WSL Ubuntu on Windows | Machines: Laptop + Desktop*
 *Dashboard: http://localhost:5556 | Exec Control: port 5557*
 *Git: https://github.com/andydoc/Prediction-trading (branch: main)*
