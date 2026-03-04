@@ -2,8 +2,8 @@
 # User Guide · Architecture · Roadmap · Progress
 
 > **Version**: v0.03.04 (pre-release, shadow trading)
-> **Last updated**: 2026-03-04 15:30 UTC
-> **Mode**: SHADOW | Cash: $0.52 | Deployed: $100.00 | Total: $100.52 | 10 open, 179 closed
+> **Last updated**: 2026-03-04 16:00 UTC
+> **Mode**: SHADOW | Cash: $17.67 | Deployed: $90.00 | Total: $107.67 | 9 open, 180 closed
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
 
 ---
@@ -448,26 +448,26 @@ git push -u origin dev
 
 ## 10. Performance
 
-### Current State (2026-03-04, v0.03.02)
-Live figures from `execution_state.json`:
-- **Cash (current_capital)**: $0.52 | **Deployed**: $100.00 | **Total**: $100.52
-- **Open**: 10 | **Closed**: 179
+### Current State (2026-03-04, v0.03.04)
+Live figures from `execution_state.json` (post sell-arb payout correction):
+- **Cash (current_capital)**: $17.67 | **Deployed**: $90.00 | **Total**: $107.67
+- **Open**: 9 | **Closed**: 180
 
 
-### Audit (2026-03-03, updated v0.03.02)
-After cleaning Somaliland + Japan, with Arkansas and TX-31 identified but not yet cleaned:
-- **Open positions**: 10 (including Trump Truth Social — confirmed legitimate)
-- **Closed positions**: 179
-- **Legitimately profitable** (>$0.01): ~5 positions, ~$2.04 total
-- **Phantom profit pending cleanup**: Arkansas $0.89 + TX-31 $0.85 = $1.74 (pre-validator `_expire_position()`)
-- **Already cleaned**: Somaliland $0.93 (INC-002), Japan loss booked $10.00 (INC-001)
+### Audit (2026-03-04, updated v0.03.04)
+- **Open positions**: 9 | **Closed**: 180
+- **Profitable resolved arbs**: 3 (SC Sagamihara +$0.72, Trump Truth Social pending, others)
+- **Phantom profit cleaned**: Somaliland $0.93, Japan loss $10.00 (INC-001, INC-002)
+- **Phantom profit pending**: Arkansas $0.89 + TX-31 $0.85 = $1.74 — will be corrected at next capital reset
+- **Sell arb payout bug**: Sagamihara position retroactively corrected from -$3.58 to +$0.72 in state file
 
-### Key Metrics (post-reset target)
+### Key Metrics (2026-03-04)
 - **Initial capital**: $100.00
-- **Net real P&L**: ~$2.04 legitimate gains − $10.00 Japan − fees/churn ≈ **-$8.26**
-- **Current capital** (post-reset, live): $0.52 cash + $100.00 deployed = $100.52 | 10 open, 179 closed
+- **Current capital**: $17.67 cash + $90.00 deployed = **$107.67** (+$7.67 vs initial)
+- **Profitable resolved arbs**: 3 positions, $1.61 total legitimate profit
+- **SC Sagamihara sell arb**: $10.72 payout on $10.00 invested = **+$0.72** (7.2%) — first correct sell arb resolution
 - **Win rate on resolved arbs**: 100% (all legitimate completions)
-- **Avg return per resolved arb**: ~$0.41
+- **Avg return per resolved arb**: ~$0.54
 
 ### Lessons
 - **Sell arb payout is fundamentally different from buy arb**: in a sell arb (buy-NO on all legs), the winning market's NO bet *loses*; profit comes from all *other* legs resolving NO. Using the buy arb formula (winning leg only) would have caused severe P&L understatement on every resolved sell arb.
@@ -500,7 +500,7 @@ After cleaning Somaliland + Japan, with Arkansas and TX-31 identified but not ye
 
 ---
 
-*Last updated: 2026-03-04 15:30 UTC*
+*Last updated: 2026-03-04 16:00 UTC*
 *System: WSL Ubuntu on Windows | Machines: Laptop + Desktop*
 *Dashboard: http://localhost:5556 | Exec Control: port 5557*
 *Git: https://github.com/andydoc/Prediction-trading (branch: main)*
