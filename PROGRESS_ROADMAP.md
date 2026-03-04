@@ -1,9 +1,9 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: 0.3.2 (pre-release, paper trading)
-> **Last updated**: 2026-03-03 18:00 UTC
-> **Mode**: PAPER | Capital: ~$9.99 | 9 open, 138 closed
+> **Version**: v0.03.02 (pre-release, shadow trading)
+> **Last updated**: 2026-03-04 14:00 UTC
+> **Mode**: SHADOW | Cash: $0.52 | Deployed: $100.00 | Total: $100.52 | 10 open, 179 closed
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
 
 ---
@@ -40,14 +40,15 @@ L3 finds opportunity → L4 opens position → monitors prices →
 
 Key: positions are **never** closed by time expiry. Capital remains locked until markets actually resolve. This prevents phantom P&L on long-dated markets.
 
-### 2.3 Resolution Validator (NEW — v0.3.0)
+### 2.3 Resolution Validator (NEW — v0.03.00)
 
 Before entering a position, L4 now optionally calls the Anthropic API to validate the market's actual resolution date against its rules text. This catches cases where the API `endDate` is misleading (e.g. shows "March 31" but rules say "December 31").
 
 - **Module**: `resolution_validator.py`
-- **Config**: `config.yaml` → `resolution_validation.enabled: true`
-- **API key**: `config.yaml` → `resolution_validation.anthropic_api_key`
-- **Filter**: `max_days_to_resolution: 60` — skip markets resolving beyond N days
+- **Config**: `config.yaml` → `arbitrage.resolution_validation.enabled: true`
+- **API key**: `config/secrets.yaml` → `resolution_validation.anthropic_api_key` *(moved out of config.yaml in v0.03.02)*
+- **Entry filter**: `arbitrage.max_days_to_resolution: 60` — new positions are skipped if the market resolves >60 days away.
+- **Replacement filter**: `arbitrage.max_days_to_replacement: 30` — when evaluating candidates to *replace* an existing position, only opportunities resolving within 30 days are considered. This is intentionally stricter than the entry filter: replacement should only occur when the incoming opportunity offers faster capital velocity. Because all entered positions already satisfy <60 days, and replacement candidates must satisfy <30 days, replacement scoring always favours near-term resolution over longer-dated alternatives.
 - **Cache**: Results cached for 168 hours (1 week) per constraint group
 
 ### 2.4 Multi-Machine Execution Control
@@ -60,6 +61,8 @@ Only ONE machine may run L4 at a time. A Flask server manages leader election:
 - **Commands**: `exec_claim.sh status|claim|release`
 
 ### 2.5 Trading Modes
+
+> See **§5.2** for mode-switching commands.
 
 | Mode | Config | Behaviour |
 |------|--------|-----------|
@@ -114,17 +117,21 @@ C:\Users\andyd\ai-workspace\prediction-trader\   ← Windows git mirror
 
 **config.yaml** (in git — safe, no secrets):
 ```yaml
-trading:
-  capital_per_trade_pct: 0.10          # 10% of capital per position
+arbitrage:
+  capital_per_trade_pct: 0.10          # 10% of capital per position (floor=$10, cap=$1000)
   max_concurrent_positions: 20
-  max_days_to_resolution: 60           # Skip markets >60 days out
+  max_days_to_resolution: 60           # Entry filter: skip new positions resolving >60 days away
+  max_days_to_replacement: 30          # Replacement filter: only consider candidates resolving <30 days (faster velocity)
   max_profit_threshold: 0.3            # Skip >30% (likely bad data)
   resolution_validation:
     enabled: true
-    anthropic_api_key: YOUR_KEY_HERE   # Or use ${ANTHROPIC_API_KEY} env var
+    # anthropic_api_key: MOVED to secrets.yaml
     cache_ttl_hours: 168               # Cache AI results for 1 week
   fees:
-    taker_fee: 0.0001
+    polymarket_taker_fee: 0.0001
+live_trading:
+  enabled: true
+  shadow_only: true                    # SHADOW mode; set false for LIVE
 ```
 
 **secrets.yaml** (NOT in git — contains private keys):
@@ -134,6 +141,8 @@ polymarket:
   chain_id: 137
   private_key: "0x..."
   funder_address: "0x..."
+resolution_validation:
+  anthropic_api_key: "sk-ant-..."      # Moved here from config.yaml in v0.03.02
 ```
 
 ---
@@ -184,8 +193,15 @@ Place `START_TRADER_HIDDEN.vbs` in:
 ### 5.1 Starting / Stopping
 ```bash
 # Start (from Windows)
-scripts/START_TRADER.bat              # With console window
-scripts/START_TRADER_SILENT.bat       # Silent (for Task Scheduler)
+scripts\START_TRADER.bat              # With console window
+scripts\START_TRADER_SILENT.bat       # Silent (for Task Scheduler)
+scripts\START_TRADER_HIDDEN.vbs       # Hidden (for Startup folder)
+
+# Stop (from Windows)
+scripts\STOP_TRADER.bat               # Kill all layers
+
+# Restart (from Windows)
+scripts\RESTART_TRADER.bat            # Stop + git pull + restart
 
 # Start (from WSL)
 source ~/prediction-trader-env/bin/activate && cd ~/prediction-trader
@@ -275,7 +291,6 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
 - [x] **Anthropic API key configuration** — Key configured, validator making successful API calls
 - [x] **Verify resolution validator in production** — Confirmed: catches Somaliland (392d), unrepresented outcomes (6+ markets blocked)
 - [x] **24h replacement protection** — Positions resolving within 24h protected from replacement (uses AI-validated dates)
-- [ ] **Capital reset** — Current capital ~$9.87 includes ~$1.74 phantom profit (Arkansas $0.89 + TX-31 $0.85 from pre-validator era); needs manual reset before go-live
 
 ### Phase 2 — Go Live
 - [ ] Deposit $100+ USDC to Polymarket wallet
@@ -285,11 +300,12 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
 - [ ] Position reconciliation (CLOB vs paper)
 
 ### Phase 3 — Reliability & Monitoring
+- [x] **Supervisor double-instance bug fixed** — `check_pid_lock()` added to main.py; stale PID files cleaned on startup
 - [ ] Wire dashboard control panel (mode switch, parameter save, restart via API)
-- [ ] Fix supervisor double-instance bug (L4 sometimes spawns twice)
 - [ ] WhatsApp notifications via OpenClaw (trade alerts, errors, daily summary)
 - [ ] API key auth for execution_control.py (before exposing to public IP)
 - [ ] Oracle Cloud VPS for execution control server
+- [ ] File structure reorganisation (runners into layer dirs, L4 modes into sub-folder, services area for dashboard/exec-ctrl) — **Phase 3 cleanup only, do not refactor during active trading**
 
 ### Phase 4 — Scale & Optimise
 - [ ] Increase capital_per_trade from 10% to 30-50% (backtested)
@@ -302,14 +318,14 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
 
 ## 7. Changelog
 
-### v0.3.2 (2026-03-03) — Replacement Loop Fix & Fee Config
+### v0.03.02 (2026-03-03) — Replacement Loop Fix & Fee Config
 - **FIXED** Replacement loop bug: same opportunity could liquidate multiple positions in one round (T20 World Cup replaced 5 positions at once). Added `used_opp_cids` set to prevent reuse within a round.
 - **FIXED** Fee config mismatch: `paper_trading.py` read `polymarket_taker_fee` from wrong config section (always fell back to hardcoded default). Now reads from `arbitrage.fees.polymarket_taker_fee` via `self.taker_fee` set during init.
 - **FIXED** Performance counters: reset stale `total_trades` (was 1304, now matches actual position count of 147)
 - **MOVED** 57 one-off investigation scripts to `scripts/debug/` (gitignored)
 - **NOTED** Caracas FC churn: position replaced/re-entered 14+ times due to score hovering near replacement threshold — not a bug, but highlights need for hysteresis or cooldown on re-entry
 
-### v0.3.1 (2026-03-03) — Replacement Protection & Validator Verification
+### v0.03.01 (2026-03-03) — Replacement Protection & Validator Verification
 - **ADDED** 24h replacement protection: positions whose AI-validated resolution date is <24h away are immune from replacement scoring (prevents last-minute swaps before payout)
 - **FIXED** Replacement scoring now uses AI-validated resolution date from cache (not raw API `end_date`) for the 24h protection window
 - **VERIFIED** Resolution validator working in production: Anthropic API returning 200s, caching results, catching long-dated markets and unrepresented outcomes
@@ -318,7 +334,7 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
 - **IDENTIFIED** TX-31 Republican Primary: 2 expired positions ($0.85 phantom) + 1 replaced — pre-validator era, "Other" outcome unrepresented
 - **CONFIRMED** Trump Truth Social position is legitimate: L2 correctly narrowed to 3 remaining live brackets (160-179, 180-199, 200+) covering all possible outcomes, ~3.5% arb
 
-### v0.3.0 (2026-03-03) — Resolution Safety
+### v0.03.00 (2026-03-03) — Resolution Safety
 - **REMOVED** `_expire_position()` — positions no longer close by time; capital stays locked until markets resolve
 - **ADDED** `_check_group_resolved()` — checks all markets in group for price→1.0 before closing
 - **ADDED** `resolution_validator.py` — Anthropic API call to validate true resolution dates from rules text
@@ -328,7 +344,7 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
 - **CLEANED** Japan unemployment positions (markets 1323418-1323422) — $10 loss from incomplete mutex
 - **CLEANED** Somaliland parliamentary positions (markets 948391-948394) — $0.93 phantom profit from false expiry
 
-### v0.2.0 (2026-02-28) — Dashboard & Scripts
+### v0.02.00 (2026-02-28) — Dashboard & Scripts
 - Dashboard tabs: Paper/Shadow/Live/Control Panel
 - Score column (profit_pct/hours * 10000)
 - Mode badge with colour coding
@@ -336,7 +352,7 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
 - Naming standardisation across codebase
 - Git repository established
 
-### v0.1.0 (2026-02-17) — Initial System
+### v0.01.00 (2026-02-17) — Initial System
 - Four-layer pipeline with supervisor
 - Paper trading engine with position lifecycle
 - CVXPY LP arbitrage detection
@@ -356,16 +372,20 @@ Current state: all work on `main` branch, no tags. Plan:
 - `hotfix/<name>` — urgent production fixes
 
 ### Tag Convention
-- `v0.1.0`, `v0.2.0`, `v0.3.0` — retrospective tags for milestones above
-- `v1.0.0` — first successful live trade
-- Semantic versioning: MAJOR.MINOR.PATCH
+- Format: `vMAJOR.MINOR.PATCH` with zero-padded 2-digit minor/patch — e.g. `v0.03.02`
+- `v0.01.00` → initial four-layer system
+- `v0.02.00` → dashboard and scripts  
+- `v0.03.00` → resolution safety
+- `v0.03.01` → replacement protection & validator verification
+- `v0.03.02` → replacement loop fix + fee config + API key to secrets.yaml *(current)*
+- `v1.00.00` → first successful live trade
 
 ### Implementation Steps
 ```bash
 # Tag existing milestones retrospectively
-git tag -a v0.1.0 <initial-commit-hash> -m "Initial four-layer system"
-git tag -a v0.2.0 <dashboard-commit-hash> -m "Dashboard and scripts"
-git tag -a v0.3.0 HEAD -m "Resolution safety"
+git tag -a v0.01.00 <initial-commit-hash> -m "Initial four-layer system"
+git tag -a v0.02.00 <dashboard-commit-hash> -m "Dashboard and scripts"
+git tag -a v0.03.00 HEAD -m "Resolution safety"
 git push origin --tags
 
 # Create dev branch
@@ -419,20 +439,26 @@ git push -u origin dev
 
 ## 10. Performance
 
-### Audit (2026-03-03, updated v0.3.1)
-After cleaning Somaliland + Japan, with Arkansas and TX-31 identified but not yet cleaned:
-- **Closed positions**: 1,208
-- **Open positions**: 9 (including 1 confirmed-legitimate Trump Truth Social arb)
-- **Legitimately profitable** (>$0.01): 5 positions, $2.04 total (pre-reset)
-- **Phantom profit cleaned**: Somaliland $0.93, Arkansas $0.89, TX-31 $0.85 — all from pre-validator `_expire_position()` era
-- **Current capital**: ~$9.99 (after state reset, performance counters corrected)
-- **Open positions**: 9 | **Closed positions**: 138
+### Current State (2026-03-04, v0.03.02)
+Live figures from `execution_state.json`:
+- **Cash (current_capital)**: $0.52 | **Deployed**: $100.00 | **Total**: $100.52
+- **Open**: 10 | **Closed**: 179
 
-### Key Metrics (post-reset)
+
+### Audit (2026-03-03, updated v0.03.02)
+After cleaning Somaliland + Japan, with Arkansas and TX-31 identified but not yet cleaned:
+- **Open positions**: 10 (including Trump Truth Social — confirmed legitimate)
+- **Closed positions**: 179
+- **Legitimately profitable** (>$0.01): ~5 positions, ~$2.04 total
+- **Phantom profit pending cleanup**: Arkansas $0.89 + TX-31 $0.85 = $1.74 (pre-validator `_expire_position()`)
+- **Already cleaned**: Somaliland $0.93 (INC-002), Japan loss booked $10.00 (INC-001)
+
+### Key Metrics (post-reset target)
 - **Initial capital**: $100.00
-- **Net P&L**: -$90.01 (dominated by Japan $10 loss + replacement churn + incident cleanups)
-- **Win rate on resolved arbs**: 100% (5/5 legitimate, pre-reset)
-- **Avg return per resolved arb**: ~$0.41 (pre-reset)
+- **Net real P&L**: ~$2.04 legitimate gains − $10.00 Japan − fees/churn ≈ **-$8.26**
+- **Current capital** (post-reset, live): $0.52 cash + $100.00 deployed = $100.52 | 10 open, 179 closed
+- **Win rate on resolved arbs**: 100% (all legitimate completions)
+- **Avg return per resolved arb**: ~$0.41
 
 ### Lessons
 - Replacement churn ($0.001/swap × ~1200 swaps ≈ $1.20) is negligible individually but adds up
@@ -444,22 +470,27 @@ After cleaning Somaliland + Japan, with Arkansas and TX-31 identified but not ye
 
 ## 11. Key Configuration Reference
 
-| Parameter | Location | Current Value | Purpose |
-|-----------|----------|---------------|---------|
-| `capital_per_trade_pct` | config.yaml | 0.10 | % of capital per position |
-| `max_concurrent_positions` | config.yaml | 20 | Max open positions |
-| `max_days_to_resolution` | config.yaml | 60 | Skip markets resolving >N days |
-| `max_profit_threshold` | config.yaml | 0.3 | Skip >30% arbs (likely bad data) |
-| `resolution_validation.enabled` | config.yaml | true | AI date validation on/off |
-| `resolution_validation.anthropic_api_key` | config.yaml | (needs key) | Anthropic API key |
-| `taker_fee` | config.yaml | 0.0001 | Polymarket fee per trade |
-| `L2 min_price_sum` | constraint_detector.py | 0.85 | Min sum for mutex group |
-| `L3 direct mutex guard` | arbitrage_engine.py | 0.90 | Skip if raw_sum < 0.90 |
-| `L3 polytope mutex guard` | arbitrage_engine.py | 0.90 | Skip Bregman/FW if sum < 0.90 |
+| Parameter | File | YAML path | Current Value | Purpose |
+|-----------|------|-----------|---------------|---------|
+| `capital_per_trade_pct` | config.yaml | `arbitrage.capital_per_trade_pct` | 0.10 | 10% of cash per position (floor $10, cap $1000) |
+| `max_concurrent_positions` | config.yaml | `arbitrage.max_concurrent_positions` | 20 | Max open positions |
+| `max_days_to_resolution` | config.yaml | `arbitrage.max_days_to_resolution` | 60 | Entry filter: skip new positions resolving >60 days |
+| `max_days_to_replacement` | config.yaml | `arbitrage.max_days_to_replacement` | 30 | Replacement filter: only swap in candidates resolving <30 days (stricter than entry) |
+| `max_profit_threshold` | config.yaml | `arbitrage.max_profit_threshold` | 0.3 | Skip >30% arbs (likely bad data) |
+| `min_profit_threshold` | config.yaml | `arbitrage.min_profit_threshold` | 0.03 | Skip <3% arbs (not worth fees) |
+| `resolution_validation.enabled` | config.yaml | `arbitrage.resolution_validation.enabled` | true | AI date validation on/off |
+| `polymarket_taker_fee` | config.yaml | `arbitrage.fees.polymarket_taker_fee` | 0.0001 | Polymarket fee per trade |
+| `live_trading.enabled` | config.yaml | `live_trading.enabled` | true | false=paper, true=shadow or live |
+| `live_trading.shadow_only` | config.yaml | `live_trading.shadow_only` | true | true=shadow, false=live |
+| `anthropic_api_key` | **secrets.yaml** | `resolution_validation.anthropic_api_key` | (your key) | API key for resolution validator |
+| `private_key` | **secrets.yaml** | `polymarket.private_key` | (your key) | Polymarket wallet private key |
+| `L2 min_price_sum` | constraint_detector.py | hardcoded | 0.85 | Min sum for mutex group |
+| `L3 direct mutex guard` | arbitrage_engine.py | hardcoded | 0.90 | Skip if raw_sum < 0.90 |
+| `L3 polytope mutex guard` | arbitrage_engine.py | hardcoded | 0.90 | Skip Bregman/FW if sum < 0.90 |
 
 ---
 
-*Last updated: 2026-03-03 18:00 UTC*
+*Last updated: 2026-03-04 15:00 UTC*
 *System: WSL Ubuntu on Windows | Machines: Laptop + Desktop*
 *Dashboard: http://localhost:5556 | Exec Control: port 5557*
 *Git: https://github.com/andydoc/Prediction-trading (branch: main)*
