@@ -130,6 +130,7 @@ async def main():
             secrets = yaml.safe_load(f) or {}
     max_positions = config.get('arbitrage', {}).get('max_concurrent_positions', 20)
     max_days_to_resolution = config.get('arbitrage', {}).get('max_days_to_resolution', 60)
+    max_days_to_replacement = config.get('arbitrage', {}).get('max_days_to_replacement', 30)
     capital_pct = config.get('arbitrage', {}).get('capital_per_trade_pct', 0.10)
     res_val_cfg = config.get('arbitrage', {}).get('resolution_validation', {})
     # Anthropic key: secrets.yaml > config.yaml > env var
@@ -235,7 +236,7 @@ async def main():
                     if not opp_text.strip():
                         raise ValueError("Empty opportunities file (L3 writing)")
                     opps_for_replace = json.loads(opp_text).get('opportunities', [])
-                    ranked_for_replace = rank_opportunities(opps_for_replace, market_lookup, min_resolution_secs=300, max_days_to_resolution=max_days_to_resolution)
+                    ranked_for_replace = rank_opportunities(opps_for_replace, market_lookup, min_resolution_secs=300, max_days_to_resolution=max_days_to_replacement)
                     now_utc = datetime.now(timezone.utc)
                     replacements_made = 0
                     max_replacements_per_round = 5
@@ -266,7 +267,7 @@ async def main():
                                         try:
                                             vd = datetime.strptime(val['latest_resolution_date'], '%Y-%m-%d').replace(
                                                 hour=23, minute=59, second=59, tzinfo=timezone.utc)
-                                            if (vd - datetime.now(timezone.utc)).days > max_days_to_resolution:
+                                            if (vd - datetime.now(timezone.utc)).days > max_days_to_replacement:
                                                 continue
                                         except (ValueError, KeyError):
                                             pass

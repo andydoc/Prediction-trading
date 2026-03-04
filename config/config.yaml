@@ -13,7 +13,8 @@ arbitrage:
     enabled: true
     # anthropic_api_key: moved to secrets.yaml → resolution_validation.anthropic_api_key
     cache_ttl_hours: 168
-  max_days_to_resolution: 60
+  max_days_to_resolution: 60           # Entry filter: skip new positions resolving >60 days away
+  max_days_to_replacement: 30          # Replacement filter: only consider candidates resolving <30 days away (faster capital velocity)
   max_exposure_per_market: 500
   max_position_size: 1000
   max_profit_threshold: 0.3
