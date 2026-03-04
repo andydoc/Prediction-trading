@@ -2,8 +2,9 @@
 # User Guide · Architecture · Roadmap · Progress
 
 > **Version**: v0.03.04 (pre-release, shadow trading)
-> **Last updated**: 2026-03-04 16:00 UTC
-> **Mode**: SHADOW | Cash: $17.67 | Deployed: $90.00 | Total: $107.67 | 9 open, 180 closed
+> **Last updated**: 2026-03-04 17:00 UTC
+> **Mode**: SHADOW | Cash: $1.24 | Deployed: $100.00 | Total: $101.24 | 10 open, 181 closed
+> **Note**: 4 football positions (Mar 3 games) awaiting Polymarket resolution — correct behaviour
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
 
 ---
@@ -450,8 +451,9 @@ git push -u origin dev
 
 ### Current State (2026-03-04, v0.03.04)
 Live figures from `execution_state.json` (post sell-arb payout correction):
-- **Cash (current_capital)**: $17.67 | **Deployed**: $90.00 | **Total**: $107.67
-- **Open**: 9 | **Closed**: 180
+- **Cash (current_capital)**: $1.24 | **Deployed**: $100.00 | **Total**: $101.24
+- **Open**: 10 | **Closed**: 181
+- **4 football positions** (Independiente Petrolero, Academia Puerto Cabello, Barcelona SC, CD Cobresal) from Mar 3 games — in `monitoring`, correctly awaiting Polymarket resolution before closing
 
 
 ### Audit (2026-03-04, updated v0.03.04)
@@ -463,7 +465,7 @@ Live figures from `execution_state.json` (post sell-arb payout correction):
 
 ### Key Metrics (2026-03-04)
 - **Initial capital**: $100.00
-- **Current capital**: $17.67 cash + $90.00 deployed = **$107.67** (+$7.67 vs initial)
+- **Current capital**: $1.24 cash + $100.00 deployed = **$101.24** (+$1.24 vs initial)
 - **Profitable resolved arbs**: 3 positions, $1.61 total legitimate profit
 - **SC Sagamihara sell arb**: $10.72 payout on $10.00 invested = **+$0.72** (7.2%) — first correct sell arb resolution
 - **Win rate on resolved arbs**: 100% (all legitimate completions)
@@ -500,7 +502,7 @@ Live figures from `execution_state.json` (post sell-arb payout correction):
 
 ---
 
-*Last updated: 2026-03-04 16:00 UTC*
+*Last updated: 2026-03-04 17:00 UTC*
 *System: WSL Ubuntu on Windows | Machines: Laptop + Desktop*
 *Dashboard: http://localhost:5556 | Exec Control: port 5557*
 *Git: https://github.com/andydoc/Prediction-trading (branch: main)*
