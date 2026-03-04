@@ -1,5 +1,5 @@
 arbitrage:
-  capital_per_trade: 10.0
+  capital_per_trade_pct: 0.10          # % of current capital; floor=$10, cap=$1000
   fees:
     crypto_15min_fee: 0.001
     fee_on_winnings: false
@@ -11,7 +11,7 @@ arbitrage:
   max_concurrent_positions: 20
   resolution_validation:
     enabled: true
-    anthropic_api_key: ${ANTHROPIC_API_KEY}
+    # anthropic_api_key: moved to secrets.yaml → resolution_validation.anthropic_api_key
     cache_ttl_hours: 168
   max_days_to_resolution: 60
   max_exposure_per_market: 500
@@ -56,7 +56,8 @@ execution_control:
 fees:
   min_profit_threshold: 0.03
 live_trading:
-  capital_per_trade: 10
+  # capital_per_trade now derived dynamically: pct × current_capital (min $10, max $1000)
+  # see arbitrage.capital_per_trade_pct
   enabled: true
   fill_check_interval_secs: 2
   low_balance_pause_usd: 20

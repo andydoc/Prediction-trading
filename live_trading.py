@@ -46,7 +46,8 @@ class LiveTradingEngine:
         # Settings
         self.max_capital = self.live_config.get('max_capital', 100)
         self.max_positions = self.live_config.get('max_positions', 11)
-        self.capital_per_trade = self.live_config.get('capital_per_trade', 10)
+        # capital_per_trade is set dynamically by L4 (dynamic_capital); stored here for shadow validation
+        self.capital_per_trade = self.live_config.get('capital_per_trade', 10)  # fallback only
         self.min_profit_after_fees = self.live_config.get('min_profit_after_fees', 0.03)
         self.min_orderbook_depth = self.live_config.get('min_orderbook_depth_usd', 50)
         self.order_timeout = self.live_config.get('order_timeout_secs', 60)

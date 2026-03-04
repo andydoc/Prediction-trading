@@ -324,9 +324,11 @@ class ArbitrageMathEngine:
         self.max_position_size    = self.config.get('max_position_size', 1000)
         self.trading_fee          = self.config.get('fees', {}).get('trading_fee', 0.0001)
         self.max_profit_threshold = self.config.get('max_profit_threshold', 0.30)
-        # Dynamic: will be recalculated per-trade in L4
-        # L3 uses a reference value just for opportunity sizing
-        self.capital_per_trade    = config.get('capital_per_trade', 10.0)
+        # Dynamic: will be rescaled per-trade in L4 (dynamic_capital).
+        # L3 uses initial_capital × pct as a reference for opportunity sizing only.
+        _pct = config.get('capital_per_trade_pct', 0.10)
+        _initial = config.get('initial_capital', 100.0)
+        self.capital_per_trade    = max(10.0, min(_initial * _pct, 1000.0))
 
         self.opportunities: List[ArbitrageOpportunity] = []
 

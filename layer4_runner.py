@@ -47,8 +47,9 @@ def write_status(status, capital=0, open_pos=0, error=None):
         'error': error, 'timestamp': datetime.now(ZoneInfo('Europe/London')).isoformat()
     }))
 
-def dynamic_capital(current_balance: float) -> float:
-    return max(10.0, min(current_balance * 0.1, 1000.0))
+def dynamic_capital(current_balance: float, pct: float = 0.10) -> float:
+    """% of current capital, floor $10, cap $1000."""
+    return max(10.0, min(current_balance * pct, 1000.0))
 
 def get_resolution_hours(opp_dict: dict, market_lookup: dict) -> float:
     """Hours until ALL markets resolve (LATEST/MAX end_date).
@@ -129,6 +130,7 @@ async def main():
             secrets = yaml.safe_load(f) or {}
     max_positions = config.get('arbitrage', {}).get('max_concurrent_positions', 20)
     max_days_to_resolution = config.get('arbitrage', {}).get('max_days_to_resolution', 60)
+    capital_pct = config.get('arbitrage', {}).get('capital_per_trade_pct', 0.10)
     res_val_cfg = config.get('arbitrage', {}).get('resolution_validation', {})
     # Anthropic key: secrets.yaml > config.yaml > env var
     anthropic_api_key = (
@@ -381,7 +383,7 @@ async def main():
             if OPP_PATH.exists() and slots > 0:
                 opps = json.loads(OPP_PATH.read_text()).get('opportunities', [])
                 if opps:
-                    cap = dynamic_capital(engine.current_capital)
+                    cap = dynamic_capital(engine.current_capital, capital_pct)
                     ranked = rank_opportunities(opps, market_lookup, min_resolution_secs=300, max_days_to_resolution=max_days_to_resolution)
                     log.info(f'[iter {iteration}] {len(opps)} raw opps -> {len(ranked)} ranked, cap=${cap:.2f}')
 
