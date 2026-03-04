@@ -430,17 +430,37 @@ class PaperTradingEngine:
         Close a paper position based on actual market resolution
         Calculate real PnL and compare to expected
         """
-        # Calculate actual payout
-        # In arbitrage, we bought all markets - only winner pays out
-        
-        winning_market = position.markets[winning_market_id]
-        entry_price = winning_market['entry_price']
-        bet_amount = winning_market['bet_amount']
-        
-        # Payout calculation: (bet_amount / entry_price) = shares bought
-        # Shares pay $1.00 per share if they win
-        shares_bought = bet_amount / entry_price
-        payout = shares_bought * 1.00  # Winning shares pay $1
+        # Calculate actual payout.
+        # Strategy determines which formula applies:
+        #
+        # BUY arb (mutex_buy_all, bregman_frank_wolfe):
+        #   Bought YES on all markets. Only winner pays out.
+        #   bet_amount = shares_YES * YES_price → shares_YES = bet_amount / entry_price
+        #   payout = shares_YES * 1.0  (winning YES shares pay $1)
+        #
+        # SELL arb (mutex_sell_all):
+        #   Bought NO on all markets (entry_price stores YES price; NO price = 1 - entry_price).
+        #   bet_amount = shares_NO * NO_price → shares_NO = bet_amount / (1 - entry_price)
+        #   The WINNING market's NO bet LOSES (outcome was YES → NO payout = $0).
+        #   All other markets' NO bets WIN (outcome was NO → each pays $1/share).
+        #   payout = sum of (bet_amount_k / (1 - entry_price_k)) for k != winning_market
+        strategy = position.metadata.get('method', '')
+        is_sell_arb = 'sell' in strategy
+
+        if is_sell_arb:
+            payout = 0.0
+            for market_id, mkt_data in position.markets.items():
+                if market_id != winning_market_id:
+                    no_price = 1.0 - mkt_data['entry_price']
+                    if no_price > 0:
+                        shares_no = mkt_data['bet_amount'] / no_price
+                        payout += shares_no  # Each NO share pays $1
+        else:
+            winning_market = position.markets[winning_market_id]
+            entry_price = winning_market['entry_price']
+            bet_amount = winning_market['bet_amount']
+            shares_bought = bet_amount / entry_price
+            payout = shares_bought * 1.00  # Winning YES shares pay $1
         
         # Calculate profit
         total_invested = position.total_capital + position.fees_paid
