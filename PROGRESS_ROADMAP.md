@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.03.02 (pre-release, shadow trading)
-> **Last updated**: 2026-03-04 14:00 UTC
+> **Version**: v0.03.04 (pre-release, shadow trading)
+> **Last updated**: 2026-03-04 15:30 UTC
 > **Mode**: SHADOW | Cash: $0.52 | Deployed: $100.00 | Total: $100.52 | 10 open, 179 closed
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
 
@@ -318,6 +318,13 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
 
 ## 7. Changelog
 
+### v0.03.04 (2026-03-04) — Sell Arb Payout Formula Fix
+- **FIXED** Critical payout formula error in `paper_trading.py` for sell arb positions (`mutex_sell_all`). Previously, payout was calculated the same way as buy arb — using only the *winning* market's YES shares — which is wrong for sell arb. In a sell arb, the system buys NO on every market. When the outcome is known, the winning market's NO bet *loses* (outcome was YES), and every other market's NO bet *wins* (outcome was NO, paying $1/share). Corrected formula: `payout = sum(bet_amount_k / (1 - entry_price_k))` for all legs `k` except the winning market.
+
+### v0.03.03 (2026-03-04) — Replacement Filter Tightening & Restart Fix
+- **ADDED** `max_days_to_replacement: 30` config param — replacement candidates must resolve within 30 days (stricter than the 60-day entry filter). Wired into `rank_opportunities()` call and AI validation check inside replacement loop.
+- **FIXED** `restart.sh` awk syntax error (`{print $2, $NF}` eaten by Windows batch); replaced with `tr -s ' ' | cut -d' ' -f2,11`. Also: `>` → `>>` to append main.log on restart, added `disown`, added capital summary readout.
+
 ### v0.03.02 (2026-03-03) — Replacement Loop Fix & Fee Config
 - **FIXED** Replacement loop bug: same opportunity could liquidate multiple positions in one round (T20 World Cup replaced 5 positions at once). Added `used_opp_cids` set to prevent reuse within a round.
 - **FIXED** Fee config mismatch: `paper_trading.py` read `polymarket_taker_fee` from wrong config section (always fell back to hardcoded default). Now reads from `arbitrage.fees.polymarket_taker_fee` via `self.taker_fee` set during init.
@@ -377,7 +384,9 @@ Current state: all work on `main` branch, no tags. Plan:
 - `v0.02.00` → dashboard and scripts  
 - `v0.03.00` → resolution safety
 - `v0.03.01` → replacement protection & validator verification
-- `v0.03.02` → replacement loop fix + fee config + API key to secrets.yaml *(current)*
+- `v0.03.02` → replacement loop fix + fee config + API key to secrets.yaml
+- `v0.03.03` → separate replacement filter (30d) from entry filter (60d)
+- `v0.03.04` → sell arb payout formula fix + restart.sh fixes *(current)*
 - `v1.00.00` → first successful live trade
 
 ### Implementation Steps
@@ -461,6 +470,7 @@ After cleaning Somaliland + Japan, with Arkansas and TX-31 identified but not ye
 - **Avg return per resolved arb**: ~$0.41
 
 ### Lessons
+- **Sell arb payout is fundamentally different from buy arb**: in a sell arb (buy-NO on all legs), the winning market's NO bet *loses*; profit comes from all *other* legs resolving NO. Using the buy arb formula (winning leg only) would have caused severe P&L understatement on every resolved sell arb.
 - Replacement churn ($0.001/swap × ~1200 swaps ≈ $1.20) is negligible individually but adds up
 - The system correctly identifies profitable arbs — both incidents were data/guard failures, not math failures
 - Resolution validation will prevent the Somaliland class of bug
@@ -490,7 +500,7 @@ After cleaning Somaliland + Japan, with Arkansas and TX-31 identified but not ye
 
 ---
 
-*Last updated: 2026-03-04 15:00 UTC*
+*Last updated: 2026-03-04 15:30 UTC*
 *System: WSL Ubuntu on Windows | Machines: Laptop + Desktop*
 *Dashboard: http://localhost:5556 | Exec Control: port 5557*
 *Git: https://github.com/andydoc/Prediction-trading (branch: main)*
