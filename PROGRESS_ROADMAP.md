@@ -1,10 +1,10 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.03.04 (pre-release, shadow trading)
-> **Last updated**: 2026-03-04 17:00 UTC
-> **Mode**: SHADOW | Cash: $1.24 | Deployed: $100.00 | Total: $101.24 | 10 open, 181 closed
-> **Note**: 4 football positions (Mar 3 games) awaiting Polymarket resolution — correct behaviour
+> **Version**: v0.03.05 (pre-release, shadow trading)
+> **Last updated**: 2026-03-06 19:00 UTC
+> **Mode**: SHADOW | Cash: $5.42 | Deployed: $100.00 | Total: $105.42 | 10 open, 197 closed
+> **Note**: Resolution delay model live — P95 category delay + soft volume penalty in scoring
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
 
 ---
@@ -318,6 +318,18 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
 ---
 
 ## 7. Changelog
+
+### v0.03.05 (2026-03-06) — Resolution Delay Model
+- **ADDED** Resolution delay scoring model in `layer4_runner.py`. Scoring formula now uses `effective_hours = raw_hours + P95_category_delay + volume_penalty` instead of raw hours. Based on analysis of 512,894 historical resolved Polymarket markets.
+- **ADDED** `CATEGORY_P95_DELAY_HOURS` table: football 14.8h, us_sports 33.6h, esports 20h, politics 350.2h, crypto 3.4h, etc.
+- **ADDED** `classify_opportunity_category()` — classifies opportunities into delay categories from market names/descriptions.
+- **ADDED** `get_volume_penalty_hours()` — soft penalty: `max(0, (5 - log10(vol+1)) * 2)`. Adds ~6h for $100 vol, ~2h for $10K, ~0 for $100K+.
+- **ADDED** `get_min_volume()` — uses minimum volume_24h across all markets in an opportunity (resolution limited by least-liquid market).
+- **ADDED** Same delay model applied to replacement scoring (existing position scoring now matches new opportunity scoring).
+- **ADDED** Debug logging: `Rank model: top score=X cat=Y raw_h=Z +p95=A +vol_pen=B (vol=$C)`.
+- **DATA** Harvested 512,894 resolved markets from Gamma API to D:\ClaudeData\resolved_markets_harvest.jsonl (731MB). Analysis saved to D:\ClaudeData\delay_analysis.txt and volume_delay_correlation.txt.
+- **FINDING** Football resolution delay is ~5h median across all leagues, very consistent. Volume does NOT affect median delay but dramatically affects tail risk (P95: $0-100 vol = 35h, $500K+ vol = 6.3h).
+- **FINDING** South American low-volume leagues (Bolivia, Venezuela, Ecuador, Colombia, Chile) responsible for stuck positions — low UMA oracle incentive to resolve.
 
 ### v0.03.04 (2026-03-04) — Sell Arb Payout Formula Fix
 - **FIXED** Critical payout formula error in `paper_trading.py` for sell arb positions (`mutex_sell_all`). Previously, payout was calculated the same way as buy arb — using only the *winning* market's YES shares — which is wrong for sell arb. In a sell arb, the system buys NO on every market. When the outcome is known, the winning market's NO bet *loses* (outcome was YES), and every other market's NO bet *wins* (outcome was NO, paying $1/share). Corrected formula: `payout = sum(bet_amount_k / (1 - entry_price_k))` for all legs `k` except the winning market.
