@@ -319,17 +319,22 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
 
 ## 7. Changelog
 
-### v0.03.05 (2026-03-06) — Resolution Delay Model
-- **ADDED** Resolution delay scoring model in `layer4_runner.py`. Scoring formula now uses `effective_hours = raw_hours + P95_category_delay + volume_penalty` instead of raw hours. Based on analysis of 512,894 historical resolved Polymarket markets.
-- **ADDED** `CATEGORY_P95_DELAY_HOURS` table: football 14.8h, us_sports 33.6h, esports 20h, politics 350.2h, crypto 3.4h, etc.
+### v0.03.05 (2026-03-06) — Resolution Delay Model (Dynamic)
+- **ADDED** Resolution delay scoring model in `layer4_runner.py`. Scoring formula now uses `effective_hours = raw_hours + P95_category_delay + volume_penalty` instead of raw hours.
+- **ADDED** Dynamic P95 table loaded from `data/resolution_delay_p95.json` at runtime (1h cache). Falls back to hardcoded values if file missing.
+- **ADDED** Rolling 12-month P95 window — captures seasonal variation in sports/politics. Temporal analysis showed Polymarket resolution speed improved dramatically (all-category P95: 161h in 2024-H1 → 24h in 2026-H1).
+- **ADDED** `scripts/debug/compute_delay_table.py` — computes 12-month rolling P95 from harvest data, writes JSON.
+- **ADDED** `scripts/debug/update_delay_table.py` — weekly updater: harvests last 30 days from Gamma API, appends to master file, recomputes P95 table. Triggered automatically by L4 at startup and every ~24h (iteration 2880).
 - **ADDED** `classify_opportunity_category()` — classifies opportunities into delay categories from market names/descriptions.
 - **ADDED** `get_volume_penalty_hours()` — soft penalty: `max(0, (5 - log10(vol+1)) * 2)`. Adds ~6h for $100 vol, ~2h for $10K, ~0 for $100K+.
 - **ADDED** `get_min_volume()` — uses minimum volume_24h across all markets in an opportunity (resolution limited by least-liquid market).
 - **ADDED** Same delay model applied to replacement scoring (existing position scoring now matches new opportunity scoring).
 - **ADDED** Debug logging: `Rank model: top score=X cat=Y raw_h=Z +p95=A +vol_pen=B (vol=$C)`.
-- **DATA** Harvested 512,894 resolved markets from Gamma API to D:\ClaudeData\resolved_markets_harvest.jsonl (731MB). Analysis saved to D:\ClaudeData\delay_analysis.txt and volume_delay_correlation.txt.
+- **DATA** Harvested 512,894 resolved markets from Gamma API to D:\ClaudeData\resolved_markets_harvest.jsonl (731MB). Analysis saved to D:\ClaudeData\delay_analysis.txt, volume_delay_correlation.txt, delay_temporal_analysis.txt.
+- **FINDING** Resolution delays are NOT static — Polymarket got ~6x faster between 2024-H1 and 2025-H2. All-time P95 values were significantly wrong for current conditions.
 - **FINDING** Football resolution delay is ~5h median across all leagues, very consistent. Volume does NOT affect median delay but dramatically affects tail risk (P95: $0-100 vol = 35h, $500K+ vol = 6.3h).
 - **FINDING** South American low-volume leagues (Bolivia, Venezuela, Ecuador, Colombia, Chile) responsible for stuck positions — low UMA oracle incentive to resolve.
+- **12-month P95 values** (as of 2026-03-06): football 15.1h, us_sports 44.4h, esports 12.5h, crypto 3.4h, politics 702.4h, sports_props 10.1h, mma_boxing 26.1h, gov_policy 41.2h, other 35.1h
 
 ### v0.03.04 (2026-03-04) — Sell Arb Payout Formula Fix
 - **FIXED** Critical payout formula error in `paper_trading.py` for sell arb positions (`mutex_sell_all`). Previously, payout was calculated the same way as buy arb — using only the *winning* market's YES shares — which is wrong for sell arb. In a sell arb, the system buys NO on every market. When the outcome is known, the winning market's NO bet *loses* (outcome was YES), and every other market's NO bet *wins* (outcome was NO, paying $1/share). Corrected formula: `payout = sum(bet_amount_k / (1 - entry_price_k))` for all legs `k` except the winning market.
@@ -514,7 +519,7 @@ Live figures from `execution_state.json` (post sell-arb payout correction):
 
 ---
 
-*Last updated: 2026-03-04 17:00 UTC*
+*Last updated: 2026-03-06 19:15 UTC*
 *System: WSL Ubuntu on Windows | Machines: Laptop + Desktop*
 *Dashboard: http://localhost:5556 | Exec Control: port 5557*
 *Git: https://github.com/andydoc/Prediction-trading (branch: main)*
