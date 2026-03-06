@@ -40,23 +40,68 @@ logging.basicConfig(level=logging.DEBUG,
     handlers=[logging.FileHandler(str(WORKSPACE / 'logs' / f'layer4_{datetime.now().strftime("%Y%m%d")}.log')), logging.StreamHandler()])
 log = logging.getLogger('layer4')
 
-# --- Resolution delay model (from 512k market Gamma API analysis, 2026-03-06) ---
-# P95 delay = hours between endDate and Polymarket closedTime at 95th percentile
-CATEGORY_P95_DELAY_HOURS = {
-    'football':     14.8,   # 33k samples, very consistent
-    'us_sports':    33.6,   # 58k samples (NBA/NFL/NHL/MLB)
-    'esports':      20.0,   # 29k samples
-    'tennis':       20.8,   # 2k samples
-    'mma_boxing':   50.3,   # 2k samples
-    'cricket':      21.8,   # 2k samples
-    'rugby':        23.3,   # 29 samples (low confidence)
-    'politics':    350.2,   # 13k samples — very long tail
-    'gov_policy':   44.3,   # 520 samples
-    'crypto':        3.4,   # 184k samples — resolves fast
-    'sports_props':  6.5,   # 44k samples
-    'other':        33.5,   # 142k samples — catch-all
+# --- Resolution delay model (dynamically loaded, updated weekly) ---
+# Fallback P95 values if JSON file not yet generated
+_FALLBACK_P95 = {
+    'football': 14.8, 'us_sports': 33.6, 'esports': 20.0, 'tennis': 20.8,
+    'mma_boxing': 50.3, 'cricket': 21.8, 'rugby': 23.3, 'politics': 350.2,
+    'gov_policy': 44.3, 'crypto': 3.4, 'sports_props': 6.5, 'other': 33.5,
 }
-DEFAULT_P95_DELAY_HOURS = 33.5  # 'other' category default
+_FALLBACK_DEFAULT = 33.5
+
+P95_JSON_PATH = WORKSPACE / 'data' / 'resolution_delay_p95.json'
+_delay_table_cache = {'p95_hours': None, 'default': None, 'loaded_at': None}
+
+
+def load_delay_table():
+    """Load P95 delay table from JSON. Returns (p95_dict, default_p95).
+    Falls back to hardcoded values if file missing or corrupt."""
+    # Cache for 1 hour to avoid repeated disk reads
+    if (_delay_table_cache['p95_hours'] is not None and _delay_table_cache['loaded_at']
+            and (_time.time() - _delay_table_cache['loaded_at']) < 3600):
+        return _delay_table_cache['p95_hours'], _delay_table_cache['default']
+    try:
+        if P95_JSON_PATH.exists():
+            data = json.loads(P95_JSON_PATH.read_text())
+            p95 = data.get('p95_hours', {})
+            default = data.get('default_p95_hours', _FALLBACK_DEFAULT)
+            if p95:
+                _delay_table_cache['p95_hours'] = p95
+                _delay_table_cache['default'] = default
+                _delay_table_cache['loaded_at'] = _time.time()
+                log.debug(f'Loaded delay table: {len(p95)} categories, '
+                          f'generated={data.get("generated_at","?")[:10]}, '
+                          f'lookback={data.get("lookback_months","?")}mo')
+                return p95, default
+    except Exception as e:
+        log.warning(f'Failed to load delay table: {e}')
+    return _FALLBACK_P95, _FALLBACK_DEFAULT
+
+
+def trigger_weekly_delay_update():
+    """Check if weekly delay table update is due, run in background if so."""
+    try:
+        update_state_path = WORKSPACE / 'data' / 'delay_update_state.json'
+        if update_state_path.exists():
+            state = json.loads(update_state_path.read_text())
+            last = datetime.fromisoformat(state.get('last_update', '2000-01-01'))
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - last).days < 7:
+                return  # Not due yet
+        # Run update in subprocess to avoid blocking L4
+        import subprocess
+        script = WORKSPACE / 'scripts' / 'debug' / 'update_delay_table.py'
+        if script.exists():
+            log.info('Weekly delay table update triggered')
+            subprocess.Popen(
+                [sys.executable, str(script)],
+                stdout=open(str(WORKSPACE / 'logs' / 'delay_update.log'), 'a'),
+                stderr=subprocess.STDOUT,
+                cwd=str(WORKSPACE)
+            )
+    except Exception as e:
+        log.debug(f'Delay update check error: {e}')
 
 import math
 
@@ -194,9 +239,10 @@ def rank_opportunities(opps: list, market_lookup: dict, min_resolution_secs: int
             continue
         profit_pct = opp.get('expected_profit_pct', 0)
         # --- Resolution delay adjustment ---
+        p95_table, default_p95 = load_delay_table()
         category = classify_opportunity_category(
             opp.get('market_names', []), market_lookup, opp.get('market_ids', []))
-        p95_delay = CATEGORY_P95_DELAY_HOURS.get(category, DEFAULT_P95_DELAY_HOURS)
+        p95_delay = p95_table.get(category, default_p95)
         min_vol = get_min_volume(opp, market_lookup)
         vol_penalty = get_volume_penalty_hours(min_vol)
         effective_hours = hours + p95_delay + vol_penalty
@@ -209,8 +255,9 @@ def rank_opportunities(opps: list, market_lookup: dict, min_resolution_secs: int
         top_cat = classify_opportunity_category(
             top_o.get('market_names', []), market_lookup, top_o.get('market_ids', []))
         top_vol = get_min_volume(top_o, market_lookup)
+        p95_t, def_p95 = load_delay_table()
         log.debug(f'  Rank model: top score={top_s:.6f} cat={top_cat} '
-                  f'raw_h={top_h:.1f} +p95={CATEGORY_P95_DELAY_HOURS.get(top_cat, DEFAULT_P95_DELAY_HOURS):.1f} '
+                  f'raw_h={top_h:.1f} +p95={p95_t.get(top_cat, def_p95):.1f} '
                   f'+vol_pen={get_volume_penalty_hours(top_vol):.1f} (vol=${top_vol:.0f})')
     return scored
 
@@ -301,6 +348,9 @@ async def main():
     
     log.info(f'Layer 4 started [{mode_str.upper()}] (dynamic capital + resolution ranking + replacement)')
     write_status('starting')
+
+    # Check for weekly delay table update at startup
+    trigger_weekly_delay_update()
 
     # Execution lock — only the leader machine may trade
     exec_lock_url = config.get('execution_control', {}).get('url', 'http://localhost:5557')
@@ -455,7 +505,8 @@ async def main():
                             pos_names = [m.get('name', '') for m in pos.markets.values()]
                             pos_mids = list(pos.markets.keys())
                             pos_category = classify_opportunity_category(pos_names, market_lookup, pos_mids)
-                            pos_p95 = CATEGORY_P95_DELAY_HOURS.get(pos_category, DEFAULT_P95_DELAY_HOURS)
+                            pos_p95_table, pos_def_p95 = load_delay_table()
+                            pos_p95 = pos_p95_table.get(pos_category, pos_def_p95)
                             pos_min_vol = 0.0
                             for mid_str in pos.markets.keys():
                                 md = market_lookup.get(str(mid_str))
@@ -639,6 +690,10 @@ async def main():
                          f'dynamic_cap=${dynamic_capital(capital):.2f}')
             else:
                 log.debug(f'[iter {iteration}] Capital=${capital:.2f} positions={len(engine.open_positions)}')
+
+            # Check for weekly delay table update (~daily check, cheap)
+            if iteration % 2880 == 0:  # ~24h at 30s intervals
+                trigger_weekly_delay_update()
 
         except Exception as e:
             log.error(f'[iter {iteration}] Error: {e}', exc_info=True)
