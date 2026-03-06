@@ -40,6 +40,112 @@ logging.basicConfig(level=logging.DEBUG,
     handlers=[logging.FileHandler(str(WORKSPACE / 'logs' / f'layer4_{datetime.now().strftime("%Y%m%d")}.log')), logging.StreamHandler()])
 log = logging.getLogger('layer4')
 
+# --- Resolution delay model (from 512k market Gamma API analysis, 2026-03-06) ---
+# P95 delay = hours between endDate and Polymarket closedTime at 95th percentile
+CATEGORY_P95_DELAY_HOURS = {
+    'football':     14.8,   # 33k samples, very consistent
+    'us_sports':    33.6,   # 58k samples (NBA/NFL/NHL/MLB)
+    'esports':      20.0,   # 29k samples
+    'tennis':       20.8,   # 2k samples
+    'mma_boxing':   50.3,   # 2k samples
+    'cricket':      21.8,   # 2k samples
+    'rugby':        23.3,   # 29 samples (low confidence)
+    'politics':    350.2,   # 13k samples — very long tail
+    'gov_policy':   44.3,   # 520 samples
+    'crypto':        3.4,   # 184k samples — resolves fast
+    'sports_props':  6.5,   # 44k samples
+    'other':        33.5,   # 142k samples — catch-all
+}
+DEFAULT_P95_DELAY_HOURS = 33.5  # 'other' category default
+
+import math
+
+def classify_opportunity_category(market_names: list, market_lookup: dict, market_ids: list) -> str:
+    """Classify an opportunity into a resolution-delay category based on market names."""
+    names_lower = ' '.join(n.lower() for n in market_names)
+    # Try to get descriptions from market_lookup for better classification
+    descs = ''
+    for mid in market_ids:
+        md = market_lookup.get(str(mid))
+        if md and hasattr(md, 'metadata') and isinstance(md.metadata, dict):
+            descs += ' ' + md.metadata.get('description', '').lower()
+
+    # Football — most common in our arb universe
+    football_q = any(p in names_lower for p in ['win on 20', 'end in a draw', 'halftime', 'leading at halftime'])
+    football_d = any(p in descs for p in ['90 minutes', 'stoppage time', 'regular play'])
+    if football_q and (football_d or not descs):
+        return 'football'
+    if any(p in names_lower for p in ['halftime', 'leading at halftime']):
+        return 'football'
+
+    # US Sports
+    if any(p in names_lower for p in ['nba ', 'nfl ', 'nhl ', 'mlb ', 'wnba ',
+                                       'touchdown', 'rushing yards', 'passing yards',
+                                       'rebounds', 'three-pointer']):
+        return 'us_sports'
+    if any(p in names_lower for p in ['spread:', 'team total:', 'o/u ']):
+        if any(p in descs for p in ['90 minutes', 'stoppage']):
+            return 'football'
+        return 'sports_props'
+
+    # Esports
+    if any(p in names_lower for p in ['counter-strike', 'cs2', 'dota', 'league of legends',
+                                       'valorant', 'overwatch', 'dreamleague']):
+        return 'esports'
+
+    # Tennis
+    if any(p in names_lower for p in ['atp ', 'wta ', 'tennis']):
+        return 'tennis'
+
+    # MMA/Boxing
+    if any(p in names_lower for p in ['ufc ', 'mma ', 'boxing', 'pfl ', 'bellator']):
+        return 'mma_boxing'
+
+    # Cricket
+    if any(p in names_lower for p in ['cricket', 'ipl ', 't20 ']):
+        return 'cricket'
+
+    # Rugby
+    if any(p in names_lower for p in ['rugby', 'super rugby', 'waratahs']):
+        return 'rugby'
+
+    # Crypto
+    if any(p in names_lower for p in ['bitcoin', 'ethereum', 'solana', 'btc ', 'eth ',
+                                       'up or down']):
+        return 'crypto'
+
+    # Politics
+    if any(p in names_lower for p in ['governor', 'congress', 'senate', 'primary',
+                                       'democrat', 'republican', 'election', 'president']):
+        return 'politics'
+
+    # Government/Policy
+    if any(p in names_lower for p in ['fed ', 'federal reserve', 'interest rate',
+                                       'tariff', 'government shutdown']):
+        return 'gov_policy'
+
+    return 'other'
+
+
+def get_volume_penalty_hours(min_volume: float) -> float:
+    """Soft volume penalty: low-volume markets take longer to resolve.
+    Adds ~6h for $100 volume, ~2h for $10K, ~0h for $100K+."""
+    if min_volume <= 0:
+        return 8.0  # No volume data = assume slow
+    return max(0.0, (5.0 - math.log10(min_volume + 1)) * 2.0)
+
+
+def get_min_volume(opp_dict: dict, market_lookup: dict) -> float:
+    """Get minimum volume_24h across all markets in an opportunity.
+    Resolution speed is limited by the least-liquid market."""
+    volumes = []
+    for mid in opp_dict.get('market_ids', []):
+        md = market_lookup.get(str(mid))
+        if md and hasattr(md, 'volume_24h'):
+            volumes.append(md.volume_24h or 0)
+    return min(volumes) if volumes else 0.0
+
+
 def write_status(status, capital=0, open_pos=0, error=None):
     STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
     STATUS_PATH.write_text(json.dumps({
@@ -87,9 +193,25 @@ def rank_opportunities(opps: list, market_lookup: dict, min_resolution_secs: int
             log.debug(f"  Filtered out {opp.get('opportunity_id','?')}: {hours/24:.0f}d > {max_days_to_resolution}d max")
             continue
         profit_pct = opp.get('expected_profit_pct', 0)
-        score = profit_pct / max(hours, 0.01)
+        # --- Resolution delay adjustment ---
+        category = classify_opportunity_category(
+            opp.get('market_names', []), market_lookup, opp.get('market_ids', []))
+        p95_delay = CATEGORY_P95_DELAY_HOURS.get(category, DEFAULT_P95_DELAY_HOURS)
+        min_vol = get_min_volume(opp, market_lookup)
+        vol_penalty = get_volume_penalty_hours(min_vol)
+        effective_hours = hours + p95_delay + vol_penalty
+        score = profit_pct / max(effective_hours, 0.01)
         scored.append((score, hours, opp))
     scored.sort(key=lambda x: x[0], reverse=True)
+    if scored:
+        # Log delay model stats for top opportunity
+        top_s, top_h, top_o = scored[0]
+        top_cat = classify_opportunity_category(
+            top_o.get('market_names', []), market_lookup, top_o.get('market_ids', []))
+        top_vol = get_min_volume(top_o, market_lookup)
+        log.debug(f'  Rank model: top score={top_s:.6f} cat={top_cat} '
+                  f'raw_h={top_h:.1f} +p95={CATEGORY_P95_DELAY_HOURS.get(top_cat, DEFAULT_P95_DELAY_HOURS):.1f} '
+                  f'+vol_pen={get_volume_penalty_hours(top_vol):.1f} (vol=${top_vol:.0f})')
     return scored
 
 def get_held_market_ids(engine) -> set:
@@ -328,8 +450,21 @@ async def main():
                                 liq_value += shares * cur_p
                             unrealized_pnl = liq_value - pos.total_capital
                             remaining_upside = pos.expected_profit - unrealized_pnl
-                            # Normalize to pct/hr to match opp scoring (profit_pct / hours)
-                            remaining_score = (remaining_upside / max(pos.total_capital, 0.01)) / max(hours_remaining, 0.01)
+                            # Normalize to pct/hr to match opp scoring (profit_pct / effective_hours)
+                            # Apply same delay model as rank_opportunities
+                            pos_names = [m.get('name', '') for m in pos.markets.values()]
+                            pos_mids = list(pos.markets.keys())
+                            pos_category = classify_opportunity_category(pos_names, market_lookup, pos_mids)
+                            pos_p95 = CATEGORY_P95_DELAY_HOURS.get(pos_category, DEFAULT_P95_DELAY_HOURS)
+                            pos_min_vol = 0.0
+                            for mid_str in pos.markets.keys():
+                                md = market_lookup.get(str(mid_str))
+                                if md and hasattr(md, 'volume_24h'):
+                                    v = md.volume_24h or 0
+                                    pos_min_vol = v if pos_min_vol == 0 else min(pos_min_vol, v)
+                            pos_vol_penalty = get_volume_penalty_hours(pos_min_vol)
+                            effective_remaining = hours_remaining + pos_p95 + pos_vol_penalty
+                            remaining_score = (remaining_upside / max(pos.total_capital, 0.01)) / max(effective_remaining, 0.01)
                             if remaining_score < worst_remaining_score:
                                 worst_remaining_score = remaining_score
                                 worst_pos = (pid, pos, remaining_score, hours_remaining, unrealized_pnl)
