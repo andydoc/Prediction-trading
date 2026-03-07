@@ -17,6 +17,7 @@ arbitrage:
   max_days_to_replacement: 30          # Replacement filter: only consider candidates resolving <30 days away (faster capital velocity)
   replace_on_postponement: true        # Trigger replacement when a position's event is detected as postponed/cancelled
   postponement_replace_breakeven_only: true  # Only replace postponed positions if current liquidation value >= capital deployed (no loss on exit)
+  postponement_rescore_days: 14        # When scoring held positions that are postponed/overdue, extend denominator to now+N days (prevents artificially high scores)
   max_exposure_per_market: 500
   max_position_size: 1000
   max_profit_threshold: 0.3

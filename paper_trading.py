@@ -419,6 +419,7 @@ class PaperTradingEngine:
         )
 
 
+    def _check_group_resolved(self, position, market_lookup) -> tuple:
         """
         Check if ALL markets in a position's group have resolved.
         A market is resolved if:
