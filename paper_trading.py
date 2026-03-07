@@ -357,8 +357,68 @@ class PaperTradingEngine:
             if position.status == PositionStatus.MONITORING:
                 self._update_price_drift(position, market_lookup)
                 position.last_check = datetime.now(timezone.utc)
-    
-    def _check_group_resolved(self, position, market_lookup) -> tuple:
+
+            # Check for postponement / cancellation (only if not already resolved)
+            if not group_resolved:
+                is_postponed, reason = self._check_postponed(position, market_lookup)
+                if is_postponed and not position.metadata.get('postponed'):
+                    self.logger.warning(
+                        f"POSTPONED detected for {position_id[:40]}: {reason}"
+                    )
+                    position.metadata['postponed'] = True
+                    position.metadata['postponed_at'] = datetime.now(timezone.utc).isoformat()
+                    position.metadata['postponed_reason'] = reason
+                elif not is_postponed and position.metadata.get('postponed'):
+                    # end_date extended or market rescheduled — clear flag
+                    self.logger.info(
+                        f"Postponement cleared for {position_id[:40]} (end_date may have been extended)"
+                    )
+                    position.metadata.pop('postponed', None)
+                    position.metadata.pop('postponed_at', None)
+                    position.metadata.pop('postponed_reason', None)
+
+    def _check_postponed(self, position, market_lookup) -> tuple:
+        """
+        Detect postponed / cancelled event:
+          - ALL markets in the group have end_date in the past
+          - BUT none have resolved (no outcome price >= 0.95)
+          - AND markets are still present in the API (not removed)
+        Returns (is_postponed: bool, reason: str)
+        """
+        now = datetime.now(timezone.utc)
+        total = len(position.markets)
+        if total == 0:
+            return False, ''
+
+        past_count = 0
+        for market_id in position.markets.keys():
+            md = market_lookup.get(market_id)
+            if md is None:
+                return False, ''  # missing markets handled by _check_group_resolved
+            ed = md.end_date
+            if ed.tzinfo is None:
+                ed = ed.replace(tzinfo=timezone.utc)
+            if ed < now:
+                past_count += 1
+
+        if past_count < total:
+            return False, ''  # Some markets not yet past end_date
+
+        # All end_dates past — check none have resolved
+        for market_id in position.markets.keys():
+            md = market_lookup.get(market_id)
+            if md is None:
+                return False, ''  # let group_resolved handle this
+            max_p = max((float(p) for p in md.outcome_prices.values()), default=0)
+            if max_p >= 0.95:
+                return False, ''  # Normal resolution in progress
+
+        return True, (
+            f'end_date passed for all {total} markets, no resolution detected '
+            f'(end_dates all < {now.strftime("%Y-%m-%dT%H:%M")}Z)'
+        )
+
+
         """
         Check if ALL markets in a position's group have resolved.
         A market is resolved if:

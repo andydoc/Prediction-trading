@@ -289,6 +289,26 @@ def opportunity_overlaps_held(opp_dict, held_market_ids) -> bool:
             return True
     return False
 
+def calc_position_liq_value(pos, market_lookup) -> float:
+    """Estimate current liquidation value of a position at mid-prices."""
+    liq = 0.0
+    for mid_str, mkt_info in pos.markets.items():
+        entry_p = mkt_info.get('entry_price', 0)
+        bet_amt = mkt_info.get('bet_amount', 0)
+        if entry_p <= 0:
+            continue
+        shares = bet_amt / entry_p
+        md = market_lookup.get(str(mid_str))
+        if md:
+            outcome = mkt_info.get('outcome', 'Yes')
+            cur_p = md.outcome_prices.get(outcome, entry_p)
+        else:
+            cur_p = entry_p
+        liq += shares * cur_p
+    return liq
+
+
+
 async def main():
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
@@ -300,6 +320,8 @@ async def main():
     max_positions = config.get('arbitrage', {}).get('max_concurrent_positions', 20)
     max_days_to_resolution = config.get('arbitrage', {}).get('max_days_to_resolution', 60)
     max_days_to_replacement = config.get('arbitrage', {}).get('max_days_to_replacement', 30)
+    replace_on_postponement = config.get('arbitrage', {}).get('replace_on_postponement', True)
+    postponement_breakeven_only = config.get('arbitrage', {}).get('postponement_replace_breakeven_only', True)
     capital_pct = config.get('arbitrage', {}).get('capital_per_trade_pct', 0.10)
     res_val_cfg = config.get('arbitrage', {}).get('resolution_validation', {})
     # Anthropic key: secrets.yaml > config.yaml > env var
@@ -382,7 +404,87 @@ async def main():
                 log.debug(f'[iter {iteration}] Monitoring {len(engine.open_positions)} open positions')
                 await engine.monitor_positions(markets)
 
-            # --- EXECUTION LOCK CHECK ---
+            # --- POSTPONEMENT REPLACEMENT ---
+            # Triggered by monitor_positions flagging position.metadata['postponed']=True.
+            # Controlled by: replace_on_postponement (bool) and postponement_breakeven_only (bool).
+            # breakeven_only=True means we only replace if liq_value >= capital_deployed (no loss on exit).
+            if replace_on_postponement and engine.open_positions and OPP_PATH.exists():
+                for ppid, ppos in list(engine.open_positions.items()):
+                    if not ppos.metadata.get('postponed'):
+                        continue
+                    pname = list(ppos.markets.values())[0].get('name', '?')[:40] if ppos.markets else '?'
+                    liq_val = calc_position_liq_value(ppos, market_lookup)
+                    unrealized = liq_val - ppos.total_capital
+                    log.info(f'[iter {iteration}] POSTPONED position: "{pname}" '
+                             f'capital=${ppos.total_capital:.2f} liq=${liq_val:.2f} P&L=${unrealized:+.2f}')
+                    if postponement_breakeven_only and unrealized < 0:
+                        log.info(f'  Skipping replacement — P&L ${unrealized:+.2f} < 0 '
+                                 f'(postponement_replace_breakeven_only=True)')
+                        continue
+                    # Find best replacement candidate (reuse same ranked list if available)
+                    try:
+                        opp_text = OPP_PATH.read_text()
+                        if not opp_text.strip():
+                            continue
+                        post_opps = json.loads(opp_text).get('opportunities', [])
+                        post_ranked = rank_opportunities(post_opps, market_lookup,
+                                                         min_resolution_secs=300,
+                                                         max_days_to_resolution=max_days_to_replacement)
+                        held_cids = get_held_constraint_ids(engine)
+                        held_mids = get_held_market_ids(engine)
+                        best_post = None
+                        for pscore, phours, popp in post_ranked:
+                            pcid = popp.get('constraint_id', '')
+                            if pcid in held_cids:
+                                continue
+                            if opportunity_overlaps_held(popp, held_mids):
+                                continue
+                            if resolution_validation_enabled and anthropic_api_key:
+                                try:
+                                    pmids = popp.get('market_ids', [])
+                                    pval = get_full_validation(pmids, market_lookup, anthropic_api_key, pcid)
+                                    if pval:
+                                        if pval.get('has_unrepresented_outcome', False):
+                                            continue
+                                        try:
+                                            pvd = datetime.strptime(pval['latest_resolution_date'], '%Y-%m-%d').replace(
+                                                hour=23, minute=59, second=59, tzinfo=timezone.utc)
+                                            if (pvd - datetime.now(timezone.utc)).days > max_days_to_replacement:
+                                                continue
+                                        except (ValueError, KeyError):
+                                            pass
+                                except Exception:
+                                    pass
+                            best_post = (pscore, phours, popp)
+                            break
+                        if best_post:
+                            bpscore, bphours, bpopp = best_post
+                            bpname = bpopp.get('market_names', ['?'])[0][:40]
+                            log.info(f'  Replacing with: "{bpname}" '
+                                     f'(score={bpscore:.6f}/hr, {bphours:.0f}h, '
+                                     f'{bpopp.get("expected_profit_pct",0)*100:.1f}%)')
+                            presult = await engine.liquidate_position(ppid, market_lookup)
+                            if presult.get('success'):
+                                log.info(f'  Liquidated postponed: freed ${presult["freed_capital"]:.2f}, '
+                                         f'realized ${presult["actual_profit"]:+.2f}')
+                                if live_engine and trading_mode in ('live_trading', 'dual'):
+                                    plive_meta = ppos.metadata.get('live', {})
+                                    if plive_meta.get('token_map'):
+                                        try:
+                                            live_engine.liquidate_live_position(
+                                                {mid: {'token_id': info.get('token_id', ''), 'shares': info.get('shares', 0)}
+                                                 for mid, info in plive_meta.get('position_markets', {}).items()},
+                                                plive_meta['token_map'])
+                                        except Exception as ple:
+                                            log.error(f'  LIVE postponed liquidation error: {ple}')
+                            else:
+                                log.warning(f'  Postponed liquidation failed: {presult.get("reason")}')
+                        else:
+                            log.info(f'  No valid replacement found for postponed position — holding')
+                    except Exception as pe:
+                        log.error(f'[iter {iteration}] Postponement replacement error: {pe}', exc_info=True)
+
+
             if not exec_lock.can_execute():
                 leader = (exec_lock.last_status or {}).get('leader', '?')
                 if iteration % 10 == 1:
@@ -484,20 +586,7 @@ async def main():
                             if hours_remaining < 24:
                                 log.debug(f'  Position {pid[:30]} protected: resolves in {hours_remaining:.1f}h')
                                 continue
-                            liq_value = 0.0
-                            for mid_str, mkt_info in pos.markets.items():
-                                entry_p = mkt_info.get('entry_price', 0)
-                                bet_amt = mkt_info.get('bet_amount', 0)
-                                if entry_p <= 0:
-                                    continue
-                                shares = bet_amt / entry_p
-                                md = market_lookup.get(str(mid_str))
-                                if md:
-                                    outcome = mkt_info.get('outcome', 'Yes')
-                                    cur_p = md.outcome_prices.get(outcome, entry_p)
-                                else:
-                                    cur_p = entry_p
-                                liq_value += shares * cur_p
+                            liq_value = calc_position_liq_value(pos, market_lookup)
                             unrealized_pnl = liq_value - pos.total_capital
                             remaining_upside = pos.expected_profit - unrealized_pnl
                             # Normalize to pct/hr to match opp scoring (profit_pct / effective_hours)
