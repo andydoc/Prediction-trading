@@ -589,10 +589,27 @@ async def main():
                             _postponement_rescore_days = config.get('arbitrage', {}).get('postponement_rescore_days', 14)
                             _rescore_floor = now_utc + timedelta(days=_postponement_rescore_days)
                             if pos.metadata.get('postponed') or pos_latest_end < now_utc:
+<<<<<<< Updated upstream
                                 # Use entry_timestamp (dataclass field) as reference baseline.
                                 # Push denominator to max(original_end, now + 14d).
                                 pos_latest_end = max(pos_latest_end, _rescore_floor)
                                 log.debug(f'  {pid[:30]} postponed/past — denominator extended to {pos_latest_end.date()}')
+=======
+                                # Entry time as reference; score over (now+14d - entry_time)
+                                entry_time = pos.metadata.get('entry_time')
+                                if entry_time:
+                                    try:
+                                        entry_dt = datetime.fromisoformat(entry_time).replace(tzinfo=timezone.utc) \
+                                            if isinstance(entry_time, str) else entry_time
+                                        if entry_dt.tzinfo is None:
+                                            entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                                        pos_latest_end = max(pos_latest_end, _rescore_floor)
+                                        log.debug(f'  {pid[:30]} postponed/past — denominator extended to {pos_latest_end.date()}')
+                                    except Exception:
+                                        pos_latest_end = _rescore_floor
+                                else:
+                                    pos_latest_end = _rescore_floor
+>>>>>>> Stashed changes
                             hours_remaining = (pos_latest_end - now_utc).total_seconds() / 3600
                             if hours_remaining < 24:
                                 log.debug(f'  Position {pid[:30]} protected: resolves in {hours_remaining:.1f}h')
