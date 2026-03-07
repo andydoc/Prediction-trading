@@ -2,9 +2,9 @@
 # User Guide · Architecture · Roadmap · Progress
 
 > **Version**: v0.03.05 (pre-release, shadow trading)
-> **Last updated**: 2026-03-06 19:00 UTC
-> **Mode**: SHADOW | Cash: $5.42 | Deployed: $100.00 | Total: $105.42 | 10 open, 197 closed
-> **Note**: Resolution delay model live — P95 category delay + soft volume penalty in scoring
+> **Last updated**: 2026-03-07 15:00 UTC
+> **Mode**: SHADOW | Laptop: $5.42 cash, 10 open, 197 closed | VPS: $100.00 cash, 0 open, fresh start
+> **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4GB RAM, Ubuntu 24.04, systemd auto-restart
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
 
 ---
@@ -61,9 +61,33 @@ Only ONE machine may run L4 at a time. A Flask server manages leader election:
 - **Behaviour**: TTL-based lock with heartbeat. Fail-open (if server unreachable, allow execution).
 - **Commands**: `exec_claim.sh status|claim|release`
 
-### 2.5 Trading Modes
+### 2.6 VPS Deployment (NEW — v0.03.05)
+
+A ZAP-Hosting Lifetime VPS runs an independent copy of the trading system:
+
+- **Host**: 193.23.127.99 (ZAP-Hosting, Frankfurt/Eygelshoven, Germany)
+- **Specs**: 4 vCPUs (AMD EPYC), 4GB RAM, 25GB NVMe, Ubuntu 24.04 x86_64
+- **Cost**: $76 one-time (lifetime, no recurring fees)
+- **Service**: `prediction-trader.service` (systemd, auto-start on reboot, Restart=always)
+- **Dashboard**: http://193.23.127.99:5556
+- **Exec Control**: http://193.23.127.99:5557 (API only, not browser-rendered)
+- **Paths**: Repo at `/root/prediction-trader`, venv at `/root/prediction-trader-env`
+- **Note**: Paths use `/root/` not `/home/andydoc/` — sed replacements applied to all runners
+- **Caveat**: Must log into ZAP dashboard every 3 months or server suspended
+
+**SSH access**: `ssh root@193.23.127.99`
+**Monitoring**: `ssh root@193.23.127.99 'tail -f /root/prediction-trader/logs/layer4_$(date +%Y%m%d).log'`
+
+### 2.7 Multi-Machine Operation
+
+Currently both laptop and VPS run independently in SHADOW mode with separate execution states. The execution control server on each machine claims its own lock. To coordinate:
+- **Both independent**: Each machine trades its own $100 paper capital (current state)
+- **Coordinated**: Point one machine's `execution_control.url` to the other's `:5557` so only one trades at a time
+- **Leader election**: The machine that claims the lock first becomes the active trader; the other monitors only
 
 > See **§5.2** for mode-switching commands.
+
+### 2.8 Trading Modes
 
 | Mode | Config | Behaviour |
 |------|--------|-----------|
@@ -112,6 +136,9 @@ Only ONE machine may run L4 at a time. A Flask server manages leader election:
 /home/andydoc/prediction-trader-env/          ← Python venv
 
 C:\Users\andyd\ai-workspace\prediction-trader\   ← Windows git mirror
+
+root@193.23.127.99:/root/prediction-trader/       ← VPS (ZAP-Hosting, independent copy)
+root@193.23.127.99:/root/prediction-trader-env/    ← VPS Python venv
 ```
 
 ### Key Config Files
@@ -319,7 +346,7 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
 
 ## 7. Changelog
 
-### v0.03.05 (2026-03-06) — Resolution Delay Model (Dynamic)
+### v0.03.05 (2026-03-06/07) — Resolution Delay Model (Dynamic) + VPS Deployment
 - **ADDED** Resolution delay scoring model in `layer4_runner.py`. Scoring formula now uses `effective_hours = raw_hours + P95_category_delay + volume_penalty` instead of raw hours.
 - **ADDED** Dynamic P95 table loaded from `data/resolution_delay_p95.json` at runtime (1h cache). Falls back to hardcoded values if file missing.
 - **ADDED** Rolling 12-month P95 window — captures seasonal variation in sports/politics. Temporal analysis showed Polymarket resolution speed improved dramatically (all-category P95: 161h in 2024-H1 → 24h in 2026-H1).
@@ -327,13 +354,19 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
 - **ADDED** `scripts/debug/update_delay_table.py` — weekly updater: harvests last 30 days from Gamma API, appends to master file, recomputes P95 table. Triggered automatically by L4 at startup and every ~24h (iteration 2880).
 - **ADDED** `classify_opportunity_category()` — classifies opportunities into delay categories from market names/descriptions.
 - **ADDED** `get_volume_penalty_hours()` — soft penalty: `max(0, (5 - log10(vol+1)) * 2)`. Adds ~6h for $100 vol, ~2h for $10K, ~0 for $100K+.
-- **ADDED** `get_min_volume()` — uses minimum volume_24h across all markets in an opportunity (resolution limited by least-liquid market).
-- **ADDED** Same delay model applied to replacement scoring (existing position scoring now matches new opportunity scoring).
-- **ADDED** Debug logging: `Rank model: top score=X cat=Y raw_h=Z +p95=A +vol_pen=B (vol=$C)`.
-- **DATA** Harvested 512,894 resolved markets from Gamma API to D:\ClaudeData\resolved_markets_harvest.jsonl (731MB). Analysis saved to D:\ClaudeData\delay_analysis.txt, volume_delay_correlation.txt, delay_temporal_analysis.txt.
-- **FINDING** Resolution delays are NOT static — Polymarket got ~6x faster between 2024-H1 and 2025-H2. All-time P95 values were significantly wrong for current conditions.
-- **FINDING** Football resolution delay is ~5h median across all leagues, very consistent. Volume does NOT affect median delay but dramatically affects tail risk (P95: $0-100 vol = 35h, $500K+ vol = 6.3h).
-- **FINDING** South American low-volume leagues (Bolivia, Venezuela, Ecuador, Colombia, Chile) responsible for stuck positions — low UMA oracle incentive to resolve.
+- **ADDED** `get_min_volume()` — uses minimum volume_24h across all markets in an opportunity.
+- **ADDED** Same delay model applied to replacement scoring.
+- **DEPLOYED** ZAP-Hosting Lifetime VPS (193.23.127.99) — 4 cores, 4GB RAM, 25GB NVMe, Ubuntu 24.04. Full system running with $100 fresh paper capital. Dashboard at :5556, exec control at :5557. Systemd service with auto-restart on reboot.
+- **ADDED** `scripts/cloud_init_oracle.sh` and `scripts/cloud_init_oracle_v2.sh` — Oracle Cloud ARM A1 cloud-init scripts.
+- **ADDED** `scripts/setup_vps.sh` — manual VPS setup script.
+- **ADDED** `scripts/setup_remote_vps.sh` — remote setup from laptop via SSH.
+- **ADDED** `scripts/oci_retry_create.sh` — Oracle Cloud ARM instance auto-retry (capacity usually exhausted).
+- **NOTE** VPS uses `/root/` paths (not `/home/andydoc/`) — sed replacements applied to all runner files on VPS only (not committed to git).
+- **NOTE** ZAP-Hosting requires dashboard login every 3 months to avoid suspension.
+- **DATA** Harvested 512,894 resolved markets from Gamma API to D:\ClaudeData\resolved_markets_harvest.jsonl (731MB).
+- **FINDING** Resolution delays are NOT static — Polymarket got ~6x faster between 2024-H1 and 2025-H2.
+- **FINDING** Football resolution delay is ~5h median, consistent across leagues. Volume affects tail risk not median.
+- **FINDING** South American low-volume leagues responsible for stuck positions — low UMA oracle incentive.
 - **12-month P95 values** (as of 2026-03-06): football 15.1h, us_sports 44.4h, esports 12.5h, crypto 3.4h, politics 702.4h, sports_props 10.1h, mma_boxing 26.1h, gov_policy 41.2h, other 35.1h
 
 ### v0.03.04 (2026-03-04) — Sell Arb Payout Formula Fix
@@ -519,7 +552,8 @@ Live figures from `execution_state.json` (post sell-arb payout correction):
 
 ---
 
-*Last updated: 2026-03-06 19:15 UTC*
-*System: WSL Ubuntu on Windows | Machines: Laptop + Desktop*
+*Last updated: 2026-03-07 15:00 UTC*
+*System: WSL Ubuntu on Windows (laptop) + ZAP-Hosting VPS (193.23.127.99)*
+*Machines: Laptop (WSL) + VPS (ZAP) + Desktop HP-800G2 (dormant)*
 *Dashboard: http://localhost:5556 | Exec Control: port 5557*
 *Git: https://github.com/andydoc/Prediction-trading (branch: main)*
