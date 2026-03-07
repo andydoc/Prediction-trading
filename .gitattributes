@@ -1,2 +1,18 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Force LF line endings for all text files (WSL authoritative)
+* text=auto eol=lf
+
+# Explicitly LF for source files
+*.py eol=lf
+*.yaml eol=lf
+*.yml eol=lf
+*.sh eol=lf
+*.md eol=lf
+*.json eol=lf
+*.txt eol=lf
+*.cfg eol=lf
+*.ini eol=lf
+*.env eol=lf
+
+# Windows batch files keep CRLF
+*.bat eol=crlf
+*.cmd eol=crlf
