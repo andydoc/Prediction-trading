@@ -945,9 +945,9 @@ def make_html():
   .header h1 {{ margin: 0; }}
   .meta {{ text-align: right; line-height: 1.8; font-size: 12px; color: #888; }}
   .meta span {{ color: #ccc; }}
-        .val-tag { font-size: 0.68em; margin-left: 3px; padding: 1px 3px; border-radius: 3px; vertical-align: middle; }
-        .vtick { color: #4c4; background: #1a2e1a; border: 1px solid #2a4a2a; }
-        .vapi  { color: #888; background: #1e1e1e; border: 1px solid #333; }
+        .val-tag {{ font-size: 0.68em; margin-left: 3px; padding: 1px 3px; border-radius: 3px; vertical-align: middle; }}
+        .vtick {{ color: #4c4; background: #1a2e1a; border: 1px solid #2a4a2a; }}
+        .vapi  {{ color: #888; background: #1e1e1e; border: 1px solid #333; }}
 </style>
 <script>
 var refreshBehaviourNormal = true;
