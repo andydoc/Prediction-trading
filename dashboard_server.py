@@ -127,12 +127,26 @@ def make_html():
     market_data = load_json(DATA / 'latest_markets.json')
     markets = {str(m['market_id']): m for m in market_data.get('markets', [])}
 
+    # Load resolution cache for date validation badges
+    import hashlib
+    _res_cache_dir = DATA / 'resolution_cache'
+    _res_cache = {}
+    if _res_cache_dir.exists():
+        for _cf in _res_cache_dir.glob('*.json'):
+            try:
+                _cd = json.loads(_cf.read_text())
+                if 'latest_resolution_date' in _cd:
+                    _res_cache[_cf.stem] = _cd
+            except:
+                pass
+
     # Build opportunity rows with resolution info
     opp_rows = []
     for opp in opps:
         profit_pct = opp.get('expected_profit_pct', 0) * 100
         latest = None
         all_past = True
+        cid = opp.get('constraint_id', '')
         for mid in opp.get('market_ids', []):
             m = markets.get(str(mid))
             if m:
@@ -153,10 +167,31 @@ def make_html():
                 score = -1
             else:
                 days = delta_h / 24
-                res_str = f'{days:.1f}d' if days > 1 else f'{delta_h:.1f}h'
+                # check AI-validated cache
+                _first_mid = str(opp.get('market_ids', [''])[0]) if opp.get('market_ids') else ''
+                _gid = cid or _first_mid
+                _ckey = hashlib.md5(str(_gid).encode()).hexdigest()[:12]
+                _cv = _res_cache.get(_ckey)
+                if _cv and 'latest_resolution_date' in _cv:
+                    try:
+                        from datetime import timezone as _tz
+                        _vd = datetime.strptime(_cv['latest_resolution_date'], '%Y-%m-%d')
+                        _vd = _vd.replace(hour=23, minute=59, second=59, tzinfo=_tz.utc)
+                        delta_h = (_vd - now).total_seconds() / 3600
+                    except:
+                        pass
+                _conf = _cv.get('confidence','') if _cv else ''
+                _vtag = (f'<span class="val-tag vtick" title="AI-validated ({_conf})">&#10003;</span>'
+                         if _gid and _ckey in _res_cache
+                         else '<span class="val-tag vapi" title="Raw API endDate">[API]</span>')
+                res_str = (f'{days:.1f}d' if days > 1 else f'{delta_h:.1f}h') + _vtag
                 score = (opp.get('expected_profit_pct', 0) / max(delta_h, 0.01))
         else:
-            res_str = '?'
+            _gid2 = opp.get('constraint_id','') or (str(opp.get('market_ids',[''])[0]) if opp.get('market_ids') else '')
+            _ckey2 = hashlib.md5(str(_gid2).encode()).hexdigest()[:12]
+            _vtag2 = ('<span class="val-tag vtick">&#10003;</span>' if _ckey2 in _res_cache
+                      else '<span class="val-tag vapi">[API]</span>')
+            res_str = '?' + _vtag2
             score = 0
 
         names = opp.get('market_names', [])
@@ -910,6 +945,9 @@ def make_html():
   .header h1 {{ margin: 0; }}
   .meta {{ text-align: right; line-height: 1.8; font-size: 12px; color: #888; }}
   .meta span {{ color: #ccc; }}
+        .val-tag { font-size: 0.68em; margin-left: 3px; padding: 1px 3px; border-radius: 3px; vertical-align: middle; }
+        .vtick { color: #4c4; background: #1a2e1a; border: 1px solid #2a4a2a; }
+        .vapi  { color: #888; background: #1e1e1e; border: 1px solid #333; }
 </style>
 <script>
 var refreshBehaviourNormal = true;
