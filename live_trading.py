@@ -393,11 +393,13 @@ class LiveTradingEngine:
 
         total_capital = opp_dict.get('total_capital_required', self.capital_per_trade)
         est_profit_pct = mispricing  # Simplified
-        # Estimate fees: taker fee on each leg
-        n_legs = len(market_ids)
-        avg_fee = sum(self.get_fee_rate(token_map[m]['yes_token']) for m in market_ids) / max(n_legs, 1)
-        est_total_fees = total_capital * avg_fee * n_legs
-        net_profit_pct = est_profit_pct - (est_total_fees / total_capital)
+        # Estimate fees: taker fee on each leg's actual bet amount (not total * n_legs)
+        est_total_fees = 0.0
+        for m in market_ids:
+            bet = optimal_bets.get(m, total_capital / max(len(market_ids), 1))
+            fee_rate = self.get_fee_rate(token_map[m]['yes_token'])
+            est_total_fees += bet * fee_rate
+        net_profit_pct = est_profit_pct - (est_total_fees / max(total_capital, 0.01))
 
         if net_profit_pct < self.min_profit_after_fees:
             return {
@@ -570,16 +572,25 @@ class LiveTradingEngine:
                         open_ids.add(oid)
                 
                 # Orders no longer in open list are either filled or cancelled
+                # Verify via trades endpoint to distinguish filled from cancelled
                 for oid, meta in order_ids.items():
                     if oid not in open_ids and oid not in fills:
-                        # Assume filled (could also check trades endpoint)
-                        fills[oid] = {
-                            **meta,
-                            'status': 'filled',
-                            'fill_time': datetime.now(timezone.utc).isoformat()
-                        }
-                        log.info(f"  Fill confirmed: {meta['market_id'][:30]} "
-                                 f"{meta['size']}@{meta['price']}")
+                        confirmed_filled = False
+                        try:
+                            trades = self.client.get_trades(order_id=oid)
+                            if trades and len(trades) > 0:
+                                confirmed_filled = True
+                        except Exception:
+                            # Trades endpoint unavailable — fall back to absence heuristic
+                            confirmed_filled = True  # optimistic: absent = filled
+                        if confirmed_filled:
+                            fills[oid] = {
+                                **meta,
+                                'status': 'filled',
+                                'fill_time': datetime.now(timezone.utc).isoformat()
+                            }
+                            log.info(f"  Fill confirmed: {meta['market_id'][:30]} "
+                                     f"{meta['size']}@{meta['price']}")
                 
                 if len(fills) == len(order_ids):
                     log.info(f"All {len(fills)} orders filled in "
