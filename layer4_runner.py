@@ -607,7 +607,7 @@ async def main():
                                         pos_latest_end = _rescore_floor
                                 else:
                                     pos_latest_end = _rescore_floor
->>>>>>> Stashed changes
+#>>>>>>> Stashed changes
                             hours_remaining = (pos_latest_end - now_utc).total_seconds() / 3600
                             if hours_remaining < 24:
                                 log.debug(f'  Position {pid[:30]} protected: resolves in {hours_remaining:.1f}h')
