@@ -455,8 +455,8 @@ class WebSocketManager:
             self._handle_last_trade_price(data)
         elif event_type == 'market_resolved':
             await self._handle_market_resolved(data)
-        elif event_type == 'tick_size_change':
-            pass  # Logged but not acted on
+        elif event_type in ('tick_size_change', 'new_market'):
+            pass  # Known events, no action needed
         else:
             log.debug(f'WS market: unknown event_type={event_type}')
 

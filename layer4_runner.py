@@ -41,6 +41,10 @@ logging.basicConfig(level=logging.DEBUG,
     handlers=[logging.FileHandler(str(WORKSPACE / 'logs' / f'layer4_{datetime.now().strftime("%Y%m%d")}.log')), logging.StreamHandler()])
 log = logging.getLogger('layer4')
 
+# Quiet noisy libraries at DEBUG level
+logging.getLogger('websockets').setLevel(logging.WARNING)
+logging.getLogger('websockets.client').setLevel(logging.WARNING)
+
 # --- Resolution delay model (dynamically loaded, updated weekly) ---
 # Fallback P95 values if JSON file not yet generated
 _FALLBACK_P95 = {
