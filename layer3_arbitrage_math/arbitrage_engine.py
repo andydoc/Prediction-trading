@@ -401,22 +401,26 @@ class ArbitrageMathEngine:
         Direct mutex arb: if N markets are mutually exclusive (exactly 1 wins),
         then sum of YES prices should = 1.0.
 
-        Buy-side arb: sum(p) less than 1.0 -> buy YES on all, guaranteed payout = 1.0
-        Sell-side arb: sum(p) greater than 1.0 -> buy NO on all, guaranteed payout = N-1
+        Buy-side arb: sum(YES asks) less than 1.0 -> buy YES on all, guaranteed payout = 1.0
+        Sell-side arb: sum(YES asks) greater than 1.0 -> buy NO on all, guaranteed payout = N-1
 
-        Polymarket fee model: ~2% on winning proceeds (not on cost).
+        Uses ask prices (entry cost) when WS live data available, falls back to midpoint.
         """
         market_ids = [m.market_id for m in markets]
         n = len(markets)
-        prices = {}
-        for m in markets:
-            p = (m.outcome_prices.get('Yes') or
-                 m.outcome_prices.get('yes') or
-                 m.outcome_prices.get('true') or
-                 next(iter(m.outcome_prices.values()), 0.5))
-            prices[m.market_id] = float(p)
 
-        p_vec = np.array([prices[mid] for mid in market_ids])
+        # YES ask prices (cost to buy YES on each leg)
+        yes_prices = {}
+        for m in markets:
+            p = m.get_entry_price('Yes')
+            if p <= 0:
+                p = (m.outcome_prices.get('Yes') or
+                     m.outcome_prices.get('yes') or
+                     m.outcome_prices.get('true') or
+                     next(iter(m.outcome_prices.values()), 0.5))
+            yes_prices[m.market_id] = float(p)
+
+        p_vec = np.array([yes_prices[mid] for mid in market_ids])
 
         # Skip dead markets
         if float(p_vec.min()) < 0.02:
@@ -443,7 +447,7 @@ class ArbitrageMathEngine:
         # Polymarket fee: ~2% on proceeds from winning contracts
         fee_rate = self.trading_fee  # From config (default 0.0001 = 1bp)
 
-        # --- Buy-side: sum less than 1.0 ---
+        # --- Buy-side: sum(YES asks) less than 1.0 ---
         if price_sum < 1.0:
             units = capital / price_sum
             cost = capital
@@ -454,8 +458,7 @@ class ArbitrageMathEngine:
             profit_pct = net_profit / capital
 
             if profit_pct >= self.min_profit_threshold and profit_pct <= self.max_profit_threshold:
-                # Proportional to price -> equal payouts (payout = capital / price_sum per leg)
-                bets = {mid: float(capital * prices[mid] / price_sum) for mid in market_ids}
+                bets = {mid: float(capital * yes_prices[mid] / price_sum) for mid in market_ids}
                 self.logger.debug(
                     f"  MUTEX BUY-ALL: sum={price_sum:.4f} profit={profit_pct:.4f} n={n}")
                 return ArbitrageOpportunity(
@@ -463,7 +466,7 @@ class ArbitrageMathEngine:
                     constraint_id=constraint.constraint_id,
                     market_ids=market_ids,
                     market_names=[m.market_name for m in markets],
-                    current_prices=prices,
+                    current_prices=yes_prices,
                     optimal_bets=bets,
                     expected_profit=gross_profit,
                     expected_profit_pct=gross_profit / capital,
@@ -482,10 +485,19 @@ class ArbitrageMathEngine:
                     }
                 )
 
-        # --- Sell-side: sum greater than 1.0 ---
+        # --- Sell-side: sum(YES asks) greater than 1.0 ---
+        # Buy NO on all legs. Use actual NO ask prices from book (not 1-YES).
         elif price_sum > 1.0:
-            no_prices = 1.0 - p_vec
-            no_cost_per_unit = float(no_prices.sum())  # = n - price_sum
+            no_prices = {}
+            for m in markets:
+                no_p = m.get_entry_price('No')
+                if no_p <= 0:
+                    # Fallback: derive from YES if no NO book data
+                    no_p = 1.0 - yes_prices[m.market_id]
+                no_prices[m.market_id] = float(no_p)
+
+            no_vec = np.array([no_prices[mid] for mid in market_ids])
+            no_cost_per_unit = float(no_vec.sum())
             if no_cost_per_unit <= 0:
                 return None
             units = capital / no_cost_per_unit
@@ -497,16 +509,15 @@ class ArbitrageMathEngine:
             profit_pct = net_profit / capital
 
             if profit_pct >= self.min_profit_threshold and profit_pct <= self.max_profit_threshold:
-                # Proportional to NO price (1-p) -> equal payouts per leg
-                bets = {mid: float(capital * (1.0 - prices[mid]) / no_cost_per_unit) for mid in market_ids}
+                bets = {mid: float(capital * no_prices[mid] / no_cost_per_unit) for mid in market_ids}
                 self.logger.debug(
-                    f"  MUTEX SELL-ALL: sum={price_sum:.4f} profit={profit_pct:.4f} n={n}")
+                    f"  MUTEX SELL-ALL: yes_sum={price_sum:.4f} no_sum={no_cost_per_unit:.4f} profit={profit_pct:.4f} n={n}")
                 return ArbitrageOpportunity(
                     opportunity_id="arb_sell_" + constraint.constraint_id + "_" + str(datetime.now().timestamp()),
                     constraint_id=constraint.constraint_id,
                     market_ids=market_ids,
                     market_names=[m.market_name for m in markets],
-                    current_prices=prices,
+                    current_prices=yes_prices,
                     optimal_bets=bets,
                     expected_profit=gross_profit,
                     expected_profit_pct=gross_profit / capital,
@@ -520,6 +531,7 @@ class ArbitrageMathEngine:
                     metadata={
                         'method': 'mutex_sell_all',
                         'price_sum': price_sum,
+                        'no_price_sum': no_cost_per_unit,
                         'num_markets': n,
                         'fee_rate': fee_rate,
                     }
@@ -544,10 +556,12 @@ class ArbitrageMathEngine:
         market_ids = [m.market_id for m in markets]
         prices_raw = {}
         for m in markets:
-            p = (m.outcome_prices.get('Yes') or
-                 m.outcome_prices.get('yes') or
-                 m.outcome_prices.get('true') or
-                 next(iter(m.outcome_prices.values()), 0.5))
+            p = m.get_entry_price('Yes')
+            if p <= 0:
+                p = (m.outcome_prices.get('Yes') or
+                     m.outcome_prices.get('yes') or
+                     m.outcome_prices.get('true') or
+                     next(iter(m.outcome_prices.values()), 0.5))
             prices_raw[m.market_id] = float(p)
 
         p_vec = np.array([prices_raw[mid] for mid in market_ids])

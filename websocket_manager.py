@@ -99,6 +99,8 @@ BookCallback = Callable[[str, LocalOrderBook], None]
 TradeCallback = Callable[[Dict], None]
 # on_market_resolved(market_condition_id, winning_asset_id)
 ResolvedCallback = Callable[[str, str], None]
+# on_new_market(new_market_data_dict)
+NewMarketCallback = Callable[[Dict], None]
 
 
 class WebSocketManager:
@@ -150,6 +152,7 @@ class WebSocketManager:
         self._on_book_update: List[BookCallback] = []
         self._on_trade_confirm: List[TradeCallback] = []
         self._on_market_resolved: List[ResolvedCallback] = []
+        self._on_new_market: List[NewMarketCallback] = []
 
         # --- Stats ---
         self._stats = {
@@ -174,6 +177,9 @@ class WebSocketManager:
 
     def on_market_resolved(self, cb: ResolvedCallback):
         self._on_market_resolved.append(cb)
+
+    def on_new_market(self, cb: NewMarketCallback):
+        self._on_new_market.append(cb)
 
     # --- Public: query local book mirror ---
 
@@ -491,8 +497,10 @@ class WebSocketManager:
             self._handle_last_trade_price(data)
         elif event_type == 'market_resolved':
             await self._handle_market_resolved(data)
-        elif event_type in ('tick_size_change', 'new_market'):
-            pass  # Known events, no action needed
+        elif event_type == 'new_market':
+            self._handle_new_market(data)
+        elif event_type == 'tick_size_change':
+            pass  # Known event, no action needed
         else:
             log.debug(f'WS market: unknown event_type={event_type}')
 
@@ -633,6 +641,17 @@ class WebSocketManager:
                 cb(market_cid, asset_id)
             except Exception as e:
                 log.warning(f'Resolved callback error: {e}')
+
+    def _handle_new_market(self, data: Dict):
+        """A new market was created — fire callbacks for constraint rebuild."""
+        market_id = data.get('id', '')
+        question = data.get('question', '?')[:60]
+        log.info(f'WS: new_market id={market_id} "{question}"')
+        for cb in self._on_new_market:
+            try:
+                cb(data)
+            except Exception as e:
+                log.warning(f'New market callback error: {e}')
 
     async def _handle_user_message(self, data: Dict):
         """Route user channel messages."""

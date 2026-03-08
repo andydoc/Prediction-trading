@@ -20,7 +20,7 @@ class MarketData:
     market_id: str
     market_name: str
     question: str
-    outcome_prices: Dict[str, float]  # outcome -> price
+    outcome_prices: Dict[str, float]  # outcome -> price (L1/Gamma midpoint, fallback)
     volume_24h: float
     liquidity: float
     end_date: datetime
@@ -28,12 +28,19 @@ class MarketData:
     metadata: Dict[str, Any]
     timestamp: datetime
     source: str  # polymarket, kalshi, etc
+    outcome_bids: Dict[str, float] = None   # outcome -> best bid (WS live, exit price)
+    outcome_asks: Dict[str, float] = None   # outcome -> best ask (WS live, entry cost)
     
     def to_dict(self) -> Dict:
         """Convert to dictionary for storage"""
         data = asdict(self)
         data['end_date'] = self.end_date.isoformat()
         data['timestamp'] = self.timestamp.isoformat()
+        # Only include bid/ask if populated (WS data)
+        if not data.get('outcome_bids'):
+            data.pop('outcome_bids', None)
+        if not data.get('outcome_asks'):
+            data.pop('outcome_asks', None)
         return data
     
     @classmethod
@@ -41,7 +48,26 @@ class MarketData:
         """Create from dictionary"""
         data['end_date'] = datetime.fromisoformat(data['end_date'])
         data['timestamp'] = datetime.fromisoformat(data['timestamp'])
+        # Handle missing bid/ask fields (L1 data won't have them)
+        data.setdefault('outcome_bids', None)
+        data.setdefault('outcome_asks', None)
         return cls(**data)
+
+    def get_entry_price(self, outcome: str = 'Yes') -> float:
+        """Best available entry price (ask if WS live, else midpoint fallback)."""
+        if self.outcome_asks and outcome in self.outcome_asks:
+            return self.outcome_asks[outcome]
+        return self.outcome_prices.get(outcome, 0.0)
+
+    def get_exit_price(self, outcome: str = 'Yes') -> float:
+        """Best available exit price (bid if WS live, else midpoint fallback)."""
+        if self.outcome_bids and outcome in self.outcome_bids:
+            return self.outcome_bids[outcome]
+        return self.outcome_prices.get(outcome, 0.0)
+
+    def has_live_prices(self) -> bool:
+        """True if WS bid/ask data has been populated."""
+        return bool(self.outcome_asks) or bool(self.outcome_bids)
 
 
 class MarketDataCollector(ABC):
