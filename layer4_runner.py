@@ -15,6 +15,7 @@ from live_trading import LiveTradingEngine
 from layer1_market_data.market_data import MarketData
 from execution_control_client import ExecutionLock
 from resolution_validator import get_validated_resolution_date, get_full_validation, _load_cache as load_resolution_cache
+from websocket_manager import WebSocketManager, get_asset_ids_for_constraints, get_condition_ids_for_positions
 import os
 
 # Load .env file for API keys (bashrc interactive guard blocks non-interactive shells)
@@ -308,6 +309,44 @@ def calc_position_liq_value(pos, market_lookup) -> float:
     return liq
 
 
+def get_asset_ids_for_positions(engine, market_lookup: dict) -> list:
+    """Extract all CLOB token_ids (YES+NO) for markets in open positions.
+    Used to subscribe WS market channel for live depth + resolution."""
+    asset_ids = set()
+    for pos in engine.open_positions.values():
+        for mid in pos.markets.keys():
+            md = market_lookup.get(str(mid))
+            if not md:
+                continue
+            clob_raw = md.metadata.get('clobTokenIds', '[]') if hasattr(md, 'metadata') else '[]'
+            try:
+                clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for tid in (clob_ids or []):
+                if tid:
+                    asset_ids.add(tid)
+    return list(asset_ids)
+
+
+def get_asset_ids_for_opportunity(opp_dict: dict, market_lookup: dict) -> list:
+    """Extract CLOB token_ids for a single opportunity's markets."""
+    asset_ids = set()
+    for mid in opp_dict.get('market_ids', []):
+        md = market_lookup.get(str(mid))
+        if not md:
+            continue
+        clob_raw = md.metadata.get('clobTokenIds', '[]') if hasattr(md, 'metadata') else '[]'
+        try:
+            clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for tid in (clob_ids or []):
+            if tid:
+                asset_ids.add(tid)
+    return list(asset_ids)
+
+
 
 async def main():
     with open(CONFIG_PATH) as f:
@@ -387,6 +426,54 @@ async def main():
     iteration = 0
     last_replacement_time = 0.0  # Unix timestamp of last replacement
 
+    # --- WebSocket Manager (Phase 6b) ---
+    ws_manager = None
+    ws_resolved_markets = set()  # condition_ids resolved via WS (consumed by monitor_positions)
+    try:
+        ws_manager = WebSocketManager(config=config, secrets=secrets)
+
+        # Wire user channel auth from live engine's derived CLOB API creds
+        if live_engine and hasattr(live_engine, 'client'):
+            try:
+                creds = live_engine.client.get_api_creds()
+                if creds and creds.api_key:
+                    ws_manager._user_auth = {
+                        'apiKey': creds.api_key,
+                        'secret': creds.api_secret,
+                        'passphrase': creds.api_passphrase,
+                    }
+                    log.info(f'WS user channel: auth from live engine (key={creds.api_key[:8]}...)')
+            except Exception as ae:
+                log.debug(f'WS user auth from live engine failed: {ae}')
+
+        # Callback: market_resolved → flag for immediate resolution check
+        def _on_ws_resolved(market_cid, asset_id):
+            ws_resolved_markets.add(market_cid)
+            log.info(f'WS: market_resolved {market_cid[:20]}... — queued for resolution check')
+
+        ws_manager.on_market_resolved(_on_ws_resolved)
+
+        # Callback: trade confirm (log for now, wire to fill tracking later)
+        def _on_ws_trade(trade_data):
+            status = trade_data.get('status', '?')
+            side = trade_data.get('side', '?')
+            size = trade_data.get('size', '?')
+            price = trade_data.get('price', '?')
+            log.info(f'WS trade: status={status} side={side} size={size} price={price}')
+
+        ws_manager.on_trade_confirm(_on_ws_trade)
+
+        await ws_manager.start()
+        log.info('WebSocket manager started')
+    except ImportError:
+        log.warning('WebSocket manager: websockets package not installed, running without WS')
+    except Exception as e:
+        log.warning(f'WebSocket manager init failed: {e} — running without WS')
+
+    # Track last WS subscription refresh (don't refresh every iteration)
+    ws_last_sub_refresh = 0.0
+    WS_SUB_REFRESH_INTERVAL = 120  # seconds between full subscription refreshes
+
     while True:
         iteration += 1
         try:
@@ -398,6 +485,42 @@ async def main():
                 continue
             markets = [MarketData.from_dict(m) for m in json.loads(MARKETS_PATH.read_text()).get('markets', [])]
             market_lookup = {str(m.market_id): m for m in markets}
+
+            # --- WS: refresh subscriptions periodically ---
+            if ws_manager and ws_manager._running:
+                now_ws = _time.time()
+                if (now_ws - ws_last_sub_refresh) >= WS_SUB_REFRESH_INTERVAL:
+                    try:
+                        # Subscribe assets for all open positions
+                        pos_assets = get_asset_ids_for_positions(engine, market_lookup)
+                        if pos_assets:
+                            await ws_manager.subscribe_assets(pos_assets)
+                        # Subscribe assets from L3 opportunities
+                        if OPP_PATH.exists():
+                            try:
+                                opp_text = OPP_PATH.read_text()
+                                if opp_text.strip():
+                                    l3_opps = json.loads(opp_text).get('opportunities', [])
+                                    opp_constraints = [{'market_ids': o.get('market_ids', [])} for o in l3_opps[:50]]
+                                    opp_assets = get_asset_ids_for_constraints(opp_constraints, market_lookup)
+                                    if opp_assets:
+                                        await ws_manager.subscribe_assets(opp_assets)
+                            except Exception:
+                                pass
+                        ws_last_sub_refresh = now_ws
+                        if iteration % 20 == 1:
+                            stats = ws_manager.get_stats()
+                            log.debug(f'WS: subs={len(ws_manager._subscribed_assets)} '
+                                      f'market_msgs={stats["market_msgs"]} user_msgs={stats["user_msgs"]}')
+                    except Exception as wse:
+                        log.debug(f'WS subscription refresh error: {wse}')
+
+            # --- WS: check for resolved markets (instant resolution trigger) ---
+            if ws_resolved_markets:
+                resolved_cids = list(ws_resolved_markets)
+                ws_resolved_markets.clear()
+                log.info(f'[iter {iteration}] WS triggered resolution check for {len(resolved_cids)} markets')
+                # Force a monitor pass — the next monitor_positions call will detect price→1.0
 
             # Monitor open positions
             if engine.open_positions:
@@ -766,6 +889,14 @@ async def main():
                                 for mid in opp_dict.get('market_ids', []):
                                     held_mids.add(str(mid))
                                 entered += 1
+                                # WS: subscribe new position's assets for live depth + resolution
+                                if ws_manager and ws_manager._running:
+                                    try:
+                                        new_assets = get_asset_ids_for_opportunity(opp_dict, market_lookup)
+                                        if new_assets:
+                                            await ws_manager.subscribe_assets(new_assets)
+                                    except Exception:
+                                        pass
                                 # Shadow/Live execution (if enabled)
                                 if live_engine and result and result.get('success'):
                                     if shadow_only:
@@ -801,8 +932,13 @@ async def main():
             capital = metrics.get('current_capital', 0)
             write_status('running', capital, len(engine.open_positions))
             if iteration % 10 == 1:
+                ws_info = ''
+                if ws_manager and ws_manager._running:
+                    ws_stats = ws_manager.get_stats()
+                    ws_info = (f' | WS: subs={len(ws_manager._subscribed_assets)} '
+                               f'msgs={ws_stats["market_msgs"]}')
                 log.info(f'[iter {iteration}] Capital=${capital:.2f} positions={len(engine.open_positions)} '
-                         f'dynamic_cap=${dynamic_capital(capital):.2f}')
+                         f'dynamic_cap=${dynamic_capital(capital):.2f}{ws_info}')
             else:
                 log.debug(f'[iter {iteration}] Capital=${capital:.2f} positions={len(engine.open_positions)}')
 
@@ -815,6 +951,10 @@ async def main():
             write_status('error', 0, 0, str(e))
 
         await asyncio.sleep(check_interval)
+
+    # Cleanup (if loop ever exits)
+    if ws_manager:
+        await ws_manager.stop()
 
 if __name__ == '__main__':
     asyncio.run(main())

@@ -140,3 +140,11 @@ workspace:
   results: /mnt/c/Users/andyd/ai-workspace/results
   root: /home/andydoc/prediction-trader
   tasks: /mnt/c/Users/andyd/ai-workspace/tasks
+websocket:
+  enabled: true
+  market_channel_url: wss://ws-subscriptions-clob.polymarket.com/ws/market
+  user_channel_url: wss://ws-subscriptions-clob.polymarket.com/ws/user
+  heartbeat_interval: 10
+  reconnect_base_delay: 1.0
+  reconnect_max_delay: 60.0
+  max_book_staleness_secs: 30

@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.03.05 (pre-release, shadow trading)
-> **Last updated**: 2026-03-08 ~14:30 UTC
+> **Version**: v0.03.06 (pre-release, shadow trading)
+> **Last updated**: 2026-03-08 ~22:00 UTC
 > **Mode**: SHADOW | Laptop: running | VPS (193.23.127.99): $100 fresh capital, all layers healthy
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4GB RAM, Ubuntu 24.04, systemd auto-restart
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
@@ -108,6 +108,8 @@ Currently both laptop and VPS run independently in SHADOW mode with separate exe
 ├── dashboard_server.py                       ← Web dashboard (port 5556)
 ├── execution_control.py                      ← Multi-machine lock server (port 5557)
 ├── execution_control_client.py               ← Lock client (used by L4)
+├── orderbook_depth.py                        ← Phase 5a: CLOB book depth analysis
+├── websocket_manager.py                      ← Phase 6: WS market+user channels, local book mirror
 ├── layer1_runner.py                          ← L1 process entry
 ├── layer2_runner.py                          ← L2 process entry
 ├── layer3_runner.py                          ← L3 process entry
@@ -399,15 +401,84 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
   - New B: inherits chain_id + chain_start_time (capital locked since original entry)
 
 #### Implementation Sequence
-- [ ] **5a** — Order book depth infrastructure: CLOB book fetching, 80% depth calc, log with L3 output
+- [x] **5a** — Order book depth infrastructure: CLOB book fetching, 80% depth calc (**orderbook_depth.py** — tested, working)
+- [ ] **5a.2** — Integrate depth check into L4 entry/replacement flow + log depth-limited trades
+- [ ] **5a.3** — Display depth info on dashboard
 - [ ] **5b** — Shadow trading honesty: config to $10k, remove max_positions, cap shadow fills at book depth
 - [ ] **5c** — Partial fill handling: score-based unwind logic, minimum unwind calc, fill metadata
 - [ ] **5d** — Replacement chain tracking (reporting): chain_id/start_time/fees in metadata, dashboard view
 - [ ] **5e** — FAK live trading (future): FAK time_in_force, real fill checking, live unwind
 
+### Phase 6 — WebSocket Integration (designed 2026-03-08)
+
+**Goal:** Replace REST polling with persistent WebSocket connections for price data, orderbook depth, fill confirmation, and resolution detection. Reduces latency and slippage across all L3 opportunities (direct LP, Bregman/FW polytope — math-path-agnostic).
+
+**Module:** `websocket_manager.py` (NEW — created 2026-03-08)
+
+**Architecture:**
+- Two persistent WS connections: market channel (public, no auth) + user channel (auth required)
+- Market channel: `wss://ws-subscriptions-clob.polymarket.com/ws/market`
+  - Events: `book` (full snapshot), `price_change` (incremental), `best_bid_ask`, `last_trade_price`, `market_resolved`
+  - Subscribes to asset_ids (CLOB token IDs) for all markets in active L2 constraint groups
+  - Maintains local orderbook mirror (dict[asset_id] → LocalOrderBook) queryable by L3/L4
+- User channel: `wss://ws-subscriptions-clob.polymarket.com/ws/user`
+  - Events: `trade` (MATCHED→CONFIRMED lifecycle), `order` (placement/cancellation)
+  - Subscribes by condition_id for all open positions
+  - Provides instant fill confirmation (replaces REST `GET /orders` polling)
+- Auto-reconnect with exponential backoff (1s→60s)
+- PING heartbeat every 10s (Polymarket requirement)
+- Dynamic subscription: add/remove assets without reconnecting
+- Callback registration for L3/L4 consumers
+
+**Integration Points:**
+
+| Consumer | Current (REST) | New (WS) | Benefit |
+|----------|---------------|----------|---------|
+| L3 price monitoring | 30s stale snapshot via `latest_markets.json` | Live `price_change`/`best_bid_ask` callbacks | Instant mispricing detection |
+| L4 pre-trade depth | REST `GET /book` per leg (Phase 5a) | Local book mirror from WS `book` events | Zero-latency depth check |
+| L4 fill confirmation | REST `GET /orders` polling | WS user `trade` events | Instant fill status |
+| L4 resolution detection | L1 polling + price→1.0 check | WS `market_resolved` event | Instant resolution trigger |
+| orderbook_depth.py | REST fetch per check | Query `ws_manager.get_book(asset_id)` | Eliminates REST calls |
+
+**Implementation Sequence:**
+- [x] **6a** — Core `websocket_manager.py`: WebSocketManager class, market+user channel loops, local book mirror, callback system, auto-reconnect, heartbeat, dynamic subscription (**DONE** 2026-03-08)
+- [x] **6b** — L4 integration: start WS manager in `layer4_runner.py`, subscribe open position assets, register resolution callback, register fill confirmation callback, user auth from live engine creds, periodic subscription refresh, WS stats in log output (**DONE** 2026-03-08)
+- [ ] **6c** — L3→WS bridge: on L2 constraint refresh, compute asset_ids for all validated groups, subscribe via WS manager; L3 reads live prices from WS mirror instead of `latest_markets.json`
+- [ ] **6d** — orderbook_depth.py WS mode: add `get_depth_from_ws(ws_manager, asset_id)` path; fall back to REST if WS book stale (>30s)
+- [ ] **6e** — Dashboard: WS connection status, message rates, subscription count, book staleness indicators
+- [ ] **6f** — Config: add `websocket:` section to `config.yaml` with enable/disable, URLs, heartbeat interval
+
+**Config (planned):**
+```yaml
+websocket:
+  enabled: true
+  market_channel_url: wss://ws-subscriptions-clob.polymarket.com/ws/market
+  user_channel_url: wss://ws-subscriptions-clob.polymarket.com/ws/user
+  heartbeat_interval: 10
+  reconnect_base_delay: 1.0
+  reconnect_max_delay: 60.0
+  max_book_staleness_secs: 30    # Fall back to REST if WS book older than this
+```
+
 ---
 
 ## 7. Changelog
+
+### v0.03.06 (2026-03-08) — WebSocket Integration (Phase 6a+6b)
+- **ADDED** `websocket_manager.py` — persistent WebSocket connections to Polymarket market + user channels
+- **ADDED** Local orderbook mirror: `LocalOrderBook` with bid/ask levels, depth calculations, staleness tracking
+- **ADDED** Market channel: `book`, `price_change`, `best_bid_ask`, `last_trade_price`, `market_resolved` events
+- **ADDED** User channel: `trade` (MATCHED→CONFIRMED) and `order` events for fill confirmation
+- **ADDED** Dynamic subscription: add/remove asset_ids without reconnecting (Polymarket subscription limit removed)
+- **ADDED** Auto-reconnect with exponential backoff (1s→60s), PING heartbeat every 10s
+- **ADDED** Callback system: `on_price_change`, `on_book_update`, `on_trade_confirm`, `on_market_resolved`
+- **ADDED** Convenience functions: `get_asset_ids_for_constraints()`, `get_condition_ids_for_positions()`
+- **INTEGRATED** L4 runner: WS manager starts with L4, subscribes open position + L3 opportunity assets, fires `market_resolved` callback for instant resolution detection, logs trade confirmations
+- **INTEGRATED** User channel auth derived from live engine's CLOB API creds (when live engine available)
+- **INTEGRATED** Periodic subscription refresh (every 120s), WS stats in status log every 10th iteration
+- **INTEGRATED** New position asset subscription on trade entry
+- **ADDED** `websocket:` config section in config.yaml (enabled, URLs, heartbeat, staleness)
+- **ADDED** Phase 6 section to PROGRESS_ROADMAP.md with full integration plan
 
 ### v0.03.05 (2026-03-06/07) — Resolution Delay Model (Dynamic) + VPS Deployment
 - **ADDED** Resolution delay scoring model in `layer4_runner.py`. Scoring formula now uses `effective_hours = raw_hours + P95_category_delay + volume_penalty` instead of raw hours.
@@ -615,7 +686,7 @@ Live figures from `execution_state.json` (post sell-arb payout correction):
 
 ---
 
-*Last updated: 2026-03-08 ~14:30 UTC*
+*Last updated: 2026-03-08 ~22:00 UTC*
 *System: WSL Ubuntu on Windows (laptop) + ZAP-Hosting VPS (193.23.127.99)*
 *Machines: Laptop (WSL authoritative) + VPS (ZAP-Hosting 193.23.127.99) + Desktop HP-800G2 (dormant)*
 *Dashboard: http://localhost:5556 | Exec Control: port 5557*
