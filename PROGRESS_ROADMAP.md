@@ -2,7 +2,7 @@
 # User Guide · Architecture · Roadmap · Progress
 
 > **Version**: v0.03.06 (pre-release, shadow trading)
-> **Last updated**: 2026-03-08 ~22:00 UTC
+> **Last updated**: 2026-03-09 ~01:00 UTC
 > **Mode**: SHADOW | Laptop: running | VPS (193.23.127.99): $100 fresh capital, all layers healthy
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4GB RAM, Ubuntu 24.04, systemd auto-restart
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
@@ -443,7 +443,7 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
 **Implementation Sequence:**
 - [x] **6a** — Core `websocket_manager.py`: WebSocketManager class, market+user channel loops, local book mirror, callback system, auto-reconnect, heartbeat, dynamic subscription (**DONE** 2026-03-08)
 - [x] **6b** — L4 integration: start WS manager in `layer4_runner.py`, subscribe open position assets, register resolution callback, register fill confirmation callback, user auth from live engine creds, periodic subscription refresh, WS stats in log output (**DONE** 2026-03-08)
-- [ ] **6c** — L3→WS bridge: on L2 constraint refresh, compute asset_ids for all validated groups, subscribe via WS manager; L3 reads live prices from WS mirror instead of `latest_markets.json`
+- [x] **6c** — L3→WS price bridge: L4 writes `data/ws_prices.json` (market_id→{Yes, No} actual prices from WS), L3 overlays live prices onto MarketData before scanning. Uses ACTUAL No prices (not 1-Yes). Resolved assets pruned from bridge via `market_resolved` event. (**DONE** 2026-03-08, fixed 2026-03-09)
 - [ ] **6d** — orderbook_depth.py WS mode: add `get_depth_from_ws(ws_manager, asset_id)` path; fall back to REST if WS book stale (>30s)
 - [ ] **6e** — Dashboard: WS connection status, message rates, subscription count, book staleness indicators
 - [ ] **6f** — Config: add `websocket:` section to `config.yaml` with enable/disable, URLs, heartbeat interval
@@ -464,7 +464,7 @@ websocket:
 
 ## 7. Changelog
 
-### v0.03.06 (2026-03-08) — WebSocket Integration (Phase 6a+6b)
+### v0.03.06 (2026-03-08/09) — WebSocket Integration (Phase 6a+6b+6c)
 - **ADDED** `websocket_manager.py` — persistent WebSocket connections to Polymarket market + user channels
 - **ADDED** Local orderbook mirror: `LocalOrderBook` with bid/ask levels, depth calculations, staleness tracking
 - **ADDED** Market channel: `book`, `price_change`, `best_bid_ask`, `last_trade_price`, `market_resolved` events
@@ -479,6 +479,13 @@ websocket:
 - **INTEGRATED** New position asset subscription on trade entry
 - **ADDED** `websocket:` config section in config.yaml (enabled, URLs, heartbeat, staleness)
 - **ADDED** Phase 6 section to PROGRESS_ROADMAP.md with full integration plan
+- **ADDED** Phase 6c: WS price bridge — L4 writes `data/ws_prices.json` with both Yes AND No actual WS prices per market; L3 reads and overlays onto MarketData before scanning
+- **ADDED** `export_price_cache()` in websocket_manager.py — exports all local book prices for bridge
+- **ADDED** `build_token_to_market_map()` — reverse map: CLOB token_id → (market_id, token_index)
+- **ADDED** `overlay_ws_prices()` in layer3_runner.py — reads bridge file, applies live prices to MarketData, skips stale (>30s)
+- **FIXED** L3 now uses ACTUAL No prices from WS (was incorrectly computing `No = 1 - Yes`, which is wrong due to bid-ask spread)
+- **ADDED** Resolved market pruning: `market_resolved` WS event removes asset from local book mirror + excludes from price bridge export
+- **ADDED** `_resolved_assets` tracking set in WebSocketManager; resolved count in stats output
 
 ### v0.03.05 (2026-03-06/07) — Resolution Delay Model (Dynamic) + VPS Deployment
 - **ADDED** Resolution delay scoring model in `layer4_runner.py`. Scoring formula now uses `effective_hours = raw_hours + P95_category_delay + volume_penalty` instead of raw hours.

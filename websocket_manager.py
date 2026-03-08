@@ -136,6 +136,7 @@ class WebSocketManager:
         self._books: Dict[str, LocalOrderBook] = {}     # asset_id -> LocalOrderBook
         self._subscribed_assets: Set[str] = set()        # asset_ids on market channel
         self._subscribed_markets: Set[str] = set()        # condition_ids on user channel
+        self._resolved_assets: Set[str] = set()          # asset_ids resolved via WS (pruned from bridge)
         self._market_ws = None
         self._user_ws = None
         self._market_task: Optional[asyncio.Task] = None
@@ -205,7 +206,10 @@ class WebSocketManager:
         return set(self._subscribed_assets)
 
     def get_stats(self) -> Dict:
-        return dict(self._stats)
+        s = dict(self._stats)
+        s['resolved_assets'] = len(self._resolved_assets)
+        s['active_books'] = len(self._books)
+        return s
 
     def export_price_cache(self) -> Dict[str, Dict]:
         """Export all local book prices as {asset_id: {best_bid, best_ask, mid, last_trade, ts, updates}}.
@@ -215,6 +219,8 @@ class WebSocketManager:
         for aid, book in self._books.items():
             if book.update_count == 0:
                 continue  # No data received yet
+            if aid in self._resolved_assets:
+                continue  # Resolved — don't export stale prices
             mid = round((book.best_bid + book.best_ask) / 2, 6) if (book.best_bid and book.best_ask) else 0.0
             cache[aid] = {
                 'best_bid': book.best_bid,
@@ -611,11 +617,17 @@ class WebSocketManager:
             self._books[asset_id].last_update = time.time()
 
     async def _handle_market_resolved(self, data: Dict):
-        """A market has resolved — fire callback for L4 to act on."""
+        """A market has resolved — mark resolved, prune from books, fire callback."""
         market_cid = data.get('market', '')        # condition_id
         asset_id = data.get('asset_id', '')
         winner = data.get('winner', '')
         log.info(f'WS: market_resolved market={market_cid[:20]} asset={asset_id[:20]} winner={winner}')
+
+        # Mark as resolved and remove from local book (prevents stale prices in bridge)
+        if asset_id:
+            self._resolved_assets.add(asset_id)
+            self._books.pop(asset_id, None)
+        # Fire callbacks (L4 uses this for immediate resolution check)
         for cb in self._on_market_resolved:
             try:
                 cb(market_cid, asset_id)

@@ -46,7 +46,8 @@ class ConstraintTimeout(Exception):
 def overlay_ws_prices(markets: list, max_age_secs: float = 30.0) -> int:
     """Overlay live WS prices onto MarketData objects.
     Reads ws_prices.json written by L4's WS manager.
-    Returns count of markets updated. Skips stale data (>max_age_secs)."""
+    Returns count of markets updated. Skips stale data (>max_age_secs).
+    Uses ACTUAL Yes and No prices from WS (not No = 1-Yes)."""
     if not WS_PRICES_PATH.exists():
         return 0
     try:
@@ -66,10 +67,17 @@ def overlay_ws_prices(markets: list, max_age_secs: float = 30.0) -> int:
             ts = mp.get('ts', 0)
             if ts and (_t.time() - ts) > max_age_secs:
                 continue  # WS data too old for this market
+            # Use actual WS prices for both Yes and No (never assume No=1-Yes)
             yes_p = mp.get('Yes')
+            no_p = mp.get('No')
+            did_update = False
             if yes_p is not None and yes_p > 0:
                 m.outcome_prices['Yes'] = float(yes_p)
-                m.outcome_prices['No'] = round(1.0 - float(yes_p), 6)
+                did_update = True
+            if no_p is not None and no_p > 0:
+                m.outcome_prices['No'] = float(no_p)
+                did_update = True
+            if did_update:
                 updated += 1
         return updated
     except Exception:
