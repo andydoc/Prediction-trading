@@ -356,7 +356,15 @@ class WebSocketManager:
                         self._stats['last_market_msg'] = time.time()
                         try:
                             data = json.loads(raw_msg)
-                            await self._handle_market_message(data)
+                            # WS can send single dict or array of events
+                            if isinstance(data, list):
+                                for item in data:
+                                    if isinstance(item, dict):
+                                        await self._handle_market_message(item)
+                            elif isinstance(data, dict):
+                                await self._handle_market_message(data)
+                            else:
+                                log.debug(f'WS market: unexpected type {type(data).__name__}')
                         except json.JSONDecodeError:
                             log.debug(f'WS market: non-JSON msg: {raw_msg[:80]}')
                         except Exception as e:

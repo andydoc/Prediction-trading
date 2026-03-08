@@ -435,8 +435,8 @@ async def main():
         # Wire user channel auth from live engine's derived CLOB API creds
         if live_engine and hasattr(live_engine, 'client'):
             try:
-                creds = live_engine.client.get_api_creds()
-                if creds and creds.api_key:
+                creds = live_engine.client.creds
+                if creds and hasattr(creds, 'api_key') and creds.api_key:
                     ws_manager._user_auth = {
                         'apiKey': creds.api_key,
                         'secret': creds.api_secret,
