@@ -2,8 +2,8 @@
 # User Guide · Architecture · Roadmap · Progress
 
 > **Version**: v0.03.05 (pre-release, shadow trading)
-> **Last updated**: 2026-03-07 15:00 UTC
-> **Mode**: SHADOW | Laptop: $5.42 cash, 10 open, 197 closed | VPS: $100.00 cash, 0 open, fresh start
+> **Last updated**: 2026-03-08 09:15 UTC
+> **Mode**: SHADOW | Laptop: running | VPS (193.23.127.99): $100 fresh capital, all layers healthy
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4GB RAM, Ubuntu 24.04, systemd auto-restart
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
 
@@ -552,8 +552,8 @@ Live figures from `execution_state.json` (post sell-arb payout correction):
 
 ---
 
-*Last updated: 2026-03-07 15:00 UTC*
+*Last updated: 2026-03-08 09:15 UTC*
 *System: WSL Ubuntu on Windows (laptop) + ZAP-Hosting VPS (193.23.127.99)*
-*Machines: Laptop (WSL) + VPS (ZAP) + Desktop HP-800G2 (dormant)*
+*Machines: Laptop (WSL authoritative) + VPS (ZAP-Hosting 193.23.127.99) + Desktop HP-800G2 (dormant)*
 *Dashboard: http://localhost:5556 | Exec Control: port 5557*
 *Git: https://github.com/andydoc/Prediction-trading (branch: main)*
