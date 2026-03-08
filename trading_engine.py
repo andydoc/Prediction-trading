@@ -432,7 +432,7 @@ class TradingEngine:
             self.constraint_by_id[c.constraint_id] = c
         log.info(f'Detected {len(self.constraints)} constraints')
         # Also write to file so dashboard/debug tools can read
-        self.detector.save_constraints(self.constraints, CONSTRAINTS_PATH)
+        self.detector.save_constraints(CONSTRAINTS_PATH)
 
     def build_index(self):
         """Build asset_id → constraint_id and asset_id → market_id mappings."""
