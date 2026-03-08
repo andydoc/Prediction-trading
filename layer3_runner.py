@@ -15,6 +15,7 @@ CONSTRAINTS_PATH = WORKSPACE / 'layer2_constraint_detection' / 'data' / 'latest_
 MARKETS_PATH     = WORKSPACE / 'data' / 'latest_markets.json'
 OUTPUT_PATH      = WORKSPACE / 'layer3_arbitrage_math' / 'data' / 'latest_opportunities.json'
 STATUS_PATH      = WORKSPACE / 'data' / 'layer3_status.json'
+WS_PRICES_PATH   = WORKSPACE / 'data' / 'ws_prices.json'       # Phase 6c: WS price bridge from L4
 
 logging.basicConfig(level=logging.INFO,
     format='%(asctime)s - [L3] %(levelname)s - %(message)s',
@@ -42,6 +43,38 @@ def write_opportunities(opps):
 class ConstraintTimeout(Exception):
     pass
 
+def overlay_ws_prices(markets: list, max_age_secs: float = 30.0) -> int:
+    """Overlay live WS prices onto MarketData objects.
+    Reads ws_prices.json written by L4's WS manager.
+    Returns count of markets updated. Skips stale data (>max_age_secs)."""
+    if not WS_PRICES_PATH.exists():
+        return 0
+    try:
+        data = json.loads(WS_PRICES_PATH.read_text())
+        prices = data.get('prices', {})
+        exported_at = data.get('exported_at', 0)
+        # Skip if bridge file itself is stale (L4 stopped writing)
+        import time as _t
+        if _t.time() - exported_at > 60:
+            return 0
+        updated = 0
+        for m in markets:
+            mid = str(m.market_id)
+            if mid not in prices:
+                continue
+            mp = prices[mid]
+            ts = mp.get('ts', 0)
+            if ts and (_t.time() - ts) > max_age_secs:
+                continue  # WS data too old for this market
+            yes_p = mp.get('Yes')
+            if yes_p is not None and yes_p > 0:
+                m.outcome_prices['Yes'] = float(yes_p)
+                m.outcome_prices['No'] = round(1.0 - float(yes_p), 6)
+                updated += 1
+        return updated
+    except Exception:
+        return 0
+
 def _timeout_handler(signum, frame):
     raise ConstraintTimeout("Constraint check timed out")
 
@@ -66,9 +99,13 @@ def main():
 
             market_data = json.loads(MARKETS_PATH.read_text())
             markets = [MarketData.from_dict(m) for m in market_data.get('markets', [])]
+
+            # Overlay live WS prices (Phase 6c) — replaces 30s-stale L1 prices
+            ws_updated = overlay_ws_prices(markets)
+
             constraints = detector.load_constraints(CONSTRAINTS_PATH)
             total = len(constraints)
-            log.info(f'[iter {iteration}] Scanning {total} constraints...')
+            log.info(f'[iter {iteration}] Scanning {total} constraints... (WS prices: {ws_updated} markets updated)')
             write_status('scanning', total)
 
             # Scan constraints one by one, write incrementally

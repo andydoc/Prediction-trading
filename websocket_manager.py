@@ -207,6 +207,26 @@ class WebSocketManager:
     def get_stats(self) -> Dict:
         return dict(self._stats)
 
+    def export_price_cache(self) -> Dict[str, Dict]:
+        """Export all local book prices as {asset_id: {best_bid, best_ask, mid, last_trade, ts, updates}}.
+        Used by L4 to build the ws_prices.json bridge file for L3."""
+        cache = {}
+        now = time.time()
+        for aid, book in self._books.items():
+            if book.update_count == 0:
+                continue  # No data received yet
+            mid = round((book.best_bid + book.best_ask) / 2, 6) if (book.best_bid and book.best_ask) else 0.0
+            cache[aid] = {
+                'best_bid': book.best_bid,
+                'best_ask': book.best_ask,
+                'mid': mid,
+                'last_trade': book.last_trade_price,
+                'ts': book.last_update,
+                'age_secs': round(now - book.last_update, 1) if book.last_update else -1,
+                'updates': book.update_count,
+            }
+        return cache
+
     # --- Public: subscription management ---
 
     async def subscribe_assets(self, asset_ids: List[str]):

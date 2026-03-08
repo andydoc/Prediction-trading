@@ -33,6 +33,7 @@ SECRETS_PATH = WORKSPACE / 'config' / 'secrets.yaml'
 OPP_PATH     = WORKSPACE / 'layer3_arbitrage_math' / 'data' / 'latest_opportunities.json'
 MARKETS_PATH = WORKSPACE / 'data' / 'latest_markets.json'
 STATUS_PATH  = WORKSPACE / 'data' / 'layer4_status.json'
+WS_PRICES_PATH = WORKSPACE / 'data' / 'ws_prices.json'   # Phase 6c: WS price bridge for L3
 STATE_DIR    = WORKSPACE / 'data' / 'system_state'
 EXEC_STATE   = STATE_DIR / 'execution_state.json'
 
@@ -351,6 +352,56 @@ def get_asset_ids_for_opportunity(opp_dict: dict, market_lookup: dict) -> list:
     return list(asset_ids)
 
 
+def build_token_to_market_map(market_lookup: dict) -> dict:
+    """Build reverse map: CLOB token_id → (market_id, token_index).
+    token_index 0 = YES token, 1 = NO token."""
+    tmap = {}
+    for mid, md in market_lookup.items():
+        if not hasattr(md, 'metadata'):
+            continue
+        clob_raw = md.metadata.get('clobTokenIds', '[]')
+        try:
+            clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for idx, tid in enumerate(clob_ids or []):
+            if tid:
+                tmap[tid] = (mid, idx)
+    return tmap
+
+
+def write_ws_price_bridge(ws_manager, market_lookup: dict):
+    """Write WS live prices to data/ws_prices.json for L3 to consume.
+    Maps asset_id prices back to market_id Yes/No prices."""
+    try:
+        price_cache = ws_manager.export_price_cache()
+        if not price_cache:
+            return
+        token_map = build_token_to_market_map(market_lookup)
+        market_prices = {}
+        for asset_id, pdata in price_cache.items():
+            mapping = token_map.get(asset_id)
+            if not mapping:
+                continue
+            mid, token_idx = mapping
+            if mid not in market_prices:
+                market_prices[mid] = {'ts': pdata['ts']}
+            price = pdata['mid'] or pdata['best_ask'] or pdata['best_bid'] or 0
+            if token_idx == 0:
+                market_prices[mid]['Yes'] = round(price, 6)
+            elif token_idx == 1:
+                market_prices[mid]['No'] = round(price, 6)
+            if pdata['ts'] > market_prices[mid].get('ts', 0):
+                market_prices[mid]['ts'] = pdata['ts']
+        if market_prices:
+            WS_PRICES_PATH.write_text(json.dumps({
+                'prices': market_prices,
+                'count': len(market_prices),
+                'exported_at': _time.time(),
+            }))
+    except Exception as e:
+        log.debug(f'WS price bridge write error: {e}')
+
 
 async def main():
     with open(CONFIG_PATH) as f:
@@ -518,6 +569,9 @@ async def main():
                                       f'market_msgs={stats["market_msgs"]} user_msgs={stats["user_msgs"]}')
                     except Exception as wse:
                         log.debug(f'WS subscription refresh error: {wse}')
+
+                # Write WS price bridge for L3 (every iteration, cheap)
+                write_ws_price_bridge(ws_manager, market_lookup)
 
             # --- WS: check for resolved markets (instant resolution trigger) ---
             if ws_resolved_markets:
