@@ -135,7 +135,7 @@ Currently both laptop and VPS run independently in SHADOW mode with separate exe
 
 /home/andydoc/prediction-trader-env/          ← Python venv
 
-C:\Users\andyd\ai-workspace\prediction-trader\   ← Windows git mirror
+# RETIRED: Windows mirror removed 2026-03-07 (WSL is authoritative, VPS is independent)
 
 root@193.23.127.99:/root/prediction-trader/       ← VPS (ZAP-Hosting, independent copy)
 root@193.23.127.99:/root/prediction-trader-env/    ← VPS Python venv
@@ -282,8 +282,8 @@ EXEC_CTRL_URL=http://<ip>:5557 scripts/exec_claim.sh claim laptop   # Remote
 # Push from WSL
 wsl bash scripts/sync.sh "commit message"
 
-# Pull on other machine
-cd ~/prediction-trader && git pull --ff-only origin main
+# Pull on VPS
+ssh root@193.23.127.99 "cd /root/prediction-trader && git pull --ff-only origin main"
 ```
 
 ### 5.6 Recovery After Crash / Reboot
