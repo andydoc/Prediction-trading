@@ -2,7 +2,7 @@
 # User Guide · Architecture · Roadmap · Progress
 
 > **Version**: v0.03.05 (pre-release, shadow trading)
-> **Last updated**: 2026-03-08 09:15 UTC
+> **Last updated**: 2026-03-08 ~14:30 UTC
 > **Mode**: SHADOW | Laptop: running | VPS (193.23.127.99): $100 fresh capital, all layers healthy
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4GB RAM, Ubuntu 24.04, systemd auto-restart
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
@@ -342,6 +342,69 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
 - [ ] VPS migration for 24/7 operation
 - [ ] Git versioning: branches for features, tags for releases (see §8)
 
+### Phase 5 — Risk Management (designed 2026-03-08, not yet implemented)
+
+#### Risk 1: Order Book Depth / Liquidity
+**Problem:** System enters arbs based on price without checking if the book can absorb the trade.
+**Solution — Pre-trade depth check:**
+1. Fetch CLOB order book for every leg before entry/replacement
+2. Calculate effective depth at 80% of reported book (phantom order haircut)
+3. Min depth across all legs sets max trade size: `trade_size = min(10% capital, min_leg_depth)`
+4. If min depth < floor ($5), skip the opportunity entirely
+5. Place orders at furthest price within usable depth (not best ask)
+6. Live trading: use FAK (Fill And Kill) order type — fills available, cancels rest
+   (Confirmed: all Polymarket orders are limit orders, FAK is a supported `time_in_force`)
+
+**Partial fill handling (score-based):**
+- After submission, check actual fills on all legs
+- Calculate arb score of actual filled position
+- If score ≥ threshold → keep everything (imbalanced position is acceptable)
+- If score < threshold → unwind minimum needed on overfilled leg(s) to restore score
+- If no partial retention produces acceptable score → full unwind all legs
+- Key: the score is the arbiter, not a "must match exactly" rule
+
+#### Risk 2: Scaling / Thin Markets
+**Problem:** As capital scales, profitability may decline due to thin books. Current config masks this.
+**Solution — Config changes:**
+- `initial_capital`: 100 → 10000
+- `max_capital`: 100 → 10000
+- `max_positions`: remove cap (replace with soft log warning at 50)
+- `capital_per_trade_pct`: stays at 0.10 (10%)
+
+**Shadow trading honesty:**
+- Cap simulated fills at 80% of actual book depth per leg (ties to Risk 1)
+- If system wants $1000 but book only supports $80, shadow fill = $64 (80% of $80)
+- Log "depth-limited" trades separately to measure how often depth constrains deployment
+- This reveals real capital deployment ceiling before going live
+
+#### Risk 3: Replacement Chain Capital Lockup
+**Problem:** Replacement scoring treats each trade in isolation, ignoring cumulative capital lockup.
+**Agreed approach — HYBRID (forward-looking decisions, chain-aware reporting):**
+
+**For DECISIONS (replacement logic):** Forward-looking scoring only.
+- Sunk time is sunk — only ask "what's the best use of this capital from now?"
+- Prevents irrational holding of degrading positions due to chain penalty
+- Capital velocity maximised by marginal return decisions
+
+**For REPORTING (analytics):** Track full chain history.
+- `chain_id`: UUID, inherited through replacements
+- `chain_start_time`: timestamp of first entry in chain, inherited
+- `chain_cumulative_fees`: running total of all fees in chain
+- True return = `(payout - total_fees) / chain_duration` — for performance analysis only
+- If chains consistently drag returns → tighten entry criteria, not replacement criteria
+
+**Chain splitting on partial replacement (reporting only):**
+- If replacing A→B but only partially unwind A due to liquidity:
+  - Residual A: keeps chain_id, tracked separately until A resolves
+  - New B: inherits chain_id + chain_start_time (capital locked since original entry)
+
+#### Implementation Sequence
+- [ ] **5a** — Order book depth infrastructure: CLOB book fetching, 80% depth calc, log with L3 output
+- [ ] **5b** — Shadow trading honesty: config to $10k, remove max_positions, cap shadow fills at book depth
+- [ ] **5c** — Partial fill handling: score-based unwind logic, minimum unwind calc, fill metadata
+- [ ] **5d** — Replacement chain tracking (reporting): chain_id/start_time/fees in metadata, dashboard view
+- [ ] **5e** — FAK live trading (future): FAK time_in_force, real fill checking, live unwind
+
 ---
 
 ## 7. Changelog
@@ -552,7 +615,7 @@ Live figures from `execution_state.json` (post sell-arb payout correction):
 
 ---
 
-*Last updated: 2026-03-08 09:15 UTC*
+*Last updated: 2026-03-08 ~14:30 UTC*
 *System: WSL Ubuntu on Windows (laptop) + ZAP-Hosting VPS (193.23.127.99)*
 *Machines: Laptop (WSL authoritative) + VPS (ZAP-Hosting 193.23.127.99) + Desktop HP-800G2 (dormant)*
 *Dashboard: http://localhost:5556 | Exec Control: port 5557*
