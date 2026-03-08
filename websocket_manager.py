@@ -325,6 +325,11 @@ class WebSocketManager:
         """Persistent market channel connection with auto-reconnect."""
         delay = self.reconnect_base
         while self._running:
+            # Wait until we have something to subscribe to
+            while self._running and not self._subscribed_assets:
+                await asyncio.sleep(1.0)
+            if not self._running:
+                break
             try:
                 async with websockets.connect(self.market_url) as ws:
                     self._market_ws = ws
@@ -390,6 +395,11 @@ class WebSocketManager:
         """Persistent user channel connection with auto-reconnect."""
         delay = self.reconnect_base
         while self._running:
+            # Wait until we have markets to subscribe to
+            while self._running and not self._subscribed_markets:
+                await asyncio.sleep(1.0)
+            if not self._running:
+                break
             try:
                 async with websockets.connect(self.user_url) as ws:
                     self._user_ws = ws
