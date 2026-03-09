@@ -394,7 +394,12 @@ class ArbitrageMathEngine:
             direct = self._arb_mutex_direct(constraint, constrained_markets)
             if direct:
                 return direct
-            # Fallback to full polytope/Bregman/FW analysis
+            # Rust direct check is comprehensive for mutex (buy+sell).
+            # Polytope fallback only finds partial hedges we don't trade.
+            # Skip it when Rust is available to avoid 80ms CVXPY overhead.
+            if HAS_RUST:
+                return None
+            # Python-only fallback: full polytope/Bregman/FW analysis
             return self._arb_via_polytope(constraint, constrained_markets,
                                           'mutual_exclusivity')
         elif rt == RelationshipType.LOGICAL_IMPLICATION:
