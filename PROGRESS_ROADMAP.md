@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.02 (pre-release, shadow trading)
-> **Last updated**: 2026-03-09 ~13:30 UTC
+> **Version**: v0.04.03-dev (pre-release, shadow trading)
+> **Last updated**: 2026-03-09 ~18:00 UTC
 > **Mode**: SHADOW | Laptop: running | VPS (193.23.127.99): $100 fresh capital, all layers healthy
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4GB RAM, Ubuntu 24.04, systemd auto-restart
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
@@ -44,7 +44,11 @@ WS price_change/book event
 
 **Key metrics (measured 2026-03-09):**
 - WS: 9 shards × 2000 assets, ~1700 msgs/sec, ~8000 markets with live bid/ask
-- Queue: p50 latency 5-10s (bottleneck: Python arb math ~80ms/eval)
+- Queue: p50 latency 2-6s (bottleneck: GIL contention, NOT arb math)
+- Rust arb math: 4.2µs/eval (19000× faster than Python 80ms), but only 8% of wall time
+- Eval batch wall time: p50=3026ms for 100 evals containing ~10ms actual CPU work (300× overhead)
+- Background queue: ~1400 constraints perpetually queued, never drains
+- Exec lock HTTP: 12.9ms/iteration overhead (12,780 calls in session)
 - Stability: 0 disconnects in steady state (ThreadPoolExecutor prevents heartbeat blocking)
 
 ### 2.1 Legacy Four-Layer Pipeline (pre-v0.04.00, kept for reference)
@@ -548,7 +552,71 @@ price_history (asset_id, timestamp, bid, ask, efp)
 - [ ] **7d** — Shadow validation: compare negRisk vs standard fill simulation
 **Status:** 7a+7b done, 7c+7d next
 
+### Phase 8 — Latency Optimization (designed 2026-03-09)
+
+**Root Cause Analysis (2026-03-09 bottleneck audit):**
+Rust arb math port achieved 19,000× speedup (80ms→4.2µs) but total system latency barely improved.
+Root cause: arb math was only 8% of wall time. The other 92% is:
+- **GIL contention (80%)**: ~1,700 WS callbacks/sec each grab the GIL, starving the eval thread. 100 evals take 3s wall time despite ~10ms CPU.
+- **`asyncio.sleep(1.0)` (10%)**: Even urgent evals wait up to 999ms before processing.
+- **Exec lock HTTP (2%)**: 2 synchronous HTTP round-trips per iteration (12.9ms), blocking the event loop.
+
+**Measured evidence:**
+| Metric | Value |
+|--------|-------|
+| Eval batch wall time p50 | 3,026ms (for ~10ms of actual work) |
+| Gap between batches p50 | 3,263ms |
+| Background queue steady state | ~1,400 items (never drains) |
+| Exec lock HTTP total | 82s over session (12,780 calls) |
+| Batches finding arb | 33.9% (66% of eval CPU wasted) |
+
+#### P0 — Quick Python Fixes (hours)
+- [ ] **8a** — Replace `asyncio.sleep(1.0)` with `asyncio.Event`-based wake (instant urgent processing, 50ms fallback)
+- [ ] **8b** — Cache exec lock status (check every 30s, not every iteration)
+- [ ] **8c** — Increase `MAX_EVALS_PER_BATCH` from 100 to 500
+- [ ] **8d** — Remove `indent=2` from JSON state serialization (2.2MB → ~700KB, 2-3× faster writes)
+
+#### P1 — SQLite State (hours)
+- [ ] **8e** — SQLite in-memory DB + WAL journal for `execution_state`, periodic `db.backup()` to disk
+- [ ] **8f** — Incremental position updates (INSERT/UPDATE single rows, not rewrite entire file)
+
+#### P2 — Rust Bregman + Polytope Reintroduction (1-2 days)
+- [ ] **8g** — Port Bregman KL projection to Rust (iterative Dykstra, ~100µs vs CVXPY 80ms)
+- [ ] **8h** — Port polytope construction to Rust (combinatorics only)
+- [ ] **8i** — Reintroduce polytope check for mutex constraints where direct check found no arb (partial hedges)
+
+#### P3 — Reduce Python↔Rust Boundary Crossings (hours)
+- [ ] **8j** — Batch EFP computation: single `Vec<(asset_id, asks)>` → Rust → `Vec<(asset_id, efp, drift)>`
+- [ ] **8k** — Move constraint index (`asset_to_constraints`) into Rust `DashMap`
+- [ ] **8l** — WS stale-asset re-subscribe sweep (replaces REST fallback plan — WS re-sub is 10ms vs REST 200ms)
+
+#### P4 — Full Rust Engine (1-2 weeks)
+- [ ] **8m** — Rust `tokio-tungstenite` WS client with local book mirror (replaces Python `websockets`)
+- [ ] **8n** — Rust eval queue with `tokio::select!` instant wake (no polling, no sleep)
+- [ ] **8o** — Rust `rusqlite` state persistence (WAL mode, incremental updates)
+- [ ] **8p** — Single Rust binary: WS + queue + eval + state. Python kept for dashboard + resolution validator only.
+- [ ] **8q** — Full Rust port: dashboard (axum/warp), resolution validator, everything. Zero Python.
+
+**Expected latency after each phase:**
+| Phase | p50 | p95 | bg_queue |
+|-------|-----|-----|----------|
+| Current | 2-6s | 60-300s | ~1400 (growing) |
+| After P0 | ~200ms | ~2s | ~500 (draining) |
+| After P1 | ~200ms | ~1s | ~200 |
+| After P2 | ~150ms | ~800ms | ~100 (polytope adds load but Rust handles it) |
+| After P3 | ~50ms | ~300ms | ~50 |
+| After P4 | <1ms | <5ms | 0 (instant processing) |
+
 ---
+
+### v0.04.03-dev (2026-03-09) — Latency Bottleneck Analysis + Phase 8 Plan
+- **ANALYSED** Full bottleneck audit: Rust arb math (19000×) only addressed 8% of wall time; GIL contention is 80%
+- **MEASURED** Eval batch p50=3026ms for ~10ms CPU work (300× overhead from GIL + sleep + HTTP)
+- **MEASURED** Exec lock HTTP overhead: 12.9ms/iter, 82s total, 12780 calls
+- **MEASURED** Background queue permanently at ~1400 items, eval throughput ~17/sec (need ~500/sec)
+- **MEASURED** 66.1% of eval batches find zero arbs (wasted CPU on non-arb constraints)
+- **ADDED** Phase 8 (Latency Optimization) to roadmap: P0-P4 progressive plan from Python fixes → full Rust port
+- **ADDED** `scripts/debug/batch_gaps.py`, `batch_exec_time.py`, `http_overhead.py` — bottleneck profiling scripts
 
 ### v0.04.02 (2026-03-09) — EFP Queue Metric + negRisk Tagging + Latency Instrumentation
 - **ADDED** Effective Fill Price (EFP) as 2D queue metric: VWAP at trade size captures both price AND depth drift
