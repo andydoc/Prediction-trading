@@ -622,7 +622,7 @@ class TradingEngine:
         if current_efp <= 0:
             return  # No usable book data
 
-        # EFP drift from last evaluation
+        # Cumulative drift from last evaluation
         last_efp = self._last_eval_efp.get(asset_id, 0.0)
         drift = abs(current_efp - last_efp) if last_efp > 0 else 999.0
         significant = drift >= self.EFP_DRIFT_THRESHOLD
@@ -630,6 +630,8 @@ class TradingEngine:
         now = _time.time()
         for cid in affected:
             if significant:
+                # Update EFP baseline only when drift triggers queue
+                self._last_eval_efp[asset_id] = current_efp
                 if cid not in self._constraint_queue_time:
                     self._constraint_queue_time[cid] = now
                 self._urgent_evals.add(cid)
@@ -678,21 +680,8 @@ class TradingEngine:
             if len(self._recent_latencies) > 200:
                 self._recent_latencies = self._recent_latencies[-200:]
 
-        # Record eval time + snapshot current EFP (resets cumulative drift)
+        # Record eval time (EFP baselines updated at queue time, not here)
         self._constraint_last_eval[constraint_id] = _time.time()
-        for mid in market_ids:
-            md = self.market_lookup.get(str(mid))
-            if md:
-                clob_raw = md.metadata.get('clobTokenIds', '[]') if hasattr(md, 'metadata') else '[]'
-                try:
-                    clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
-                except (json.JSONDecodeError, TypeError):
-                    clob_ids = []
-                for tid in (clob_ids or []):
-                    if tid:
-                        efp = self._get_efp(tid)
-                        if efp > 0:
-                            self._last_eval_efp[tid] = efp
 
         # Build MarketData list for the arb engine
         markets = []
