@@ -51,7 +51,7 @@ HEARTBEAT_INTERVAL = 10     # seconds
 RECONNECT_BASE = 1.0        # seconds
 RECONNECT_MAX = 60.0        # seconds
 SUB_BATCH_SIZE = 500         # max assets per subscription message
-ASSETS_PER_CONNECTION = 4000 # max assets per WS connection (prevents data flood)
+ASSETS_PER_CONNECTION = 2000 # max assets per WS connection (smaller = more stable + less data per reconnect)
 
 
 @dataclass
@@ -245,7 +245,7 @@ class WebSocketManager:
 
     async def _send_batched_subscribe(self, ws, asset_ids: list, is_initial: bool = False):
         """Send subscription in batches of SUB_BATCH_SIZE to avoid overwhelming the server.
-        Uses initial_dump=false to skip massive book snapshots on subscribe."""
+        Sends initial_dump=true so we get full orderbook snapshots for order sizing."""
         batches = [asset_ids[i:i + SUB_BATCH_SIZE] for i in range(0, len(asset_ids), SUB_BATCH_SIZE)]
         for idx, batch in enumerate(batches):
             if is_initial and idx == 0:
@@ -254,7 +254,7 @@ class WebSocketManager:
                     'assets_ids': batch,
                     'type': 'market',
                     'custom_feature_enabled': True,
-                    'initial_dump': False,
+                    'initial_dump': True,
                 })
             else:
                 # Subsequent batches use 'operation' field (dynamic subscribe)
@@ -262,7 +262,7 @@ class WebSocketManager:
                     'assets_ids': batch,
                     'operation': 'subscribe',
                     'custom_feature_enabled': True,
-                    'initial_dump': False,
+                    'initial_dump': True,
                 })
             await ws.send(msg)
             if len(batches) > 1:

@@ -31,6 +31,7 @@ import signal
 import sys
 import time as _time
 import yaml
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -400,6 +401,10 @@ class TradingEngine:
         self._last_replacement = 0.0
         self._iteration = 0
 
+        # Thread pool for CPU-bound work (arb math, constraint detection)
+        # Keeps asyncio event loop free for WS heartbeats
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='arb')
+
         # --- Timing config ---
         self.STATE_SAVE_INTERVAL = 30       # seconds
         self.MONITOR_INTERVAL = 30          # seconds
@@ -407,6 +412,7 @@ class TradingEngine:
         self.CONSTRAINT_REBUILD_INTERVAL = 600  # seconds (on new_market batch)
         self._last_constraint_rebuild = 0.0
         self._new_market_buffer: list = []  # buffer new_market events for batch rebuild
+        self.MAX_EVALS_PER_BATCH = 100      # cap constraint evals per loop iteration
 
     # --- Index Building ---
 
@@ -605,19 +611,25 @@ class TradingEngine:
 
     def _process_pending_evals(self) -> List[dict]:
         """
-        Drain the pending constraint eval queue.
-        Evaluate each constraint, collect profitable opportunities.
+        Process up to MAX_EVALS_PER_BATCH constraints from the queue.
+        Leaves remaining for the next iteration so the main loop stays responsive.
         Returns list of opportunity dicts.
         """
         if not self._pending_constraint_evals:
             return []
 
-        # Snapshot and clear the queue (new events can keep arriving)
-        to_eval = list(self._pending_constraint_evals)
-        self._pending_constraint_evals.clear()
+        # Take at most MAX_EVALS_PER_BATCH, leave rest in queue
+        all_pending = list(self._pending_constraint_evals)
+        batch = all_pending[:self.MAX_EVALS_PER_BATCH]
+        remaining = all_pending[self.MAX_EVALS_PER_BATCH:]
+        self._pending_constraint_evals = set(remaining)
+
+        if len(all_pending) > self.MAX_EVALS_PER_BATCH:
+            log.debug(f'Eval batch: processing {len(batch)}, '
+                      f'{len(remaining)} deferred to next iteration')
 
         opportunities = []
-        for cid in to_eval:
+        for cid in batch:
             opp = self._evaluate_constraint(cid)
             if opp:
                 opportunities.append(opp)
@@ -899,12 +911,13 @@ class TradingEngine:
             return
         self.load_markets()
 
-        # 3. Constraint detection (inline, replaces old L2)
-        log.info('Running constraint detection...')
-        self.load_and_detect_constraints()
+        # 3. Constraint detection (inline, replaces old L2) — runs in thread pool
+        log.info('Running constraint detection (threaded)...')
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(self._executor, self.load_and_detect_constraints)
 
-        # 4. Build index
-        self.build_index()
+        # 4. Build index (threaded)
+        await loop.run_in_executor(self._executor, self.build_index)
 
         # 5. Init live engine
         if self.live_enabled:
@@ -988,8 +1001,9 @@ class TradingEngine:
                 if exec_lock._enabled:
                     exec_lock.heartbeat()
 
-                # --- Process WS-triggered constraint evaluations ---
-                opportunities = self._process_pending_evals()
+                # --- Process WS-triggered constraint evaluations (threaded) ---
+                opportunities = await loop.run_in_executor(
+                    self._executor, self._process_pending_evals)
                 if opportunities:
                     # Write opportunities to file (dashboard + debug)
                     from layer3_arbitrage_math.arbitrage_engine import ArbitrageOpportunity
@@ -1014,11 +1028,13 @@ class TradingEngine:
                         and (now - self._last_constraint_rebuild) >= self.CONSTRAINT_REBUILD_INTERVAL):
                     count = len(self._new_market_buffer)
                     self._new_market_buffer.clear()
-                    log.info(f'Rebuilding constraints ({count} new markets buffered)')
-                    # Reload markets (Market Scanner may have updated)
-                    self.load_markets()
-                    self.load_and_detect_constraints()
-                    self.build_index()
+                    log.info(f'Rebuilding constraints ({count} new markets buffered, threaded)')
+                    # Reload markets + detect constraints in thread pool
+                    def _rebuild():
+                        self.load_markets()
+                        self.load_and_detect_constraints()
+                        self.build_index()
+                    await loop.run_in_executor(self._executor, _rebuild)
                     # Re-subscribe all assets
                     if self.ws_manager and self.ws_manager._running:
                         all_assets = list(self.asset_to_constraints.keys())
