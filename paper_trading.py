@@ -730,17 +730,20 @@ class PaperTradingEngine:
                 
                 # Sync open positions (full replace — small set, always fresh)
                 open_dicts = [p.to_dict() for p in self.open_positions.values()]
-                # Delete any positions in DB that are no longer open
-                db_open_ids = {p['position_id'] for p in self._state_store.get_positions_by_status('open')}
-                db_open_ids |= {p['position_id'] for p in self._state_store.get_positions_by_status('monitoring')}
+                # Delete stale open positions from DB using lightweight ID-only query
+                db_open_ids = set()
+                for row in self._state_store.db.execute(
+                        "SELECT position_id FROM positions WHERE status IN ('open','monitoring')").fetchall():
+                    db_open_ids.add(row[0])
                 live_open_ids = {p.position_id for p in self.open_positions.values()}
                 for stale_id in (db_open_ids - live_open_ids):
                     self._state_store.delete_position(stale_id)
                 if open_dicts:
                     self._state_store.upsert_positions_bulk(open_dicts, 'open')
                 
-                # Sync closed positions (incremental — only new ones)
-                db_closed_count = len(self._state_store.get_positions_by_status('closed'))
+                # Sync closed positions (incremental — count without deserializing)
+                counts = self._state_store.count_by_status()
+                db_closed_count = counts.get('closed', 0)
                 if len(self.closed_positions) > db_closed_count:
                     new_closed = [p.to_dict() for p in self.closed_positions[db_closed_count:]]
                     self._state_store.upsert_positions_bulk(new_closed, 'closed')
