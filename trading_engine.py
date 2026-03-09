@@ -394,17 +394,18 @@ class TradingEngine:
 
         # --- State ---
         self._running = False
-        self._pending_constraint_evals: Set[str] = set()  # constraint_ids queued for re-eval
         self._ws_resolved_markets: Set[str] = set()        # condition_ids resolved via WS
         self._last_state_save = 0.0
         self._last_monitor = 0.0
         self._last_replacement = 0.0
         self._iteration = 0
 
-        # Smart queue filtering: track cumulative drift from last EVALUATION
-        self._last_eval_price: Dict[str, float] = {}       # asset_id → midpoint at time of last eval
-        self._constraint_last_eval: Dict[str, float] = {}  # constraint_id → unix time of last eval
-        self.PRICE_DELTA_THRESHOLD = 0.005                  # $0.005 cumulative drift triggers immediate re-eval
+        # Priority queues: urgent (price drift / depth change) processed before background (stale)
+        self._urgent_evals: Set[str] = set()               # significant move or book depth change
+        self._background_evals: Set[str] = set()            # >5s stale with any new data
+        self._last_eval_price: Dict[str, float] = {}        # asset_id → midpoint at time of last eval
+        self._constraint_last_eval: Dict[str, float] = {}   # constraint_id → unix time of last eval
+        self.PRICE_DELTA_THRESHOLD = 0.005                   # $0.005 cumulative drift → urgent
 
         # Thread pool for CPU-bound work (arb math, constraint detection)
         # Keeps asyncio event loop free for WS heartbeats
@@ -417,7 +418,7 @@ class TradingEngine:
         self.CONSTRAINT_REBUILD_INTERVAL = 600  # seconds (on new_market batch)
         self._last_constraint_rebuild = 0.0
         self._new_market_buffer: list = []  # buffer new_market events for batch rebuild
-        self.MAX_EVALS_PER_BATCH = 500      # cap constraint evals per loop iteration (queue is pre-filtered)
+        self.MAX_EVALS_PER_BATCH = 200      # cap per loop iteration (urgent processed first)
 
     # --- Index Building ---
 
@@ -494,14 +495,14 @@ class TradingEngine:
             return
 
         def on_price_change(asset_id: str, best_bid: float, best_ask: float, ts: float):
-            """A price changed — update MarketData, queue constraint only if significant."""
+            """Price level changed — update MarketData, check drift for queueing."""
             self._update_market_price_from_ws(asset_id, best_bid, best_ask)
-            self._maybe_queue_constraint(asset_id, best_bid, best_ask)
+            self._queue_on_price_change(asset_id, best_bid, best_ask)
 
         def on_book_update(asset_id: str, local_book):
-            """Full orderbook snapshot — update MarketData, queue constraint only if significant."""
+            """Full book snapshot (triggered by trade) — always urgent, depth changed."""
             self._update_market_price_from_ws(asset_id, local_book.best_bid, local_book.best_ask)
-            self._maybe_queue_constraint(asset_id, local_book.best_bid, local_book.best_ask)
+            self._queue_on_book_update(asset_id, local_book.best_bid, local_book.best_ask)
 
         def on_market_resolved(market_cid: str, asset_id: str):
             """A market resolved — trigger immediate payout check."""
@@ -565,13 +566,26 @@ class TradingEngine:
         if best_bid > 0 and best_ask > 0:
             md.outcome_prices[outcome] = round((best_bid + best_ask) / 2.0, 6)
 
-    def _maybe_queue_constraint(self, asset_id: str, best_bid: float, best_ask: float):
+    def _queue_on_book_update(self, asset_id: str, best_bid: float, best_ask: float):
         """
-        Queue affected constraints for re-evaluation based on:
-          1. Significant cumulative drift: midpoint moved >0.5c from price at LAST EVAL
-          2. Stale data: >5s since last eval AND any new data arrived
-        These are OR conditions — either triggers re-eval.
-        No per-constraint cooldown — significant moves are never delayed.
+        Book event = trade happened, depth changed. Always urgent.
+        Also resets drift tracking since we have fresh depth data.
+        """
+        affected = self.asset_to_constraints.get(asset_id)
+        if not affected:
+            return
+        # Update drift baseline (book gives us fresh reference)
+        if best_bid > 0 and best_ask > 0:
+            self._last_eval_price[asset_id] = (best_bid + best_ask) / 2.0
+        # All affected constraints → urgent
+        self._urgent_evals.update(affected)
+
+    def _queue_on_price_change(self, asset_id: str, best_bid: float, best_ask: float):
+        """
+        Price level changed — queue based on:
+          1. Cumulative drift >0.5c from last EVAL midpoint → urgent
+          2. >5s since last eval + any new data → background
+        These are OR — either triggers.
         """
         affected = self.asset_to_constraints.get(asset_id)
         if not affected:
@@ -587,20 +601,22 @@ class TradingEngine:
         else:
             return
 
-        # Cumulative drift from last evaluation price (not last queue)
+        # Cumulative drift from last evaluation price
         last_eval_mid = self._last_eval_price.get(asset_id, 0.0)
-        drift = abs(mid - last_eval_mid) if last_eval_mid > 0 else 999.0  # First data always queues
+        drift = abs(mid - last_eval_mid) if last_eval_mid > 0 else 999.0
         significant_move = drift >= self.PRICE_DELTA_THRESHOLD
 
         now = _time.time()
         for cid in affected:
             if significant_move:
-                self._pending_constraint_evals.add(cid)
+                self._urgent_evals.add(cid)
+                self._background_evals.discard(cid)  # promote to urgent
             else:
-                # Stale check: >5s since last eval + any new data = re-eval
+                # Stale check: >5s since last eval + new data arrived
                 last_eval_time = self._constraint_last_eval.get(cid, 0.0)
                 if (now - last_eval_time) >= 5.0:
-                    self._pending_constraint_evals.add(cid)
+                    if cid not in self._urgent_evals:  # don't demote
+                        self._background_evals.add(cid)
 
     # =================================================================
     # Event Processing — the heart of the event-driven engine
@@ -666,22 +682,39 @@ class TradingEngine:
 
     def _process_pending_evals(self) -> List[dict]:
         """
-        Process up to MAX_EVALS_PER_BATCH constraints from the queue.
-        Leaves remaining for the next iteration so the main loop stays responsive.
+        Process constraints from priority queues:
+          1. ALL urgent evals first (price drift / book depth change)
+          2. Background evals fill remaining batch capacity (stale re-checks)
         Returns list of opportunity dicts.
         """
-        if not self._pending_constraint_evals:
+        if not self._urgent_evals and not self._background_evals:
             return []
 
-        # Take at most MAX_EVALS_PER_BATCH, leave rest in queue
-        all_pending = list(self._pending_constraint_evals)
-        batch = all_pending[:self.MAX_EVALS_PER_BATCH]
-        remaining = all_pending[self.MAX_EVALS_PER_BATCH:]
-        self._pending_constraint_evals = set(remaining)
+        # Build batch: urgent first, background fills remaining
+        batch = []
+        # Take all urgent (they should never wait)
+        urgent_list = list(self._urgent_evals)
+        self._urgent_evals.clear()
+        batch.extend(urgent_list)
 
-        if len(all_pending) > self.MAX_EVALS_PER_BATCH:
-            log.debug(f'Eval batch: processing {len(batch)}, '
-                      f'{len(remaining)} deferred to next iteration')
+        # Fill remaining capacity with background
+        remaining_cap = max(0, self.MAX_EVALS_PER_BATCH - len(batch))
+        if remaining_cap > 0 and self._background_evals:
+            bg_list = list(self._background_evals)
+            bg_batch = bg_list[:remaining_cap]
+            bg_remaining = bg_list[remaining_cap:]
+            self._background_evals = set(bg_remaining)
+            # Don't add if already in urgent batch
+            for cid in bg_batch:
+                if cid not in set(urgent_list):
+                    batch.append(cid)
+
+        if batch:
+            n_urgent = len(urgent_list)
+            n_bg = len(batch) - n_urgent
+            n_bg_remaining = len(self._background_evals)
+            log.debug(f'Eval batch: {n_urgent} urgent + {n_bg} background '
+                      f'(bg_queue={n_bg_remaining})')
 
         opportunities = []
         for cid in batch:
@@ -1121,13 +1154,13 @@ class TradingEngine:
                     ws_info = ''
                     if self.ws_manager and self.ws_manager._running:
                         ws_stats = self.ws_manager.get_stats()
-                        pending = len(self._pending_constraint_evals)
+                        n_urgent = len(self._urgent_evals)
+                        n_bg = len(self._background_evals)
                         live_count = sum(1 for m in self.market_lookup.values() if m.has_live_prices())
                         ws_info = (f' | WS: subs={len(self.ws_manager._subscribed_assets)} '
                                    f'msgs={ws_stats["market_msgs"]} '
                                    f'live={live_count}/{len(self.market_lookup)} '
-                                   f'queue={pending} '
-                                   f'tracked={len(self._last_eval_price)}')
+                                   f'urgent={n_urgent} bg={n_bg}')
                     cap = self.paper_engine.current_capital
                     npos = len(self.paper_engine.open_positions)
                     log.info(f'[iter {self._iteration}] Capital=${cap:.2f} '
