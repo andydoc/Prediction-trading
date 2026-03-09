@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.01 (pre-release, shadow trading)
-> **Last updated**: 2026-03-09 ~09:00 UTC
+> **Version**: v0.04.02 (pre-release, shadow trading)
+> **Last updated**: 2026-03-09 ~13:30 UTC
 > **Mode**: SHADOW | Laptop: running | VPS (193.23.127.99): $100 fresh capital, all layers healthy
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4GB RAM, Ubuntu 24.04, systemd auto-restart
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
@@ -19,7 +19,35 @@ Automated detection and exploitation of pricing inefficiencies across Polymarket
 
 ## 2. Architecture
 
-### 2.1 Four-Layer Pipeline
+### 2.0 Current Architecture (v0.04.00+, event-driven)
+
+Two-process system replacing the old four-layer poll-based pipeline:
+
+| Process | Script | Purpose |
+|---------|--------|---------|
+| **Market Scanner** | `layer1_runner.py` | Fetches all active markets from Polymarket Gamma API (33k+), writes `latest_markets.json`. Runs at startup + periodic refresh. |
+| **Trading Engine** | `trading_engine.py` | Event-driven core: constraint detection (inline), arb math, execution, position management. Reacts to WS price events in real-time. |
+| Dashboard | `dashboard_server.py` | Web UI on port 5556 |
+| Exec Control | `execution_control.py` | Multi-machine lock server on port 5557 |
+
+**Data flow:**
+```
+WS price_change/book event
+  → _update_market_price_from_ws(): writes bid/ask into MarketData in-place
+  → _queue_by_efp(): compute effective fill price (VWAP at trade size)
+      → if EFP drift >0.5c from last eval → urgent queue
+      → if >5s since last eval + new data → background queue
+  → _process_pending_evals(): urgent first, background fills remaining
+      → _evaluate_constraint(): arb math on live ask prices (spread-aware)
+      → _try_enter_or_replace(): enter or replace positions
+```
+
+**Key metrics (measured 2026-03-09):**
+- WS: 9 shards × 2000 assets, ~1700 msgs/sec, ~8000 markets with live bid/ask
+- Queue: p50 latency 5-10s (bottleneck: Python arb math ~80ms/eval)
+- Stability: 0 disconnects in steady state (ThreadPoolExecutor prevents heartbeat blocking)
+
+### 2.1 Legacy Four-Layer Pipeline (pre-v0.04.00, kept for reference)
 
 | Layer | Runner | Core Module | Frequency | Purpose |
 |-------|--------|-------------|-----------|---------|
@@ -102,6 +130,7 @@ Currently both laptop and VPS run independently in SHADOW mode with separate exe
 ```
 /home/andydoc/prediction-trader/              ← WSL (authoritative running code)
 ├── main.py                                   ← Supervisor: starts L1-L4 + dashboard
+├── trading_engine.py                         ← v0.04.00+: Event-driven core (replaces L2+L3+L4)
 ├── paper_trading.py                          ← Paper trading engine (position lifecycle)
 ├── live_trading.py                           ← Live CLOB trading engine
 ├── resolution_validator.py                   ← AI-powered resolution date validation
@@ -323,6 +352,9 @@ All state persists in `data/system_state/execution_state.json`. No data is lost 
 - [x] **24h replacement protection** — Positions resolving within 24h protected from replacement (uses AI-validated dates)
 
 ### Phase 2 — Go Live
+- [ ] Refactor `paper_trading.py` → PositionManager + TradingExecutor (see §6.1)
+- [ ] Pre-trade validation: walk fresh books at execution time (see §6.2)
+- [ ] negRisk order placement: pass `negRisk: true` flag for negRisk markets
 - [ ] Deposit $100+ USDC to Polymarket wallet
 - [ ] Run shadow mode 24h+ for orderbook validation
 - [ ] First live trade
@@ -462,7 +494,72 @@ websocket:
 
 ---
 
-## 7. Changelog
+### Phase 7 — Architecture Evolution (designed 2026-03-09)
+
+#### §6.1 PositionManager / Executor Refactor
+**Problem:** `paper_trading.py` bundles position tracking with simulated execution. Live trading requires real fill prices, not theoretical.
+**Solution:** Split into:
+- **PositionManager** — tracks positions, capital, state, resolution, P&L. `record_entry(opp, fills)` takes actual fill prices.
+- **TradingExecutor** (abstract) → PaperExecutor, ShadowExecutor, LiveExecutor
+- Trading engine calls: `fills = executor.execute(opp)` → `position_manager.record_entry(opp, fills)`
+**Status:** Design complete, implementation deferred to Phase 2 (go-live prerequisite)
+
+#### §6.2 Pre-trade Validation
+**Problem:** Between arb detection and execution, the book may have changed. Multi-leg arbs are especially vulnerable.
+**Solution — Two-phase commit:**
+1. **Detection** (current): WS price events → constraint eval → arb math → candidate opportunity
+2. **Validation** (new, pre-execution): For each candidate, re-read local book mirror for all legs, walk at trade size, compute actual VWAP execution cost vs expected profit. If any leg book >5s stale, REST fallback for that leg only. Abort if `real_profit / expected_profit < 0.7` or insufficient depth.
+**Status:** Design complete, implementation as part of Phase 2
+
+#### §6.3 Rust Port (Performance)
+**Bottleneck:** Arb math in Python (~80ms/constraint). p50 queue→eval latency stuck at ~8s due to batch processing time.
+**Pragmatic path:** PyO3/maturin extension for hot path only:
+- `_arb_mutex_direct()` — price sum + bet sizing (10-20× speedup potential)
+- `frank_wolfe_optimal_bets()` — iterative LP (50-100× with SIMD)
+- Keep Python for everything else (WS, state, orchestration)
+**Expected impact:** p50 latency from ~8s → <1s
+**Status:** Design complete, implementation deferred (high effort, not blocking shadow trading)
+**Future comparison:** Approach 4 (Weighted Book Distance) queue metric should be paper-traded against current Approach 1 (EFP) once Rust speeds up eval enough to handle higher queue volume.
+
+#### §6.4 SQLite Migration
+**Problem:** JSON state files are not atomic, don't support partial reads, and grow linearly with closed positions.
+**Proposed schema:**
+```sql
+markets (market_id PK, data JSON, updated_at)
+constraints (constraint_id PK, data JSON, updated_at)
+positions (position_id PK, status, data JSON, opened_at, closed_at)
+trades (trade_id PK, position_id FK, data JSON, executed_at)
+price_history (asset_id, timestamp, bid, ask, efp)
+```
+**Migration order:** execution_state.json first (biggest pain point) → markets → constraints
+**Status:** Design complete, implementation deferred (not blocking, incremental migration possible)
+
+#### §6.5 negRisk Execution
+**Context:** Polymarket negRisk contracts reduce collateral for mutex groups. All our constraint groups ARE negRisk (detected via `negRiskMarketID`).
+**Key rules:**
+- Buy arbs (sum < 1.0): Do NOT use negRisk — use standard markets (lower cost = the profit)
+- Sell arbs (sum > 1.0): negRisk reduces collateral from sum(NO asks) to $1.00 per unit
+- Orders must pass `negRisk: true` to CLOB API for negRisk markets
+- Different contract addresses (NegRiskCtfExchange vs standard CTFExchange)
+**Implementation:**
+- [x] **7a** — negRisk metadata tag in arb opportunities (`metadata.neg_risk: true/false`)
+- [x] **7b** — negRisk flag passed to CLOB `create_order()` via `PartialCreateOrderOptions`
+- [ ] **7c** — Sell arb capital calculation rework for negRisk (collateral = $1.00, not sum(NO))
+- [ ] **7d** — Shadow validation: compare negRisk vs standard fill simulation
+**Status:** 7a+7b done, 7c+7d next
+
+---
+
+### v0.04.02 (2026-03-09) — EFP Queue Metric + negRisk Tagging + Latency Instrumentation
+- **ADDED** Effective Fill Price (EFP) as 2D queue metric: VWAP at trade size captures both price AND depth drift
+- **ADDED** `LocalOrderBook.effective_fill_price(trade_size_usd)` — walks ask book to compute execution cost
+- **ADDED** Priority queue: urgent (EFP drift >0.5c) processed first, background (>5s stale) fills remaining
+- **ADDED** Real latency instrumentation: p50/p95/max reported in stats line from queue_time→eval_time
+- **ADDED** negRisk metadata tag (`metadata.neg_risk`) in all arb opportunity types
+- **ADDED** negRisk flag on CLOB order placement via `PartialCreateOrderOptions(neg_risk=True)`
+- **CHANGED** Queue uses cumulative EFP drift from last eval, no per-constraint cooldown
+- **MEASURED** p50=5-10s (stable), p95=170-470s (background starvation), bottleneck is Python arb math ~80ms/eval
+- **ADDED** Phase 7 (Architecture Evolution) to roadmap: PositionManager refactor, pre-trade validation, Rust port, SQLite, negRisk execution
 
 ### v0.04.01 (2026-03-09) — Threaded Arb Eval + WS Stability
 - **ADDED** `ThreadPoolExecutor` (2 workers) for CPU-bound arb evaluation — asyncio event loop stays free for WS heartbeats
@@ -717,7 +814,7 @@ Live figures from `execution_state.json` (post sell-arb payout correction):
 
 ---
 
-*Last updated: 2026-03-08 ~22:00 UTC*
+*Last updated: 2026-03-09 ~13:30 UTC*
 *System: WSL Ubuntu on Windows (laptop) + ZAP-Hosting VPS (193.23.127.99)*
 *Machines: Laptop (WSL authoritative) + VPS (ZAP-Hosting 193.23.127.99) + Desktop HP-800G2 (dormant)*
 *Dashboard: http://localhost:5556 | Exec Control: port 5557*
