@@ -405,6 +405,8 @@ class TradingEngine:
         self._background_evals: Set[str] = set()            # >5s stale with any new data
         self._last_eval_price: Dict[str, float] = {}        # asset_id → midpoint at time of last eval
         self._constraint_last_eval: Dict[str, float] = {}   # constraint_id → unix time of last eval
+        self._constraint_queue_time: Dict[str, float] = {}  # constraint_id → unix time when queued
+        self._recent_latencies: list = []                    # last 200 (latency_ms, queue_type) tuples
         self.PRICE_DELTA_THRESHOLD = 0.005                   # $0.005 cumulative drift → urgent
 
         # Thread pool for CPU-bound work (arb math, constraint detection)
@@ -578,6 +580,10 @@ class TradingEngine:
         if best_bid > 0 and best_ask > 0:
             self._last_eval_price[asset_id] = (best_bid + best_ask) / 2.0
         # All affected constraints → urgent
+        now = _time.time()
+        for cid in affected:
+            if cid not in self._constraint_queue_time:
+                self._constraint_queue_time[cid] = now
         self._urgent_evals.update(affected)
 
     def _queue_on_price_change(self, asset_id: str, best_bid: float, best_ask: float):
@@ -609,6 +615,8 @@ class TradingEngine:
         now = _time.time()
         for cid in affected:
             if significant_move:
+                if cid not in self._constraint_queue_time:
+                    self._constraint_queue_time[cid] = now
                 self._urgent_evals.add(cid)
                 self._background_evals.discard(cid)  # promote to urgent
             else:
@@ -616,6 +624,8 @@ class TradingEngine:
                 last_eval_time = self._constraint_last_eval.get(cid, 0.0)
                 if (now - last_eval_time) >= 5.0:
                     if cid not in self._urgent_evals:  # don't demote
+                        if cid not in self._constraint_queue_time:
+                            self._constraint_queue_time[cid] = now
                         self._background_evals.add(cid)
 
     # =================================================================
@@ -639,11 +649,20 @@ class TradingEngine:
         """
         constraint = self.constraint_by_id.get(constraint_id)
         if not constraint:
+            self._constraint_queue_time.pop(constraint_id, None)
             return None
 
         market_ids = constraint.market_ids
         if not self._all_markets_live(market_ids):
             return None  # Will be re-queued when book events arrive
+
+        # Measure queue→eval latency
+        queue_time = self._constraint_queue_time.pop(constraint_id, None)
+        if queue_time:
+            latency_ms = (_time.time() - queue_time) * 1000
+            self._recent_latencies.append(latency_ms)
+            if len(self._recent_latencies) > 200:
+                self._recent_latencies = self._recent_latencies[-200:]
 
         # Record eval time + snapshot current prices (resets cumulative drift)
         self._constraint_last_eval[constraint_id] = _time.time()
@@ -1157,10 +1176,18 @@ class TradingEngine:
                         n_urgent = len(self._urgent_evals)
                         n_bg = len(self._background_evals)
                         live_count = sum(1 for m in self.market_lookup.values() if m.has_live_prices())
+                        # Latency percentiles from recent evals
+                        lat_info = ''
+                        if self._recent_latencies:
+                            lats = sorted(self._recent_latencies)
+                            p50 = lats[len(lats) // 2]
+                            p95 = lats[int(len(lats) * 0.95)]
+                            mx = lats[-1]
+                            lat_info = f' lat_ms p50={p50:.0f} p95={p95:.0f} max={mx:.0f}'
                         ws_info = (f' | WS: subs={len(self.ws_manager._subscribed_assets)} '
                                    f'msgs={ws_stats["market_msgs"]} '
                                    f'live={live_count}/{len(self.market_lookup)} '
-                                   f'urgent={n_urgent} bg={n_bg}')
+                                   f'urgent={n_urgent} bg={n_bg}{lat_info}')
                     cap = self.paper_engine.current_capital
                     npos = len(self.paper_engine.open_positions)
                     log.info(f'[iter {self._iteration}] Capital=${cap:.2f} '
