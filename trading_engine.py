@@ -420,7 +420,7 @@ class TradingEngine:
         self.CONSTRAINT_REBUILD_INTERVAL = 600  # seconds (on new_market batch)
         self._last_constraint_rebuild = 0.0
         self._new_market_buffer: list = []  # buffer new_market events for batch rebuild
-        self.MAX_EVALS_PER_BATCH = 200      # cap per loop iteration (urgent processed first)
+        self.MAX_EVALS_PER_BATCH = 100      # smaller batch = lower latency for urgent items
 
     # --- Index Building ---
 
