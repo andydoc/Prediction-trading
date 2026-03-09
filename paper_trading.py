@@ -22,6 +22,12 @@ from enum import Enum
 from pathlib import Path
 import json
 
+try:
+    from state_store import StateStore
+    HAS_SQLITE = True
+except ImportError:
+    HAS_SQLITE = False
+
 
 class PositionStatus(Enum):
     OPEN = "open"
@@ -135,6 +141,18 @@ class PaperTradingEngine:
         
         # Market data cache
         self.latest_market_data = {}
+        
+        # SQLite state store (in-memory + disk backup)
+        self._state_store: Optional['StateStore'] = None
+        self._save_counter = 0  # Track save cycles for JSON compat frequency
+        if HAS_SQLITE:
+            try:
+                db_path = Path(workspace_root) / 'data' / 'system_state' / 'execution_state.db'
+                self._state_store = StateStore(str(db_path))
+                self.logger.info(f'SQLite state store initialized: {db_path}')
+            except Exception as e:
+                self.logger.warning(f'SQLite state store failed, using JSON fallback: {e}')
+                self._state_store = None
         
         self.logger.info("Complete Paper Trading Engine initialized")
     
@@ -691,9 +709,58 @@ class PaperTradingEngine:
         }
     
     def save_state(self, output_path: Path):
-        """Save complete state"""
+        """Save complete state — SQLite primary, JSON for backward compat."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
+        if self._state_store:
+            try:
+                import time as _t
+                t0 = _t.time()
+                # Sync scalars
+                self._state_store.save_scalars({
+                    'current_capital': self.current_capital,
+                    'initial_capital': self.initial_capital,
+                })
+                # Sync performance metrics as scalars
+                perf = self.get_performance_metrics()
+                for k in ('total_trades', 'winning_trades', 'losing_trades',
+                          'total_actual_profit', 'total_expected_profit'):
+                    if k in perf:
+                        self._state_store.save_scalar(k, perf[k])
+                
+                # Sync open positions (full replace — small set, always fresh)
+                open_dicts = [p.to_dict() for p in self.open_positions.values()]
+                # Delete any positions in DB that are no longer open
+                db_open_ids = {p['position_id'] for p in self._state_store.get_positions_by_status('open')}
+                db_open_ids |= {p['position_id'] for p in self._state_store.get_positions_by_status('monitoring')}
+                live_open_ids = {p.position_id for p in self.open_positions.values()}
+                for stale_id in (db_open_ids - live_open_ids):
+                    self._state_store.delete_position(stale_id)
+                if open_dicts:
+                    self._state_store.upsert_positions_bulk(open_dicts, 'open')
+                
+                # Sync closed positions (incremental — only new ones)
+                db_closed_count = len(self._state_store.get_positions_by_status('closed'))
+                if len(self.closed_positions) > db_closed_count:
+                    new_closed = [p.to_dict() for p in self.closed_positions[db_closed_count:]]
+                    self._state_store.upsert_positions_bulk(new_closed, 'closed')
+                
+                # Atomic backup to disk
+                self._state_store.backup_to_disk()
+                
+                # JSON compat for dashboard — every 5th save (~150s at 30s interval)
+                self._save_counter += 1
+                if self._save_counter % 5 == 1:
+                    self._state_store.save_json_compat(str(output_path))
+                
+                elapsed_ms = (_t.time() - t0) * 1000
+                self.logger.info(f"Saved state (SQLite): {len(self.open_positions)} open, "
+                                f"{len(self.closed_positions)} closed [{elapsed_ms:.0f}ms]")
+                return
+            except Exception as e:
+                self.logger.warning(f"SQLite save failed, falling back to JSON: {e}")
+        
+        # JSON fallback
         state = {
             'current_capital': self.current_capital,
             'initial_capital': self.initial_capital,
@@ -703,17 +770,95 @@ class PaperTradingEngine:
         }
         
         with open(output_path, 'w') as f:
-            json.dump(state, f, separators=(',', ':'))  # No indent — 2.2MB→~700KB, 3× faster
+            json.dump(state, f, separators=(',', ':'))
         
-        self.logger.info(f"Saved state: {len(self.open_positions)} open, {len(self.closed_positions)} closed")
+        self.logger.info(f"Saved state (JSON): {len(self.open_positions)} open, {len(self.closed_positions)} closed")
 
 
 
     def load_state(self, state_path: Path):
-        """Load state from saved JSON"""
+        """Load state — SQLite primary, JSON migration fallback."""
+        
+        # Try SQLite first
+        if self._state_store:
+            try:
+                restored = self._state_store.restore_from_disk()
+                if restored:
+                    self._load_from_state_store()
+                    self.logger.info(f"Loaded state (SQLite): capital=${self.current_capital:.2f}, "
+                                    f"{len(self.open_positions)} open, {len(self.closed_positions)} closed")
+                    return
+                # No disk DB yet — try importing from JSON
+                if state_path.exists():
+                    self.logger.info(f"No SQLite state, migrating from JSON: {state_path}")
+                    self._state_store.import_from_json(str(state_path))
+                    self._load_from_state_store()
+                    self._state_store.backup_to_disk()  # Persist the migration
+                    self.logger.info(f"Migrated JSON→SQLite: capital=${self.current_capital:.2f}, "
+                                    f"{len(self.open_positions)} open, {len(self.closed_positions)} closed")
+                    return
+            except Exception as e:
+                self.logger.warning(f"SQLite load failed, falling back to JSON: {e}")
+        
+        # JSON fallback
         with open(state_path) as f:
             state = json.load(f)
+        self._load_from_json_dict(state)
+    
+    def _load_from_state_store(self):
+        """Populate in-memory structures from SQLite state store."""
+        scalars = self._state_store.get_all_scalars()
+        self.current_capital = scalars.get('current_capital', self.initial_capital)
+        self.initial_capital = scalars.get('initial_capital', self.initial_capital)
         
+        # Restore open positions
+        self.open_positions = {}
+        for p_dict in self._state_store.get_positions_by_status('open'):
+            pos = self._dict_to_position(p_dict)
+            self.open_positions[pos.position_id] = pos
+        # Also load monitoring positions as open
+        for p_dict in self._state_store.get_positions_by_status('monitoring'):
+            pos = self._dict_to_position(p_dict)
+            self.open_positions[pos.position_id] = pos
+        
+        # Restore closed positions
+        self.closed_positions = []
+        for p_dict in self._state_store.get_positions_by_status('closed'):
+            self.closed_positions.append(self._dict_to_position(p_dict))
+        
+        # Restore metrics
+        self.total_trades = int(scalars.get('total_trades', 0))
+        self.winning_trades = int(scalars.get('winning_trades', 0))
+        self.losing_trades = int(scalars.get('losing_trades', 0))
+        self.total_actual_profit = scalars.get('total_actual_profit', 0)
+        self.total_expected_profit = scalars.get('total_expected_profit', 0)
+    
+    def _dict_to_position(self, p_dict: dict) -> PaperPosition:
+        """Convert a dict back to PaperPosition."""
+        return PaperPosition(
+            position_id=p_dict.get('position_id', ''),
+            opportunity_id=p_dict.get('opportunity_id', ''),
+            markets=p_dict.get('markets', {}),
+            total_capital=p_dict.get('total_capital', 0),
+            expected_profit=p_dict.get('expected_profit', 0),
+            expected_profit_pct=p_dict.get('expected_profit_pct', 0),
+            fees_paid=p_dict.get('fees_paid', 0),
+            entry_timestamp=datetime.fromisoformat(p_dict['entry_timestamp']) if p_dict.get('entry_timestamp') else datetime.now(timezone.utc),
+            entry_prices=p_dict.get('entry_prices', {}),
+            status=PositionStatus(p_dict.get('status', 'open')),
+            close_timestamp=p_dict.get('close_timestamp'),
+            actual_profit=p_dict.get('actual_profit', 0),
+            actual_profit_pct=p_dict.get('actual_profit_pct', 0),
+            actual_payout=p_dict.get('actual_payout', 0),
+            winning_market=p_dict.get('winning_market'),
+            resolved_at=datetime.fromisoformat(p_dict['resolved_at']) if p_dict.get('resolved_at') else None,
+            profit_delta=p_dict.get('profit_delta', 0),
+            profit_accuracy=p_dict.get('profit_accuracy', 0),
+            metadata=p_dict.get('metadata', {}),
+        )
+    
+    def _load_from_json_dict(self, state: dict):
+        """Load from a parsed JSON state dict (original load_state logic)."""
         self.current_capital = state.get('current_capital', self.initial_capital)
         self.initial_capital = state.get('initial_capital', self.initial_capital)
         
