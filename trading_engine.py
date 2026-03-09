@@ -415,6 +415,10 @@ class TradingEngine:
         self._recent_latencies: list = []                    # last 200 latency_ms values
         self.EFP_DRIFT_THRESHOLD = 0.005                     # $0.005 effective fill price drift → urgent
 
+        # Wake event: WS callbacks set this to instantly wake the eval loop
+        # Created in run() because it needs the asyncio event loop
+        self._eval_wake: Optional[asyncio.Event] = None
+
         # Thread pool for CPU-bound work (arb math, constraint detection)
         # Keeps asyncio event loop free for WS heartbeats
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='arb')
@@ -426,7 +430,7 @@ class TradingEngine:
         self.CONSTRAINT_REBUILD_INTERVAL = 600  # seconds (on new_market batch)
         self._last_constraint_rebuild = 0.0
         self._new_market_buffer: list = []  # buffer new_market events for batch rebuild
-        self.MAX_EVALS_PER_BATCH = 100      # smaller batch = lower latency for urgent items
+        self.MAX_EVALS_PER_BATCH = 500      # Rust arb math = 4µs each; 500 evals = 2ms CPU
 
     # --- Index Building ---
 
@@ -636,6 +640,9 @@ class TradingEngine:
                     self._constraint_queue_time[cid] = now
                 self._urgent_evals.add(cid)
                 self._background_evals.discard(cid)
+                # Wake the eval loop immediately (Phase 8a)
+                if self._eval_wake is not None:
+                    self._eval_wake.set()
             else:
                 last_eval_time = self._constraint_last_eval.get(cid, 0.0)
                 if (now - last_eval_time) >= 5.0:
@@ -1092,6 +1099,14 @@ class TradingEngine:
         write_status('running', self.paper_engine.current_capital,
                      len(self.paper_engine.open_positions))
 
+        # Phase 8a: Event-based eval wake (replaces asyncio.sleep(1.0))
+        self._eval_wake = asyncio.Event()
+
+        # Phase 8b: Exec lock caching (check every 30s, not every iteration)
+        _exec_lock_interval = 30.0        # seconds between exec lock checks
+        _last_exec_check = 0.0
+        _cached_can_execute = True
+
         # =============================================================
         # EVENT LOOP — process WS-triggered evaluations + periodic tasks
         # =============================================================
@@ -1100,15 +1115,18 @@ class TradingEngine:
             now = _time.time()
 
             try:
-                # --- Execution lock check ---
-                if not exec_lock.can_execute():
+                # --- Execution lock check (cached — Phase 8b) ---
+                if (now - _last_exec_check) >= _exec_lock_interval:
+                    _cached_can_execute = exec_lock.can_execute()
+                    if _cached_can_execute and exec_lock._enabled:
+                        exec_lock.heartbeat()
+                    _last_exec_check = now
+                if not _cached_can_execute:
                     leader = (exec_lock.last_status or {}).get('leader', '?')
                     if self._iteration % 60 == 1:
                         log.info(f'[iter {self._iteration}] Locked by {leader} — monitoring only')
                     await asyncio.sleep(1.0)
                     continue
-                if exec_lock._enabled:
-                    exec_lock.heartbeat()
 
                 # --- Process WS-triggered constraint evaluations (threaded) ---
                 opportunities = await loop.run_in_executor(
@@ -1171,7 +1189,7 @@ class TradingEngine:
                     write_status('running', cap, npos)
 
                 # --- Stats logging (every ~30s) ---
-                if self._iteration % 30 == 1:
+                if (now - getattr(self, '_last_stats_log', 0)) >= 30.0:
                     ws_info = ''
                     if self.ws_manager and self.ws_manager._running:
                         ws_stats = self.ws_manager.get_stats()
@@ -1194,17 +1212,25 @@ class TradingEngine:
                     npos = len(self.paper_engine.open_positions)
                     log.info(f'[iter {self._iteration}] Capital=${cap:.2f} '
                              f'positions={npos}{ws_info}')
+                    self._last_stats_log = now
 
                 # --- Weekly delay update ---
-                if self._iteration % 86400 == 0:  # ~24h at 1s loop
+                if (now - getattr(self, '_last_delay_update', 0)) >= 86400.0:
                     trigger_weekly_delay_update()
+                    self._last_delay_update = now
 
             except Exception as e:
                 log.error(f'[iter {self._iteration}] Error: {e}', exc_info=True)
                 write_status('error', 0, 0, str(e))
 
-            # Yield to event loop — WS callbacks fire during this sleep
-            await asyncio.sleep(1.0)
+            # Phase 8a: Event-based wake — instant processing of urgent evals
+            # WS callbacks set _eval_wake when urgent drift detected.
+            # Falls back to 50ms timeout for background processing.
+            self._eval_wake.clear()
+            try:
+                await asyncio.wait_for(self._eval_wake.wait(), timeout=0.05)
+            except asyncio.TimeoutError:
+                pass  # Normal: no urgent evals, process background on next iter
 
         # --- Shutdown ---
         log.info('Trading Engine shutting down...')
