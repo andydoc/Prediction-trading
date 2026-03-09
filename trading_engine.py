@@ -53,6 +53,12 @@ from websocket_manager import (
     get_condition_ids_for_positions
 )
 
+try:
+    import rust_arb
+    HAS_RUST = True
+except ImportError:
+    HAS_RUST = False
+
 # Load .env file for API keys
 _env_file = Path(__file__).parent / '.env'
 if _env_file.exists():
@@ -570,13 +576,18 @@ class TradingEngine:
 
     def _get_efp(self, asset_id: str) -> float:
         """Get current effective fill price for an asset at our trade size.
+        Uses Rust implementation when available (4.5μs vs ~50μs Python).
         Returns 0.0 if no book data or insufficient depth."""
         if not self.ws_manager:
             return 0.0
         book = self.ws_manager.get_book(asset_id)
-        if not book:
+        if not book or not book.asks:
             return 0.0
         trade_size = dynamic_capital(self.paper_engine.current_capital, self.capital_pct)
+        if HAS_RUST:
+            ask_prices = [level.price for level in book.asks]
+            ask_sizes = [level.size for level in book.asks]
+            return rust_arb.effective_fill_price(ask_prices, ask_sizes, trade_size)
         return book.effective_fill_price(trade_size)
 
     def _queue_on_book_update(self, asset_id: str, best_bid: float, best_ask: float):

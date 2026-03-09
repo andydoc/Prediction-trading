@@ -13,6 +13,13 @@ import numpy as np
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
+
+try:
+    import rust_arb
+    HAS_RUST = True
+except ImportError:
+    HAS_RUST = False
+    logging.warning("rust_arb not installed. Using Python arb math (slower).")
 from pathlib import Path
 import json
 from itertools import product as iterproduct
@@ -428,6 +435,55 @@ class ArbitrageMathEngine:
         # Skip dead markets
         if float(p_vec.min()) < 0.02:
             return None
+
+        # --- RUST FAST PATH ---
+        if HAS_RUST:
+            no_prices_list = []
+            for m in markets:
+                no_p = m.get_entry_price('No')
+                if no_p <= 0:
+                    no_p = 1.0 - yes_prices[m.market_id]
+                no_prices_list.append(float(no_p))
+
+            is_neg_risk = bool(constraint.metadata.get('negRiskMarketID'))
+            result = rust_arb.check_mutex_arb(
+                market_ids=market_ids,
+                yes_prices=[yes_prices[mid] for mid in market_ids],
+                no_prices=no_prices_list,
+                capital=self.capital_per_trade,
+                fee_rate=self.trading_fee,
+                min_profit_threshold=self.min_profit_threshold,
+                max_profit_threshold=self.max_profit_threshold,
+                is_neg_risk=is_neg_risk,
+            )
+            if result is None:
+                return None
+            # Convert Rust dict → ArbitrageOpportunity
+            method = result['method']
+            cap_eff = result.get('capital_efficiency', 1.0)
+            neg_info = f' negRisk: {cap_eff:.1f}x' if is_neg_risk and method == 'mutex_sell_all' else ''
+            self.logger.debug(
+                f"  RUST {method.upper()}: sum={result['price_sum']:.4f} "
+                f"profit={result['profit_pct']:.4f} n={n}{neg_info}")
+            return ArbitrageOpportunity(
+                opportunity_id=f"arb_{'buy' if 'buy' in method else 'sell'}_{constraint.constraint_id}_{datetime.now().timestamp()}",
+                constraint_id=constraint.constraint_id,
+                market_ids=market_ids,
+                market_names=[m.market_name for m in markets],
+                current_prices=yes_prices,
+                optimal_bets=dict(result['bets']),
+                expected_profit=result['gross_profit'],
+                expected_profit_pct=result['gross_profit'] / self.capital_per_trade,
+                max_loss=0.0,
+                worst_case_return=result['profit_pct'],
+                total_capital_required=self.capital_per_trade,
+                fees_estimated=result['fees'],
+                net_profit=result['net_profit'],
+                detected_at=datetime.now(),
+                expires_at=None,
+                metadata=dict(result),
+            )
+        # --- END RUST FAST PATH (Python fallback below) ---
 
         # SAFETY: price_sum must be close to 1.0 for a valid complete mutex group
         # If sum << 1.0, outcomes are likely incomplete (missing scenarios)
