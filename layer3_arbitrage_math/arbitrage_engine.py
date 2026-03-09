@@ -504,6 +504,15 @@ class ArbitrageMathEngine:
             no_cost_per_unit = float(no_vec.sum())
             if no_cost_per_unit <= 0:
                 return None
+
+            # negRisk: flag for capital efficiency tracking
+            # In negRisk markets, collateral locked per unit set = $1.00 (vs sum(NO_ask))
+            # Profit calculation is the same — determined by book prices
+            # Capital efficiency matters for live trading collateral, not paper P&L
+            is_neg_risk = bool(constraint.metadata.get('negRiskMarketID'))
+            collateral_per_unit = 1.0 if is_neg_risk else no_cost_per_unit
+            cap_efficiency = no_cost_per_unit / collateral_per_unit if collateral_per_unit > 0 else 1.0
+
             units = capital / no_cost_per_unit
             cost = capital
             payout = units * (n - 1)
@@ -515,7 +524,9 @@ class ArbitrageMathEngine:
             if profit_pct >= self.min_profit_threshold and profit_pct <= self.max_profit_threshold:
                 bets = {mid: float(capital * no_prices[mid] / no_cost_per_unit) for mid in market_ids}
                 self.logger.debug(
-                    f"  MUTEX SELL-ALL: yes_sum={price_sum:.4f} no_sum={no_cost_per_unit:.4f} profit={profit_pct:.4f} n={n}")
+                    f"  MUTEX SELL-ALL: yes_sum={price_sum:.4f} no_sum={no_cost_per_unit:.4f} "
+                    f"profit={profit_pct:.4f} n={n}"
+                    f"{f' negRisk: {cap_efficiency:.1f}x cap efficient' if is_neg_risk else ''}")
                 return ArbitrageOpportunity(
                     opportunity_id="arb_sell_" + constraint.constraint_id + "_" + str(datetime.now().timestamp()),
                     constraint_id=constraint.constraint_id,
@@ -538,7 +549,9 @@ class ArbitrageMathEngine:
                         'no_price_sum': no_cost_per_unit,
                         'num_markets': n,
                         'fee_rate': fee_rate,
-                        'neg_risk': bool(constraint.metadata.get('negRiskMarketID')),
+                        'neg_risk': is_neg_risk,
+                        'collateral_per_unit': collateral_per_unit,
+                        'capital_efficiency': cap_efficiency,
                     }
                 )
 
