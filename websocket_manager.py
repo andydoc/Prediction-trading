@@ -91,6 +91,42 @@ class LocalOrderBook:
         """Ask depth with phantom order haircut (matches orderbook_depth.py)."""
         return self.total_ask_depth_usd() * haircut
 
+    def effective_fill_price(self, trade_size_usd: float) -> float:
+        """
+        Walk the ask book to compute VWAP for a given trade size in USD.
+        Returns the weighted average price we'd pay to fill $trade_size_usd.
+        Returns 0.0 if insufficient depth.
+        
+        This is a 2D metric capturing both price AND depth:
+        - A wall disappearing at level 2 shifts this value
+        - Price moving at best shifts this value
+        - New liquidity appearing shifts this value
+        """
+        if not self.asks or trade_size_usd <= 0:
+            return 0.0
+        remaining = trade_size_usd
+        total_shares = 0.0
+        total_cost = 0.0
+        for level in self.asks:
+            level_usd = level.price * level.size
+            if level_usd <= 0:
+                continue
+            if level_usd >= remaining:
+                # Partial fill at this level
+                shares_here = remaining / level.price
+                total_shares += shares_here
+                total_cost += remaining
+                remaining = 0
+                break
+            else:
+                # Full fill at this level
+                total_shares += level.size
+                total_cost += level_usd
+                remaining -= level_usd
+        if total_shares <= 0 or remaining > 0:
+            return 0.0  # Insufficient depth
+        return total_cost / total_shares
+
 
 # --- Callback type aliases ---
 # on_price_change(asset_id, best_bid, best_ask, timestamp)

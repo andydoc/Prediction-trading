@@ -400,14 +400,14 @@ class TradingEngine:
         self._last_replacement = 0.0
         self._iteration = 0
 
-        # Priority queues: urgent (price drift / depth change) processed before background (stale)
-        self._urgent_evals: Set[str] = set()               # significant move or book depth change
-        self._background_evals: Set[str] = set()            # >5s stale with any new data
-        self._last_eval_price: Dict[str, float] = {}        # asset_id → midpoint at time of last eval
+        # Priority queues: urgent (effective fill price drift) processed before background (stale)
+        self._urgent_evals: Set[str] = set()
+        self._background_evals: Set[str] = set()
+        self._last_eval_efp: Dict[str, float] = {}         # asset_id → effective fill price at last eval
         self._constraint_last_eval: Dict[str, float] = {}   # constraint_id → unix time of last eval
         self._constraint_queue_time: Dict[str, float] = {}  # constraint_id → unix time when queued
-        self._recent_latencies: list = []                    # last 200 (latency_ms, queue_type) tuples
-        self.PRICE_DELTA_THRESHOLD = 0.005                   # $0.005 cumulative drift → urgent
+        self._recent_latencies: list = []                    # last 200 latency_ms values
+        self.EFP_DRIFT_THRESHOLD = 0.005                     # $0.005 effective fill price drift → urgent
 
         # Thread pool for CPU-bound work (arb math, constraint detection)
         # Keeps asyncio event loop free for WS heartbeats
@@ -568,62 +568,65 @@ class TradingEngine:
         if best_bid > 0 and best_ask > 0:
             md.outcome_prices[outcome] = round((best_bid + best_ask) / 2.0, 6)
 
+    def _get_efp(self, asset_id: str) -> float:
+        """Get current effective fill price for an asset at our trade size.
+        Returns 0.0 if no book data or insufficient depth."""
+        if not self.ws_manager:
+            return 0.0
+        book = self.ws_manager.get_book(asset_id)
+        if not book:
+            return 0.0
+        trade_size = dynamic_capital(self.paper_engine.current_capital, self.capital_pct)
+        return book.effective_fill_price(trade_size)
+
     def _queue_on_book_update(self, asset_id: str, best_bid: float, best_ask: float):
         """
-        Book event = trade happened, depth changed. Always urgent.
-        Also resets drift tracking since we have fresh depth data.
+        Book event (trade happened, depth changed).
+        Uses effective fill price drift to decide urgency — same logic as price_change.
+        Book events always carry depth information so EFP is always computable.
         """
-        affected = self.asset_to_constraints.get(asset_id)
-        if not affected:
-            return
-        # Update drift baseline (book gives us fresh reference)
-        if best_bid > 0 and best_ask > 0:
-            self._last_eval_price[asset_id] = (best_bid + best_ask) / 2.0
-        # All affected constraints → urgent
-        now = _time.time()
-        for cid in affected:
-            if cid not in self._constraint_queue_time:
-                self._constraint_queue_time[cid] = now
-        self._urgent_evals.update(affected)
+        self._queue_by_efp(asset_id)
 
     def _queue_on_price_change(self, asset_id: str, best_bid: float, best_ask: float):
+        """Price level changed — check EFP drift for queueing."""
+        self._queue_by_efp(asset_id)
+
+    def _queue_by_efp(self, asset_id: str):
         """
-        Price level changed — queue based on:
-          1. Cumulative drift >0.5c from last EVAL midpoint → urgent
+        Unified queue logic for both book and price_change events.
+        Computes effective fill price (VWAP at trade size) and compares
+        to EFP at last evaluation. This captures both price AND depth
+        changes in a single metric.
+
+        Triggers:
+          1. EFP drift > threshold from last eval → urgent
           2. >5s since last eval + any new data → background
-        These are OR — either triggers.
+        OR condition — either triggers.
         """
         affected = self.asset_to_constraints.get(asset_id)
         if not affected:
             return
 
-        # Calculate current midpoint
-        if best_bid > 0 and best_ask > 0:
-            mid = (best_bid + best_ask) / 2.0
-        elif best_ask > 0:
-            mid = best_ask
-        elif best_bid > 0:
-            mid = best_bid
-        else:
-            return
+        current_efp = self._get_efp(asset_id)
+        if current_efp <= 0:
+            return  # No usable book data
 
-        # Cumulative drift from last evaluation price
-        last_eval_mid = self._last_eval_price.get(asset_id, 0.0)
-        drift = abs(mid - last_eval_mid) if last_eval_mid > 0 else 999.0
-        significant_move = drift >= self.PRICE_DELTA_THRESHOLD
+        # EFP drift from last evaluation
+        last_efp = self._last_eval_efp.get(asset_id, 0.0)
+        drift = abs(current_efp - last_efp) if last_efp > 0 else 999.0
+        significant = drift >= self.EFP_DRIFT_THRESHOLD
 
         now = _time.time()
         for cid in affected:
-            if significant_move:
+            if significant:
                 if cid not in self._constraint_queue_time:
                     self._constraint_queue_time[cid] = now
                 self._urgent_evals.add(cid)
-                self._background_evals.discard(cid)  # promote to urgent
+                self._background_evals.discard(cid)
             else:
-                # Stale check: >5s since last eval + new data arrived
                 last_eval_time = self._constraint_last_eval.get(cid, 0.0)
                 if (now - last_eval_time) >= 5.0:
-                    if cid not in self._urgent_evals:  # don't demote
+                    if cid not in self._urgent_evals:
                         if cid not in self._constraint_queue_time:
                             self._constraint_queue_time[cid] = now
                         self._background_evals.add(cid)
@@ -664,12 +667,11 @@ class TradingEngine:
             if len(self._recent_latencies) > 200:
                 self._recent_latencies = self._recent_latencies[-200:]
 
-        # Record eval time + snapshot current prices (resets cumulative drift)
+        # Record eval time + snapshot current EFP (resets cumulative drift)
         self._constraint_last_eval[constraint_id] = _time.time()
         for mid in market_ids:
             md = self.market_lookup.get(str(mid))
             if md:
-                # Snapshot midpoints for all assets in this constraint
                 clob_raw = md.metadata.get('clobTokenIds', '[]') if hasattr(md, 'metadata') else '[]'
                 try:
                     clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
@@ -677,9 +679,9 @@ class TradingEngine:
                     clob_ids = []
                 for tid in (clob_ids or []):
                     if tid:
-                        book = self.ws_manager.get_book(tid) if self.ws_manager else None
-                        if book and book.best_bid > 0 and book.best_ask > 0:
-                            self._last_eval_price[tid] = (book.best_bid + book.best_ask) / 2.0
+                        efp = self._get_efp(tid)
+                        if efp > 0:
+                            self._last_eval_efp[tid] = efp
 
         # Build MarketData list for the arb engine
         markets = []
