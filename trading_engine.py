@@ -401,11 +401,10 @@ class TradingEngine:
         self._last_replacement = 0.0
         self._iteration = 0
 
-        # Smart queue filtering: avoid re-evaluating on every tiny tick
-        self._last_queued_price: Dict[str, float] = {}     # asset_id → midpoint when last queued
+        # Smart queue filtering: track cumulative drift from last EVALUATION
+        self._last_eval_price: Dict[str, float] = {}       # asset_id → midpoint at time of last eval
         self._constraint_last_eval: Dict[str, float] = {}  # constraint_id → unix time of last eval
-        self.PRICE_DELTA_THRESHOLD = 0.005                  # $0.005 min price move to re-queue
-        self.CONSTRAINT_EVAL_COOLDOWN = 5.0                 # seconds between evals of same constraint
+        self.PRICE_DELTA_THRESHOLD = 0.005                  # $0.005 cumulative drift triggers immediate re-eval
 
         # Thread pool for CPU-bound work (arb math, constraint detection)
         # Keeps asyncio event loop free for WS heartbeats
@@ -568,14 +567,17 @@ class TradingEngine:
 
     def _maybe_queue_constraint(self, asset_id: str, best_bid: float, best_ask: float):
         """
-        Only queue affected constraints if the price moved significantly.
-        Prevents flooding the eval queue with every tiny tick.
+        Queue affected constraints for re-evaluation based on:
+          1. Significant cumulative drift: midpoint moved >0.5c from price at LAST EVAL
+          2. Stale data: >5s since last eval AND any new data arrived
+        These are OR conditions — either triggers re-eval.
+        No per-constraint cooldown — significant moves are never delayed.
         """
         affected = self.asset_to_constraints.get(asset_id)
         if not affected:
             return
 
-        # Calculate midpoint
+        # Calculate current midpoint
         if best_bid > 0 and best_ask > 0:
             mid = (best_bid + best_ask) / 2.0
         elif best_ask > 0:
@@ -585,20 +587,20 @@ class TradingEngine:
         else:
             return
 
-        # Check price delta threshold
-        last_mid = self._last_queued_price.get(asset_id, 0.0)
-        delta = abs(mid - last_mid)
-        if last_mid > 0 and delta < self.PRICE_DELTA_THRESHOLD:
-            return  # Price hasn't moved enough
+        # Cumulative drift from last evaluation price (not last queue)
+        last_eval_mid = self._last_eval_price.get(asset_id, 0.0)
+        drift = abs(mid - last_eval_mid) if last_eval_mid > 0 else 999.0  # First data always queues
+        significant_move = drift >= self.PRICE_DELTA_THRESHOLD
 
-        # Price moved enough — update tracking and queue constraints
-        self._last_queued_price[asset_id] = mid
         now = _time.time()
         for cid in affected:
-            # Per-constraint cooldown
-            last_eval = self._constraint_last_eval.get(cid, 0.0)
-            if (now - last_eval) >= self.CONSTRAINT_EVAL_COOLDOWN:
+            if significant_move:
                 self._pending_constraint_evals.add(cid)
+            else:
+                # Stale check: >5s since last eval + any new data = re-eval
+                last_eval_time = self._constraint_last_eval.get(cid, 0.0)
+                if (now - last_eval_time) >= 5.0:
+                    self._pending_constraint_evals.add(cid)
 
     # =================================================================
     # Event Processing — the heart of the event-driven engine
@@ -627,8 +629,22 @@ class TradingEngine:
         if not self._all_markets_live(market_ids):
             return None  # Will be re-queued when book events arrive
 
-        # Record eval time for cooldown
+        # Record eval time + snapshot current prices (resets cumulative drift)
         self._constraint_last_eval[constraint_id] = _time.time()
+        for mid in market_ids:
+            md = self.market_lookup.get(str(mid))
+            if md:
+                # Snapshot midpoints for all assets in this constraint
+                clob_raw = md.metadata.get('clobTokenIds', '[]') if hasattr(md, 'metadata') else '[]'
+                try:
+                    clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
+                except (json.JSONDecodeError, TypeError):
+                    clob_ids = []
+                for tid in (clob_ids or []):
+                    if tid:
+                        book = self.ws_manager.get_book(tid) if self.ws_manager else None
+                        if book and book.best_bid > 0 and book.best_ask > 0:
+                            self._last_eval_price[tid] = (book.best_bid + book.best_ask) / 2.0
 
         # Build MarketData list for the arb engine
         markets = []
@@ -1111,7 +1127,7 @@ class TradingEngine:
                                    f'msgs={ws_stats["market_msgs"]} '
                                    f'live={live_count}/{len(self.market_lookup)} '
                                    f'queue={pending} '
-                                   f'tracked={len(self._last_queued_price)}')
+                                   f'tracked={len(self._last_eval_price)}')
                     cap = self.paper_engine.current_capital
                     npos = len(self.paper_engine.open_positions)
                     log.info(f'[iter {self._iteration}] Capital=${cap:.2f} '
