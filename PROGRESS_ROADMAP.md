@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.03.06 (pre-release, shadow trading)
-> **Last updated**: 2026-03-09 ~01:00 UTC
+> **Version**: v0.04.01 (pre-release, shadow trading)
+> **Last updated**: 2026-03-09 ~09:00 UTC
 > **Mode**: SHADOW | Laptop: running | VPS (193.23.127.99): $100 fresh capital, all layers healthy
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4GB RAM, Ubuntu 24.04, systemd auto-restart
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
@@ -463,6 +463,30 @@ websocket:
 ---
 
 ## 7. Changelog
+
+### v0.04.01 (2026-03-09) — Threaded Arb Eval + WS Stability
+- **ADDED** `ThreadPoolExecutor` (2 workers) for CPU-bound arb evaluation — asyncio event loop stays free for WS heartbeats
+- **ADDED** `MAX_EVALS_PER_BATCH = 100` — processes at most 100 constraints per loop iteration, defers rest to next tick
+- **CHANGED** Constraint detection + index building runs in thread pool during startup and rebuilds
+- **CHANGED** `ASSETS_PER_CONNECTION` reduced from 4000 to 2000 — smaller shards are more stable
+- **CHANGED** `initial_dump` set to `True` — full orderbook snapshot on WS subscribe for accurate depth data
+- **RESULT** Zero WS disconnects over 8+ minutes (was 8+ disconnects per 8 min before). 821k msgs in 8 min.
+
+### v0.04.00 (2026-03-08/09) — Event-Driven Trading Engine Refactor
+- **CREATED** `trading_engine.py` — replaces L2+L3+L4 with single async event-driven process
+- **ARCHITECTURE** Two-process system: Market Scanner (`layer1_runner.py`) + Trading Engine (`trading_engine.py`)
+- **ADDED** Bid/ask spread-aware arb math: `MarketData.outcome_bids`, `outcome_asks`, `get_entry_price()`, `get_exit_price()`
+- **ADDED** Arb engine uses actual ask prices (entry cost) instead of midpoints; sell arbs use real NO ask prices from book
+- **ADDED** `asset_to_market` reverse lookup: `asset_id → (market_id, token_index)` for instant WS→MarketData price updates
+- **ADDED** `has_live_prices()` gate — constraints only evaluated when all markets have live WS bid/ask data
+- **ADDED** WS callbacks update `MarketData` in-place: `price_change`/`book` → `outcome_bids`/`outcome_asks` directly
+- **ADDED** WS sharded connection pool: N connections × 2000 assets each, prevents server-side data flood
+- **ADDED** `on_new_market` WS callback → buffers new markets for batch constraint rebuild every 10 min
+- **ADDED** `calc_position_liq_value()` uses bid prices (exit) for liquidation valuation
+- **MODIFIED** `main.py` supervisor: starts Market Scanner + Trading Engine (no more L2/L3/L4 separate processes)
+- **MODIFIED** `arbitrage_engine.py`: `_arb_mutex_direct()` and `_arb_via_polytope()` use `get_entry_price()` for asks
+- **MODIFIED** `layer1_market_data/market_data.py`: added `outcome_bids`, `outcome_asks` fields + helper methods
+- **KEPT** Old `layer2_runner.py`, `layer3_runner.py`, `layer4_runner.py` as reference (not used by supervisor)
 
 ### v0.03.06 (2026-03-08/09) — WebSocket Integration (Phase 6a+6b+6c)
 - **ADDED** `websocket_manager.py` — persistent WebSocket connections to Polymarket market + user channels
