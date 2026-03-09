@@ -50,6 +50,8 @@ USER_WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/user'
 HEARTBEAT_INTERVAL = 10     # seconds
 RECONNECT_BASE = 1.0        # seconds
 RECONNECT_MAX = 60.0        # seconds
+SUB_BATCH_SIZE = 500         # max assets per subscription message
+ASSETS_PER_CONNECTION = 4000 # max assets per WS connection (prevents data flood)
 
 
 @dataclass
@@ -139,11 +141,11 @@ class WebSocketManager:
         self._subscribed_assets: Set[str] = set()        # asset_ids on market channel
         self._subscribed_markets: Set[str] = set()        # condition_ids on user channel
         self._resolved_assets: Set[str] = set()          # asset_ids resolved via WS (pruned from bridge)
-        self._market_ws = None
+        # Market channel pool: multiple connections, each ≤ ASSETS_PER_CONNECTION
+        self._market_shards: Dict[int, dict] = {}        # shard_id -> {ws, task, heartbeat_task, assets: set}
+        self._next_shard_id = 0
         self._user_ws = None
-        self._market_task: Optional[asyncio.Task] = None
         self._user_task: Optional[asyncio.Task] = None
-        self._heartbeat_task_market: Optional[asyncio.Task] = None
         self._heartbeat_task_user: Optional[asyncio.Task] = None
         self._running = False
 
@@ -241,8 +243,35 @@ class WebSocketManager:
 
     # --- Public: subscription management ---
 
+    async def _send_batched_subscribe(self, ws, asset_ids: list, is_initial: bool = False):
+        """Send subscription in batches of SUB_BATCH_SIZE to avoid overwhelming the server.
+        Uses initial_dump=false to skip massive book snapshots on subscribe."""
+        batches = [asset_ids[i:i + SUB_BATCH_SIZE] for i in range(0, len(asset_ids), SUB_BATCH_SIZE)]
+        for idx, batch in enumerate(batches):
+            if is_initial and idx == 0:
+                # First batch on connect uses 'type' field
+                msg = json.dumps({
+                    'assets_ids': batch,
+                    'type': 'market',
+                    'custom_feature_enabled': True,
+                    'initial_dump': False,
+                })
+            else:
+                # Subsequent batches use 'operation' field (dynamic subscribe)
+                msg = json.dumps({
+                    'assets_ids': batch,
+                    'operation': 'subscribe',
+                    'custom_feature_enabled': True,
+                    'initial_dump': False,
+                })
+            await ws.send(msg)
+            if len(batches) > 1:
+                log.debug(f'WS: subscription batch {idx+1}/{len(batches)} ({len(batch)} assets)')
+                await asyncio.sleep(0.5)  # Brief pause between batches
+        log.info(f'WS market: subscribed {len(asset_ids)} assets in {len(batches)} batch(es)')
+
     async def subscribe_assets(self, asset_ids: List[str]):
-        """Add asset_ids to market channel subscription (dynamic, no reconnect)."""
+        """Add asset_ids to market channel subscription. Routes to existing shards or creates new ones."""
         new_ids = [aid for aid in asset_ids if aid not in self._subscribed_assets]
         if not new_ids:
             return
@@ -251,18 +280,39 @@ class WebSocketManager:
         for aid in new_ids:
             if aid not in self._books:
                 self._books[aid] = LocalOrderBook(asset_id=aid)
-        # Send subscribe operation if connected
-        if self._market_ws:
-            try:
-                msg = json.dumps({
-                    'assets_ids': new_ids,
-                    'operation': 'subscribe',
-                    'custom_feature_enabled': True,
-                })
-                await self._market_ws.send(msg)
-                log.info(f'WS: subscribed {len(new_ids)} new assets (total={len(self._subscribed_assets)})')
-            except Exception as e:
-                log.warning(f'WS: subscribe send error: {e}')
+
+        # Distribute to shards
+        remaining = list(new_ids)
+        # Fill existing shards first
+        for sid, shard in self._market_shards.items():
+            if not remaining:
+                break
+            capacity = ASSETS_PER_CONNECTION - len(shard['assets'])
+            if capacity > 0:
+                batch = remaining[:capacity]
+                remaining = remaining[capacity:]
+                shard['assets'].update(batch)
+                ws = shard.get('ws')
+                if ws:
+                    try:
+                        await self._send_batched_subscribe(ws, batch, is_initial=False)
+                    except Exception as e:
+                        log.warning(f'WS shard {sid}: subscribe send error: {e}')
+
+        # Create new shards for overflow
+        while remaining:
+            batch = remaining[:ASSETS_PER_CONNECTION]
+            remaining = remaining[ASSETS_PER_CONNECTION:]
+            sid = self._next_shard_id
+            self._next_shard_id += 1
+            self._market_shards[sid] = {
+                'ws': None, 'task': None, 'heartbeat_task': None,
+                'assets': set(batch),
+            }
+            if self._running:
+                self._market_shards[sid]['task'] = asyncio.create_task(
+                    self._market_shard_loop(sid))
+            log.info(f'WS: created shard {sid} with {len(batch)} assets')
 
     async def unsubscribe_assets(self, asset_ids: List[str]):
         """Remove asset_ids from market channel subscription."""
@@ -272,16 +322,19 @@ class WebSocketManager:
         self._subscribed_assets -= set(to_remove)
         for aid in to_remove:
             self._books.pop(aid, None)
-        if self._market_ws:
-            try:
-                msg = json.dumps({
-                    'assets_ids': to_remove,
-                    'operation': 'unsubscribe',
-                })
-                await self._market_ws.send(msg)
-                log.info(f'WS: unsubscribed {len(to_remove)} assets (total={len(self._subscribed_assets)})')
-            except Exception as e:
-                log.warning(f'WS: unsubscribe send error: {e}')
+        # Remove from shards and send unsubscribe
+        for sid, shard in self._market_shards.items():
+            shard_remove = [a for a in to_remove if a in shard['assets']]
+            if shard_remove:
+                shard['assets'] -= set(shard_remove)
+                ws = shard.get('ws')
+                if ws:
+                    try:
+                        msg = json.dumps({'assets_ids': shard_remove, 'operation': 'unsubscribe'})
+                        await ws.send(msg)
+                    except Exception:
+                        pass
+        log.info(f'WS: unsubscribed {len(to_remove)} assets (total={len(self._subscribed_assets)})')
 
     async def subscribe_user_markets(self, condition_ids: List[str]):
         """Subscribe to user channel for trade/order events on given condition_ids."""
@@ -303,14 +356,32 @@ class WebSocketManager:
     # --- Lifecycle ---
 
     async def start(self):
-        """Start both WebSocket connections as background tasks."""
+        """Start WebSocket connections as background tasks."""
         if not self.enabled:
             log.info('WS: disabled in config')
             return
         if self._running:
             return
         self._running = True
-        self._market_task = asyncio.create_task(self._market_channel_loop())
+
+        # Create initial shards from pre-subscribed assets
+        if self._subscribed_assets and not self._market_shards:
+            all_assets = list(self._subscribed_assets)
+            for i in range(0, len(all_assets), ASSETS_PER_CONNECTION):
+                batch = all_assets[i:i + ASSETS_PER_CONNECTION]
+                sid = self._next_shard_id
+                self._next_shard_id += 1
+                self._market_shards[sid] = {
+                    'ws': None, 'task': None, 'heartbeat_task': None,
+                    'assets': set(batch),
+                }
+
+        # Launch shard tasks
+        for sid in self._market_shards:
+            self._market_shards[sid]['task'] = asyncio.create_task(
+                self._market_shard_loop(sid))
+        log.info(f'WS: launching {len(self._market_shards)} market shard(s)')
+
         if self._user_auth:
             self._user_task = asyncio.create_task(self._user_channel_loop())
         else:
@@ -318,23 +389,38 @@ class WebSocketManager:
         log.info('WS: started')
 
     async def stop(self):
-        """Gracefully close both connections."""
+        """Gracefully close all connections."""
         self._running = False
-        for task in [self._market_task, self._user_task,
-                     self._heartbeat_task_market, self._heartbeat_task_user]:
+        # Cancel all shard tasks
+        for sid, shard in self._market_shards.items():
+            for key in ('task', 'heartbeat_task'):
+                t = shard.get(key)
+                if t and not t.done():
+                    t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
+            ws = shard.get('ws')
+            if ws:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+        self._market_shards.clear()
+        # Cancel user channel
+        for task in [self._user_task, self._heartbeat_task_user]:
             if task and not task.done():
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
-        for ws in [self._market_ws, self._user_ws]:
-            if ws:
-                try:
-                    await ws.close()
-                except Exception:
-                    pass
-        self._market_ws = None
+        if self._user_ws:
+            try:
+                await self._user_ws.close()
+            except Exception:
+                pass
         self._user_ws = None
         log.info('WS: stopped')
 
@@ -353,35 +439,39 @@ class WebSocketManager:
 
     # --- Market Channel ---
 
-    async def _market_channel_loop(self):
-        """Persistent market channel connection with auto-reconnect."""
+    async def _market_shard_loop(self, shard_id: int):
+        """Persistent market channel connection for one shard with auto-reconnect."""
         delay = self.reconnect_base
+        shard = self._market_shards.get(shard_id)
+        if not shard:
+            return
         while self._running:
-            # Wait until we have something to subscribe to
-            while self._running and not self._subscribed_assets:
+            # Wait until shard has assets
+            while self._running and not shard['assets']:
                 await asyncio.sleep(1.0)
             if not self._running:
                 break
             try:
-                async with websockets.connect(self.market_url) as ws:
-                    self._market_ws = ws
-                    delay = self.reconnect_base  # reset on successful connect
+                async with websockets.connect(
+                        self.market_url,
+                        ping_interval=None,
+                        ping_timeout=None,
+                        close_timeout=5,
+                        max_size=2**22,
+                ) as ws:
+                    shard['ws'] = ws
+                    delay = self.reconnect_base
                     self._stats['reconnects_market'] += 1
-                    log.info(f'WS market: connected (reconnect #{self._stats["reconnects_market"]})')
-
-                    # Send initial subscription
-                    if self._subscribed_assets:
-                        sub_msg = json.dumps({
-                            'assets_ids': list(self._subscribed_assets),
-                            'type': 'market',
-                            'custom_feature_enabled': True,
-                        })
-                        await ws.send(sub_msg)
-                        log.info(f'WS market: subscribed {len(self._subscribed_assets)} assets')
+                    log.info(f'WS shard {shard_id}: connected ({len(shard["assets"])} assets)')
 
                     # Start heartbeat
-                    self._heartbeat_task_market = asyncio.create_task(
-                        self._heartbeat_loop(ws, 'market'))
+                    shard['heartbeat_task'] = asyncio.create_task(
+                        self._heartbeat_loop(ws, f'market-{shard_id}'))
+
+                    # Send initial subscription (batched)
+                    if shard['assets']:
+                        await self._send_batched_subscribe(
+                            ws, list(shard['assets']), is_initial=True)
 
                     # Message receive loop
                     async for raw_msg in ws:
@@ -408,15 +498,16 @@ class WebSocketManager:
                             log.warning(f'WS market msg handler error: {e}')
 
             except (ConnectionClosed, OSError) as e:
-                log.warning(f'WS market: disconnected ({e}), reconnecting in {delay:.1f}s')
+                log.warning(f'WS shard {shard_id}: disconnected ({e}), reconnecting in {delay:.1f}s')
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                log.error(f'WS market: unexpected error: {e}', exc_info=True)
+                log.error(f'WS shard {shard_id}: unexpected error: {e}', exc_info=True)
 
-            self._market_ws = None
-            if self._heartbeat_task_market:
-                self._heartbeat_task_market.cancel()
+            shard['ws'] = None
+            hb = shard.get('heartbeat_task')
+            if hb:
+                hb.cancel()
             if self._running:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self.reconnect_max)
@@ -433,7 +524,12 @@ class WebSocketManager:
             if not self._running:
                 break
             try:
-                async with websockets.connect(self.user_url) as ws:
+                async with websockets.connect(
+                        self.user_url,
+                        ping_interval=None,
+                        ping_timeout=None,
+                        close_timeout=5,
+                ) as ws:
                     self._user_ws = ws
                     delay = self.reconnect_base
                     self._stats['reconnects_user'] += 1
