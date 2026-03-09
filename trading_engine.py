@@ -401,6 +401,12 @@ class TradingEngine:
         self._last_replacement = 0.0
         self._iteration = 0
 
+        # Smart queue filtering: avoid re-evaluating on every tiny tick
+        self._last_queued_price: Dict[str, float] = {}     # asset_id → midpoint when last queued
+        self._constraint_last_eval: Dict[str, float] = {}  # constraint_id → unix time of last eval
+        self.PRICE_DELTA_THRESHOLD = 0.005                  # $0.005 min price move to re-queue
+        self.CONSTRAINT_EVAL_COOLDOWN = 5.0                 # seconds between evals of same constraint
+
         # Thread pool for CPU-bound work (arb math, constraint detection)
         # Keeps asyncio event loop free for WS heartbeats
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='arb')
@@ -412,7 +418,7 @@ class TradingEngine:
         self.CONSTRAINT_REBUILD_INTERVAL = 600  # seconds (on new_market batch)
         self._last_constraint_rebuild = 0.0
         self._new_market_buffer: list = []  # buffer new_market events for batch rebuild
-        self.MAX_EVALS_PER_BATCH = 100      # cap constraint evals per loop iteration
+        self.MAX_EVALS_PER_BATCH = 500      # cap constraint evals per loop iteration (queue is pre-filtered)
 
     # --- Index Building ---
 
@@ -489,18 +495,14 @@ class TradingEngine:
             return
 
         def on_price_change(asset_id: str, best_bid: float, best_ask: float, ts: float):
-            """A price changed — update MarketData in-place, queue constraint re-eval."""
+            """A price changed — update MarketData, queue constraint only if significant."""
             self._update_market_price_from_ws(asset_id, best_bid, best_ask)
-            affected = self.asset_to_constraints.get(asset_id)
-            if affected:
-                self._pending_constraint_evals.update(affected)
+            self._maybe_queue_constraint(asset_id, best_bid, best_ask)
 
         def on_book_update(asset_id: str, local_book):
-            """Full orderbook snapshot — update MarketData in-place, queue constraint re-eval."""
+            """Full orderbook snapshot — update MarketData, queue constraint only if significant."""
             self._update_market_price_from_ws(asset_id, local_book.best_bid, local_book.best_ask)
-            affected = self.asset_to_constraints.get(asset_id)
-            if affected:
-                self._pending_constraint_evals.update(affected)
+            self._maybe_queue_constraint(asset_id, local_book.best_bid, local_book.best_ask)
 
         def on_market_resolved(market_cid: str, asset_id: str):
             """A market resolved — trigger immediate payout check."""
@@ -564,6 +566,40 @@ class TradingEngine:
         if best_bid > 0 and best_ask > 0:
             md.outcome_prices[outcome] = round((best_bid + best_ask) / 2.0, 6)
 
+    def _maybe_queue_constraint(self, asset_id: str, best_bid: float, best_ask: float):
+        """
+        Only queue affected constraints if the price moved significantly.
+        Prevents flooding the eval queue with every tiny tick.
+        """
+        affected = self.asset_to_constraints.get(asset_id)
+        if not affected:
+            return
+
+        # Calculate midpoint
+        if best_bid > 0 and best_ask > 0:
+            mid = (best_bid + best_ask) / 2.0
+        elif best_ask > 0:
+            mid = best_ask
+        elif best_bid > 0:
+            mid = best_bid
+        else:
+            return
+
+        # Check price delta threshold
+        last_mid = self._last_queued_price.get(asset_id, 0.0)
+        delta = abs(mid - last_mid)
+        if last_mid > 0 and delta < self.PRICE_DELTA_THRESHOLD:
+            return  # Price hasn't moved enough
+
+        # Price moved enough — update tracking and queue constraints
+        self._last_queued_price[asset_id] = mid
+        now = _time.time()
+        for cid in affected:
+            # Per-constraint cooldown
+            last_eval = self._constraint_last_eval.get(cid, 0.0)
+            if (now - last_eval) >= self.CONSTRAINT_EVAL_COOLDOWN:
+                self._pending_constraint_evals.add(cid)
+
     # =================================================================
     # Event Processing — the heart of the event-driven engine
     # =================================================================
@@ -590,6 +626,9 @@ class TradingEngine:
         market_ids = constraint.market_ids
         if not self._all_markets_live(market_ids):
             return None  # Will be re-queued when book events arrive
+
+        # Record eval time for cooldown
+        self._constraint_last_eval[constraint_id] = _time.time()
 
         # Build MarketData list for the arb engine
         markets = []
@@ -1071,7 +1110,8 @@ class TradingEngine:
                         ws_info = (f' | WS: subs={len(self.ws_manager._subscribed_assets)} '
                                    f'msgs={ws_stats["market_msgs"]} '
                                    f'live={live_count}/{len(self.market_lookup)} '
-                                   f'pending={pending}')
+                                   f'queue={pending} '
+                                   f'tracked={len(self._last_queued_price)}')
                     cap = self.paper_engine.current_capital
                     npos = len(self.paper_engine.open_positions)
                     log.info(f'[iter {self._iteration}] Capital=${cap:.2f} '
