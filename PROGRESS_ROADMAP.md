@@ -814,7 +814,31 @@ Live figures from `execution_state.json` (post sell-arb payout correction):
 
 ---
 
-*Last updated: 2026-03-09 ~13:30 UTC*
+## Glossary
+
+| Term | Meaning |
+|------|---------|
+| **CLOB** | Central Limit Order Book — Polymarket's matching engine and trading API |
+| **EFP** | Effective Fill Price — VWAP (Volume-Weighted Average Price) computed by walking the ask book at a given trade size. Single metric capturing both price and depth. |
+| **FAK** | Fill And Kill — order type that fills as much as possible immediately, cancels the rest |
+| **FOK** | Fill Or Kill — order type that fills entirely or cancels entirely |
+| **GTC** | Good Till Cancelled — order that stays on book until filled or manually cancelled |
+| **KL** | Kullback-Leibler divergence — measure of distance between probability distributions, used in Bregman projection |
+| **LP** | Linear Program — mathematical optimization with linear objective and constraints (CVXPY solves these) |
+| **MCP** | Model Context Protocol — Anthropic's standard for AI tool integration |
+| **negRisk** | Negative Risk — Polymarket contract structure for mutex groups: reduces collateral by recognising mutual exclusivity at the contract level |
+| **P95** | 95th percentile — value below which 95% of observations fall (used for resolution delay model) |
+| **VWAP** | Volume-Weighted Average Price — average price weighted by size at each level in the order book |
+| **WS** | WebSocket — persistent bidirectional connection for real-time data streaming |
+| **Mutex** | Mutually exclusive — a set of outcomes where exactly one will resolve YES and all others NO |
+| **Shard** | One of multiple parallel WS connections, each handling ≤2000 assets to prevent server overload |
+| **EFP drift** | Change in effective fill price since last arb evaluation — triggers re-evaluation when >$0.005 |
+| **Shadow mode** | Paper trading + orderbook validation against live CLOB — no real money moves |
+| **PyO3** | Rust→Python bridge allowing Rust code to be called from Python as native extension modules |
+
+---
+
+*Last updated: 2026-03-09 ~14:00 UTC*
 *System: WSL Ubuntu on Windows (laptop) + ZAP-Hosting VPS (193.23.127.99)*
 *Machines: Laptop (WSL authoritative) + VPS (ZAP-Hosting 193.23.127.99) + Desktop HP-800G2 (dormant)*
 *Dashboard: http://localhost:5556 | Exec Control: port 5557*
