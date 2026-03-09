@@ -374,6 +374,9 @@ class ArbitrageMathEngine:
         if len(constrained_markets) != len(constraint.market_ids):
             return None
 
+        # Check if this is a negRisk constraint group
+        is_neg_risk = bool(constraint.metadata.get('negRiskMarketID'))
+
         rt = constraint.relationship_type
 
         if rt == RelationshipType.COMPLEMENTARY:
@@ -482,6 +485,7 @@ class ArbitrageMathEngine:
                         'price_sum': price_sum,
                         'num_markets': n,
                         'fee_rate': fee_rate,
+                        'neg_risk': bool(constraint.metadata.get('negRiskMarketID')),
                     }
                 )
 
@@ -534,6 +538,7 @@ class ArbitrageMathEngine:
                         'no_price_sum': no_cost_per_unit,
                         'num_markets': n,
                         'fee_rate': fee_rate,
+                        'neg_risk': bool(constraint.metadata.get('negRiskMarketID')),
                     }
                 )
 
@@ -661,6 +666,7 @@ class ArbitrageMathEngine:
                 'mispricing_l1': mispricing,
                 'valid_scenarios': len(polytope.valid_scenarios),
                 'bregman_projection': q_vec.tolist(),
+                'neg_risk': bool(constraint.metadata.get('negRiskMarketID')),
             }
         )
 

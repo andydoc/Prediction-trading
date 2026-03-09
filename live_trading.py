@@ -9,7 +9,8 @@ from typing import Dict, List, Optional, Tuple
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
-    OrderArgs, OrderType, BalanceAllowanceParams, AssetType
+    OrderArgs, OrderType, BalanceAllowanceParams, AssetType,
+    PartialCreateOrderOptions
 )
 
 log = logging.getLogger('LiveTrading')
@@ -443,6 +444,10 @@ class LiveTradingEngine:
             order_type=OrderType.GTC,
         )
 
+    def _get_neg_risk(self, market_id: str) -> bool:
+        """Check if market is negRisk from cached map."""
+        return self._market_negrisk_map.get(str(market_id), False)
+
     def place_multi_leg_order(self, opp_dict: Dict, validation: Dict) -> Dict:
         """
         Place all legs of an arbitrage position as GTC limit orders.
@@ -493,7 +498,8 @@ class LiveTradingEngine:
                 'price': price,
                 'size': shares,
                 'bet_amount': bet,
-                'is_no': is_sell_all
+                'is_no': is_sell_all,
+                'neg_risk': self._get_neg_risk(mid),
             })
 
         if not orders_to_place:
@@ -508,12 +514,15 @@ class LiveTradingEngine:
 
         for order, meta in zip(orders_to_place, order_meta):
             try:
-                # Sign and place the order
-                signed = self.client.create_order(order)
+                # Sign and place the order, passing negRisk explicitly to avoid API lookup
+                is_neg = self._get_neg_risk(meta['market_id'])
+                opts = PartialCreateOrderOptions(neg_risk=is_neg) if is_neg else None
+                signed = self.client.create_order(order, options=opts)
                 result = self.client.post_order(signed, order_type=OrderType.GTC)
                 order_id = result.get('orderID', result.get('order_id', ''))
                 log.info(f"  Order placed: {meta['market_id'][:30]} "
                          f"{meta['side']} {meta['size']}@{meta['price']} "
+                         f"{'[negRisk] ' if is_neg else ''}"
                          f"-> order_id={order_id[:12] if order_id else '?'}")
                 placed_orders.append({
                     **meta,
@@ -656,7 +665,9 @@ class LiveTradingEngine:
                     sell_price = 0.001
                 
                 order = self._build_order(token_id, 'SELL', sell_price, shares)
-                signed = self.client.create_order(order)
+                is_neg = self._get_neg_risk(mid)
+                opts = PartialCreateOrderOptions(neg_risk=is_neg) if is_neg else None
+                signed = self.client.create_order(order, options=opts)
                 result = self.client.post_order(signed, order_type=OrderType.GTC)
                 order_id = result.get('orderID', result.get('order_id', ''))
                 
