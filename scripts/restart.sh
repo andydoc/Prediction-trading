@@ -13,7 +13,7 @@ echo "Pulling latest code..."
 git pull --ff-only origin main 2>&1 || echo "  WARNING: git pull failed — continuing with local code"
 
 echo "Killing all trader processes..."
-PIDS=$(ps aux | grep -E 'main\.py|layer[1-4]_runner|dashboard_server|execution_control' | grep -v grep | tr -s ' ' | cut -d' ' -f2)
+PIDS=$(ps aux | grep -E 'main\.py|layer[1-4]_runner|dashboard_server' | grep -v grep | tr -s ' ' | cut -d' ' -f2)
 if [ -n "$PIDS" ]; then
     echo "  Killing PIDs: $PIDS"
     echo "$PIDS" | xargs kill 2>/dev/null || true

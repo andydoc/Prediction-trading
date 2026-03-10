@@ -2,10 +2,11 @@
 Run: python dashboard_server.py
 Serves on http://localhost:5556
 """
-import json, os, sys, html as html_mod
+import json, os, sys, html as html_mod, time, threading
 from pathlib import Path
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 
 WORKSPACE = Path('/home/andydoc/prediction-trader')
 CONFIG_PATH = WORKSPACE / 'config' / 'config.yaml'
@@ -76,20 +77,16 @@ def make_html():
     shadow_only = live_cfg.get('shadow_only', False)
     if live_enabled and shadow_only:
         mode_label = 'SHADOW'
-        mode_color = '#fa0'
-        mode_bg = '#332800'
+        mode_class = 'mode-shadow'
     elif trading_mode == 'live_trading' or (live_enabled and not shadow_only and trading_mode != 'dual'):
         mode_label = 'LIVE'
-        mode_color = '#f44'
-        mode_bg = '#3a1111'
+        mode_class = 'mode-live'
     elif trading_mode == 'dual' and live_enabled and not shadow_only:
         mode_label = 'DUAL (PAPER+LIVE)'
-        mode_color = '#fa0'
-        mode_bg = '#3a2a00'
+        mode_class = 'mode-dual'
     else:
         mode_label = 'PAPER'
-        mode_color = '#0f0'
-        mode_bg = '#113311'
+        mode_class = 'mode-paper'
 
     # Fetch live USDC balance if live/dual mode
     live_balance = None
@@ -298,26 +295,26 @@ def make_html():
             for mid2, md2 in market_list:
                 np2 = 1.0 - md2.get('entry_price', 0)
                 shares_map[mid2] = md2.get('bet_amount', 0) / np2 if np2 > 0 else 0
-            legs_html += '<div class="leg" style="margin-top:6px;color:#888;font-size:11px">Scenarios (exactly one wins YES, that NO leg loses):</div>'
+            legs_html += '<div class="leg scenario-header color-dim">Scenarios (exactly one wins YES, that NO leg loses):</div>'
             scenario_payouts = []
             for wmid, wmd in market_list:
                 wname = wmd.get('name', '?')[:40]
                 winners = [(mid2, shares_map[mid2]) for mid2 in shares_map if mid2 != wmid]
                 payout = sum(s for _, s in winners)
                 profit = payout - total_cap
-                parts = ' + '.join(f'<span style="color:#4c4">${s:.2f}</span>' for _, s in winners)
-                css = 'color:#4c4' if profit >= 0 else 'color:#f55'
-                legs_html += (f'<div class="leg" style="font-size:11px">'
+                parts = ' + '.join(f'<span class="color-positive">${s:.2f}</span>' for _, s in winners)
+                css = 'color-positive' if profit >= 0 else 'color-negative'
+                legs_html += (f'<div class="leg scenario-line">'
                              f'If <b>{escape_html(wname)}</b> wins: {parts}'
-                             f' = <span style="{css}">${payout:.2f}</span>'
-                             f' (<span style="{css}">{profit:+.2f}</span>)</div>')
+                             f' = <span class="{css}">${payout:.2f}</span>'
+                             f' (<span class="{css}">{profit:+.2f}</span>)</div>')
                 scenario_payouts.append(payout)
             guaranteed = min(scenario_payouts) if scenario_payouts else 0
             gprofit = guaranteed - total_cap
-            gcss = 'color:#4c4' if gprofit >= 0 else 'color:#f55'
-            legs_html += (f'<div class="leg" style="margin-top:4px;color:#0af;font-weight:bold">'
+            gcss = 'color-positive' if gprofit >= 0 else 'color-negative'
+            legs_html += (f'<div class="leg guaranteed-line color-cyan">'
                          f'Guaranteed payout: ${guaranteed:.2f} '
-                         f'(profit <span style="{gcss}">${gprofit:+.2f}</span>)'
+                         f'(profit <span class="{gcss}">${gprofit:+.2f}</span>)'
                          f'</div>')
         else:
             # Buy-all: original guaranteed payout display
@@ -328,7 +325,7 @@ def make_html():
                 all_payouts.append(b / ep2 if ep2 > 0 else 0)
             if all_payouts:
                 guaranteed = min(all_payouts)
-                legs_html += (f'<div class="leg" style="margin-top:4px;color:#0af">'
+                legs_html += (f'<div class="leg guaranteed-line color-cyan">'
                              f'Guaranteed payout: <span class="win">${guaranteed:.2f}</span> '
                              f'(profit <span class="win">${guaranteed - total_cap:.2f}</span>)'
                              f'</div>')
@@ -375,7 +372,7 @@ def make_html():
                          f'<td>${payout:.2f}</td>'
                          f'<td>{a["pos_idx"]}{dup_flag}</td></tr>\n')
     # Summary row
-    agg_rows_html += (f'<tr style="border-top:2px solid #0af;font-weight:bold">'
+    agg_rows_html += (f'<tr class="agg-total-row">'
                      f'<td>TOTAL ({len(agg_markets)} markets)</td><td></td>'
                      f'<td>${agg_total_bet:.2f}</td><td></td><td></td>'
                      f'<td>{len(open_pos)} pos</td></tr>\n')
@@ -431,22 +428,22 @@ def make_html():
             for k2, omid2 in enumerate(opp_mids):
                 np2 = 1.0 - opp_prices.get(str(omid2), 0)
                 sh_map[omid2] = opp_bets.get(str(omid2), 0) / np2 if np2 > 0 else 0
-            opp_legs += '<div class="leg" style="margin-top:6px;color:#888;font-size:11px">Scenarios (one wins YES, that NO leg loses):</div>'
+            opp_legs += '<div class="leg scenario-header color-dim">Scenarios (one wins YES, that NO leg loses):</div>'
             for k3, wmid in enumerate(opp_mids):
                 wname = opp_names[k3][:40] if k3 < len(opp_names) else '?'
                 winners = [(m, sh_map[m]) for m in opp_mids if m != wmid]
                 spayout = sum(s for _, s in winners)
                 sprofit = spayout - opp_cap
-                sparts = ' + '.join(f'<span style="color:#4c4">${s:.2f}</span>' for _, s in winners)
-                scss = 'color:#4c4' if sprofit >= 0 else 'color:#f55'
-                opp_legs += (f'<div class="leg" style="font-size:11px">'
+                sparts = ' + '.join(f'<span class="color-positive">${s:.2f}</span>' for _, s in winners)
+                scss = 'color-positive' if sprofit >= 0 else 'color-negative'
+                opp_legs += (f'<div class="leg scenario-line">'
                             f'If <b>{escape_html(wname)}</b> wins: {sparts}'
-                            f' = <span style="{scss}">{spayout:.2f}</span>'
-                            f' (<span style="{scss}">{sprofit:+.2f}</span>)</div>')
+                            f' = <span class="{scss}">{spayout:.2f}</span>'
+                            f' (<span class="{scss}">{sprofit:+.2f}</span>)</div>')
         # Guaranteed payout
         opp_net = opp_dict.get('net_profit', opp_dict.get('expected_profit', 0))
         opp_fees = opp_dict.get('fees_estimated', 0)
-        opp_legs += (f'<div class="leg" style="margin-top:4px;color:#0af;font-weight:bold">'
+        opp_legs += (f'<div class="leg guaranteed-line color-cyan">'
                     f'Guaranteed payout: ${opp_cap + opp_net:.2f} '
                     f'(profit ${opp_net:.2f}, fees ${opp_fees:.4f})</div>')
         opp_rows_html += f'<tr id="opp-detail-{opp_idx}" class="detail-row"><td colspan="6">{opp_legs}</td></tr>\n'
@@ -571,64 +568,51 @@ def make_html():
     # Market Scanner (L1)
     l1_st = layer1_status.get('status', '?')
     l1_ts = format_datetime(layer1_status.get('timestamp', ''))
-    l1_color = '#0f0' if l1_st in ('running','scanning') else '#f80'
-    layer_html += f'<tr><td>Market Scanner</td><td style="color:{l1_color}">{l1_st}</td><td>{l1_ts}</td></tr>\n'
+    l1_cls = 'color-green' if l1_st in ('running','scanning') else 'color-amber'
+    layer_html += f'<tr><td>Market Scanner</td><td class="{l1_cls}">{l1_st}</td><td>{l1_ts}</td></tr>\n'
     # Trading Engine (with rich metrics)
     eng_st = engine_status.get('status', '?')
     eng_ts = format_datetime(engine_status.get('timestamp', ''))
-    eng_color = '#0f0' if eng_st == 'running' else '#f80'
+    eng_cls = 'color-green' if eng_st == 'running' else 'color-amber'
     eng_extra = ''
     em = engine_status.get('metrics', {})
     if engine_status:
         eng_extra = f' | cash=${engine_status.get("capital", 0):.2f} | pos={engine_status.get("positions", engine_status.get("open_positions", 0))}'
-    layer_html += f'<tr><td>Trading Engine</td><td style="color:{eng_color}">{eng_st}</td><td>{eng_ts}{eng_extra}</td></tr>\n'
+    layer_html += f'<tr><td>Trading Engine</td><td class="{eng_cls}">{eng_st}</td><td>{eng_ts}{eng_extra}</td></tr>\n'
     # Engine metrics sub-rows
     if em:
-        rust_tag = '<span style="color:#0f0">Rust</span>' if em.get('has_rust') else '<span style="color:#f80">Python</span>'
-        layer_html += (f'<tr><td style="padding-left:25px;color:#888">Arb Engine</td>'
+        rust_tag = '<span class="color-green">Rust</span>' if em.get('has_rust') else '<span class="color-amber">Python</span>'
+        layer_html += (f'<tr><td class="pl-indent color-dim">Arb Engine</td>'
                       f'<td>{rust_tag}</td>'
                       f'<td>constraints={em.get("constraints",0)} | markets={em.get("markets_total",0)} | iter={em.get("iteration",0)}</td></tr>\n')
         ws_live = em.get('ws_live', 0)
         ws_total = em.get('markets_total', 1)
         ws_pct = int(ws_live / ws_total * 100) if ws_total else 0
-        ws_color = '#0f0' if ws_pct > 20 else '#f80'
-        layer_html += (f'<tr><td style="padding-left:25px;color:#888">WebSocket</td>'
-                      f'<td style="color:{ws_color}">subs={em.get("ws_subscribed",0)}</td>'
+        ws_cls = 'color-green' if ws_pct > 20 else 'color-amber'
+        layer_html += (f'<tr><td class="pl-indent color-dim">WebSocket</td>'
+                      f'<td class="{ws_cls}">subs={em.get("ws_subscribed",0)}</td>'
                       f'<td>msgs={em.get("ws_msgs",0):,} | live={ws_live}/{ws_total} ({ws_pct}%)</td></tr>\n')
         q_urg = em.get('queue_urgent', 0)
         q_bg = em.get('queue_background', 0)
-        q_color = '#0f0' if q_bg < 500 else ('#f80' if q_bg < 2000 else '#f44')
-        layer_html += (f'<tr><td style="padding-left:25px;color:#888">Eval Queue</td>'
-                      f'<td style="color:{q_color}">bg={q_bg}</td>'
+        q_cls = 'color-green' if q_bg < 500 else ('color-amber' if q_bg < 2000 else 'color-red')
+        layer_html += (f'<tr><td class="pl-indent color-dim">Eval Queue</td>'
+                      f'<td class="{q_cls}">bg={q_bg}</td>'
                       f'<td>urgent={q_urg} | bg={q_bg}</td></tr>\n')
         lat_p50 = em.get('lat_p50_ms', 0)
         lat_p95 = em.get('lat_p95_ms', 0)
-        lat_color = '#0f0' if lat_p50 < 100 else ('#fa0' if lat_p50 < 1000 else '#f44')
-        layer_html += (f'<tr><td style="padding-left:25px;color:#888">Latency</td>'
-                      f'<td style="color:{lat_color}">p50={lat_p50}ms</td>'
+        lat_cls = 'color-green' if lat_p50 < 100 else ('color-amber' if lat_p50 < 1000 else 'color-red')
+        layer_html += (f'<tr><td class="pl-indent color-dim">Latency</td>'
+                      f'<td class="{lat_cls}">p50={lat_p50}ms</td>'
                       f'<td>p50={lat_p50}ms | p95={lat_p95}ms | max={em.get("lat_max_ms",0)}ms</td></tr>\n')
     # Dashboard (always running if we're rendering this)
     dash_ts = now.strftime('%d/%m/%Y %H:%M')
-    layer_html += f'<tr><td>Dashboard</td><td style="color:#0f0">running</td><td>{dash_ts}</td></tr>\n'
-    # Exec Control
-    try:
-        import requests as _req
-        _ec = _req.get('http://localhost:5557/status', timeout=1).json()
-        _ec_st = 'running'
-        _ec_leader = _ec.get('leader', '?')
-        _ec_extra = f' | leader={_ec_leader}'
-    except Exception:
-        _ec_st = 'unreachable'
-        _ec_extra = ''
-    _ec_color = '#0f0' if _ec_st == 'running' else '#f80'
-    layer_html += f'<tr><td>Exec Control</td><td style="color:{_ec_color}">{_ec_st}</td><td>:5557{_ec_extra}</td></tr>\n'
+    layer_html += f'<tr><td>Dashboard</td><td class="color-positive">running</td><td>{dash_ts}</td></tr>\n'
 
     # --- Build annualized badges ---
-    config = cfg  # alias for control panel template
     paper_ann_badge = ''
     if annualized_str and annualized_str != 'N/A':
-        a_color = '#0f0' if annualized_ret >= 0 else '#f44'
-        paper_ann_badge = f' <span class="tab-annualized" style="color:{a_color}">{annualized_str} ann.</span>'
+        a_cls = 'color-green' if annualized_ret >= 0 else 'color-red'
+        paper_ann_badge = f' <span class="tab-annualized {a_cls}">{annualized_str} ann.</span>'
 
     shadow_ann_badge = ''  # TODO: track shadow-only P&L
     live_ann_badge = ''    # TODO: track live-only P&L
@@ -669,40 +653,40 @@ def make_html():
 </div>"""
 
         # Rejection breakdown table
-        reject_table = '<h3 style="color:#fa0;margin:15px 0 5px">Rejection Reasons</h3><table><tr><th>Reason</th><th>Count</th></tr>'
+        reject_table = '<h3 class="color-amber sub-heading">Rejection Reasons</h3><table><tr><th>Reason</th><th>Count</th></tr>'
         for reason, cnt in sorted(reject_reasons.items(), key=lambda x: -x[1]):
             reject_table += f'<tr><td>{html_mod.escape(reason)}</td><td>{cnt}</td></tr>'
         reject_table += '</table>'
 
         # Last 10 would-trade entries
-        trade_log = '<h3 style="color:#0f0;margin:15px 0 5px">Recent Would-Trade Signals</h3>'
+        trade_log = '<h3 class="color-green sub-heading">Recent Would-Trade Signals</h3>'
         if would_trade:
             trade_log += '<table><tr><th>Time</th><th>Opportunity</th><th>Details</th></tr>'
             for e in would_trade[-10:]:
                 parts = e.split(' - [L4] INFO - ')
                 ts = parts[0][:19] if parts else ''
                 msg = parts[1] if len(parts) > 1 else e
-                trade_log += f'<tr><td>{html_mod.escape(ts)}</td><td colspan="2" style="color:#0f0">{html_mod.escape(msg[:120])}</td></tr>'
+                trade_log += f'<tr><td>{html_mod.escape(ts)}</td><td colspan="2" class="color-green">{html_mod.escape(msg[:120])}</td></tr>'
             trade_log += '</table>'
         else:
-            trade_log += '<p style="color:#555">No would-trade signals yet. Opportunities that pass all live validation checks will appear here.</p>'
+            trade_log += '<p class="color-muted">No would-trade signals yet. Opportunities that pass all live validation checks will appear here.</p>'
 
         shadow_tab_html_val = shadow_stats + reject_table + trade_log
     except Exception as e:
-        shadow_tab_html_val = f'<p style="color:#f44">Error loading shadow data: {html_mod.escape(str(e))}</p>'
+        shadow_tab_html_val = f'<p class="color-red">Error loading shadow data: {html_mod.escape(str(e))}</p>'
 
     # --- Build Live Tab ---
     live_bal_html = ''
     if live_balance is not None:
         live_bal_html = f"""<div class="stats">
-  <div class="stat"><div class="label">USDC BALANCE</div><div class="value" style="color:#fa0">${live_balance:.2f}</div></div>
-  <div class="stat"><div class="label">STATUS</div><div class="value" style="color:{'#0f0' if mode_label in ('LIVE','DUAL (PAPER+LIVE)') else '#fa0'}">{'ACTIVE' if mode_label in ('LIVE','DUAL (PAPER+LIVE)') else 'SHADOW ONLY'}</div></div>
+  <div class="stat"><div class="label">USDC BALANCE</div><div class="value color-amber">${live_balance:.2f}</div></div>
+  <div class="stat"><div class="label">STATUS</div><div class="value {'color-green' if mode_label in ('LIVE','DUAL (PAPER+LIVE)') else 'color-amber'}">{'ACTIVE' if mode_label in ('LIVE','DUAL (PAPER+LIVE)') else 'SHADOW ONLY'}</div></div>
 </div>"""
     else:
-        live_bal_html = '<div class="stats"><div class="stat"><div class="label">STATUS</div><div class="value" style="color:#555">NOT CONNECTED</div></div></div>'
+        live_bal_html = '<div class="stats"><div class="stat"><div class="label">STATUS</div><div class="value color-muted">NOT CONNECTED</div></div></div>'
 
     # Live positions (positions with live metadata)
-    live_positions_html = '<h3 style="color:#0af;margin:15px 0 5px">Live Positions</h3>'
+    live_positions_html = '<h3 class="color-cyan sub-heading">Live Positions</h3>'
     live_pos_count = 0
     for p in open_pos:
         live_meta = p.get('metadata', {}).get('live', {})
@@ -711,187 +695,9 @@ def make_html():
     if live_pos_count > 0:
         live_positions_html += f'<p>{live_pos_count} positions with live CLOB orders</p>'
     else:
-        live_positions_html += '<p style="color:#555">No live positions. Switch to DUAL or LIVE mode and fund your account to start.</p>'
+        live_positions_html += '<p class="color-muted">No live positions. Switch to DUAL or LIVE mode and fund your account to start.</p>'
 
     live_tab_html_val = live_bal_html + live_positions_html
-
-    # --- Build Control Panel Tab ---
-    ctrl_mode_html = f'Mode: <span style="color:{mode_color}">{mode_label}</span><br>'
-    control_tab_html_val = """
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:10px">
-  <div>
-    <h3 style="color:#0af;margin:0 0 10px">Mode Control</h3>
-    <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="ctrl-btn paper-btn" onclick="setMode('paper')">Switch to PAPER</button>
-      <button class="ctrl-btn shadow-btn" onclick="setMode('shadow')">Switch to SHADOW</button>
-      <button class="ctrl-btn live-btn" onclick="setMode('live')">Switch to LIVE ⚠️</button>
-    </div>
-    <h3 style="color:#0af;margin:20px 0 10px">System</h3>
-    <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="ctrl-btn" onclick="ctrlAction('restart')">Restart All Processes</button>
-      <button class="ctrl-btn" onclick="ctrlAction('restart_engine')">Restart Trading Engine</button>
-      <button class="ctrl-btn danger-btn" onclick="ctrlAction('stop')">EMERGENCY STOP</button>
-    </div>
-  </div>
-  <div>
-    <h3 style="color:#0af;margin:0 0 10px">Parameters</h3>
-    <div style="display:grid;grid-template-columns:180px 80px;gap:6px;align-items:center">
-      <label style="color:#888">Max Positions:</label>
-      <input type="number" class="ctrl-input" id="param-max-pos" value=""" + f'"{config.get("max_open_positions", 20)}"' + """ min="1" max="50">
-      <label style="color:#888">Capital Per Trade ($):</label>
-      <input type="number" class="ctrl-input" id="param-cap-trade" value=""" + f'"{config.get("live_trading",dict()).get("capital_per_trade", 10)}"' + """ min="1" max="1000">
-      <label style="color:#888">Min Profit (%):</label>
-      <input type="number" class="ctrl-input" id="param-min-profit" value=""" + f'"{config.get("fees",dict()).get("min_profit_threshold", 0.03) * 100:.1f}"' + """ min="0.1" max="50" step="0.1">
-      <label style="color:#888">Max Price Drift (%):</label>
-      <input type="number" class="ctrl-input" id="param-drift" value=""" + f'"{config.get("live_trading",dict()).get("max_price_drift_pct", 0.05) * 100:.0f}"' + """ min="1" max="20">
-    </div>
-    <button class="ctrl-btn" style="margin-top:12px" onclick="saveParams()">Save Parameters</button>
-    <p style="color:#555;font-size:10px;margin-top:8px">Changes require L4 restart to take effect</p>
-    <h3 style="color:#0af;margin:20px 0 10px">Quick Info</h3>
-    <div style="color:#888;font-size:11px;line-height:1.6">
-' + ctrl_mode_html + '
-      Config: config/config.yaml<br>
-      Secrets: config/secrets.yaml<br>
-      L4 Log: logs/layer4_*.log
-    </div>
-  </div>
-</div>
-<div id="ctrl-status" style="margin-top:15px;padding:8px;display:none;border:1px solid #333;border-radius:4px;font-size:12px"></div>
-"""
-
-    # --- Build annualized badges ---
-    paper_ann_badge = ''
-    if annualized_str and annualized_str != 'N/A':
-        a_color = '#0f0' if annualized_ret >= 0 else '#f44'
-        paper_ann_badge = f' <span class="tab-annualized" style="color:{a_color}">{annualized_str} ann.</span>'
-
-    shadow_ann_badge = ''  # TODO: track shadow-only P&L
-    live_ann_badge = ''    # TODO: track live-only P&L
-
-    # --- Build Shadow Tab ---
-    shadow_rows = ''
-    try:
-        import glob
-        log_files = sorted(glob.glob(str(WORKSPACE / 'logs' / 'layer4_*.log')), reverse=True)[:2]
-        shadow_entries = []
-        for lf in log_files:
-            with open(lf) as f:
-                for line in f:
-                    if '[SHADOW]' in line:
-                        shadow_entries.append(line.strip())
-        shadow_entries = shadow_entries[-50:]  # last 50
-        would_trade = [e for e in shadow_entries if 'WOULD TRADE' in e]
-        rejected = [e for e in shadow_entries if 'Rejected' in e]
-        # Count rejection reasons
-        from collections import Counter
-        reject_reasons = Counter()
-        for e in rejected:
-            reason = e.split('- ')[-1] if '- ' in e else '?'
-            # Simplify reason
-            if 'no_tokens' in reason: reason = 'no_tokens'
-            elif 'no_live_price' in reason: reason = 'no_live_price'
-            elif 'insufficient_balance' in reason: reason = 'insufficient_balance'
-            elif 'insufficient_depth' in reason: reason = 'insufficient_depth'
-            elif 'price_drift' in reason: reason = 'price_drift'
-            elif 'profit_below' in reason: reason = 'profit_below_threshold'
-            elif 'no_mispricing' in reason: reason = 'no_mispricing'
-            reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
-
-        shadow_stats = f"""<div class="stats">
-  <div class="stat"><div class="label">WOULD TRADE</div><div class="value good">{len(would_trade)}</div></div>
-  <div class="stat"><div class="label">REJECTED</div><div class="value">{len(rejected)}</div></div>
-  <div class="stat"><div class="label">TOTAL CHECKED</div><div class="value">{len(shadow_entries)}</div></div>
-</div>"""
-
-        # Rejection breakdown table
-        reject_table = '<h3 style="color:#fa0;margin:15px 0 5px">Rejection Reasons</h3><table><tr><th>Reason</th><th>Count</th></tr>'
-        for reason, cnt in sorted(reject_reasons.items(), key=lambda x: -x[1]):
-            reject_table += f'<tr><td>{html_mod.escape(reason)}</td><td>{cnt}</td></tr>'
-        reject_table += '</table>'
-
-        # Last 10 would-trade entries
-        trade_log = '<h3 style="color:#0f0;margin:15px 0 5px">Recent Would-Trade Signals</h3>'
-        if would_trade:
-            trade_log += '<table><tr><th>Time</th><th>Opportunity</th><th>Details</th></tr>'
-            for e in would_trade[-10:]:
-                parts = e.split(' - [L4] INFO - ')
-                ts = parts[0][:19] if parts else ''
-                msg = parts[1] if len(parts) > 1 else e
-                trade_log += f'<tr><td>{html_mod.escape(ts)}</td><td colspan="2" style="color:#0f0">{html_mod.escape(msg[:120])}</td></tr>'
-            trade_log += '</table>'
-        else:
-            trade_log += '<p style="color:#555">No would-trade signals yet. Opportunities that pass all live validation checks will appear here.</p>'
-
-        shadow_tab_html_val = shadow_stats + reject_table + trade_log
-    except Exception as e:
-        shadow_tab_html_val = f'<p style="color:#f44">Error loading shadow data: {html_mod.escape(str(e))}</p>'
-
-    # --- Build Live Tab ---
-    live_bal_html = ''
-    if live_balance is not None:
-        live_bal_html = f"""<div class="stats">
-  <div class="stat"><div class="label">USDC BALANCE</div><div class="value" style="color:#fa0">${live_balance:.2f}</div></div>
-  <div class="stat"><div class="label">STATUS</div><div class="value" style="color:{'#0f0' if mode_label in ('LIVE','DUAL (PAPER+LIVE)') else '#fa0'}">{'ACTIVE' if mode_label in ('LIVE','DUAL (PAPER+LIVE)') else 'SHADOW ONLY'}</div></div>
-</div>"""
-    else:
-        live_bal_html = '<div class="stats"><div class="stat"><div class="label">STATUS</div><div class="value" style="color:#555">NOT CONNECTED</div></div></div>'
-
-    # Live positions (positions with live metadata)
-    live_positions_html = '<h3 style="color:#0af;margin:15px 0 5px">Live Positions</h3>'
-    live_pos_count = 0
-    for p in open_pos:
-        live_meta = p.get('metadata', {}).get('live', {})
-        if live_meta:
-            live_pos_count += 1
-    if live_pos_count > 0:
-        live_positions_html += f'<p>{live_pos_count} positions with live CLOB orders</p>'
-    else:
-        live_positions_html += '<p style="color:#555">No live positions. Switch to DUAL or LIVE mode and fund your account to start.</p>'
-
-    live_tab_html_val = live_bal_html + live_positions_html
-
-    # --- Build Control Panel Tab ---
-    control_tab_html_val = """
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:10px">
-  <div>
-    <h3 style="color:#0af;margin:0 0 10px">Mode Control</h3>
-    <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="ctrl-btn paper-btn" onclick="setMode('paper')">Switch to PAPER</button>
-      <button class="ctrl-btn shadow-btn" onclick="setMode('shadow')">Switch to SHADOW</button>
-      <button class="ctrl-btn live-btn" onclick="setMode('live')">Switch to LIVE ⚠️</button>
-    </div>
-    <h3 style="color:#0af;margin:20px 0 10px">System</h3>
-    <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="ctrl-btn" onclick="ctrlAction('restart')">Restart All Processes</button>
-      <button class="ctrl-btn" onclick="ctrlAction('restart_engine')">Restart Trading Engine</button>
-      <button class="ctrl-btn danger-btn" onclick="ctrlAction('stop')">EMERGENCY STOP</button>
-    </div>
-  </div>
-  <div>
-    <h3 style="color:#0af;margin:0 0 10px">Parameters</h3>
-    <div style="display:grid;grid-template-columns:180px 80px;gap:6px;align-items:center">
-      <label style="color:#888">Max Positions:</label>
-      <input type="number" class="ctrl-input" id="param-max-pos" value=""" + f'"{config.get("max_open_positions", 20)}"' + """ min="1" max="50">
-      <label style="color:#888">Capital Per Trade ($):</label>
-      <input type="number" class="ctrl-input" id="param-cap-trade" value=""" + f'"{config.get("live_trading",{}).get("capital_per_trade", 10)}"' + """ min="1" max="1000">
-      <label style="color:#888">Min Profit (%):</label>
-      <input type="number" class="ctrl-input" id="param-min-profit" value=""" + f'"{config.get("fees",{}).get("min_profit_threshold", 0.03) * 100:.1f}"' + """ min="0.1" max="50" step="0.1">
-      <label style="color:#888">Max Price Drift (%):</label>
-      <input type="number" class="ctrl-input" id="param-drift" value=""" + f'"{config.get("live_trading",{}).get("max_price_drift_pct", 0.05) * 100:.0f}"' + """ min="1" max="20">
-    </div>
-    <button class="ctrl-btn" style="margin-top:12px" onclick="saveParams()">Save Parameters</button>
-    <p style="color:#555;font-size:10px;margin-top:8px">Changes require L4 restart to take effect</p>
-    <h3 style="color:#0af;margin:20px 0 10px">Quick Info</h3>
-    <div style="color:#888;font-size:11px;line-height:1.6">
-      Mode: <span style="color:{mode_color}">{mode_label}</span><br>
-      Config: config/config.yaml<br>
-      Secrets: config/secrets.yaml<br>
-      L4 Log: logs/layer4_*.log
-    </div>
-  </div>
-</div>
-<div id="ctrl-status" style="margin-top:15px;padding:8px;display:none;border:1px solid #333;border-radius:4px;font-size:12px"></div>
-"""
 
     start_str = START_TIME.strftime('%d/%m/%Y %H:%M')
     now_str = now.strftime('%d/%m/%Y %H:%M:%S')
@@ -903,11 +709,8 @@ def make_html():
 <title>Prediction Trader Dashboard</title>
 <style>
   body {{ font-family: 'Courier New', monospace; background: #0a0a0a; color: #ccc; padding: 20px; margin: 0; }}
-  .header {{ display: flex; justify-content: space-between; align-items: baseline; margin: 0 0 5px 0; }}
   .header h1 {{ color: #0f0; margin: 0; }}
   .mode-badge {{ display: inline-block; padding: 3px 12px; border-radius: 4px; font-size: 13px; font-weight: bold; margin-left: 12px; vertical-align: middle; letter-spacing: 1px; border: 1px solid; }}
-  .header .meta {{ color: #888; font-size: 12px; text-align: right; }}
-  .header .meta span {{ color: #aaa; }}
   h2 {{ color: #0af; margin: 20px 0 8px 0; font-size: 16px; }}
   .stats {{ display: flex; gap: 12px; margin: 10px 0; flex-wrap: wrap; }}
   .stat {{ background: #1a1a1a; border: 1px solid #333; padding: 8px 14px; border-radius: 8px; }}
@@ -947,42 +750,10 @@ def make_html():
   .section-title:hover {{ color: #0f0; }}
   .section-title::before {{ content: '\\25BC \\00a0'; font-size: 10px; }}
   .section-title.collapsed::before {{ content: '\\25B6 \\00a0'; font-size: 10px; }}
-  .section-content {{ }}
   .section-content.hidden {{ display: none; }}
-  .section-btn {{ background: #333; color: #0af; border: 1px solid #0af; padding: 2px 10px; font-size: 11px; cursor: pointer; margin-left: 12px; font-family: 'Courier New', monospace; border-radius: 4px; display: none; vertical-align: middle; }}
-  .section-btn:hover {{ background: #0af; color: #000; }}
-  .section-btn.paused {{ color: #f80; border-color: #f80; }}
-  .section-btn.paused:hover {{ background: #f80; color: #000; }}
-  .refresh-indicator {{ color: #555; font-size: 11px; margin-left: 8px; }}
-  .refresh-indicator.paused {{ color: #f80; }}
+  .collapse-all-btn {{ background: #333; color: #0af; border: 1px solid #0af; padding: 2px 10px; font-size: 11px; cursor: pointer; margin-left: 12px; font-family: 'Courier New', monospace; border-radius: 4px; vertical-align: middle; }}
+  .collapse-all-btn:hover {{ background: #0af; color: #000; }}
 
-  /* Control panel */
-  .ctrl-btn {{ padding: 8px 16px; background: #1a1a2a; color: #0af; border: 1px solid #0af; cursor: pointer; font-family: 'Courier New', monospace; font-size: 12px; border-radius: 4px; transition: all 0.15s; width: 100%; }}
-  .ctrl-btn:hover {{ background: #0af; color: #000; }}
-  .danger-btn {{ color: #f44; border-color: #f44; }}
-  .danger-btn:hover {{ background: #f44; color: #000; }}
-  .shadow-btn {{ color: #fa0; border-color: #fa0; }}
-  .shadow-btn:hover {{ background: #fa0; color: #000; }}
-  .paper-btn {{ color: #0f0; border-color: #0f0; }}
-  .paper-btn:hover {{ background: #0f0; color: #000; }}
-  .live-btn {{ color: #f44; border-color: #f44; }}
-  .live-btn:hover {{ background: #f44; color: #000; }}
-  .ctrl-input {{ background: #111; color: #ccc; border: 1px solid #444; padding: 4px 8px; font-family: 'Courier New', monospace; font-size: 12px; border-radius: 3px; width: 70px; }}
-  .ctrl-input:focus {{ border-color: #0af; outline: none; }}
-
-  /* Control panel */
-  .ctrl-btn {{ padding: 8px 16px; background: #1a1a2a; color: #0af; border: 1px solid #0af; border-radius: 4px; cursor: pointer; font-family: 'Courier New', monospace; font-size: 12px; transition: all 0.15s; }}
-  .ctrl-btn:hover {{ background: #0af; color: #000; }}
-  .danger-btn {{ color: #f44; border-color: #f44; }}
-  .danger-btn:hover {{ background: #f44; color: #000; }}
-  .shadow-btn {{ color: #fa0; border-color: #fa0; }}
-  .shadow-btn:hover {{ background: #fa0; color: #000; }}
-  .paper-btn {{ color: #0f0; border-color: #0f0; }}
-  .paper-btn:hover {{ background: #0f0; color: #000; }}
-  .live-btn {{ color: #f44; border-color: #f44; }}
-  .live-btn:hover {{ background: #f44; color: #000; }}
-  .ctrl-input {{ background: #111; color: #ccc; border: 1px solid #444; padding: 4px 8px; font-family: 'Courier New', monospace; font-size: 12px; border-radius: 3px; width: 70px; }}
-  .ctrl-input:focus {{ border-color: #0af; outline: none; }}
   /* Tab navigation */
   .tab-bar {{ display: flex; gap: 0; margin: 12px 0 0 0; border-bottom: 2px solid #333; }}
   .tab-btn {{ padding: 8px 20px; background: #111; color: #888; border: 1px solid #333; border-bottom: none; cursor: pointer; font-family: 'Courier New', monospace; font-size: 13px; font-weight: bold; letter-spacing: 0.5px; border-radius: 6px 6px 0 0; margin-right: 2px; transition: all 0.15s; }}
@@ -999,20 +770,47 @@ def make_html():
         .val-tag {{ font-size: 0.68em; margin-left: 3px; padding: 1px 3px; border-radius: 3px; vertical-align: middle; }}
         .vtick {{ color: #4c4; background: #1a2e1a; border: 1px solid #2a4a2a; }}
         .vapi  {{ color: #888; background: #1e1e1e; border: 1px solid #333; }}
+  /* Dynamic utility classes — replace inline style= for easy theming */
+  .color-positive {{ color: #4c4; }}
+  .color-negative {{ color: #f55; }}
+  .color-green {{ color: #0f0; }}
+  .color-red {{ color: #f44; }}
+  .color-amber {{ color: #fa0; }}
+  .color-cyan {{ color: #0af; }}
+  .color-muted {{ color: #555; }}
+  .color-dim {{ color: #888; }}
+  .text-bold {{ font-weight: bold; }}
+  .text-sm {{ font-size: 11px; }}
+  .text-xs {{ font-size: 10px; }}
+  .mt-sm {{ margin-top: 4px; }}
+  .mt-md {{ margin-top: 6px; }}
+  .mt-lg {{ margin-top: 15px; }}
+  .mb-sm {{ margin-bottom: 5px; }}
+  .pl-indent {{ padding-left: 25px; }}
+  .scenario-header {{ margin-top: 6px; font-size: 11px; }}
+  .scenario-line {{ font-size: 11px; }}
+  .guaranteed-line {{ margin-top: 4px; font-weight: bold; }}
+  .sub-heading {{ margin: 15px 0 5px; }}
+  .agg-total-row {{ border-top: 2px solid #0af; font-weight: bold; }}
+  /* Mode badge — set dynamically via Python class */
+  .mode-shadow {{ color: #fa0; background: #332800; border-color: #fa0; }}
+  .mode-live {{ color: #f44; background: #3a1111; border-color: #f44; }}
+  .mode-dual {{ color: #fa0; background: #3a2a00; border-color: #fa0; }}
+  .mode-paper {{ color: #0f0; background: #113311; border-color: #0f0; }}
+  /* SSE connection indicator */
+  .sse-dot {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #555; vertical-align: middle; margin-right: 4px; transition: background 0.3s; }}
+  .sse-dot.connected {{ background: #0f0; }}
+  .sse-dot.disconnected {{ background: #f44; }}
 </style>
 <script>
-var refreshBehaviourNormal = true;
-
-    function toggleOpp(idx) {{
-      var d = document.getElementById("opp-detail-" + idx);
-      if (d) {{
-        d.classList.toggle("show");
-        var prev = d.previousElementSibling;
-        if (prev) prev.classList.toggle("expanded");
-      }}
-      refreshBehaviourNormal = true;
-      updateRefreshState();
-    }}
+function toggleOpp(idx) {{
+  var d = document.getElementById("opp-detail-" + idx);
+  if (d) {{
+    d.classList.toggle("show");
+    var prev = d.previousElementSibling;
+    if (prev) prev.classList.toggle("expanded");
+  }}
+}}
 function togglePos(idx) {{
   var row = document.getElementById('detail-' + idx);
   var main = document.getElementById('pos-' + idx);
@@ -1020,109 +818,45 @@ function togglePos(idx) {{
     row.classList.toggle('show');
     main.classList.toggle('expanded');
   }}
-  refreshBehaviourNormal = true;
-  updateRefreshState();
 }}
-
 function collapseAll() {{
   document.querySelectorAll('.detail-row.show').forEach(function(r) {{ r.classList.remove('show'); }});
   document.querySelectorAll('.pos-row.expanded').forEach(function(r) {{ r.classList.remove('expanded'); }});
-  refreshBehaviourNormal = true;
-  updateRefreshState();
 }}
-
 function toggleSection(el) {{
   el.classList.toggle('collapsed');
   var content = el.nextElementSibling;
   if (content) content.classList.toggle('hidden');
-  refreshBehaviourNormal = true;
-  updateRefreshState();
 }}
 
-function toggleRefresh(btn, evt) {{
-  evt.stopPropagation();
-  refreshBehaviourNormal = !refreshBehaviourNormal;
-  updateRefreshState();
-}}
-
-function updateRefreshState() {{
-  var detailOpen = document.querySelectorAll('.detail-row.show').length > 0;
-
-  // Positions: show collapse-all when details expanded, else show refresh btn when section open
-  var colBtn = document.getElementById('collapse-all-btn');
-  var posRefBtn = document.getElementById('pos-refresh-btn');
-  var posTitle = document.getElementById('section-positions');
-  var posOpen = posTitle && !posTitle.classList.contains('collapsed');
-  if (colBtn) colBtn.style.display = detailOpen ? 'inline-block' : 'none';
-  if (posRefBtn) {{
-    if (posOpen && !detailOpen) {{
-      posRefBtn.style.display = 'inline-block';
-    }} else {{
-      posRefBtn.style.display = 'none';
-    }}
-  }}
-
-  // All refresh-toggle-btn: show when parent section is expanded
-  document.querySelectorAll('.refresh-toggle-btn').forEach(function(btn) {{
-    var title = btn.closest('h2');
-    var isExpanded = title && !title.classList.contains('collapsed');
-    // For positions, already handled above
-    if (btn.id === 'pos-refresh-btn') return;
-    if (isExpanded) {{
-      btn.style.display = 'inline-block';
-    }} else {{
-      btn.style.display = 'none';
-    }}
-  }});
-
-  // Update text on ALL visible refresh-toggle-btn
-  document.querySelectorAll('.refresh-toggle-btn').forEach(function(btn) {{
-    if (btn.style.display !== 'none') {{
-      if (refreshBehaviourNormal) {{
-        btn.textContent = '\u25B6 Resume Refresh';
-      }} else {{
-        btn.textContent = '\u23F8 Pause Refresh';
-      }}
-    }}
-  }});
-
-  // Footer indicator
-  var ind = document.getElementById('refresh-status');
-  if (ind) {{
-    var anythingExpanded = document.querySelectorAll('.detail-row.show').length > 0;
-    document.querySelectorAll('.section-title').forEach(function(t) {{
-      if (!t.classList.contains('collapsed') && t.id !== 'section-positions') anythingExpanded = true;
-    }});
-    var blocked = (anythingExpanded && refreshBehaviourNormal);
-    if (blocked) {{
-      ind.textContent = '(paused)';
-      ind.classList.add('paused');
-    }} else {{
-      ind.textContent = '(active)';
-      ind.classList.remove('paused');
-    }}
-  }}
-}}
-
-// === Auto-refresh: reload after 60s with no user interaction ===
+// === SSE: live stats updates without page reload ===
 (function() {{
-  var IDLE_MS = 10000;
-  var deadline = Date.now() + IDLE_MS;
-  function resetIdle() {{ deadline = Date.now() + IDLE_MS; }}
-  ['mousemove','keydown','mousedown','touchstart','scroll','click'].forEach(function(ev) {{
-    document.addEventListener(ev, resetIdle, {{passive: true}});
-  }});
-  setInterval(function() {{
-    var anythingExpanded = document.querySelectorAll('.detail-row.show').length > 0;
-    document.querySelectorAll('.section-title').forEach(function(t) {{
-      if (!t.classList.contains('collapsed') && t.id !== 'section-positions') anythingExpanded = true;
-    }});
-    var controlOpen = document.getElementById('tab-control') && document.getElementById('tab-control').classList.contains('active');
-    var blocked = (anythingExpanded && refreshBehaviourNormal) || controlOpen;
-    if (!blocked && Date.now() >= deadline) {{
-      location.reload();
-    }}
-  }}, 5000);
+  var es = new EventSource('/stream');
+  var dot = document.getElementById('sse-dot');
+  es.onmessage = function(e) {{
+    try {{
+      var d = JSON.parse(e.data);
+      function upd(id, val, cls) {{
+        var el = document.getElementById(id);
+        if (el) {{ el.textContent = val; if (cls !== undefined) el.className = 'value ' + cls; }}
+      }}
+      upd('stat-total', '$' + d.total_value.toFixed(2), d.total_value >= d.init_cap ? 'good' : 'bad');
+      upd('stat-cash', '$' + d.cash.toFixed(2));
+      upd('stat-deployed', '$' + d.deployed.toFixed(2));
+      upd('stat-fees', '$' + d.fees.toFixed(2));
+      upd('stat-return', (d.ret_pct >= 0 ? '+' : '') + d.ret_pct.toFixed(1) + '%', d.ret_pct >= 0 ? 'good' : 'bad');
+      upd('stat-trades', '' + d.trades);
+      upd('stat-open', '' + d.open_count);
+      upd('stat-realized', '$' + d.realized.toFixed(2), d.realized >= 0 ? 'good' : 'bad');
+      if (d.annualized) upd('stat-annualized', d.annualized, d.annualized_ret >= 0 ? 'good' : 'bad');
+      var ts = document.getElementById('last-update');
+      if (ts) ts.textContent = d.timestamp;
+      if (dot) {{ dot.className = 'sse-dot connected'; clearTimeout(dot._t); dot._t = setTimeout(function(){{ dot.className = 'sse-dot'; }}, 1500); }}
+    }} catch(ex) {{ console.warn('SSE parse error', ex); }}
+  }};
+  es.onerror = function() {{
+    if (dot) dot.className = 'sse-dot disconnected';
+  }};
 }})();
 
 // === Tab switching with URL hash persistence ===
@@ -1134,51 +868,15 @@ function switchTab(tabName) {{
   for (var i = 0; i < btns.length; i++) {{ if (btns[i].getAttribute('data-tab') === tabName) btns[i].classList.add('active'); }}
   window.location.hash = tabName;
 }}
-// Restore tab from URL hash on load
 (function() {{
   var hash = window.location.hash.replace('#', '');
-  if (hash && document.getElementById('tab-' + hash)) {{
-    switchTab(hash);
-  }}
+  if (hash && document.getElementById('tab-' + hash)) switchTab(hash);
 }})();
-
-// === Control panel functions ===
-function showCtrlStatus(msg, color) {{
-  var el = document.getElementById('ctrl-status');
-  if (el) {{ el.style.display = 'block'; el.style.color = color || '#0af'; el.textContent = msg; }}
-}}
-function setMode(mode) {{
-  var msg = 'Switch to ' + mode.toUpperCase() + ' mode?';
-  if (mode === 'live') msg += ' WARNING: This will use REAL money!';
-  if (!confirm(msg)) return;
-  fetch('/api/mode', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{mode:mode}})}})
-    .then(function(r){{return r.json()}}).then(function(d){{showCtrlStatus(d.message||'Done',d.ok?'#0f0':'#f44')}})
-    .catch(function(e){{showCtrlStatus('Error: '+e,'#f44')}});
-}}
-function ctrlAction(action) {{
-  if (action === 'stop') {{
-    if (!confirm('EMERGENCY STOP: This will halt all trading immediately. Continue?')) return;
-  }}
-  fetch('/api/action', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:action}})}})
-    .then(function(r){{return r.json()}}).then(function(d){{showCtrlStatus(d.message||'Done',d.ok?'#0f0':'#f44')}})
-    .catch(function(e){{showCtrlStatus('Error: '+e,'#f44')}});
-}}
-function saveParams() {{
-  var params = {{
-    max_positions: parseInt(document.getElementById('param-max-pos').value),
-    capital_per_trade: parseInt(document.getElementById('param-cap-trade').value),
-    min_profit_pct: parseFloat(document.getElementById('param-min-profit').value) / 100,
-    max_price_drift_pct: parseFloat(document.getElementById('param-drift').value) / 100
-  }};
-  fetch('/api/params', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(params)}})
-    .then(function(r){{return r.json()}}).then(function(d){{showCtrlStatus(d.message||'Saved',d.ok?'#0f0':'#f44')}})
-    .catch(function(e){{showCtrlStatus('Error: '+e,'#f44')}});
-}}
 </script>
 </head><body>
 
 <div class="header">
-  <h1>&#x1F4C8; PREDICTION TRADER <span class="mode-badge" style="color:{mode_color};background:{mode_bg};border-color:{mode_color}">{mode_label}</span></h1>
+  <h1>&#x1F4C8; PREDICTION TRADER <span class="mode-badge {mode_class}">{mode_label}</span></h1>
   <div class="meta">
     Started: <span>{first_trade_str}</span><br>
     System Restarted: <span>{start_str} UTC</span><br>
@@ -1189,40 +887,40 @@ function saveParams() {{
 <div class="stats">
   <div class="stat">
     <div class="label">TOTAL VALUE</div>
-    <div class="value {'good' if total_value >= init_cap else 'bad'}">${total_value:.2f}</div>
+    <div id="stat-total" class="value {'good' if total_value >= init_cap else 'bad'}">${total_value:.2f}</div>
   </div>
   <div class="stat">
     <div class="label">CASH</div>
-    <div class="value">${cap:.2f}</div>
+    <div id="stat-cash" class="value">${cap:.2f}</div>
   </div>
   <div class="stat">
     <div class="label">DEPLOYED</div>
-    <div class="value">${deployed:.2f}</div>
+    <div id="stat-deployed" class="value">${deployed:.2f}</div>
   </div>
   <div class="stat">
     <div class="label">FEES PAID</div>
-    <div class="value">${total_fees:.2f}</div>
+    <div id="stat-fees" class="value">${total_fees:.2f}</div>
   </div>
-  {f'<div class="stat"><div class="label">USDC (LIVE)</div><div class="value" style="color:#fa0">${live_balance:.2f}</div></div>' if live_balance is not None else ''}
+  {f'<div class="stat"><div class="label">USDC (LIVE)</div><div id="stat-usdc" class="value color-amber">${live_balance:.2f}</div></div>' if live_balance is not None else ''}
   <div class="stat">
     <div class="label">RETURN</div>
-    <div class="value {'good' if ret_pct >= 0 else 'bad'}">{ret_pct:+.1f}%</div>
+    <div id="stat-return" class="value {'good' if ret_pct >= 0 else 'bad'}">{ret_pct:+.1f}%</div>
   </div>
   <div class="stat">
     <div class="label">TRADES</div>
-    <div class="value">{trades}</div>
+    <div id="stat-trades" class="value">{trades}</div>
   </div>
   <div class="stat">
     <div class="label">OPEN</div>
-    <div class="value">{len(open_pos)}</div>
+    <div id="stat-open" class="value">{len(open_pos)}</div>
   </div>
   <div class="stat">
     <div class="label">REALIZED P&L</div>
-    <div class="value {'good' if total_realized >= 0 else 'bad'}">${total_realized:.2f}</div>
+    <div id="stat-realized" class="value {'good' if total_realized >= 0 else 'bad'}">${total_realized:.2f}</div>
   </div>
   <div class="stat">
     <div class="label">ANNUALIZED (closed)</div>
-    <div class="value {'good' if annualized_ret >= 0 else 'bad'}">{annualized_str}</div>
+    <div id="stat-annualized" class="value {'good' if annualized_ret >= 0 else 'bad'}">{annualized_str}</div>
   </div>
 </div>
 
@@ -1230,19 +928,18 @@ function saveParams() {{
   <div class="tab-btn active" data-tab="paper" onclick="switchTab('paper')">Paper{paper_ann_badge}</div>
   <div class="tab-btn" data-tab="shadow" onclick="switchTab('shadow')">Shadow{shadow_ann_badge}</div>
   <div class="tab-btn" data-tab="live" onclick="switchTab('live')">Live{live_ann_badge}</div>
-  <div class="tab-btn" data-tab="control" onclick="switchTab('control')">Control Panel</div>
 </div>
 
 <div id="tab-paper" class="tab-content active">
-<h2 class="section-title" id="section-positions" onclick="toggleSection(this)">OPEN POSITIONS ({len(open_pos)})<button id="pos-refresh-btn" class="section-btn refresh-toggle-btn" onclick="toggleRefresh(this, event)" style="display:none"></button><button id="collapse-all-btn" class="section-btn" onclick="event.stopPropagation(); collapseAll()">Collapse All</button></h2>
+<h2 class="section-title" id="section-positions" onclick="toggleSection(this)">OPEN POSITIONS ({len(open_pos)})<button class="collapse-all-btn" onclick="event.stopPropagation(); collapseAll()">Collapse All</button></h2>
 <div class="section-content">
 <table>
 <tr><th>#</th><th>Market</th><th>Strategy</th><th>Score</th><th>Deployed</th><th>Expected P&L</th><th>Resolves</th><th>Status</th><th>Entered</th></tr>
-{pos_rows_html if pos_rows_html else '<tr><td colspan="8" style="color:#555">No open positions</td></tr>'}
+{pos_rows_html if pos_rows_html else '<tr><td colspan="8" class="color-muted">No open positions</td></tr>'}
 </table>
 </div>
 
-<h2 class="section-title collapsed" onclick="toggleSection(this)">AGGREGATE HOLDINGS ({len(agg_markets)} markets)<button class="section-btn refresh-toggle-btn" onclick="toggleRefresh(this, event)" style="display:none"></button></h2>
+<h2 class="section-title collapsed" onclick="toggleSection(this)">AGGREGATE HOLDINGS ({len(agg_markets)} markets)</h2>
 <div class="section-content hidden">
 <table>
 <tr><th>Market</th><th>Side</th><th>Deployed</th><th>Avg Price</th><th>Payout (if wins)</th><th>Pos#</th></tr>
@@ -1250,15 +947,15 @@ function saveParams() {{
 </table>
 </div>
 
-<h2 class="section-title collapsed" onclick="toggleSection(this)">OPPORTUNITIES ({len(opps)} found, top 20 by score)<button class="section-btn refresh-toggle-btn" onclick="toggleRefresh(this, event)" style="display:none"></button></h2>
+<h2 class="section-title collapsed" onclick="toggleSection(this)">OPPORTUNITIES ({len(opps)} found, top 20 by score)</h2>
 <div class="section-content hidden">
 <table>
 <tr><th>#</th><th>Profit%</th><th>Resolves</th><th>Strategy</th><th>Score</th><th>Market</th></tr>
-{opp_rows_html if opp_rows_html else '<tr><td colspan="7" style="color:#555">No opportunities</td></tr>'}
+{opp_rows_html if opp_rows_html else '<tr><td colspan="7" class="color-muted">No opportunities</td></tr>'}
 </table>
 </div>
 
-<h2 class="section-title collapsed" onclick="toggleSection(this)">SYSTEM<button class="section-btn refresh-toggle-btn" onclick="toggleRefresh(this, event)" style="display:none"></button></h2>
+<h2 class="section-title collapsed" onclick="toggleSection(this)">SYSTEM</h2>
 <div class="section-content hidden">
 <table>
 <tr><th>Process</th><th>Status</th><th>Info</th></tr>
@@ -1266,7 +963,7 @@ function saveParams() {{
 </table>
 </div>
 
-{'<h2 class="section-title collapsed" onclick="toggleSection(this)">CLOSED POSITIONS<button class="section-btn refresh-toggle-btn" onclick="toggleRefresh(this, event)" style="display:none"></button></h2><div class="section-content hidden">' + closed_html + '</div>' if closed_html else ''}
+{'<h2 class="section-title collapsed" onclick="toggleSection(this)">CLOSED POSITIONS</h2><div class="section-content hidden">' + closed_html + '</div>' if closed_html else ''}
 
 </div><!-- end tab-paper -->
 
@@ -1278,17 +975,72 @@ function saveParams() {{
 {live_tab_html_val}
 </div>
 
-<div id="tab-control" class="tab-content">
-{control_tab_html_val}
-</div>
-
-<div class="footer">Updated: {now_str} UTC | Auto-refresh: 10s <span id="refresh-status">(active)</span></div>
+<div class="footer">Updated: <span id="last-update">{now_str}</span> UTC | <span class="sse-dot" id="sse-dot"></span> Live via SSE</div>
 </body></html>'''
     return html
 
+def get_stats_json():
+    """Return key dashboard metrics as a JSON-serializable dict for SSE."""
+    state = load_execution_state()
+    cap = state.get('current_capital', 0)
+    init_cap = state.get('initial_capital', 100)
+    open_pos = state.get('open_positions', [])
+    closed_pos = state.get('closed_positions', [])
+    perf = state.get('performance', {})
+    deployed = sum(sum(m.get('bet_amount', 0) for m in p.get('markets', {}).values()) for p in open_pos)
+    total_fees = sum(p.get('fees_paid', 0) for p in open_pos) + sum(p.get('fees_paid', 0) for p in closed_pos)
+    total_value = cap + deployed
+    ret_pct = ((total_value - init_cap) / init_cap * 100) if init_cap else 0
+    trades = perf.get('total_trades', 0)
+    total_realized = sum(p.get('actual_profit', 0) for p in closed_pos if p.get('actual_profit') is not None)
+    # Annualized
+    annualized_str = 'N/A'
+    annualized_ret = 0
+    if closed_pos:
+        timestamps = [p.get('entry_timestamp') for p in closed_pos if p.get('entry_timestamp')]
+        if timestamps:
+            try:
+                first_dt = min(datetime.fromisoformat(str(t)) for t in timestamps)
+                if first_dt.tzinfo is None:
+                    first_dt = first_dt.replace(tzinfo=timezone.utc)
+                days = (datetime.now(timezone.utc) - first_dt).total_seconds() / 86400
+                if days > 1:
+                    annualized_ret = (total_realized / init_cap) * (365 / days) * 100
+                    annualized_str = f'{annualized_ret:+.0f}%'
+            except Exception:
+                pass
+    now = datetime.now(timezone.utc)
+    return {
+        'cash': cap, 'deployed': deployed, 'total_value': total_value,
+        'init_cap': init_cap, 'fees': total_fees, 'ret_pct': ret_pct,
+        'trades': trades, 'open_count': len(open_pos),
+        'realized': total_realized, 'annualized': annualized_str,
+        'annualized_ret': annualized_ret,
+        'timestamp': now.strftime('%d/%m/%Y %H:%M:%S'),
+    }
+
+class ThreadingDashboardServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == '/status':
+        if self.path == '/stream':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            try:
+                while True:
+                    data = json.dumps(get_stats_json())
+                    self.wfile.write(f'data: {data}\n\n'.encode())
+                    self.wfile.flush()
+                    time.sleep(5)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass  # Client disconnected
+            return
+        elif self.path == '/status':
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -1313,79 +1065,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
-    def do_POST(self):
-        try:
-            length = int(self.headers.get('Content-Length', 0))
-            body = json.loads(self.rfile.read(length)) if length else {}
-        except:
-            return self._json_response({'ok': False, 'message': 'Invalid JSON'}, 400)
-
-        if self.path == '/api/mode':
-            return self._handle_mode(body)
-        elif self.path == '/api/action':
-            return self._handle_action(body)
-        elif self.path == '/api/params':
-            return self._handle_params(body)
-        else:
-            return self._json_response({'ok': False, 'message': 'Unknown endpoint'}, 404)
-
-    def _handle_mode(self, body):
-        import yaml, subprocess
-        mode = body.get('mode', '')
-        cfg = load_config()
-        if mode == 'paper':
-            cfg['mode'] = 'paper_trading'
-            cfg.setdefault('live_trading', {})['enabled'] = False
-            cfg['live_trading']['shadow_only'] = False
-        elif mode == 'shadow':
-            cfg['mode'] = 'dual'
-            cfg.setdefault('live_trading', {})['enabled'] = True
-            cfg['live_trading']['shadow_only'] = True
-        elif mode == 'live':
-            cfg['mode'] = 'dual'
-            cfg.setdefault('live_trading', {})['enabled'] = True
-            cfg['live_trading']['shadow_only'] = False
-        else:
-            return self._json_response({'ok': False, 'message': f'Unknown mode: {mode}'})
-        with open(CONFIG_PATH, 'w') as f:
-            yaml.dump(cfg, f, default_flow_style=False)
-        # Restart trading engine to pick up new config
-        subprocess.Popen(['pkill', '-f', 'trading_engine'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return self._json_response({'ok': True, 'message': f'Switched to {mode.upper()}. L4 restarting...'})
-
-    def _handle_action(self, body):
-        import subprocess
-        action = body.get('action', '')
-        if action == 'stop':
-            subprocess.Popen(['pkill', '-f', 'main.py'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.Popen(['pkill', '-f', 'layer'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return self._json_response({'ok': True, 'message': 'EMERGENCY STOP executed. All processes killed.'})
-        elif action == 'restart':
-            subprocess.Popen(['pkill', '-f', 'trading_engine'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.Popen(['pkill', '-f', 'layer1_runner'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return self._json_response({'ok': True, 'message': 'All processes killed. Supervisor will restart them.'})
-        elif action in ('restart_l4', 'restart_engine'):
-            subprocess.Popen(['pkill', '-f', 'trading_engine'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return self._json_response({'ok': True, 'message': 'Trading Engine killed. Supervisor will restart it.'})
-        else:
-            return self._json_response({'ok': False, 'message': f'Unknown action: {action}'})
-
-    def _handle_params(self, body):
-        import yaml
-        cfg = load_config()
-        if 'max_positions' in body:
-            cfg['max_open_positions'] = int(body['max_positions'])
-        if 'capital_per_trade' in body:
-            cfg.setdefault('live_trading', {})['capital_per_trade'] = int(body['capital_per_trade'])
-        if 'min_profit_pct' in body:
-            cfg.setdefault('fees', {})['min_profit_threshold'] = float(body['min_profit_pct'])
-        if 'max_price_drift_pct' in body:
-            cfg.setdefault('live_trading', {})['max_price_drift_pct'] = float(body['max_price_drift_pct'])
-        with open(CONFIG_PATH, 'w') as f:
-            yaml.dump(cfg, f, default_flow_style=False)
-        return self._json_response({'ok': True, 'message': 'Parameters saved. Restart L4 to apply.'})
-
 if __name__ == '__main__':
     port = 5556
-    print(f'Dashboard starting on http://localhost:{port}')
-    HTTPServer(('127.0.0.1', port), DashboardHandler).serve_forever()
+    print(f'Dashboard starting on http://localhost:{port} (SSE-enabled)')
+    ThreadingDashboardServer(('0.0.0.0', port), DashboardHandler).serve_forever()

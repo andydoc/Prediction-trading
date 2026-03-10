@@ -709,104 +709,81 @@ class PaperTradingEngine:
         }
     
     def save_state(self, output_path: Path):
-        """Save complete state — SQLite primary, JSON for backward compat."""
+        """Save complete state to SQLite."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        if self._state_store:
-            try:
-                import time as _t
-                t0 = _t.time()
-                # Sync scalars
-                self._state_store.save_scalars({
-                    'current_capital': self.current_capital,
-                    'initial_capital': self.initial_capital,
-                })
-                # Sync performance metrics as scalars
-                perf = self.get_performance_metrics()
-                for k in ('total_trades', 'winning_trades', 'losing_trades',
-                          'total_actual_profit', 'total_expected_profit'):
-                    if k in perf:
-                        self._state_store.save_scalar(k, perf[k])
-                
-                # Sync open positions (full replace — small set, always fresh)
-                open_dicts = [p.to_dict() for p in self.open_positions.values()]
-                # Delete stale open positions from DB using lightweight ID-only query
-                db_open_ids = set()
-                for row in self._state_store.db.execute(
-                        "SELECT position_id FROM positions WHERE status IN ('open','monitoring')").fetchall():
-                    db_open_ids.add(row[0])
-                live_open_ids = {p.position_id for p in self.open_positions.values()}
-                for stale_id in (db_open_ids - live_open_ids):
-                    self._state_store.delete_position(stale_id)
-                if open_dicts:
-                    self._state_store.upsert_positions_bulk(open_dicts, 'open')
-                
-                # Sync closed positions (incremental — count without deserializing)
-                counts = self._state_store.count_by_status()
-                db_closed_count = counts.get('closed', 0)
-                if len(self.closed_positions) > db_closed_count:
-                    new_closed = [p.to_dict() for p in self.closed_positions[db_closed_count:]]
-                    self._state_store.upsert_positions_bulk(new_closed, 'closed')
-                
-                # Atomic backup to disk
-                self._state_store.backup_to_disk()
-                
-                # JSON compat for dashboard — every 5th save (~150s at 30s interval)
-                self._save_counter += 1
-                if self._save_counter % 5 == 1:
-                    self._state_store.save_json_compat(str(output_path))
-                
-                elapsed_ms = (_t.time() - t0) * 1000
-                self.logger.info(f"Saved state (SQLite): {len(self.open_positions)} open, "
-                                f"{len(self.closed_positions)} closed [{elapsed_ms:.0f}ms]")
-                return
-            except Exception as e:
-                self.logger.warning(f"SQLite save failed, falling back to JSON: {e}")
+        if not self._state_store:
+            self.logger.error("No SQLite state store — cannot save state")
+            return
         
-        # JSON fallback
-        state = {
+        import time as _t
+        t0 = _t.time()
+        # Sync scalars
+        self._state_store.save_scalars({
             'current_capital': self.current_capital,
             'initial_capital': self.initial_capital,
-            'open_positions': [p.to_dict() for p in self.open_positions.values()],
-            'closed_positions': [p.to_dict() for p in self.closed_positions],
-            'performance': self.get_performance_metrics()
-        }
+        })
+        # Sync performance metrics as scalars
+        perf = self.get_performance_metrics()
+        for k in ('total_trades', 'winning_trades', 'losing_trades',
+                  'total_actual_profit', 'total_expected_profit'):
+            if k in perf:
+                self._state_store.save_scalar(k, perf[k])
         
-        with open(output_path, 'w') as f:
-            json.dump(state, f, separators=(',', ':'))
+        # Sync open positions (full replace — small set, always fresh)
+        open_dicts = [p.to_dict() for p in self.open_positions.values()]
+        # Delete stale open positions from DB using lightweight ID-only query
+        db_open_ids = set()
+        for row in self._state_store.db.execute(
+                "SELECT position_id FROM positions WHERE status IN ('open','monitoring')").fetchall():
+            db_open_ids.add(row[0])
+        live_open_ids = {p.position_id for p in self.open_positions.values()}
+        for stale_id in (db_open_ids - live_open_ids):
+            self._state_store.delete_position(stale_id)
+        if open_dicts:
+            self._state_store.upsert_positions_bulk(open_dicts, 'open')
         
-        self.logger.info(f"Saved state (JSON): {len(self.open_positions)} open, {len(self.closed_positions)} closed")
+        # Sync closed positions (incremental — count without deserializing)
+        counts = self._state_store.count_by_status()
+        db_closed_count = counts.get('closed', 0)
+        if len(self.closed_positions) > db_closed_count:
+            new_closed = [p.to_dict() for p in self.closed_positions[db_closed_count:]]
+            self._state_store.upsert_positions_bulk(new_closed, 'closed')
+        
+        # Atomic backup to disk
+        self._state_store.backup_to_disk()
+        
+        elapsed_ms = (_t.time() - t0) * 1000
+        self.logger.info(f"Saved state (SQLite): {len(self.open_positions)} open, "
+                        f"{len(self.closed_positions)} closed [{elapsed_ms:.0f}ms]")
 
 
 
     def load_state(self, state_path: Path):
-        """Load state — SQLite primary, JSON migration fallback."""
+        """Load state from SQLite. One-time migration from JSON if no DB exists."""
         
-        # Try SQLite first
-        if self._state_store:
-            try:
-                restored = self._state_store.restore_from_disk()
-                if restored:
-                    self._load_from_state_store()
-                    self.logger.info(f"Loaded state (SQLite): capital=${self.current_capital:.2f}, "
-                                    f"{len(self.open_positions)} open, {len(self.closed_positions)} closed")
-                    return
-                # No disk DB yet — try importing from JSON
-                if state_path.exists():
-                    self.logger.info(f"No SQLite state, migrating from JSON: {state_path}")
-                    self._state_store.import_from_json(str(state_path))
-                    self._load_from_state_store()
-                    self._state_store.backup_to_disk()  # Persist the migration
-                    self.logger.info(f"Migrated JSON→SQLite: capital=${self.current_capital:.2f}, "
-                                    f"{len(self.open_positions)} open, {len(self.closed_positions)} closed")
-                    return
-            except Exception as e:
-                self.logger.warning(f"SQLite load failed, falling back to JSON: {e}")
+        if not self._state_store:
+            self.logger.error("No SQLite state store — cannot load state")
+            return
         
-        # JSON fallback
-        with open(state_path) as f:
-            state = json.load(f)
-        self._load_from_json_dict(state)
+        restored = self._state_store.restore_from_disk()
+        if restored:
+            self._load_from_state_store()
+            self.logger.info(f"Loaded state (SQLite): capital=${self.current_capital:.2f}, "
+                            f"{len(self.open_positions)} open, {len(self.closed_positions)} closed")
+            return
+        
+        # No disk DB yet — one-time migration from JSON if it exists
+        if state_path.exists():
+            self.logger.info(f"No SQLite state, migrating from JSON: {state_path}")
+            self._state_store.import_from_json(str(state_path))
+            self._load_from_state_store()
+            self._state_store.backup_to_disk()  # Persist the migration
+            self.logger.info(f"Migrated JSON→SQLite: capital=${self.current_capital:.2f}, "
+                            f"{len(self.open_positions)} open, {len(self.closed_positions)} closed")
+            return
+        
+        self.logger.warning("No existing state found — starting fresh")
     
     def _load_from_state_store(self):
         """Populate in-memory structures from SQLite state store."""

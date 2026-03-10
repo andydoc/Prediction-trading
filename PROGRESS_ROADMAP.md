@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.03 (pre-release, shadow trading)
-> **Last updated**: 2026-03-10 ~18:00 UTC
+> **Version**: v0.04.04 (pre-release, shadow trading)
+> **Last updated**: 2026-03-10 ~14:00 UTC
 > **Mode**: SHADOW | Laptop: running | VPS (193.23.127.99): $100 fresh capital, all layers healthy
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4GB RAM, Ubuntu 24.04, systemd auto-restart
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
@@ -27,8 +27,7 @@ Two-process system replacing the old four-layer poll-based pipeline:
 |---------|--------|---------|
 | **Market Scanner** | `layer1_runner.py` | Fetches all active markets from Polymarket Gamma API (33k+), writes `latest_markets.json`. Runs at startup + periodic refresh. |
 | **Trading Engine** | `trading_engine.py` | Event-driven core: constraint detection (inline), arb math, execution, position management. Reacts to WS price events in real-time. |
-| Dashboard | `dashboard_server.py` | Web UI on port 5556 |
-| Exec Control | `execution_control.py` | Multi-machine lock server on port 5557 |
+| Dashboard | `dashboard_server.py` | Web UI on port 5556 (SSE live updates) |
 
 **Data flow:**
 ```
@@ -84,14 +83,9 @@ Before entering a position, L4 now optionally calls the Anthropic API to validat
 - **Replacement filter**: `arbitrage.max_days_to_replacement: 30` — when evaluating candidates to *replace* an existing position, only opportunities resolving within 30 days are considered. This is intentionally stricter than the entry filter: replacement should only occur when the incoming opportunity offers faster capital velocity. Because all entered positions already satisfy <60 days, and replacement candidates must satisfy <30 days, replacement scoring always favours near-term resolution over longer-dated alternatives.
 - **Cache**: Results cached for 168 hours (1 week) per constraint group
 
-### 2.4 Multi-Machine Execution Control
+### 2.4 Multi-Machine Coordination (REMOVED — v0.04.04)
 
-Only ONE machine may run L4 at a time. A Flask server manages leader election:
-
-- **Server**: `execution_control.py` (port 5557)
-- **Client**: `execution_control_client.py` (imported by L4)
-- **Behaviour**: TTL-based lock with heartbeat. Fail-open (if server unreachable, allow execution).
-- **Commands**: `exec_claim.sh status|claim|release`
+Execution control server (`execution_control.py`) and client have been removed. Multi-machine access strategy is TBD — VPS runs independently; other machines pull standalone copies for development only.
 
 ### 2.6 VPS Deployment (NEW — v0.03.05)
 
@@ -102,7 +96,6 @@ A ZAP-Hosting Lifetime VPS runs an independent copy of the trading system:
 - **Cost**: $76 one-time (lifetime, no recurring fees)
 - **Service**: `prediction-trader.service` (systemd, auto-start on reboot, Restart=always)
 - **Dashboard**: http://193.23.127.99:5556
-- **Exec Control**: http://193.23.127.99:5557 (API only, not browser-rendered)
 - **Paths**: Repo at `/root/prediction-trader`, venv at `/root/prediction-trader-env`
 - **Note**: Paths use `/root/` not `/home/andydoc/` — sed replacements applied to all runners
 - **Caveat**: Must log into ZAP dashboard every 3 months or server suspended
@@ -112,10 +105,7 @@ A ZAP-Hosting Lifetime VPS runs an independent copy of the trading system:
 
 ### 2.7 Multi-Machine Operation
 
-Currently both laptop and VPS run independently in SHADOW mode with separate execution states. The execution control server on each machine claims its own lock. To coordinate:
-- **Both independent**: Each machine trades its own $100 paper capital (current state)
-- **Coordinated**: Point one machine's `execution_control.url` to the other's `:5557` so only one trades at a time
-- **Leader election**: The machine that claims the lock first becomes the active trader; the other monitors only
+VPS runs the production trading system independently. Laptop and desktop pull standalone copies for development only. Multi-machine coordination strategy TBD.
 
 > See **§5.2** for mode-switching commands.
 
@@ -612,6 +602,22 @@ Root cause: arb math was only 8% of wall time. The other 92% is:
 
 ---
 
+### v0.04.04 (2026-03-10) — Dashboard SSE Rewrite + Exec Control Removal + CSS Consolidation
+- **REPLACED** Dashboard AJAX polling with Server-Sent Events (SSE) — stats update live without page reload
+- **ADDED** `/stream` SSE endpoint: pushes capital, positions, queue depth, latency, WS stats every 5s
+- **ADDED** JS `EventSource` client with auto-reconnect and connection status indicator (green/red dot)
+- **REMOVED** Execution control server (`execution_control.py`), client (`execution_control_client.py`), script (`exec_claim.sh`)
+- **REMOVED** Exec lock HTTP calls from trading engine event loop (was 12.9ms/iter overhead)
+- **REMOVED** Control Panel tab (mode switching, parameter editing, emergency stop)
+- **REMOVED** Pause/resume refresh logic, buttons, and CSS classes
+- **CONSOLIDATED** All inline `style=` attributes into head CSS utility classes (`.color-positive`, `.color-negative`, `.color-warn`, `.color-muted`, `.mode-shadow`, `.mode-live`, `.mode-paper`)
+- **REMOVED** Duplicate code section in dashboard (136 lines of dead merge artifact)
+- **CHANGED** Dashboard reads from SQLite state DB (primary) with JSON fallback
+- **REDUCED** dashboard_server.py from 1391 → 1071 lines (23% smaller)
+- **MEASURED** Post-P0/P1 latency (697 samples): steady-state p50=19-167ms (was 2-6s), bg_queue drains to 0 (was permanently 1400+)
+- **MEASURED** WS reconnect spikes: p50 jumps to 1-4s during ~30s recovery window, then returns to <200ms
+- **NOTED** Exec control strategy to be redesigned for VPS-based multi-machine access
+
 ### v0.04.03 (2026-03-10) — Latency Bottleneck Analysis + P0/P1 Fixes + Dashboard Metrics
 - **ANALYSED** Full bottleneck audit: Rust arb math (19000×) only addressed 8% of wall time; GIL contention is 80%
 - **MEASURED** Eval batch p50=3026ms for ~10ms CPU work (300× overhead from GIL + sleep + HTTP)
@@ -915,8 +921,8 @@ Live figures from `execution_state.json` (post sell-arb payout correction):
 
 ---
 
-*Last updated: 2026-03-10 ~18:00 UTC*
+*Last updated: 2026-03-10 ~14:00 UTC*
 *System: WSL Ubuntu on Windows (laptop) + ZAP-Hosting VPS (193.23.127.99)*
 *Machines: Laptop (WSL authoritative) + VPS (ZAP-Hosting 193.23.127.99) + Desktop HP-800G2 (dormant)*
-*Dashboard: http://localhost:5556 | Exec Control: port 5557*
+*Dashboard: http://localhost:5556 (SSE-enabled)*
 *Git: https://github.com/andydoc/Prediction-trading (branch: main)*

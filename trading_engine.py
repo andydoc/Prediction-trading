@@ -43,7 +43,6 @@ from live_trading import LiveTradingEngine
 from layer1_market_data.market_data import MarketData
 from layer2_constraint_detection.constraint_detector import ConstraintDetector
 from layer3_arbitrage_math.arbitrage_engine import ArbitrageMathEngine
-from execution_control_client import ExecutionLock
 from resolution_validator import (
     get_validated_resolution_date, get_full_validation,
     _load_cache as load_resolution_cache
@@ -1084,16 +1083,6 @@ class TradingEngine:
             log.warning(f'WS manager failed: {e} — running without live prices')
             self.ws_manager = None
 
-        # Execution lock
-        exec_cfg = self.config.get('execution_control', {})
-        exec_lock = ExecutionLock(
-            server_url=exec_cfg.get('url', 'http://localhost:5557'), ttl=300)
-        if not exec_cfg.get('enabled', True):
-            exec_lock.disable()
-            log.info('Execution lock DISABLED')
-        else:
-            log.info(f'Execution lock enabled: {exec_cfg.get("url")}')
-
         # Weekly delay table update
         trigger_weekly_delay_update()
 
@@ -1105,11 +1094,6 @@ class TradingEngine:
         # Phase 8a: Event-based eval wake (replaces asyncio.sleep(1.0))
         self._eval_wake = asyncio.Event()
 
-        # Phase 8b: Exec lock caching (check every 30s, not every iteration)
-        _exec_lock_interval = 30.0        # seconds between exec lock checks
-        _last_exec_check = 0.0
-        _cached_can_execute = True
-
         # =============================================================
         # EVENT LOOP — process WS-triggered evaluations + periodic tasks
         # =============================================================
@@ -1118,19 +1102,6 @@ class TradingEngine:
             now = _time.time()
 
             try:
-                # --- Execution lock check (cached — Phase 8b) ---
-                if (now - _last_exec_check) >= _exec_lock_interval:
-                    _cached_can_execute = exec_lock.can_execute()
-                    if _cached_can_execute and exec_lock._enabled:
-                        exec_lock.heartbeat()
-                    _last_exec_check = now
-                if not _cached_can_execute:
-                    leader = (exec_lock.last_status or {}).get('leader', '?')
-                    if self._iteration % 60 == 1:
-                        log.info(f'[iter {self._iteration}] Locked by {leader} — monitoring only')
-                    await asyncio.sleep(1.0)
-                    continue
-
                 # --- Process WS-triggered constraint evaluations (threaded) ---
                 opportunities = await loop.run_in_executor(
                     self._executor, self._process_pending_evals)

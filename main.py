@@ -4,7 +4,6 @@ Manages two core processes + services:
   Market Scanner (layer1_runner.py) — discovers markets from Polymarket Gamma API
   Trading Engine (trading_engine.py) — event-driven: constraints, arb math, execution via WS
   Dashboard (dashboard_server.py)   — web UI on port 5556
-  Exec Control (execution_control.py) — multi-machine lock server on port 5557
 """
 import json, logging, os, signal, subprocess, sys, time
 from pathlib import Path
@@ -26,7 +25,6 @@ LAYERS = [
     {'name': 'market_scanner', 'script': WORKSPACE / 'layer1_runner.py', 'restart_delay': 10},
     {'name': 'trading_engine', 'script': WORKSPACE / 'trading_engine.py', 'restart_delay': 10},
     {'name': 'dashboard',      'script': WORKSPACE / 'dashboard_server.py', 'restart_delay': 5},
-    {'name': 'exec_ctrl',      'script': WORKSPACE / 'execution_control.py', 'restart_delay': 5},
 ]
 processes = {}
 running = True
