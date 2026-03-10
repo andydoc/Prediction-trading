@@ -253,11 +253,225 @@ fn effective_fill_price(
     total_cost / total_shares
 }
 
+/// Build valid outcome scenarios for a constraint type.
+/// Returns Vec<Vec<f64>> where each inner vec is a binary outcome vector.
+fn build_scenarios(n: usize, constraint_type: &str, implications: &[(usize, usize)]) -> Vec<Vec<f64>> {
+    match constraint_type {
+        "mutual_exclusivity" | "mutex" => {
+            // Exactly one market resolves YES → identity matrix
+            (0..n).map(|i| {
+                let mut row = vec![0.0; n];
+                row[i] = 1.0;
+                row
+            }).collect()
+        }
+        "complementary" => {
+            // For 2 markets: exactly one YES. For N>2: at most one YES + all-zero.
+            if n == 2 {
+                vec![vec![1.0, 0.0], vec![0.0, 1.0]]
+            } else {
+                let mut scenarios: Vec<Vec<f64>> = (0..n).map(|i| {
+                    let mut row = vec![0.0; n];
+                    row[i] = 1.0;
+                    row
+                }).collect();
+                scenarios.push(vec![0.0; n]); // all-zero is valid
+                scenarios
+            }
+        }
+        "logical_implication" => {
+            // Enumerate all 2^N, filter by implication constraints
+            // (i -> j): if outcome[i]=1 then outcome[j] must be 1
+            let total = 1usize << n;
+            let mut scenarios = Vec::new();
+            for mask in 0..total {
+                let outcome: Vec<f64> = (0..n).map(|bit| {
+                    if mask & (1 << bit) != 0 { 1.0 } else { 0.0 }
+                }).collect();
+                let mut valid = true;
+                for &(i, j) in implications {
+                    if i < n && j < n && outcome[i] == 1.0 && outcome[j] == 0.0 {
+                        valid = false;
+                        break;
+                    }
+                }
+                if valid {
+                    scenarios.push(outcome);
+                }
+            }
+            scenarios
+        }
+        _ => {
+            // Unknown: all 2^N combinations (fallback)
+            let total = 1usize << n;
+            (0..total).map(|mask| {
+                (0..n).map(|bit| {
+                    if mask & (1 << bit) != 0 { 1.0 } else { 0.0 }
+                }).collect()
+            }).collect()
+        }
+    }
+}
+
+/// Full polytope arbitrage pipeline:
+///   1. Build valid outcome scenarios from constraint type
+///   2. Run Frank-Wolfe to find optimal bets maximizing guaranteed profit
+///   3. Apply fee and profit threshold checks
+///   4. Return opportunity dict or None
+///
+/// This replaces the Python CVXPY-based Bregman + FW pipeline (~80ms)
+/// with pure Rust (~50-100µs). The Bregman pre-filter is skipped because
+/// FW is fast enough to just always run.
+#[pyfunction]
+fn polytope_arb(
+    py: Python<'_>,
+    market_ids: Vec<String>,
+    yes_prices: Vec<f64>,
+    constraint_type: String,
+    capital: f64,
+    fee_rate: f64,
+    min_profit_threshold: f64,
+    max_profit_threshold: f64,
+    implications: Vec<(usize, usize)>,
+    max_fw_iter: usize,
+) -> PyResult<Option<PyObject>> {
+    let n = market_ids.len();
+    if n < 2 || yes_prices.len() != n {
+        return Ok(None);
+    }
+
+    // Skip dead markets
+    if yes_prices.iter().any(|&p| p < 0.02) {
+        return Ok(None);
+    }
+
+    // Guard: too many markets → 2^N scenarios explodes
+    if n > 12 {
+        return Ok(None);
+    }
+
+    // Price sum sanity checks
+    let price_sum: f64 = yes_prices.iter().sum();
+    let ct = constraint_type.as_str();
+
+    // For mutex: require sum near 1.0 (incomplete groups have sum << 1.0)
+    if ct == "mutual_exclusivity" || ct == "mutex" {
+        if price_sum < 0.90 {
+            return Ok(None);
+        }
+    }
+    // General sanity
+    if price_sum < 0.30 || price_sum > 1.40 {
+        return Ok(None);
+    }
+    // 2-market: sum must be meaningful
+    if n == 2 && price_sum < 0.80 {
+        return Ok(None);
+    }
+
+    // Build scenarios
+    let scenarios = build_scenarios(n, ct, &implications);
+    if scenarios.is_empty() {
+        return Ok(None);
+    }
+
+    // Clip prices
+    let p: Vec<f64> = yes_prices.iter().map(|&x| x.max(1e-6).min(1.0)).collect();
+
+    // --- Frank-Wolfe optimization ---
+    let sum_p: f64 = p.iter().sum();
+    let mut y: Vec<f64> = (0..n).map(|i| ((capital / sum_p) / p[i]).max(0.0)).collect();
+
+    let guaranteed_payout = |y_vec: &[f64]| -> (f64, usize) {
+        let mut min_payout = f64::INFINITY;
+        let mut worst_idx = 0;
+        for (si, scenario) in scenarios.iter().enumerate() {
+            let payout: f64 = scenario.iter().zip(y_vec.iter())
+                .map(|(&s, &yv)| s * yv).sum();
+            if payout < min_payout {
+                min_payout = payout;
+                worst_idx = si;
+            }
+        }
+        (min_payout, worst_idx)
+    };
+
+    for t in 0..max_fw_iter {
+        let (_g_val, worst_idx) = guaranteed_payout(&y);
+        let grad = &scenarios[worst_idx];
+
+        let mut best_i = 0;
+        let mut best_ratio = f64::NEG_INFINITY;
+        for i in 0..n {
+            let ratio = grad[i] / p[i].max(1e-9);
+            if ratio > best_ratio {
+                best_ratio = ratio;
+                best_i = i;
+            }
+        }
+
+        let mut s_vec = vec![0.0; n];
+        s_vec[best_i] = capital / p[best_i];
+
+        let gamma = 2.0 / (t as f64 + 2.0);
+        let mut y_new = vec![0.0; n];
+        let mut diff_norm = 0.0;
+        for i in 0..n {
+            y_new[i] = (1.0 - gamma) * y[i] + gamma * s_vec[i];
+            let d = y_new[i] - y[i];
+            diff_norm += d * d;
+        }
+        if diff_norm.sqrt() < 1e-6 {
+            y = y_new;
+            break;
+        }
+        y = y_new;
+    }
+
+    // Ensure non-negative
+    for v in y.iter_mut() {
+        *v = v.max(0.0);
+    }
+
+    let (guaranteed, _) = guaranteed_payout(&y);
+    let effective_fee = fee_rate * n as f64;
+    let fees = capital * effective_fee;
+    let gross_profit = guaranteed - capital;
+    let net_profit = gross_profit - fees;
+    let profit_pct = net_profit / capital;
+
+    if profit_pct < min_profit_threshold || profit_pct > max_profit_threshold {
+        return Ok(None);
+    }
+
+    // Convert shares (y) to dollar bets: bet_i = y_i * p_i
+    let dict = PyDict::new(py);
+    dict.set_item("method", "polytope_fw")?;
+    dict.set_item("profitable", true)?;
+    dict.set_item("profit_pct", profit_pct)?;
+    dict.set_item("net_profit", net_profit)?;
+    dict.set_item("gross_profit", gross_profit)?;
+    dict.set_item("fees", fees)?;
+    dict.set_item("price_sum", price_sum)?;
+    dict.set_item("constraint_type", constraint_type.as_str())?;
+    dict.set_item("n_scenarios", scenarios.len())?;
+
+    let bets = PyDict::new(py);
+    for i in 0..n {
+        let bet = y[i] * p[i];
+        bets.set_item(&market_ids[i], bet)?;
+    }
+    dict.set_item("bets", bets)?;
+
+    Ok(Some(dict.into()))
+}
+
 /// Python module registration
 #[pymodule]
 fn rust_arb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(check_mutex_arb, m)?)?;
     m.add_function(wrap_pyfunction!(frank_wolfe_bets, m)?)?;
     m.add_function(wrap_pyfunction!(effective_fill_price, m)?)?;
+    m.add_function(wrap_pyfunction!(polytope_arb, m)?)?;
     Ok(())
 }

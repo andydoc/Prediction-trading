@@ -387,6 +387,9 @@ class ArbitrageMathEngine:
         rt = constraint.relationship_type
 
         if rt == RelationshipType.COMPLEMENTARY:
+            if HAS_RUST:
+                return self._arb_via_rust_polytope(constraint, constrained_markets,
+                                                    'complementary')
             return self._arb_via_polytope(constraint, constrained_markets,
                                           'complementary')
         elif rt == RelationshipType.MUTUAL_EXCLUSIVITY:
@@ -394,15 +397,18 @@ class ArbitrageMathEngine:
             direct = self._arb_mutex_direct(constraint, constrained_markets)
             if direct:
                 return direct
-            # Rust direct check is comprehensive for mutex (buy+sell).
-            # Polytope fallback only finds partial hedges we don't trade.
-            # Skip it when Rust is available to avoid 80ms CVXPY overhead.
+            # Rust polytope fallback: finds partial hedges the direct check misses
             if HAS_RUST:
-                return None
+                return self._arb_via_rust_polytope(constraint, constrained_markets,
+                                                    'mutual_exclusivity')
             # Python-only fallback: full polytope/Bregman/FW analysis
             return self._arb_via_polytope(constraint, constrained_markets,
                                           'mutual_exclusivity')
         elif rt == RelationshipType.LOGICAL_IMPLICATION:
+            if HAS_RUST:
+                return self._arb_via_rust_polytope(constraint, constrained_markets,
+                                                    'logical_implication',
+                                                    implications=[(0, 1)])
             return self._arb_via_polytope(constraint, constrained_markets,
                                           'logical_implication',
                                           implications=[(0, 1)])
@@ -617,6 +623,78 @@ class ArbitrageMathEngine:
                 )
 
         return None
+
+    # ── Rust polytope path (replaces CVXPY Bregman + FW, ~181µs vs ~80ms) ──
+
+    def _arb_via_rust_polytope(self, constraint, markets: List,
+                                constraint_type: str,
+                                implications: List[Tuple[int,int]] = None
+                                ) -> Optional[ArbitrageOpportunity]:
+        """
+        Fast Rust polytope arbitrage: builds scenarios + Frank-Wolfe in ~181µs.
+        Replaces the Python CVXPY pipeline (~80ms) for all constraint types.
+        """
+        market_ids = [m.market_id for m in markets]
+        n = len(markets)
+
+        # Guard: polytope explodes for large groups
+        if n > 12:
+            return None
+
+        # YES ask prices
+        yes_prices = []
+        for m in markets:
+            p = m.get_entry_price('Yes')
+            if p <= 0:
+                p = (m.outcome_prices.get('Yes') or
+                     m.outcome_prices.get('yes') or
+                     m.outcome_prices.get('true') or
+                     next(iter(m.outcome_prices.values()), 0.5))
+            yes_prices.append(float(p))
+
+        impl_tuples = [(int(a), int(b)) for a, b in (implications or [])]
+        is_neg_risk = bool(constraint.metadata.get('negRiskMarketID'))
+
+        result = rust_arb.polytope_arb(
+            market_ids=market_ids,
+            yes_prices=yes_prices,
+            constraint_type=constraint_type,
+            capital=self.capital_per_trade,
+            fee_rate=self.trading_fee,
+            min_profit_threshold=self.min_profit_threshold,
+            max_profit_threshold=self.max_profit_threshold,
+            implications=impl_tuples,
+            max_fw_iter=200,
+        )
+        if result is None:
+            return None
+
+        self.logger.debug(
+            f"  RUST POLYTOPE: type={constraint_type} profit={result['profit_pct']:.4f} "
+            f"n={n} scenarios={result['n_scenarios']}")
+
+        return ArbitrageOpportunity(
+            opportunity_id=f"arb_polytope_{constraint.constraint_id}_{datetime.now().timestamp()}",
+            constraint_id=constraint.constraint_id,
+            market_ids=market_ids,
+            market_names=[m.market_name for m in markets],
+            current_prices={mid: yes_prices[i] for i, mid in enumerate(market_ids)},
+            optimal_bets=dict(result['bets']),
+            expected_profit=result['net_profit'],
+            expected_profit_pct=result['profit_pct'],
+            max_loss=0.0,
+            worst_case_return=result['gross_profit'],
+            total_capital_required=self.capital_per_trade,
+            fees_estimated=result['fees'],
+            net_profit=result['net_profit'],
+            metadata={
+                'method': result['method'],
+                'constraint_type': constraint_type,
+                'price_sum': result['price_sum'],
+                'n_scenarios': result['n_scenarios'],
+                'neg_risk': is_neg_risk,
+            }
+        )
 
     # ── Core: Marginal Polytope + Bregman + Frank-Wolfe ──────────────────────
 
