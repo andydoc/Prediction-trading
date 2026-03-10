@@ -26,6 +26,66 @@ from typing import Dict, List, Optional, Any
 log = logging.getLogger('state_db')
 
 
+def read_state_from_disk(db_path: str) -> Optional[dict]:
+    """Read-only access to the disk SQLite file (for dashboard / external tools).
+    
+    Returns a dict matching the old JSON format:
+    {current_capital, initial_capital, open_positions, closed_positions, performance}
+    Returns None if db file doesn't exist or can't be read.
+    """
+    p = Path(db_path)
+    if not p.exists():
+        return None
+    try:
+        db = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+        db.execute('PRAGMA query_only=ON')
+        
+        # Scalars
+        scalars = {}
+        for row in db.execute('SELECT key, value FROM state').fetchall():
+            try:
+                scalars[row[0]] = json.loads(row[1])
+            except:
+                scalars[row[0]] = row[1]
+        
+        # Open positions
+        open_pos = []
+        for row in db.execute(
+                "SELECT data FROM positions WHERE status IN ('open','monitoring')").fetchall():
+            try:
+                open_pos.append(json.loads(row[0]))
+            except:
+                pass
+        
+        # Closed positions
+        closed_pos = []
+        for row in db.execute(
+                "SELECT data FROM positions WHERE status='closed'").fetchall():
+            try:
+                closed_pos.append(json.loads(row[0]))
+            except:
+                pass
+        
+        db.close()
+        
+        return {
+            'current_capital': scalars.get('current_capital', 100.0),
+            'initial_capital': scalars.get('initial_capital', 100.0),
+            'open_positions': open_pos,
+            'closed_positions': closed_pos,
+            'performance': {
+                'total_trades': scalars.get('total_trades', 0),
+                'winning_trades': scalars.get('winning_trades', 0),
+                'losing_trades': scalars.get('losing_trades', 0),
+                'total_actual_profit': scalars.get('total_actual_profit', 0),
+                'total_expected_profit': scalars.get('total_expected_profit', 0),
+            }
+        }
+    except Exception as e:
+        log.warning(f'read_state_from_disk failed: {e}')
+        return None
+
+
 class StateDB:
     """In-memory SQLite state with periodic disk mirror."""
 
@@ -247,6 +307,32 @@ class StateDB:
         elapsed_ms = (time.time() - t0) * 1000
         if elapsed_ms > 100:
             log.warning(f'Slow JSON export: {elapsed_ms:.0f}ms')
+
+    # --- Aliases (paper_trading.py compatibility) ---
+
+    def save_scalar(self, key: str, value: Any):
+        """Alias for set_scalar (paper_trading.py calls this)."""
+        self.set_scalar(key, value)
+
+    def save_scalars(self, kv: dict):
+        """Batch set_scalar from dict."""
+        for k, v in kv.items():
+            self.set_scalar(k, v)
+
+    def upsert_positions_bulk(self, positions: list, status: str = None):
+        """Alias for save_positions_bulk with optional status override."""
+        if status:
+            for p in positions:
+                p['status'] = status
+        self.save_positions_bulk(positions)
+
+    def backup_to_disk(self):
+        """Alias for mirror_to_disk."""
+        self.mirror_to_disk()
+
+    def save_json_compat(self, json_path: str):
+        """Alias for export_to_json."""
+        self.export_to_json(json_path)
 
     def close(self):
         """Final mirror + close."""

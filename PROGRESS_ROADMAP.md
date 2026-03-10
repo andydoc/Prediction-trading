@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.03-dev (pre-release, shadow trading)
-> **Last updated**: 2026-03-09 ~18:00 UTC
+> **Version**: v0.04.03 (pre-release, shadow trading)
+> **Last updated**: 2026-03-10 ~18:00 UTC
 > **Mode**: SHADOW | Laptop: running | VPS (193.23.127.99): $100 fresh capital, all layers healthy
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4GB RAM, Ubuntu 24.04, systemd auto-restart
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
@@ -142,6 +142,7 @@ Currently both laptop and VPS run independently in SHADOW mode with separate exe
 ├── execution_control.py                      ← Multi-machine lock server (port 5557)
 ├── execution_control_client.py               ← Lock client (used by L4)
 ├── orderbook_depth.py                        ← Phase 5a: CLOB book depth analysis
+├── state_db.py                               ← SQLite in-memory state + WAL disk mirror (replaces JSON)
 ├── websocket_manager.py                      ← Phase 6: WS market+user channels, local book mirror
 ├── layer1_runner.py                          ← L1 process entry
 ├── layer2_runner.py                          ← L2 process entry
@@ -571,14 +572,16 @@ Root cause: arb math was only 8% of wall time. The other 92% is:
 | Batches finding arb | 33.9% (66% of eval CPU wasted) |
 
 #### P0 — Quick Python Fixes (hours)
-- [ ] **8a** — Replace `asyncio.sleep(1.0)` with `asyncio.Event`-based wake (instant urgent processing, 50ms fallback)
-- [ ] **8b** — Cache exec lock status (check every 30s, not every iteration)
-- [ ] **8c** — Increase `MAX_EVALS_PER_BATCH` from 100 to 500
-- [ ] **8d** — Remove `indent=2` from JSON state serialization (2.2MB → ~700KB, 2-3× faster writes)
+- [x] **8a** — Replace `asyncio.sleep(1.0)` with `asyncio.Event`-based wake (instant urgent processing, 50ms fallback)
+- [x] **8b** — Cache exec lock status (check every 30s, not every iteration)
+- [x] **8c** — Increase `MAX_EVALS_PER_BATCH` from 100 to 500
+- [x] **8d** — Remove `indent=2` from JSON state serialization (2.2MB → ~700KB, 2-3× faster writes)
 
 #### P1 — SQLite State (hours)
-- [ ] **8e** — SQLite in-memory DB + WAL journal for `execution_state`, periodic `db.backup()` to disk
-- [ ] **8f** — Incremental position updates (INSERT/UPDATE single rows, not rewrite entire file)
+- [x] **8e** — SQLite in-memory DB + WAL journal for `execution_state`, periodic `db.backup()` to disk
+- [x] **8f** — Incremental position updates (INSERT/UPDATE single rows, not rewrite entire file)
+- [x] **8f.1** — `state_db.py`: `read_state_from_disk()` for dashboard read-only access, compatibility aliases for paper_trading.py
+- [x] **8f.2** — Dashboard updated to read engine metrics from `write_status()` + SQLite state
 
 #### P2 — Rust Bregman + Polytope Reintroduction (1-2 days)
 - [ ] **8g** — Port Bregman KL projection to Rust (iterative Dykstra, ~100µs vs CVXPY 80ms)
@@ -598,18 +601,18 @@ Root cause: arb math was only 8% of wall time. The other 92% is:
 - [ ] **8q** — Full Rust port: dashboard (axum/warp), resolution validator, everything. Zero Python.
 
 **Expected latency after each phase:**
-| Phase | p50 | p95 | bg_queue |
-|-------|-----|-----|----------|
-| Current | 2-6s | 60-300s | ~1400 (growing) |
-| After P0 | ~200ms | ~2s | ~500 (draining) |
-| After P1 | ~200ms | ~1s | ~200 |
-| After P2 | ~150ms | ~800ms | ~100 (polytope adds load but Rust handles it) |
-| After P3 | ~50ms | ~300ms | ~50 |
-| After P4 | <1ms | <5ms | 0 (instant processing) |
+| Phase | p50 | p95 | bg_queue | Status |
+|-------|-----|-----|----------|--------|
+| Pre-P0 | 2-6s | 60-300s | ~1400 (growing) | baseline |
+| After P0 | ~200ms | ~2s | ~500 (draining) | **DONE** |
+| After P1 | ~200ms | ~1s | ~200 | **DONE** |
+| After P2 | ~150ms | ~800ms | ~100 (polytope adds load but Rust handles it) | next |
+| After P3 | ~50ms | ~300ms | ~50 | |
+| After P4 | <1ms | <5ms | 0 (instant processing) | |
 
 ---
 
-### v0.04.03-dev (2026-03-09) — Latency Bottleneck Analysis + Phase 8 Plan
+### v0.04.03 (2026-03-10) — Latency Bottleneck Analysis + P0/P1 Fixes + Dashboard Metrics
 - **ANALYSED** Full bottleneck audit: Rust arb math (19000×) only addressed 8% of wall time; GIL contention is 80%
 - **MEASURED** Eval batch p50=3026ms for ~10ms CPU work (300× overhead from GIL + sleep + HTTP)
 - **MEASURED** Exec lock HTTP overhead: 12.9ms/iter, 82s total, 12780 calls
@@ -617,6 +620,12 @@ Root cause: arb math was only 8% of wall time. The other 92% is:
 - **MEASURED** 66.1% of eval batches find zero arbs (wasted CPU on non-arb constraints)
 - **ADDED** Phase 8 (Latency Optimization) to roadmap: P0-P4 progressive plan from Python fixes → full Rust port
 - **ADDED** `scripts/debug/batch_gaps.py`, `batch_exec_time.py`, `http_overhead.py` — bottleneck profiling scripts
+- **ADDED** `state_db.py`: `read_state_from_disk()` for dashboard read-only SQLite access + compatibility aliases (`save_scalar`, `upsert_positions_bulk`, `backup_to_disk`, `save_json_compat`)
+- **ADDED** Engine metrics exposure: `write_status()` now includes `engine_metrics` dict (iteration, has_rust, constraints, WS stats, latency percentiles)
+- **CHANGED** Dashboard reads engine metrics from status file for real-time system health display
+- **CHANGED** `MAX_EVALS_PER_BATCH` → 500 (was 100; Rust arb math at 4µs makes this feasible)
+- **COMPLETED** P0 fixes: event-based wake, exec lock caching (30s), batch size 500, no-indent JSON
+- **COMPLETED** P1 fixes: SQLite in-memory + WAL state persistence, incremental position updates
 
 ### v0.04.02 (2026-03-09) — EFP Queue Metric + negRisk Tagging + Latency Instrumentation
 - **ADDED** Effective Fill Price (EFP) as 2D queue metric: VWAP at trade size captures both price AND depth drift
@@ -906,7 +915,7 @@ Live figures from `execution_state.json` (post sell-arb payout correction):
 
 ---
 
-*Last updated: 2026-03-09 ~14:00 UTC*
+*Last updated: 2026-03-10 ~18:00 UTC*
 *System: WSL Ubuntu on Windows (laptop) + ZAP-Hosting VPS (193.23.127.99)*
 *Machines: Laptop (WSL authoritative) + VPS (ZAP-Hosting 193.23.127.99) + Desktop HP-800G2 (dormant)*
 *Dashboard: http://localhost:5556 | Exec Control: port 5557*

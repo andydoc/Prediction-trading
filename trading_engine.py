@@ -242,12 +242,15 @@ def rank_opportunities(opps: list, market_lookup: dict,
     return scored
 
 
-def write_status(status, capital=0, open_pos=0, error=None):
+def write_status(status, capital=0, open_pos=0, error=None, engine_metrics=None):
     STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATUS_PATH.write_text(json.dumps({
+    data = {
         'status': status, 'capital': capital, 'open_positions': open_pos,
         'error': error, 'timestamp': datetime.now(ZoneInfo('Europe/London')).isoformat()
-    }))
+    }
+    if engine_metrics:
+        data['metrics'] = engine_metrics
+    STATUS_PATH.write_text(json.dumps(data))
 
 
 def get_held_market_ids(engine) -> set:
@@ -1191,6 +1194,12 @@ class TradingEngine:
                 # --- Stats logging (every ~30s) ---
                 if (now - getattr(self, '_last_stats_log', 0)) >= 30.0:
                     ws_info = ''
+                    engine_metrics = {
+                        'iteration': self._iteration,
+                        'has_rust': HAS_RUST,
+                        'constraints': len(self.constraints) if self.constraints else 0,
+                        'markets_total': len(self.market_lookup),
+                    }
                     if self.ws_manager and self.ws_manager._running:
                         ws_stats = self.ws_manager.get_stats()
                         n_urgent = len(self._urgent_evals)
@@ -1198,20 +1207,32 @@ class TradingEngine:
                         live_count = sum(1 for m in self.market_lookup.values() if m.has_live_prices())
                         # Latency percentiles from recent evals
                         lat_info = ''
+                        lat_p50 = lat_p95 = lat_max = 0
                         if self._recent_latencies:
                             lats = sorted(self._recent_latencies)
-                            p50 = lats[len(lats) // 2]
-                            p95 = lats[int(len(lats) * 0.95)]
-                            mx = lats[-1]
-                            lat_info = f' lat_ms p50={p50:.0f} p95={p95:.0f} max={mx:.0f}'
+                            lat_p50 = lats[len(lats) // 2]
+                            lat_p95 = lats[int(len(lats) * 0.95)]
+                            lat_max = lats[-1]
+                            lat_info = f' lat_ms p50={lat_p50:.0f} p95={lat_p95:.0f} max={lat_max:.0f}'
                         ws_info = (f' | WS: subs={len(self.ws_manager._subscribed_assets)} '
                                    f'msgs={ws_stats["market_msgs"]} '
                                    f'live={live_count}/{len(self.market_lookup)} '
                                    f'urgent={n_urgent} bg={n_bg}{lat_info}')
+                        engine_metrics.update({
+                            'ws_subscribed': len(self.ws_manager._subscribed_assets),
+                            'ws_msgs': ws_stats.get('market_msgs', 0),
+                            'ws_live': live_count,
+                            'queue_urgent': n_urgent,
+                            'queue_background': n_bg,
+                            'lat_p50_ms': round(lat_p50),
+                            'lat_p95_ms': round(lat_p95),
+                            'lat_max_ms': round(lat_max),
+                        })
                     cap = self.paper_engine.current_capital
                     npos = len(self.paper_engine.open_positions)
                     log.info(f'[iter {self._iteration}] Capital=${cap:.2f} '
                              f'positions={npos}{ws_info}')
+                    write_status('running', cap, npos, engine_metrics=engine_metrics)
                     self._last_stats_log = now
 
                 # --- Weekly delay update ---

@@ -19,6 +19,8 @@ def load_config():
 DATA = WORKSPACE / 'data'
 OPP_PATH = WORKSPACE / 'layer3_arbitrage_math' / 'data' / 'latest_opportunities.json'
 EXEC_STATE = DATA / 'system_state' / 'execution_state.json'
+EXEC_STATE_DB = DATA / 'system_state' / 'execution_state.db'
+ENGINE_STATUS = DATA / 'trading_engine_status.json'
 
 # Track when dashboard/system started
 START_TIME = datetime.now(timezone.utc)
@@ -28,6 +30,18 @@ def load_json(p):
         return json.loads(Path(p).read_text())
     except:
         return {}
+
+def load_execution_state():
+    """Load execution state: SQLite primary, JSON fallback."""
+    if EXEC_STATE_DB.exists():
+        try:
+            from state_db import read_state_from_disk
+            result = read_state_from_disk(str(EXEC_STATE_DB))
+            if result:
+                return result
+        except Exception:
+            pass
+    return load_json(EXEC_STATE)
 
 def format_datetime(iso_str):
     """Format ISO datetime string to dd/mm/yyyy hh:mm"""
@@ -46,13 +60,12 @@ def escape_html(text):
 def make_html():
     now = datetime.now(timezone.utc)
 
-    # Layer statuses
-    layers = {}
-    for name in ['layer1','layer2','layer3','layer4']:
-        layers[name] = load_json(DATA / f'{name}_status.json')
+    # Process statuses (new 2-process architecture)
+    layer1_status = load_json(DATA / 'layer1_status.json')
+    engine_status = load_json(ENGINE_STATUS)
 
-    # Execution state
-    state = load_json(EXEC_STATE)
+    # Execution state (SQLite primary, JSON fallback)
+    state = load_execution_state()
 
     # Load trading mode
     cfg = load_config()
@@ -553,24 +566,62 @@ def make_html():
         annualized_ret = ((_total_val - _ic) / _ic) * (365.0 / _elapsed) * 100
         annualized_str = f'{annualized_ret:+.0f}%'
 
-    # Layer status rows
+    # Process status rows (new 2-process architecture + engine metrics)
     layer_html = ''
-    for name, info in layers.items():
-        st = info.get('status', '?')
-        ts = format_datetime(info.get('timestamp', ''))
-        extra = ''
-        if name == 'layer4':
-            extra = f' | cash=${info.get("capital",0):.2f} | pos={info.get("open_positions",0)}'
-        color = '#0f0' if st in ('running','scanning') else '#f80'
-        layer_labels = {
-            'layer1': '1 Market Data',
-            'layer2': '2 Constraint Detection',
-            'layer3': '3 Arbitrage Math',
-            'layer4': '4 Execution Engine',
-            'dashboard': 'Dashboard',
-        }
-        label = layer_labels.get(name, name)
-        layer_html += f'<tr><td>{label}</td><td style="color:{color}">{st}</td><td>{ts}{extra}</td></tr>\n'
+    # Market Scanner (L1)
+    l1_st = layer1_status.get('status', '?')
+    l1_ts = format_datetime(layer1_status.get('timestamp', ''))
+    l1_color = '#0f0' if l1_st in ('running','scanning') else '#f80'
+    layer_html += f'<tr><td>Market Scanner</td><td style="color:{l1_color}">{l1_st}</td><td>{l1_ts}</td></tr>\n'
+    # Trading Engine (with rich metrics)
+    eng_st = engine_status.get('status', '?')
+    eng_ts = format_datetime(engine_status.get('timestamp', ''))
+    eng_color = '#0f0' if eng_st == 'running' else '#f80'
+    eng_extra = ''
+    em = engine_status.get('metrics', {})
+    if engine_status:
+        eng_extra = f' | cash=${engine_status.get("capital", 0):.2f} | pos={engine_status.get("positions", engine_status.get("open_positions", 0))}'
+    layer_html += f'<tr><td>Trading Engine</td><td style="color:{eng_color}">{eng_st}</td><td>{eng_ts}{eng_extra}</td></tr>\n'
+    # Engine metrics sub-rows
+    if em:
+        rust_tag = '<span style="color:#0f0">Rust</span>' if em.get('has_rust') else '<span style="color:#f80">Python</span>'
+        layer_html += (f'<tr><td style="padding-left:25px;color:#888">Arb Engine</td>'
+                      f'<td>{rust_tag}</td>'
+                      f'<td>constraints={em.get("constraints",0)} | markets={em.get("markets_total",0)} | iter={em.get("iteration",0)}</td></tr>\n')
+        ws_live = em.get('ws_live', 0)
+        ws_total = em.get('markets_total', 1)
+        ws_pct = int(ws_live / ws_total * 100) if ws_total else 0
+        ws_color = '#0f0' if ws_pct > 20 else '#f80'
+        layer_html += (f'<tr><td style="padding-left:25px;color:#888">WebSocket</td>'
+                      f'<td style="color:{ws_color}">subs={em.get("ws_subscribed",0)}</td>'
+                      f'<td>msgs={em.get("ws_msgs",0):,} | live={ws_live}/{ws_total} ({ws_pct}%)</td></tr>\n')
+        q_urg = em.get('queue_urgent', 0)
+        q_bg = em.get('queue_background', 0)
+        q_color = '#0f0' if q_bg < 500 else ('#f80' if q_bg < 2000 else '#f44')
+        layer_html += (f'<tr><td style="padding-left:25px;color:#888">Eval Queue</td>'
+                      f'<td style="color:{q_color}">bg={q_bg}</td>'
+                      f'<td>urgent={q_urg} | bg={q_bg}</td></tr>\n')
+        lat_p50 = em.get('lat_p50_ms', 0)
+        lat_p95 = em.get('lat_p95_ms', 0)
+        lat_color = '#0f0' if lat_p50 < 100 else ('#fa0' if lat_p50 < 1000 else '#f44')
+        layer_html += (f'<tr><td style="padding-left:25px;color:#888">Latency</td>'
+                      f'<td style="color:{lat_color}">p50={lat_p50}ms</td>'
+                      f'<td>p50={lat_p50}ms | p95={lat_p95}ms | max={em.get("lat_max_ms",0)}ms</td></tr>\n')
+    # Dashboard (always running if we're rendering this)
+    dash_ts = now.strftime('%d/%m/%Y %H:%M')
+    layer_html += f'<tr><td>Dashboard</td><td style="color:#0f0">running</td><td>{dash_ts}</td></tr>\n'
+    # Exec Control
+    try:
+        import requests as _req
+        _ec = _req.get('http://localhost:5557/status', timeout=1).json()
+        _ec_st = 'running'
+        _ec_leader = _ec.get('leader', '?')
+        _ec_extra = f' | leader={_ec_leader}'
+    except Exception:
+        _ec_st = 'unreachable'
+        _ec_extra = ''
+    _ec_color = '#0f0' if _ec_st == 'running' else '#f80'
+    layer_html += f'<tr><td>Exec Control</td><td style="color:{_ec_color}">{_ec_st}</td><td>:5557{_ec_extra}</td></tr>\n'
 
     # --- Build annualized badges ---
     config = cfg  # alias for control panel template
@@ -677,8 +728,8 @@ def make_html():
     </div>
     <h3 style="color:#0af;margin:20px 0 10px">System</h3>
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="ctrl-btn" onclick="ctrlAction('restart')">Restart All Layers</button>
-      <button class="ctrl-btn" onclick="ctrlAction('restart_l4')">Restart L4 Only</button>
+      <button class="ctrl-btn" onclick="ctrlAction('restart')">Restart All Processes</button>
+      <button class="ctrl-btn" onclick="ctrlAction('restart_engine')">Restart Trading Engine</button>
       <button class="ctrl-btn danger-btn" onclick="ctrlAction('stop')">EMERGENCY STOP</button>
     </div>
   </div>
@@ -811,8 +862,8 @@ def make_html():
     </div>
     <h3 style="color:#0af;margin:20px 0 10px">System</h3>
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="ctrl-btn" onclick="ctrlAction('restart')">Restart All Layers</button>
-      <button class="ctrl-btn" onclick="ctrlAction('restart_l4')">Restart L4 Only</button>
+      <button class="ctrl-btn" onclick="ctrlAction('restart')">Restart All Processes</button>
+      <button class="ctrl-btn" onclick="ctrlAction('restart_engine')">Restart Trading Engine</button>
       <button class="ctrl-btn danger-btn" onclick="ctrlAction('stop')">EMERGENCY STOP</button>
     </div>
   </div>
@@ -1055,7 +1106,7 @@ function updateRefreshState() {{
 
 // === Auto-refresh: reload after 60s with no user interaction ===
 (function() {{
-  var IDLE_MS = 60000;
+  var IDLE_MS = 10000;
   var deadline = Date.now() + IDLE_MS;
   function resetIdle() {{ deadline = Date.now() + IDLE_MS; }}
   ['mousemove','keydown','mousedown','touchstart','scroll','click'].forEach(function(ev) {{
@@ -1207,10 +1258,10 @@ function saveParams() {{
 </table>
 </div>
 
-<h2 class="section-title collapsed" onclick="toggleSection(this)">LAYERS<button class="section-btn refresh-toggle-btn" onclick="toggleRefresh(this, event)" style="display:none"></button></h2>
+<h2 class="section-title collapsed" onclick="toggleSection(this)">SYSTEM<button class="section-btn refresh-toggle-btn" onclick="toggleRefresh(this, event)" style="display:none"></button></h2>
 <div class="section-content hidden">
 <table>
-<tr><th>Layer</th><th>Status</th><th>Info</th></tr>
+<tr><th>Process</th><th>Status</th><th>Info</th></tr>
 {layer_html}
 </table>
 </div>
@@ -1241,7 +1292,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            state = load_json(EXEC_STATE)
+            state = load_execution_state()
             self.wfile.write(json.dumps(state, indent=2).encode())
         else:
             try:
@@ -1298,8 +1349,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self._json_response({'ok': False, 'message': f'Unknown mode: {mode}'})
         with open(CONFIG_PATH, 'w') as f:
             yaml.dump(cfg, f, default_flow_style=False)
-        # Restart L4 to pick up new config
-        subprocess.Popen(['pkill', '-f', 'layer4_runner'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Restart trading engine to pick up new config
+        subprocess.Popen(['pkill', '-f', 'trading_engine'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return self._json_response({'ok': True, 'message': f'Switched to {mode.upper()}. L4 restarting...'})
 
     def _handle_action(self, body):
@@ -1310,11 +1361,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             subprocess.Popen(['pkill', '-f', 'layer'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return self._json_response({'ok': True, 'message': 'EMERGENCY STOP executed. All processes killed.'})
         elif action == 'restart':
-            subprocess.Popen(['pkill', '-f', 'layer'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return self._json_response({'ok': True, 'message': 'All layers killed. Supervisor will restart them.'})
-        elif action == 'restart_l4':
-            subprocess.Popen(['pkill', '-f', 'layer4_runner'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return self._json_response({'ok': True, 'message': 'L4 killed. Supervisor will restart it.'})
+            subprocess.Popen(['pkill', '-f', 'trading_engine'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(['pkill', '-f', 'layer1_runner'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return self._json_response({'ok': True, 'message': 'All processes killed. Supervisor will restart them.'})
+        elif action in ('restart_l4', 'restart_engine'):
+            subprocess.Popen(['pkill', '-f', 'trading_engine'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return self._json_response({'ok': True, 'message': 'Trading Engine killed. Supervisor will restart it.'})
         else:
             return self._json_response({'ok': False, 'message': f'Unknown action: {action}'})
 
