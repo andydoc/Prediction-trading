@@ -672,7 +672,7 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 | 8f.1 | `state_db.py`: `read_state_from_disk()` for dashboard read-only access; compatibility aliases | ✅ |
 | 8f.2 | Dashboard reads engine metrics from `write_status()` + SQLite state | ✅ |
 
-#### P2 — Rust Bregman + Polytope 🔲
+#### P2 — Rust Bregman + Polytope ✅
 
 | # | Item | Status |
 |---|------|--------|
