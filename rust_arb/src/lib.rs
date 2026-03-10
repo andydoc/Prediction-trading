@@ -466,6 +466,52 @@ fn polytope_arb(
     Ok(Some(dict.into()))
 }
 
+/// Batch compute effective fill prices for multiple assets in one PyO3 crossing.
+/// Takes parallel arrays of ask book data and returns EFPs.
+/// Called once per eval loop (~20Hz) instead of per-WS-event (~1700Hz).
+#[pyfunction]
+fn batch_effective_fill_prices(
+    all_ask_prices: Vec<Vec<f64>>,
+    all_ask_sizes: Vec<Vec<f64>>,
+    trade_size_usd: f64,
+) -> Vec<f64> {
+    let n = all_ask_prices.len();
+    let mut results = Vec::with_capacity(n);
+    for i in 0..n {
+        let prices = &all_ask_prices[i];
+        let sizes = if i < all_ask_sizes.len() { &all_ask_sizes[i] } else { results.push(0.0); continue };
+        if prices.is_empty() || trade_size_usd <= 0.0 {
+            results.push(0.0);
+            continue;
+        }
+        let mut remaining = trade_size_usd;
+        let mut total_shares = 0.0;
+        let mut total_cost = 0.0;
+        for j in 0..prices.len() {
+            let price = prices[j];
+            let size = if j < sizes.len() { sizes[j] } else { break };
+            let level_usd = price * size;
+            if level_usd <= 0.0 { continue; }
+            if level_usd >= remaining {
+                total_shares += remaining / price;
+                total_cost += remaining;
+                remaining = 0.0;
+                break;
+            } else {
+                total_shares += size;
+                total_cost += level_usd;
+                remaining -= level_usd;
+            }
+        }
+        if total_shares > 0.0 && remaining <= 0.0 {
+            results.push(total_cost / total_shares);
+        } else {
+            results.push(0.0);
+        }
+    }
+    results
+}
+
 /// Python module registration
 #[pymodule]
 fn rust_arb(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -473,5 +519,6 @@ fn rust_arb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(frank_wolfe_bets, m)?)?;
     m.add_function(wrap_pyfunction!(effective_fill_price, m)?)?;
     m.add_function(wrap_pyfunction!(polytope_arb, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_effective_fill_prices, m)?)?;
     Ok(())
 }

@@ -417,6 +417,11 @@ class TradingEngine:
         self._recent_latencies: list = []                    # last 200 latency_ms values
         self.EFP_DRIFT_THRESHOLD = 0.005                     # $0.005 effective fill price drift → urgent
 
+        # Phase 8j: buffer dirty assets from WS callbacks, batch-process in eval loop
+        # Reduces per-event Python overhead from ~10 ops to 1 (set.add)
+        self._dirty_assets: Set[str] = set()
+        self._last_stale_sweep = 0.0  # Phase 8l: periodic stale re-subscribe
+
         # Wake event: WS callbacks set this to instantly wake the eval loop
         # Created in run() because it needs the asyncio event loop
         self._eval_wake: Optional[asyncio.Event] = None
@@ -509,14 +514,14 @@ class TradingEngine:
             return
 
         def on_price_change(asset_id: str, best_bid: float, best_ask: float, ts: float):
-            """Price level changed — update MarketData, check drift for queueing."""
+            """Price level changed — update MarketData, buffer for batch queue processing."""
             self._update_market_price_from_ws(asset_id, best_bid, best_ask)
-            self._queue_on_price_change(asset_id, best_bid, best_ask)
+            self._dirty_assets.add(asset_id)  # Phase 8j: 1 Python op instead of ~10
 
         def on_book_update(asset_id: str, local_book):
-            """Full book snapshot (triggered by trade) — always urgent, depth changed."""
+            """Full book snapshot — update MarketData, buffer for batch queue processing."""
             self._update_market_price_from_ws(asset_id, local_book.best_bid, local_book.best_ask)
-            self._queue_on_book_update(asset_id, local_book.best_bid, local_book.best_ask)
+            self._dirty_assets.add(asset_id)  # Phase 8j: 1 Python op instead of ~10
 
         def on_market_resolved(market_cid: str, asset_id: str):
             """A market resolved — trigger immediate payout check."""
@@ -653,6 +658,85 @@ class TradingEngine:
                             self._constraint_queue_time[cid] = now
                         self._background_evals.add(cid)
 
+    def _process_dirty_assets(self):
+        """
+        Phase 8j: Batch-process all buffered dirty assets from WS callbacks.
+        Called once per eval loop iteration instead of per-WS-event.
+        
+        1. Snapshot and clear dirty set (atomic-ish)
+        2. Collect book data for all dirty assets
+        3. Batch compute EFPs in one Rust call
+        4. Run queue decision logic
+        """
+        if not self._dirty_assets:
+            return
+
+        # Snapshot + clear
+        dirty = list(self._dirty_assets)
+        self._dirty_assets.clear()
+
+        # Collect book data and filter to assets with constraint mappings
+        asset_ids_with_books = []
+        all_ask_prices = []
+        all_ask_sizes = []
+        trade_size = dynamic_capital(self.paper_engine.current_capital, self.capital_pct)
+
+        for asset_id in dirty:
+            if asset_id not in self.asset_to_constraints:
+                continue
+            if not self.ws_manager:
+                continue
+            book = self.ws_manager.get_book(asset_id)
+            if not book or not book.asks:
+                continue
+            asset_ids_with_books.append(asset_id)
+            all_ask_prices.append([level.price for level in book.asks])
+            all_ask_sizes.append([level.size for level in book.asks])
+
+        if not asset_ids_with_books:
+            return
+
+        # Batch EFP via Rust (1 PyO3 crossing for all assets)
+        if HAS_RUST:
+            efps = rust_arb.batch_effective_fill_prices(
+                all_ask_prices, all_ask_sizes, trade_size)
+        else:
+            efps = []
+            for i in range(len(asset_ids_with_books)):
+                book = self.ws_manager.get_book(asset_ids_with_books[i])
+                efps.append(book.effective_fill_price(trade_size) if book else 0.0)
+
+        # Queue decisions (same logic as _queue_by_efp but batched)
+        now = _time.time()
+        wake_needed = False
+        for i, asset_id in enumerate(asset_ids_with_books):
+            current_efp = efps[i]
+            if current_efp <= 0:
+                continue
+
+            last_efp = self._last_eval_efp.get(asset_id, 0.0)
+            drift = abs(current_efp - last_efp) if last_efp > 0 else 999.0
+            significant = drift >= self.EFP_DRIFT_THRESHOLD
+
+            for cid in self.asset_to_constraints.get(asset_id, ()):
+                if significant:
+                    self._last_eval_efp[asset_id] = current_efp
+                    if cid not in self._constraint_queue_time:
+                        self._constraint_queue_time[cid] = now
+                    self._urgent_evals.add(cid)
+                    self._background_evals.discard(cid)
+                    wake_needed = True
+                else:
+                    last_eval_time = self._constraint_last_eval.get(cid, 0.0)
+                    if (now - last_eval_time) >= 5.0:
+                        if cid not in self._urgent_evals:
+                            if cid not in self._constraint_queue_time:
+                                self._constraint_queue_time[cid] = now
+                            self._background_evals.add(cid)
+
+        if wake_needed and self._eval_wake is not None:
+            self._eval_wake.set()
+
     # =================================================================
     # Event Processing — the heart of the event-driven engine
     # =================================================================
@@ -713,10 +797,14 @@ class TradingEngine:
     def _process_pending_evals(self) -> List[dict]:
         """
         Process constraints from priority queues:
-          1. ALL urgent evals first (price drift / book depth change)
-          2. Background evals fill remaining batch capacity (stale re-checks)
+          1. Batch-process dirty assets from WS callbacks (Phase 8j)
+          2. ALL urgent evals first (price drift / book depth change)
+          3. Background evals fill remaining batch capacity (stale re-checks)
         Returns list of opportunity dicts.
         """
+        # Phase 8j: batch-process all WS-buffered dirty assets into queue
+        self._process_dirty_assets()
+
         if not self._urgent_evals and not self._background_evals:
             return []
 
@@ -1161,6 +1249,21 @@ class TradingEngine:
                     cap = self.paper_engine.current_capital
                     npos = len(self.paper_engine.open_positions)
                     write_status('running', cap, npos)
+
+                # --- Phase 8l: Stale-asset WS re-subscribe sweep (every 60s) ---
+                if (now - self._last_stale_sweep) >= 60.0 and self.ws_manager:
+                    stale_threshold = 30.0  # seconds
+                    stale_assets = []
+                    for asset_id in self.asset_to_constraints:
+                        book = self.ws_manager.get_book(asset_id)
+                        if book and book.last_update > 0:
+                            age = now - book.last_update
+                            if age > stale_threshold:
+                                stale_assets.append(asset_id)
+                    if stale_assets:
+                        log.info(f'Stale re-subscribe: {len(stale_assets)} assets >30s old')
+                        await self.ws_manager.subscribe_assets(stale_assets)
+                    self._last_stale_sweep = now
 
                 # --- Stats logging (every ~30s) ---
                 if (now - getattr(self, '_last_stats_log', 0)) >= 30.0:

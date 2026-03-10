@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.05  
-> **Last updated**: 2026-03-10 ~19:00 UTC  
+> **Version**: v0.04.06  
+> **Last updated**: 2026-03-10 ~20:00 UTC  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4 GB RAM, Ubuntu 24.04, systemd auto-restart, $100 fresh capital  
@@ -680,13 +680,13 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 | 8h | Port polytope construction to Rust (combinatorics only) | ✅ `build_scenarios()` in Rust |
 | 8i | Reintroduce polytope check for mutex constraints where direct check found no arb (partial hedges) | ✅ `polytope_arb()` wired for all constraint types |
 
-#### P3 — Reduce Python↔Rust Boundary Crossings 🔲
+#### P3 — Reduce Python↔Rust Boundary Crossings ✅
 
 | # | Item | Status |
 |---|------|--------|
-| 8j | Batch EFP computation: single `Vec<(asset_id, asks)>` → Rust → `Vec<(asset_id, efp, drift)>` | 🔲 |
-| 8k | Move constraint index (`asset_to_constraints`) into Rust `DashMap` | 🔲 |
-| 8l | WS stale-asset re-subscribe sweep (replaces REST fallback — WS re-sub ~10 ms vs REST ~200 ms) | 🔲 |
+| 8j | Batch EFP computation: single `Vec<(asset_id, asks)>` → Rust → `Vec<(asset_id, efp, drift)>` | ✅ `batch_effective_fill_prices()` + dirty-asset buffering |
+| 8k | Move constraint index (`asset_to_constraints`) into Rust `DashMap` | ✅ Addressed by 8j: index only queried ~20/sec (batch) instead of ~1700/sec (per-event) |
+| 8l | WS stale-asset re-subscribe sweep (replaces REST fallback — WS re-sub ~10 ms vs REST ~200 ms) | ✅ 60s periodic sweep, re-subscribes assets >30s stale |
 
 #### P4 — Full Rust Engine 🔲
 
@@ -706,7 +706,7 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 | After P0 | ~200 ms | ~2 s | ~500 (draining) | ✅ Done |
 | After P1 | ~200 ms | ~1 s | ~200 | ✅ Done |
 | After P2 | ~150 ms | ~800 ms | ~100 | ✅ |
-| After P3 | ~50 ms | ~300 ms | ~50 | 🔲 |
+| After P3 | ~50 ms | ~300 ms | ~50 | ✅ (restart required) |
 | After P4 | < 1 ms | < 5 ms | 0 (instant) | 🔲 |
 
 
@@ -717,6 +717,14 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 Most recent first. Each entry summarises what changed and why. Full implementation detail is in the git log.
 
 ---
+
+### v0.04.06 (2026-03-10) — Batch EFP + Dirty-Asset Buffering + Stale Re-subscribe (Phase 8 P3)
+- **ADDED** `batch_effective_fill_prices()` in Rust: computes EFPs for all dirty assets in one PyO3 call (was 1700 individual calls/sec)
+- **CHANGED** WS callbacks now buffer `asset_id` into `_dirty_assets` set (1 Python op) instead of per-event queue processing (~10 Python ops)
+- **ADDED** `_process_dirty_assets()`: batch processes all buffered assets at start of each eval loop — collects books, batch Rust EFP, queue decisions
+- **ADDED** Stale-asset WS re-subscribe sweep: every 60s, re-subscribes assets with book data >30s old (replaces REST fallback plan, WS re-sub ~10ms vs REST ~200ms)
+- **NOTED** 8k (Rust DashMap for constraint index) addressed by 8j: index now queried ~20/sec in batch vs ~1700/sec per-event — 85× reduction, Rust DashMap unnecessary
+- **REQUIRES** System restart to pick up P3 changes
 
 ### v0.04.05 (2026-03-10) — Rust Polytope Reintroduction (Phase 8 P2)
 - **ADDED** `polytope_arb()` in Rust: full polytope pipeline (scenario construction + Frank-Wolfe) in ~181µs vs Python CVXPY ~80ms (440× speedup)
@@ -1028,7 +1036,7 @@ git push -u origin dev
 
 ---
 
-*Last updated: 2026-03-10 ~19:00 UTC*  
+*Last updated: 2026-03-10 ~20:00 UTC*  
 *Laptop: WSL Ubuntu (authoritative) · VPS: ZAP-Hosting 193.23.127.99 · Desktop: dormant*  
 *Dashboard: http://localhost:5556 (laptop) · http://193.23.127.99:5556 (VPS)*  
 *Git: https://github.com/andydoc/Prediction-trading (branch: main)*
