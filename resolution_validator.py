@@ -105,29 +105,56 @@ def fetch_market_description(market_id: int) -> Optional[Dict]:
 
 
 def call_anthropic_api(question: str, description: str, api_end_date: str,
-                       api_key: str) -> Optional[Dict]:
-    """Call Anthropic API to extract latest resolution date from rules text."""
+                       api_key: str, ai_config: dict = None) -> Optional[Dict]:
+    """Call Anthropic API to extract latest resolution date from rules text.
+    
+    Uses model/tokens from ai_config if provided, else falls back to defaults.
+    Prompt loaded from config/prompts.yaml if available, else uses built-in EXTRACTION_PROMPT.
+    """
     if not api_key:
         log.warning('No Anthropic API key configured')
         return None
 
-    prompt = EXTRACTION_PROMPT.format(
+    # Load prompt from config or use built-in
+    prompt_template = EXTRACTION_PROMPT
+    try:
+        import yaml as _yaml
+        _prompts_path = Path('/home/andydoc/prediction-trader/config/prompts.yaml')
+        if _prompts_path.exists():
+            _pdata = _yaml.safe_load(_prompts_path.read_text())
+            if _pdata and 'resolution_validation' in _pdata:
+                prompt_template = _pdata['resolution_validation']
+    except Exception:
+        pass  # Fall back to built-in
+
+    prompt = prompt_template.format(
         question=question,
         description=description,
         api_end_date=api_end_date
     )
 
+    # Model and tokens from config or defaults
+    model = 'claude-sonnet-4-20250514'
+    max_tokens = 256
+    api_url = ANTHROPIC_API_URL
+    api_version = '2023-06-01'
+    if ai_config:
+        model = ai_config.get('models', {}).get('resolution_validation', model)
+        max_tokens = ai_config.get('max_tokens', {}).get('resolution_validation', max_tokens)
+        api_url = ai_config.get('api_url', api_url)
+        api_version = ai_config.get('api_version', api_version)
+
     try:
         resp = requests.post(
-            ANTHROPIC_API_URL,
+            api_url,
             headers={
                 'Content-Type': 'application/json',
                 'x-api-key': api_key,
-                'anthropic-version': '2023-06-01',
+                'anthropic-version': api_version,
             },
             json={
-                'model': 'claude-sonnet-4-20250514',
-                'max_tokens': 256,
+                'model': model,
+                'max_tokens': max_tokens,
                 'messages': [{'role': 'user', 'content': prompt}],
             },
             timeout=30

@@ -1,0 +1,95 @@
+# AI Prompts — referenced by config.yaml → ai.prompts
+# Kept in a separate file because prompts are long and change independently from config params.
+# Loaded by resolution_validator.py and postponement_detector.py at startup.
+
+resolution_validation: |
+  You are analyzing prediction market rules to extract the LATEST possible resolution date and check for unrepresented outcomes.
+
+  Market question: {question}
+
+  Market rules/description:
+  {description}
+
+  API-provided end date: {api_end_date}
+
+  Instructions:
+  1. Read the rules carefully for ALL resolution scenarios
+  2. Identify the LATEST date by which this market MUST resolve (including extensions, fallbacks, "if results not known by X" clauses)
+  3. If no explicit latest date exists, use the API end date
+  4. Check if the rules mention ANY outcome that could win but is NOT a named candidate
+  5. Return ONLY a JSON object, no other text:
+
+  {{"latest_resolution_date": "YYYY-MM-DD", "confidence": "high|medium|low", "has_unrepresented_outcome": true|false, "unrepresented_outcome_reason": "explanation if true, empty string if false", "reasoning": "one sentence about the date"}}
+
+  Examples of what to look for:
+  - "If no election by Dec 31, resolves to X" → latest is Dec 31
+  - "If results not known by March 31, 2027" → latest is March 31, 2027
+  - "Resolves when official results released, no later than June 30" → latest is June 30
+  - "If no primary takes place, resolves to Other" → has_unrepresented_outcome: true
+  - "Including any potential run-off" + only 2 candidates listed → has_unrepresented_outcome: true
+
+postponement_detection: |
+  You are investigating whether a scheduled sporting event has been postponed and when it will now be played.
+
+  EVENT DETAILS:
+  - Market questions: {market_names}
+  - Originally scheduled: {original_date}
+  - Current date: {today}
+  - Days overdue: {days_overdue}
+
+  TASK:
+  You MUST search thoroughly. Do at least 3 searches using different strategies:
+  1. Search for the specific match and "postponed" or "rescheduled" or "suspendido" or "reprogramado"
+  2. Search for the league/competition fixture round that this match belongs to — entire rounds are often rescheduled together
+  3. Search for the competition's official fixture list or Wikipedia page to find the new scheduled date
+
+  If the first searches don't find a new date, try searching in the local language of the competition (e.g. Spanish for Argentine football).
+
+  I need:
+  - Whether the event was postponed, cancelled, rescheduled, or already played
+  - The NEW scheduled date (or date window)
+  - When the competition season officially ends (for fallback)
+  - Why it was postponed
+
+  RESPONSE FORMAT — return ONLY this JSON object (no markdown, no explanation):
+  {{"status": "played|postponed|cancelled|unknown", "new_date": "YYYY-MM-DD or null", "date_confidence": "exact|window|season_end|unknown", "window_end": "YYYY-MM-DD or null", "season_end": "YYYY-MM-DD", "reason": "brief explanation", "sources": ["url1"], "search_queries_used": ["query1"]}}
+
+  DATE RULES:
+  - Exact date found → new_date = that date, date_confidence = "exact"
+  - Window found (e.g. "weekend of May 3") → new_date = END of window (e.g. 2026-05-04), date_confidence = "window"
+  - No date but season end known → new_date = season_end, date_confidence = "season_end"
+  - Nothing found → new_date = null, date_confidence = "unknown"
+  - Always provide season_end regardless
+  - If already played → status = "played", new_date = actual date played
+
+postponement_retry: |
+  You are continuing an investigation into a postponed event. A previous search already found:
+
+  PREVIOUS FINDINGS:
+  - Status: {prev_status}
+  - Reason: {prev_reason}
+  - Sources already checked: {prev_sources}
+  - Search queries already tried: {prev_queries}
+  - Season end found: {prev_season_end}
+
+  You already know the event was postponed. Focus ONLY on finding the new date.
+  Use DIFFERENT search strategies than those already tried:
+  1. Search for the ENTIRE fixture round being rescheduled (fecha/jornada/matchday number)
+  2. Search in the LOCAL LANGUAGE of the competition (e.g. Spanish: "fecha 9 apertura 2026 reprogramada nueva fecha")
+  3. Search the league's official rescheduling announcement
+  4. Check if OTHER matches from the same postponed round have confirmed new dates
+
+  EVENT DETAILS:
+  - Market questions: {market_names}
+  - Originally scheduled: {original_date}
+  - Current date: {today}
+
+  RESPONSE FORMAT — return ONLY this JSON (no markdown, no explanation):
+  {{"status": "played|postponed|cancelled|unknown", "new_date": "YYYY-MM-DD or null", "date_confidence": "exact|window|season_end|unknown", "window_end": "YYYY-MM-DD or null", "season_end": "YYYY-MM-DD", "reason": "brief explanation", "sources": ["url1"], "search_queries_used": ["query1"]}}
+
+  DATE RULES:
+  - Exact date → new_date = that date, date_confidence = "exact"
+  - Window (e.g. "weekend of May 3") → new_date = END of window (e.g. 2026-05-04), date_confidence = "window"
+  - No date but season end known → new_date = season_end, date_confidence = "season_end"
+  - Nothing found → new_date = null, date_confidence = "unknown"
+  - Always provide season_end

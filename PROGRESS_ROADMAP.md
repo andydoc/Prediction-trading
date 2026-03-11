@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.07  
-> **Last updated**: 2026-03-11 ~10:30 UTC  
+> **Version**: v0.04.08  
+> **Last updated**: 2026-03-11 ~12:00 UTC  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4 GB RAM, Ubuntu 24.04, systemd auto-restart, $100 fresh capital  
@@ -169,6 +169,7 @@ The execution control server (`execution_control.py`) and its client were remove
 ├── paper_trading.py                          ← Paper/shadow position lifecycle engine
 ├── live_trading.py                           ← Live CLOB trading engine
 ├── resolution_validator.py                   ← AI-powered resolution date validation (Anthropic API)
+├── postponement_detector.py                  ← AI web search for rescheduled events (2-attempt with context injection)
 ├── dashboard_server.py                       ← Web dashboard (port 5556, SSE live updates)
 ├── orderbook_depth.py                        ← Phase 5a: CLOB book depth analysis
 ├── state_db.py                               ← SQLite in-memory state + WAL disk mirror (Phase 8e/8f)
@@ -191,6 +192,7 @@ The execution control server (`execution_control.py`) and its client were remove
 │
 ├── config/
 │   ├── config.yaml                           ← All parameters (in git — no secrets)
+│   ├── prompts.yaml                          ← AI prompt templates (resolution validation, postponement detection)
 │   └── secrets.yaml                          ← Polymarket + Anthropic API keys (NOT in git)
 │
 ├── data/system_state/
@@ -718,6 +720,17 @@ Most recent first. Each entry summarises what changed and why. Full implementati
 
 ---
 
+### v0.04.08 (2026-03-11) — AI Postponement Detection + Config-Driven Prompts
+- **ADDED** `postponement_detector.py` — AI-powered web search for rescheduled events using Anthropic API + web_search tool
+- **ADDED** Two-attempt strategy: if first call finds postponement but no date, retry with context injection and different search strategies (local language, fixture round, official announcements)
+- **ADDED** `config/prompts.yaml` — all AI prompt templates extracted from code (resolution_validation, postponement_detection, postponement_retry)
+- **ADDED** `config.yaml → ai:` section — centralised AI config: models, max_tokens, API settings, postponement behaviour (thresholds, rate limits, cache TTL, buffer hours)
+- **CHANGED** `resolution_validator.py` — now reads model/prompt from config (falls back to built-in if config missing)
+- **CHANGED** `trading_engine.py` — wired postponement check into event loop (hourly, runs in thread pool). Overdue positions (>24h past expected resolution) trigger AI web search. Results stored in position metadata and used by replacement scoring.
+- **CHANGED** Replacement scoring: reads `pos.metadata.postponement.effective_date` for AI-detected dates, overrides raw end_date and the old `postponement_rescore_days` fallback
+- **TESTED** Both Argentine cases (River Plate vs Tucumán, Lanús vs CD Riestra): AI correctly finds May 3-4 2026 rescheduled date via web search, identifies AFA strike reason, returns proper JSON
+- **NOTED** Rate limit: Anthropic web search uses ~15k tokens/call, 30k/min limit = max 2 calls/min. `rate_limit_seconds: 60` in config handles this.
+
 ### v0.04.07 (2026-03-11) — Code Cleanup, Paper Retirement, Run-Once Scanner
 - **ARCHIVED** Legacy runners to `archive/`: `layer2_runner.py`, `layer3_runner.py`, `layer4_runner.py`, `start_all.sh`, `setup.ps1`, `.bak` files
 - **RENAMED** `layer1_runner.py` → `initial_market_scanner.py` — runs once at startup (not a persistent process)
@@ -860,7 +873,7 @@ Both matches were part of Argentine Liga Profesional Fecha 9, scheduled March 8,
 
 **Root cause:** External event (political/labour dispute) postponing an entire fixture round. The resolution validator cannot anticipate strike action.
 
-**Status:** Positions correctly remain in `monitoring` — no phantom P&L. Capital will be returned when games are played (~May 3, 2026). No system fix needed; this is a market risk event. Future consideration: add a "days since entry" alert for positions exceeding 2× expected resolution time.
+**Status:** Positions correctly remain in `monitoring` — no phantom P&L. Capital will be returned when games are played (~May 3, 2026). **Fixed in v0.04.08**: `postponement_detector.py` now automatically detects overdue positions, searches the web for rescheduled dates, and updates resolution estimates. The replacement scoring loop uses the AI-detected date to evaluate whether to back out of the position if a better opportunity arises.
 
 ---
 
@@ -1083,7 +1096,7 @@ git push -u origin dev
 
 ---
 
-*Last updated: 2026-03-11 ~10:30 UTC*  
+*Last updated: 2026-03-11 ~12:00 UTC*  
 *Laptop: WSL Ubuntu (authoritative) · VPS: ZAP-Hosting 193.23.127.99 · Desktop: dormant*  
 *Dashboard: http://localhost:5556 (laptop) · http://193.23.127.99:5556 (VPS)*  
 *Git: https://github.com/andydoc/Prediction-trading (branch: main)*

@@ -47,6 +47,7 @@ from resolution_validator import (
     get_validated_resolution_date, get_full_validation,
     _load_cache as load_resolution_cache
 )
+from postponement_detector import check_postponement
 from websocket_manager import (
     WebSocketManager, get_asset_ids_for_constraints,
     get_condition_ids_for_positions
@@ -438,6 +439,11 @@ class TradingEngine:
         self._last_constraint_rebuild = 0.0
         self._new_market_buffer: list = []  # buffer new_market events for batch rebuild
         self.MAX_EVALS_PER_BATCH = 500      # Rust arb math = 4µs each; 500 evals = 2ms CPU
+
+        # --- AI config (for resolution validator + postponement detector) ---
+        self.ai_config = config.get('ai', {})
+        self._last_postponement_check = 0.0
+        self.POSTPONEMENT_CHECK_INTERVAL = 3600  # seconds (1 hour — actual per-position throttle is in detector cache)
 
     # --- Index Building ---
 
@@ -896,6 +902,76 @@ class TradingEngine:
 
         return True
 
+    def _check_postponements(self):
+        """Check all open positions for overdue events and search for rescheduled dates.
+        
+        Runs in thread pool (blocking HTTP calls). Per-position caching in
+        postponement_detector prevents redundant API calls.
+        """
+        pp_cfg = self.ai_config.get('postponement', {})
+        overdue_threshold_h = pp_cfg.get('overdue_threshold_hours', 24)
+        now = datetime.now(timezone.utc)
+        checked = 0
+
+        for pos in list(self.paper_engine.open_positions.values()):
+            # Get expected resolution date from position metadata or market end_date
+            expected_date_str = None
+            meta = pos.metadata if hasattr(pos, 'metadata') else (pos.get('metadata', {}) if isinstance(pos, dict) else {})
+            pos_dict = pos.to_dict() if hasattr(pos, 'to_dict') else pos
+
+            # Try AI-validated date first, then raw end_date
+            for mid in pos_dict.get('markets', {}):
+                md = self.market_lookup.get(str(mid))
+                if md and hasattr(md, 'metadata') and md.metadata:
+                    ed = md.metadata.get('end_date', '')
+                    if ed:
+                        expected_date_str = ed[:10]  # YYYY-MM-DD
+                        break
+
+            if not expected_date_str:
+                continue
+
+            # Check if overdue
+            try:
+                expected_dt = datetime.strptime(expected_date_str, '%Y-%m-%d').replace(
+                    tzinfo=timezone.utc)
+                hours_overdue = (now - expected_dt).total_seconds() / 3600
+            except Exception:
+                continue
+
+            if hours_overdue < overdue_threshold_h:
+                continue
+
+            # Position is overdue — check for postponement
+            pos_id = pos_dict.get('position_id', '')
+            market_names = [m.get('name', '?') for m in pos_dict.get('markets', {}).values()]
+
+            result = check_postponement(
+                position_id=pos_id,
+                market_names=market_names,
+                original_date=expected_date_str,
+                ai_config=self.ai_config,
+            )
+            checked += 1
+
+            if result and result.get('effective_resolution_date'):
+                # Store in position metadata for replacement scoring
+                if hasattr(pos, 'metadata') and isinstance(pos.metadata, dict):
+                    pos.metadata['postponement'] = {
+                        'status': result.get('status'),
+                        'new_date': result.get('new_date'),
+                        'effective_date': result.get('effective_resolution_date'),
+                        'confidence': result.get('date_confidence'),
+                        'reason': result.get('reason', ''),
+                        'checked_at': result.get('checked_at'),
+                    }
+                    log.info(f'Postponement detected: {market_names[0][:40]}... '
+                             f'→ {result.get("effective_resolution_date")} '
+                             f'({result.get("date_confidence")})')
+
+        if checked > 0:
+            log.info(f'Postponement check: scanned {checked} overdue positions')
+
     async def _try_enter_or_replace(self, opportunities: List[dict]):
         """
         Given a list of new opportunities (already arb-verified with live prices):
@@ -1021,8 +1097,18 @@ class TradingEngine:
                                     pos_end = ed
                     if pos_end is None:
                         continue
-                    # Postponement/overdue: extend denominator
-                    if pos.metadata.get('postponed') or pos_end < now_utc:
+                    # Postponement detection: use AI-detected date if available
+                    pp_meta = pos.metadata.get('postponement', {})
+                    if pp_meta and pp_meta.get('effective_date'):
+                        try:
+                            pp_end = datetime.strptime(
+                                pp_meta['effective_date'], '%Y-%m-%d'
+                            ).replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+                            pos_end = pp_end
+                        except (ValueError, TypeError):
+                            pass
+                    # Fallback: if still overdue and no postponement data, extend denominator
+                    elif pos.metadata.get('postponed') or pos_end < now_utc:
                         rescore_floor = now_utc + timedelta(days=self.postponement_rescore_days)
                         pos_end = max(pos_end, rescore_floor)
 
@@ -1211,6 +1297,15 @@ class TradingEngine:
                         markets_list = list(self.market_lookup.values())
                         await self.paper_engine.monitor_positions(markets_list)
                     self._last_monitor = now
+
+                # --- Check for postponed events (periodic, threaded) ---
+                if (now - self._last_postponement_check) >= self.POSTPONEMENT_CHECK_INTERVAL:
+                    if self.paper_engine.open_positions and self.ai_config.get('postponement', {}).get('enabled', False):
+                        await loop.run_in_executor(
+                            self._executor,
+                            self._check_postponements
+                        )
+                    self._last_postponement_check = now
 
                 # --- Handle new_market buffer (batch constraint rebuild) ---
                 if (self._new_market_buffer

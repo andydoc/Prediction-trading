@@ -137,3 +137,29 @@ websocket:
   reconnect_base_delay: 1.0
   reconnect_max_delay: 60.0
   max_book_staleness_secs: 30
+
+# === AI Configuration ===
+# All AI model, prompt, and behaviour settings in one place.
+# API key remains in secrets.yaml for security.
+ai:
+  provider: anthropic
+  api_url: https://api.anthropic.com/v1/messages
+  api_version: "2023-06-01"
+
+  models:
+    resolution_validation: claude-sonnet-4-20250514   # Market rules → resolution date extraction
+    postponement_detection: claude-sonnet-4-20250514  # Web search → rescheduled event dates
+
+  max_tokens:
+    resolution_validation: 256
+    postponement_detection: 1024
+
+  postponement:
+    enabled: true
+    overdue_threshold_hours: 24    # Trigger search when position >24h past expected resolution
+    check_interval_hours: 24       # Re-check every 24h if no date found
+    rate_limit_seconds: 60         # Min seconds between API calls (web search uses ~15k tokens/call)
+    max_attempts: 2                # Max API calls per check (1st general, 2nd targeted if no date)
+    fallback_to_season_end: true   # If no date found after max_attempts, use season_end
+    date_buffer_hours: 24          # Add 24h to found date, round up to next midnight
+    cache_ttl_hours: 24            # Cache postponement results for 24h (vs 168h for resolution validation)
