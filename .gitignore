@@ -41,3 +41,5 @@ scripts/debug/
 *.bak
 *.backup*
 archive/
+rust_engine/target/
+rust_arb/target/
