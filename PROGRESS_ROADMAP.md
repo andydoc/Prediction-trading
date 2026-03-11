@@ -2,7 +2,7 @@
 # User Guide · Architecture · Roadmap · Progress
 
 > **Version**: v0.04.06  
-> **Last updated**: 2026-03-10 ~20:00 UTC  
+> **Last updated**: 2026-03-11 ~08:00 UTC  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4 GB RAM, Ubuntu 24.04, systemd auto-restart, $100 fresh capital  
@@ -839,6 +839,29 @@ Most recent first. Each entry summarises what changed and why. Full implementati
 
 ## 8. Incident Log
 
+### INC-006: Argentine Fecha 9 Postponement — Capital Locked Until May (identified 2026-03-11)
+**Markets:** 1360750–1360752 (River Plate vs CA Tucumán), 1360744–1360746 (Lanús vs CD Riestra)
+**Impact:** $20.00 capital locked for ~55 extra days ($10 per position). No loss, but capital velocity degraded.
+
+Both matches were part of Argentine Liga Profesional Fecha 9, scheduled March 8, 2026. The AFA executive committee unanimously suspended all football activities March 5–8 in protest of an ARCA investigation into unpaid social security contributions. The entire round was rescheduled to the weekend of May 3, 2026. Our positions entered before the postponement was announced.
+
+**Root cause:** External event (political/labour dispute) postponing an entire fixture round. The resolution validator cannot anticipate strike action.
+
+**Status:** Positions correctly remain in `monitoring` — no phantom P&L. Capital will be returned when games are played (~May 3, 2026). No system fix needed; this is a market risk event. Future consideration: add a "days since entry" alert for positions exceeding 2× expected resolution time.
+
+---
+
+### INC-005: WSL Disk Full — 200 GB Market Snapshots (identified & fixed 2026-03-11)
+**Impact:** WSL VHDX grew to 424 GB, leaving 5.21 GB free on C: drive. WSL became read-only.
+
+L1 market scanner (`market_data.py`) was writing timestamped 39 MB JSON snapshots every 30 seconds. Over 24 days: 20,383 files × 39 MB = 200 GB in `layer1_market_data/data/polymarket/`. Only `latest.json` is needed by the system.
+
+**Root cause:** `store_markets()` wrote both `latest.json` and `{timestamp}.json` on every collection cycle. No retention policy or disk monitoring existed.
+
+**Fixes applied:** Removed timestamped snapshot writes (only `latest.json` kept). Added `cleanup_old_logs(max_days=3)` to `main.py` startup. Manual cleanup: deleted 20,382 snapshot files, compacted VHDX via `diskpart compact vdisk`.
+
+---
+
 ### INC-004: TX-31 Republican Primary (identified 2026-03-03, cleared 2026-03-10)
 **Markets:** 704392–704394 (Carter, Gomez, Hamden — 3 of 4+ outcomes; "Other" market missing)  
 **Impact:** $0.85 phantom profit. **Cleared.**
@@ -883,18 +906,29 @@ L1 had a hard cap of 10,000 markets. Polymarket had ~33,800. The two missing out
 
 ## 9. Performance
 
-> **Note:** All figures below are from the laptop instance as of v0.03.04 (2026-03-04). The VPS was deployed later with $100 fresh capital. A combined performance view across both instances is a future dashboard feature.
+> **Note:** All figures below are from the laptop instance. The VPS was deployed with $100 fresh capital but is not currently running (paused during architecture work). Combined performance view is a future feature.
 
-### Current State (laptop, v0.03.04)
+### Current State (laptop, v0.04.06, 2026-03-11)
 
 | Metric | Value |
 |--------|-------|
-| Cash (current_capital) | $1.24 |
-| Capital deployed (open positions) | $100.00 |
-| Total portfolio value | $101.24 |
+| Cash (current_capital) | $8.83 |
+| Capital deployed (open positions) | ~$100.00 |
+| Total portfolio value | ~$108.83 |
 | Open positions | 10 |
-| Closed positions | 181 |
-| Net gain vs initial $100 | +$1.24 |
+| Closed positions | ~1,284 |
+| Net gain vs initial $100 | +$8.83 |
+
+### Latency (post-P3, measured 2026-03-11)
+
+| Metric | Steady-state | During WS reconnect |
+|--------|-------------|---------------------|
+| p50 | **23–260 ms** | 1–4 s |
+| p95 | **56–256 ms** | 7–120 s |
+| Background queue | **0** (drains fully) | 400–700 (fills, then drains) |
+| Iteration rate | ~300–500 iters/30s | ~10–50 iters/30s |
+
+**WS reconnects** occur every ~10 minutes (Polymarket server-side), take ~30s to recover live prices. During recovery, queue fills with stale-data re-evals. Once live prices return, queue drains to 0 within seconds.
 
 ### Resolved Arb Audit
 
@@ -1036,7 +1070,7 @@ git push -u origin dev
 
 ---
 
-*Last updated: 2026-03-10 ~20:00 UTC*  
+*Last updated: 2026-03-11 ~08:00 UTC*  
 *Laptop: WSL Ubuntu (authoritative) · VPS: ZAP-Hosting 193.23.127.99 · Desktop: dormant*  
 *Dashboard: http://localhost:5556 (laptop) · http://193.23.127.99:5556 (VPS)*  
 *Git: https://github.com/andydoc/Prediction-trading (branch: main)*
