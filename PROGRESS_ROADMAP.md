@@ -2,7 +2,7 @@
 # User Guide · Architecture · Roadmap · Progress
 
 > **Version**: v0.04.09  
-> **Last updated**: 2026-03-11 ~18:00 UTC  
+> **Last updated**: 2026-03-11 ~21:20 UTC  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4 GB RAM, Ubuntu 24.04, systemd auto-restart, $100 fresh capital  
@@ -212,7 +212,19 @@ The execution control server (`execution_control.py`) and its client were remove
 │   └── debug/                                ← One-off investigation scripts (gitignored)
 │
 ├── PROGRESS_ROADMAP.md                       ← This file
-└── HEARTBEAT.md                              ← Agent standing instructions
+├── HEARTBEAT.md                              ← Agent standing instructions
+│
+├── rust_arb/                                 ← Rust PyO3 crate: arb math (check_mutex_arb, polytope_arb, batch_efp)
+│   ├── src/lib.rs                            ← Single-file crate, 524 lines
+│   └── Cargo.toml
+│
+├── rust_engine/                              ← Rust PyO3 crate: WS engine + book mirror + eval queue (Phase 8 P4)
+│   ├── src/lib.rs                            ← PyO3 bindings: RustWsEngine class
+│   ├── src/types.rs                          ← OrderBook, EFP computation, config types
+│   ├── src/book.rs                           ← DashMap concurrent book mirror with EFP drift detection
+│   ├── src/queue.rs                          ← Deduped urgent/background eval queue
+│   ├── src/ws.rs                             ← tokio-tungstenite sharded WS connections
+│   └── Cargo.toml
 
 /home/andydoc/prediction-trader-env/          ← Python virtual environment
 
@@ -694,8 +706,8 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 
 | # | Item | Status |
 |---|------|--------|
-| 8m | `tokio-tungstenite` WS client with local book mirror (replaces Python `websockets`) | 🔲 |
-| 8n | Rust eval queue with `tokio::select!` instant wake (no polling, no sleep) | 🔲 |
+| 8m | `tokio-tungstenite` WS client with local book mirror (replaces Python `websockets`) | 🔧 Crate built + installed, not yet wired |
+| 8n | Rust eval queue with `tokio::select!` instant wake (no polling, no sleep) | 🔧 Queue built, needs integration |
 | 8o | `rusqlite` state persistence (WAL mode, incremental updates) | 🔲 |
 | 8p | Single Rust binary: WS + queue + eval + state. Python kept for dashboard + resolution validator only. | 🔲 |
 | 8q | Full Rust port: dashboard (axum/warp), resolution validator, everything. Zero Python. | 🔲 |

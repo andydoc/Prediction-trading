@@ -317,13 +317,22 @@ def get_positions_json():
         short_name = mkt_vals[0][1].get('name', '?')[:40] if mkt_vals else '?'
         full_names = [v.get('name', '?') for _, v in mkt_vals]
 
+        # Format entry timestamp as dd/mm/yyyy hh:mm
+        entry_ts_fmt = '?'
+        if entry_ts:
+            try:
+                _edt = datetime.fromisoformat(str(entry_ts))
+                entry_ts_fmt = _edt.strftime('%d/%m/%Y %H:%M')
+            except Exception:
+                entry_ts_fmt = str(entry_ts)[:16]
+
         positions.append({
             'idx': idx, 'short_name': short_name, 'full_names': full_names,
             'strategy': strategy, 'score': round(score, 2),
             'total_cap': round(total_cap, 2),
             'exp_profit': round(exp_profit, 2), 'exp_pct': round(exp_pct, 1),
             'resolve': resolve_str, 'postpone': postpone_info,
-            'status': status, 'entry_ts': entry_ts[:16] if entry_ts else '?',
+            'status': status, 'entry_ts': entry_ts_fmt,
             'is_sell': is_sell, 'legs': legs, 'scenarios': scenarios,
             'guaranteed': round(guaranteed, 2),
             'sort_ts': pos_resolve_dt.isoformat() if pos_resolve_dt else '9999-01-01',
@@ -544,6 +553,16 @@ def get_closed_json():
         'total_closed': len(closed_pos),
     }
 
+def _fmt_ts(iso_str, fmt='%d/%m/%Y %H:%M:%S'):
+    """Format ISO timestamp string to dd/mm/yyyy hh:mm:ss."""
+    if not iso_str:
+        return '?'
+    try:
+        dt = datetime.fromisoformat(str(iso_str))
+        return dt.strftime(fmt)
+    except Exception:
+        return str(iso_str)[:19]
+
 def get_system_json():
     """Process statuses for system section."""
     now = datetime.now(timezone.utc)
@@ -554,11 +573,11 @@ def get_system_json():
     return {
         'scanner': {
             'status': l1_status.get('status', '?'),
-            'ts': l1_status.get('timestamp', ''),
+            'ts': _fmt_ts(l1_status.get('timestamp', '')),
         },
         'engine': {
             'status': engine_status.get('status', '?'),
-            'ts': engine_status.get('timestamp', ''),
+            'ts': _fmt_ts(engine_status.get('timestamp', '')),
             'capital': engine_status.get('capital', 0),
             'positions': engine_status.get('positions', engine_status.get('open_positions', 0)),
         },

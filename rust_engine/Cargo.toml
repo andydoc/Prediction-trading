@@ -1,0 +1,22 @@
+[package]
+name = "rust_engine"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance WS engine + book mirror for prediction market trading"
+
+[lib]
+name = "rust_engine"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+dashmap = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+crossbeam-channel = "0.5"

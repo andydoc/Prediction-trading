@@ -1,0 +1,444 @@
+/// WebSocket connection manager — sharded connections to Polymarket.
+///
+/// Architecture:
+///   - N shards, each handling up to `assets_per_shard` assets
+///   - Each shard is a tokio task with auto-reconnect + exponential backoff
+///   - PING heartbeat every 10s (Polymarket requirement)
+///   - Message dispatch → BookMirror → EvalQueue (all in Rust, no GIL)
+///
+/// Message types handled:
+///   - book: full order book snapshot
+///   - price_change: bid/ask update
+///   - best_bid_ask: lightweight best prices
+///   - last_trade_price: ignored (informational only)
+///   - market_resolved: forwarded to Python via callback queue
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+use tokio::sync::Notify;
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+use serde_json::Value;
+use crate::book::BookMirror;
+use crate::queue::EvalQueue;
+use crate::types::{BookLevel, EngineConfig};
+
+/// Resolved market event, queued for Python to handle.
+#[derive(Debug, Clone)]
+pub struct ResolvedEvent {
+    pub market_cid: String,
+    pub asset_id: String,
+    pub timestamp: f64,
+}
+
+pub struct WsManager {
+    config: EngineConfig,
+    book: Arc<BookMirror>,
+    eval_queue: Arc<EvalQueue>,
+    running: Arc<AtomicBool>,
+    /// Total WS messages received across all shards.
+    total_msgs: Arc<AtomicU64>,
+    /// Resolved events queue (drained by Python).
+    resolved_events: Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
+    /// Assets currently subscribed (for stats).
+    subscribed_count: Arc<AtomicU64>,
+    /// Notify for shutdown.
+    shutdown: Arc<Notify>,
+}
+
+impl WsManager {
+    pub fn new(
+        config: EngineConfig,
+        book: Arc<BookMirror>,
+        eval_queue: Arc<EvalQueue>,
+    ) -> Self {
+        Self {
+            config,
+            book,
+            eval_queue,
+            running: Arc::new(AtomicBool::new(false)),
+            total_msgs: Arc::new(AtomicU64::new(0)),
+            resolved_events: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            subscribed_count: Arc::new(AtomicU64::new(0)),
+            shutdown: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Start WS shards for the given asset IDs.
+    /// Called from Python after constraint detection provides asset lists.
+    pub async fn start(&self, all_asset_ids: Vec<String>) {
+        self.running.store(true, Ordering::SeqCst);
+        let shard_size = self.config.assets_per_shard;
+        let chunks: Vec<Vec<String>> = all_asset_ids
+            .chunks(shard_size)
+            .map(|c| c.to_vec())
+            .collect();
+
+        tracing::info!(
+            "Starting {} WS shards for {} assets ({} per shard)",
+            chunks.len(), all_asset_ids.len(), shard_size
+        );
+
+        self.subscribed_count.store(all_asset_ids.len() as u64, Ordering::Relaxed);
+
+        for (shard_id, assets) in chunks.into_iter().enumerate() {
+            let book = Arc::clone(&self.book);
+            let queue = Arc::clone(&self.eval_queue);
+            let running = Arc::clone(&self.running);
+            let total_msgs = Arc::clone(&self.total_msgs);
+            let resolved = Arc::clone(&self.resolved_events);
+            let shutdown = Arc::clone(&self.shutdown);
+            let ws_url = self.config.ws_url.clone();
+            let hb_interval = self.config.heartbeat_interval_secs;
+
+            tokio::spawn(async move {
+                shard_loop(
+                    shard_id, assets, ws_url, hb_interval,
+                    book, queue, running, total_msgs, resolved, shutdown,
+                ).await;
+            });
+        }
+    }
+
+    /// Stop all WS connections.
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        self.shutdown.notify_waiters();
+        tracing::info!("WS manager: stop requested");
+    }
+
+    /// Drain resolved market events (called by Python).
+    pub fn drain_resolved(&self) -> Vec<ResolvedEvent> {
+        let mut events = self.resolved_events.lock();
+        std::mem::take(&mut *events)
+    }
+
+    /// Stats for monitoring.
+    pub fn stats(&self) -> WsStats {
+        WsStats {
+            total_msgs: self.total_msgs.load(Ordering::Relaxed),
+            subscribed: self.subscribed_count.load(Ordering::Relaxed),
+            live_books: self.book.live_count() as u64,
+            running: self.running.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WsStats {
+    pub total_msgs: u64,
+    pub subscribed: u64,
+    pub live_books: u64,
+    pub running: bool,
+}
+
+/// Per-shard connection loop with auto-reconnect.
+async fn shard_loop(
+    shard_id: usize,
+    assets: Vec<String>,
+    ws_url: String,
+    hb_interval_secs: u64,
+    book: Arc<BookMirror>,
+    queue: Arc<EvalQueue>,
+    running: Arc<AtomicBool>,
+    total_msgs: Arc<AtomicU64>,
+    resolved: Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
+    shutdown: Arc<Notify>,
+) {
+    let mut backoff_ms: u64 = 1000;
+    let max_backoff_ms: u64 = 60_000;
+
+    while running.load(Ordering::Relaxed) {
+        tracing::info!("Shard {}: connecting ({} assets)...", shard_id, assets.len());
+
+        match connect_and_run(
+            shard_id, &assets, &ws_url, hb_interval_secs,
+            &book, &queue, &running, &total_msgs, &resolved, &shutdown,
+        ).await {
+            Ok(()) => {
+                tracing::info!("Shard {}: clean disconnect", shard_id);
+                backoff_ms = 1000;
+            }
+            Err(e) => {
+                tracing::warn!("Shard {}: error: {}, reconnecting in {}ms", shard_id, e, backoff_ms);
+            }
+        }
+
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Backoff before reconnect
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+            _ = shutdown.notified() => { break; }
+        }
+        backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
+    }
+    tracing::info!("Shard {}: loop ended", shard_id);
+}
+
+/// Single connection lifecycle: connect → subscribe → read messages.
+async fn connect_and_run(
+    shard_id: usize,
+    assets: &[String],
+    ws_url: &str,
+    hb_interval_secs: u64,
+    book: &Arc<BookMirror>,
+    queue: &Arc<EvalQueue>,
+    running: &Arc<AtomicBool>,
+    total_msgs: &Arc<AtomicU64>,
+    resolved: &Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
+    shutdown: &Arc<Notify>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (ws_stream, _response) = tokio_tungstenite::connect_async(ws_url).await?;
+    let (mut sink, mut stream) = ws_stream.split();
+
+    tracing::info!("Shard {}: connected, subscribing {} assets", shard_id, assets.len());
+
+    // Subscribe in batches of 500 (Polymarket limit)
+    for chunk in assets.chunks(500) {
+        let asset_list: Vec<Value> = chunk.iter()
+            .map(|a| Value::String(a.clone()))
+            .collect();
+        let sub_msg = serde_json::json!({
+            "type": "subscribe",
+            "channel": "market",
+            "assets_ids": asset_list,
+        });
+        sink.send(WsMessage::Text(sub_msg.to_string())).await?;
+        // Small delay between batches to avoid server throttle
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    tracing::info!("Shard {}: subscribed {} assets", shard_id, assets.len());
+
+    // Main loop: heartbeat + message read
+    let mut heartbeat_interval = tokio::time::interval(
+        Duration::from_secs(hb_interval_secs)
+    );
+
+    loop {
+        tokio::select! {
+            // Heartbeat tick
+            _ = heartbeat_interval.tick() => {
+                let ping = serde_json::json!({"type": "ping"});
+                if let Err(e) = sink.send(WsMessage::Text(ping.to_string())).await {
+                    tracing::warn!("Shard {}: heartbeat send failed: {}", shard_id, e);
+                    return Err(Box::new(e));
+                }
+            }
+
+            // Incoming message
+            msg = stream.next() => {
+                match msg {
+                    Some(Ok(WsMessage::Text(text))) => {
+                        total_msgs.fetch_add(1, Ordering::Relaxed);
+                        handle_message(shard_id, &text, book, queue, resolved);
+                    }
+                    Some(Ok(WsMessage::Ping(data))) => {
+                        let _ = sink.send(WsMessage::Pong(data)).await;
+                    }
+                    Some(Ok(WsMessage::Close(_))) => {
+                        tracing::info!("Shard {}: server sent Close", shard_id);
+                        return Ok(());
+                    }
+                    Some(Err(e)) => {
+                        return Err(Box::new(e));
+                    }
+                    None => {
+                        tracing::info!("Shard {}: stream ended", shard_id);
+                        return Ok(());
+                    }
+                    _ => {} // Binary, Pong — ignore
+                }
+            }
+
+            // Shutdown signal
+            _ = shutdown.notified() => {
+                tracing::info!("Shard {}: shutdown", shard_id);
+                let _ = sink.send(WsMessage::Close(None)).await;
+                return Ok(());
+            }
+        }
+
+        if !running.load(Ordering::Relaxed) {
+            let _ = sink.send(WsMessage::Close(None)).await;
+            return Ok(());
+        }
+    }
+}
+
+/// Parse and dispatch a single WS message.
+fn handle_message(
+    _shard_id: usize,
+    text: &str,
+    book: &Arc<BookMirror>,
+    queue: &Arc<EvalQueue>,
+    resolved: &Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
+) {
+    // Fast path: skip pong and subscription confirmations
+    if text.starts_with("{\"type\":\"pong\"") || text.starts_with("[{\"type\":\"pong\"") {
+        return;
+    }
+
+    // Polymarket sends arrays of events
+    let messages: Vec<Value> = if text.starts_with('[') {
+        match serde_json::from_str(text) {
+            Ok(arr) => arr,
+            Err(_) => return,
+        }
+    } else {
+        match serde_json::from_str::<Value>(text) {
+            Ok(v) => vec![v],
+            Err(_) => return,
+        }
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    for msg in &messages {
+        let event_type = msg.get("event_type")
+            .or_else(|| msg.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        match event_type {
+            "book" => handle_book(msg, book, queue, now),
+            "price_change" => handle_price_change(msg, book, queue, now),
+            "best_bid_ask" => handle_best_bid_ask(msg, book, queue, now),
+            "market_resolved" => handle_resolved(msg, resolved, now),
+            "last_trade_price" | "pong" | "" => {} // ignore
+            _ => {} // unknown event type
+        }
+    }
+}
+
+/// Handle full book snapshot.
+fn handle_book(
+    msg: &Value, book: &Arc<BookMirror>, queue: &Arc<EvalQueue>, ts: f64,
+) {
+    let asset_id = match msg.get("asset_id").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => return,
+    };
+
+    let parse_levels = |key: &str| -> Vec<BookLevel> {
+        msg.get(key)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().filter_map(|level| {
+                    let price = level.get("price")
+                        .and_then(|v| v.as_str().or_else(|| v.as_f64().map(|_| "")))?;
+                    let size = level.get("size")
+                        .and_then(|v| v.as_str().or_else(|| v.as_f64().map(|_| "")))?;
+                    let p = if price.is_empty() {
+                        level.get("price").and_then(|v| v.as_f64())?
+                    } else {
+                        price.parse::<f64>().ok()?
+                    };
+                    let s = if size.is_empty() {
+                        level.get("size").and_then(|v| v.as_f64())?
+                    } else {
+                        size.parse::<f64>().ok()?
+                    };
+                    Some(BookLevel { price: p, size: s })
+                }).collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let asks = parse_levels("asks");
+    let bids = parse_levels("bids");
+    let evals = book.apply_snapshot(asset_id, asks, bids, ts);
+    for (cid, urgent) in evals {
+        queue.push(&cid, asset_id, urgent);
+    }
+}
+
+/// Handle price_change event (has price, best bid/ask fields).
+fn handle_price_change(
+    msg: &Value, book: &Arc<BookMirror>, queue: &Arc<EvalQueue>, ts: f64,
+) {
+    let asset_id = match msg.get("asset_id").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => return,
+    };
+
+    // Extract changes array if present (delta updates)
+    if let Some(changes) = msg.get("changes").and_then(|v| v.as_array()) {
+        for change in changes {
+            let price = parse_f64_field(change, "price").unwrap_or(0.0);
+            let size = parse_f64_field(change, "size").unwrap_or(0.0);
+            let side = change.get("side").and_then(|v| v.as_str()).unwrap_or("");
+            let is_ask = side == "SELL" || side == "sell" || side == "ask";
+            let evals = book.apply_delta(asset_id, is_ask, price, size, ts);
+            for (cid, urgent) in evals {
+                queue.push(&cid, asset_id, urgent);
+            }
+        }
+        return;
+    }
+
+    // Fallback: use best_bid / best_ask fields
+    let bid = parse_f64_field(msg, "best_bid").unwrap_or(0.0);
+    let ask = parse_f64_field(msg, "best_ask").unwrap_or(0.0);
+    if ask > 0.0 || bid > 0.0 {
+        let evals = book.apply_best_prices(asset_id, bid, ask, ts);
+        for (cid, urgent) in evals {
+            queue.push(&cid, asset_id, urgent);
+        }
+    }
+}
+
+/// Handle best_bid_ask event.
+fn handle_best_bid_ask(
+    msg: &Value, book: &Arc<BookMirror>, queue: &Arc<EvalQueue>, ts: f64,
+) {
+    let asset_id = match msg.get("asset_id").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => return,
+    };
+    let bid = parse_f64_field(msg, "best_bid").unwrap_or(0.0);
+    let ask = parse_f64_field(msg, "best_ask").unwrap_or(0.0);
+    if ask > 0.0 || bid > 0.0 {
+        let evals = book.apply_best_prices(asset_id, bid, ask, ts);
+        for (cid, urgent) in evals {
+            queue.push(&cid, asset_id, urgent);
+        }
+    }
+}
+
+/// Handle market_resolved event.
+fn handle_resolved(
+    msg: &Value,
+    resolved: &Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
+    ts: f64,
+) {
+    let asset_id = msg.get("asset_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let market_cid = msg.get("condition_id")
+        .or_else(|| msg.get("market_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if !asset_id.is_empty() || !market_cid.is_empty() {
+        resolved.lock().push(ResolvedEvent {
+            market_cid: market_cid.to_string(),
+            asset_id: asset_id.to_string(),
+            timestamp: ts,
+        });
+        tracing::info!("Market resolved: cid={}, asset={}", market_cid, asset_id);
+    }
+}
+
+/// Parse a JSON field that might be string or number.
+fn parse_f64_field(val: &Value, key: &str) -> Option<f64> {
+    val.get(key).and_then(|v| {
+        v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+    })
+}
