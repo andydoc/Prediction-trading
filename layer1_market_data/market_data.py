@@ -115,10 +115,8 @@ class MarketDataCollector(ABC):
         pass
     
     async def store_markets(self, markets: List[MarketData]):
-        """Store market data to disk"""
+        """Store market data to disk — latest.json only (no timestamped snapshots)."""
         timestamp = datetime.now(timezone.utc)
-        filename = f"{timestamp.strftime('%Y%m%d_%H%M%S')}.json"
-        filepath = self.data_dir / filename
         
         data = {
             'timestamp': timestamp.isoformat(),
@@ -127,13 +125,10 @@ class MarketDataCollector(ABC):
             'markets': [m.to_dict() for m in markets]
         }
         
-        with open(filepath, 'w') as f:
-            json.dump(data, f, indent=2)
-        
-        # Also maintain a "latest.json" for quick access
+        # Write latest.json only — timestamped snapshots removed (were 39MB each, caused 200GB bloat)
         latest_path = self.data_dir / 'latest.json'
         with open(latest_path, 'w') as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f)
     
     def load_latest_markets(self) -> List[MarketData]:
         """Load the most recent market data"""

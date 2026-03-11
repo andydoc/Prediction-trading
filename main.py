@@ -16,6 +16,25 @@ STATUS_DIR  = WORKSPACE / 'data'
 PID_FILE    = WORKSPACE / 'supervisor.pid'
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+# --- Startup log cleanup: keep only last 3 days of logs ---
+def cleanup_old_logs(max_days=3):
+    """Remove log files older than max_days to prevent disk bloat."""
+    import glob
+    now = time.time()
+    cutoff = now - (max_days * 86400)
+    removed = 0
+    for f in LOG_DIR.glob('*.log'):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+        except Exception:
+            pass
+    if removed:
+        print(f'[STARTUP] Cleaned {removed} old log files (>{max_days} days)')
+
+cleanup_old_logs()
+
 logging.basicConfig(level=logging.DEBUG,
     format='%(asctime)s - [SUPERVISOR] %(levelname)s - %(message)s',
     handlers=[logging.FileHandler(str(LOG_DIR / f'supervisor_{datetime.now().strftime("%Y%m%d")}.log')), logging.StreamHandler()])
