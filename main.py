@@ -1,9 +1,12 @@
 """Supervisor - Prediction Market Trading System
 
-Manages two core processes + services:
-  Market Scanner (layer1_runner.py) — discovers markets from Polymarket Gamma API
-  Trading Engine (trading_engine.py) — event-driven: constraints, arb math, execution via WS
-  Dashboard (dashboard_server.py)   — web UI on port 5556
+Startup sequence:
+  1. Initial Market Scanner (initial_market_scanner.py) — runs ONCE, fetches all markets from Gamma API
+  2. Trading Engine (trading_engine.py) — event-driven: constraints, arb math, execution via WS
+  3. Dashboard (dashboard_server.py) — web UI on port 5556, SSE live updates
+
+The scanner populates latest_markets.json which the trading engine needs at startup.
+After that, WS handles all ongoing market discovery and price monitoring.
 """
 import json, logging, os, signal, subprocess, sys, time
 from pathlib import Path
@@ -41,24 +44,11 @@ logging.basicConfig(level=logging.DEBUG,
 log = logging.getLogger('supervisor')
 
 LAYERS = [
-    {'name': 'market_scanner', 'script': WORKSPACE / 'layer1_runner.py', 'restart_delay': 10},
     {'name': 'trading_engine', 'script': WORKSPACE / 'trading_engine.py', 'restart_delay': 10},
     {'name': 'dashboard',      'script': WORKSPACE / 'dashboard_server.py', 'restart_delay': 5},
 ]
 processes = {}
 running = True
-
-def cleanup_old_logs():
-    """Delete log files older than 3 days"""
-    import glob
-    cutoff = time.time() - (3 * 86400)
-    for f in glob.glob(str(LOG_DIR / '*.log')):
-        try:
-            if os.path.getmtime(f) < cutoff:
-                os.remove(f)
-                log.info(f'Cleaned old log: {os.path.basename(f)}')
-        except:
-            pass
 
 def check_pid_lock():
     """Prevent double-start of supervisor"""
@@ -99,6 +89,21 @@ def main():
     log.info('PREDICTION MARKET TRADING SYSTEM - SUPERVISOR')
     log.info(f'PID: {os.getpid()}')
     log.info('=' * 60)
+
+    # --- Run initial market scanner (once, blocking) ---
+    scanner_script = WORKSPACE / 'initial_market_scanner.py'
+    log.info('Running initial market scanner...')
+    scanner_proc = subprocess.run(
+        [VENV_PYTHON, str(scanner_script)],
+        cwd=str(WORKSPACE),
+        timeout=120,  # 2 min max
+    )
+    if scanner_proc.returncode != 0:
+        log.error(f'Scanner failed (exit code {scanner_proc.returncode}). Starting engine anyway (may use stale data).')
+    else:
+        log.info('Scanner complete — latest_markets.json ready')
+
+    # --- Start supervised processes ---
     for layer in LAYERS:
         processes[layer['name']] = start_layer(layer)
         time.sleep(2)
