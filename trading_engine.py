@@ -387,8 +387,8 @@ class TradingEngine:
         )
 
         live_cfg = config.get('live_trading', {})
-        self.live_enabled = live_cfg.get('enabled', False)
-        self.shadow_only = live_cfg.get('shadow_only', False)
+        self.live_enabled = True  # Always enabled — paper mode retired, shadow is minimum
+        self.shadow_only = live_cfg.get('shadow_only', True)  # Default shadow if not specified
 
         # --- Core index: which constraints does each asset affect? ---
         self.market_lookup: Dict[str, MarketData] = {}
@@ -1174,7 +1174,7 @@ class TradingEngine:
         # Weekly delay table update
         trigger_weekly_delay_update()
 
-        mode_str = 'shadow' if self.shadow_only else ('live' if self.live_engine else 'paper')
+        mode_str = 'shadow' if self.shadow_only else 'live'
         log.info(f'Trading Engine ready [{mode_str.upper()}] — entering event loop')
         write_status('running', self.paper_engine.current_capital,
                      len(self.paper_engine.open_positions))

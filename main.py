@@ -93,15 +93,18 @@ def main():
     # --- Run initial market scanner (once, blocking) ---
     scanner_script = WORKSPACE / 'initial_market_scanner.py'
     log.info('Running initial market scanner...')
-    scanner_proc = subprocess.run(
-        [VENV_PYTHON, str(scanner_script)],
-        cwd=str(WORKSPACE),
-        timeout=120,  # 2 min max
-    )
-    if scanner_proc.returncode != 0:
-        log.error(f'Scanner failed (exit code {scanner_proc.returncode}). Starting engine anyway (may use stale data).')
-    else:
-        log.info('Scanner complete — latest_markets.json ready')
+    try:
+        scanner_proc = subprocess.run(
+            [VENV_PYTHON, str(scanner_script)],
+            cwd=str(WORKSPACE),
+            timeout=120,  # 2 min max
+        )
+        if scanner_proc.returncode != 0:
+            log.error(f'Scanner failed (exit code {scanner_proc.returncode}). Starting engine anyway (may use stale data).')
+        else:
+            log.info('Scanner complete — latest_markets.json ready')
+    except subprocess.TimeoutExpired:
+        log.warning('Scanner timed out after 120s — starting engine with whatever data is available')
 
     # --- Start supervised processes ---
     for layer in LAYERS:

@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.06  
-> **Last updated**: 2026-03-11 ~08:00 UTC  
+> **Version**: v0.04.07  
+> **Last updated**: 2026-03-11 ~10:30 UTC  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4 GB RAM, Ubuntu 24.04, systemd auto-restart, $100 fresh capital  
@@ -718,6 +718,19 @@ Most recent first. Each entry summarises what changed and why. Full implementati
 
 ---
 
+### v0.04.07 (2026-03-11) — Code Cleanup, Paper Retirement, Run-Once Scanner
+- **ARCHIVED** Legacy runners to `archive/`: `layer2_runner.py`, `layer3_runner.py`, `layer4_runner.py`, `start_all.sh`, `setup.ps1`, `.bak` files
+- **RENAMED** `layer1_runner.py` → `initial_market_scanner.py` — runs once at startup (not a persistent process)
+- **CHANGED** `main.py`: scanner runs once (blocking, 120s timeout with `TimeoutExpired` catch), then engine + dashboard supervised
+- **RETIRED** Paper trading mode — shadow is now minimum operating mode, live when ready
+- **REMOVED** `paper_trading:` config section from `config.yaml`
+- **CHANGED** `live_trading.enabled` always `true`; `shadow_only` controls shadow vs live (default: `true`)
+- **CHANGED** Mode display simplified: `shadow` or `live` (no more `paper`)
+- **MEASURED** Post-P3 stabilised latency (199 samples, current session):
+  - Steady-state (bg=0): **p50=35ms, p90=195ms, min=2ms**
+  - Overall session: **p50=165ms, p90=5s** (spikes during WS reconnects only)
+  - Background queue: drains to 0 in 33% of samples (rest recovering from ~10-min WS reconnect cycle)
+
 ### v0.04.06 (2026-03-10) — Batch EFP + Dirty-Asset Buffering + Stale Re-subscribe (Phase 8 P3)
 - **ADDED** `batch_effective_fill_prices()` in Rust: computes EFPs for all dirty assets in one PyO3 call (was 1700 individual calls/sec)
 - **CHANGED** WS callbacks now buffer `asset_id` into `_dirty_assets` set (1 Python op) instead of per-event queue processing (~10 Python ops)
@@ -908,7 +921,7 @@ L1 had a hard cap of 10,000 markets. Polymarket had ~33,800. The two missing out
 
 > **Note:** All figures below are from the laptop instance. The VPS was deployed with $100 fresh capital but is not currently running (paused during architecture work). Combined performance view is a future feature.
 
-### Current State (laptop, v0.04.06, 2026-03-11)
+### Current State (laptop, v0.04.07, 2026-03-11)
 
 | Metric | Value |
 |--------|-------|
@@ -919,16 +932,16 @@ L1 had a hard cap of 10,000 markets. Polymarket had ~33,800. The two missing out
 | Closed positions | ~1,284 |
 | Net gain vs initial $100 | +$8.83 |
 
-### Latency (post-P3, measured 2026-03-11)
+### Latency (post-P3 stabilised, measured 2026-03-11 10:10–10:22 UTC, 199 samples)
 
-| Metric | Steady-state | During WS reconnect |
-|--------|-------------|---------------------|
-| p50 | **23–260 ms** | 1–4 s |
-| p95 | **56–256 ms** | 7–120 s |
-| Background queue | **0** (drains fully) | 400–700 (fills, then drains) |
-| Iteration rate | ~300–500 iters/30s | ~10–50 iters/30s |
+| Metric | Steady-state (bg=0) | Overall session | During WS reconnect |
+|--------|--------------------:|----------------:|--------------------:|
+| p50 | **35 ms** | 165 ms | 1–4 s |
+| p90 | **195 ms** | 5,098 ms | 30–85 s |
+| min | 2 ms | 2 ms | — |
+| bg_queue | **0** | 263 median | 400–790 |
 
-**WS reconnects** occur every ~10 minutes (Polymarket server-side), take ~30s to recover live prices. During recovery, queue fills with stale-data re-evals. Once live prices return, queue drains to 0 within seconds.
+**Context:** Polymarket WS connections cycle every ~10 minutes (server-side). During the ~30s recovery window, live market count drops (e.g. 8500→3000→8500) and the background queue fills. In steady state between reconnects, p50 is consistently **26–78 ms** with queue at zero.
 
 ### Resolved Arb Audit
 
@@ -1070,7 +1083,7 @@ git push -u origin dev
 
 ---
 
-*Last updated: 2026-03-11 ~08:00 UTC*  
+*Last updated: 2026-03-11 ~10:30 UTC*  
 *Laptop: WSL Ubuntu (authoritative) · VPS: ZAP-Hosting 193.23.127.99 · Desktop: dormant*  
 *Dashboard: http://localhost:5556 (laptop) · http://193.23.127.99:5556 (VPS)*  
 *Git: https://github.com/andydoc/Prediction-trading (branch: main)*

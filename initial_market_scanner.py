@@ -78,3 +78,6 @@ async def scan_once():
 
 if __name__ == '__main__':
     asyncio.run(scan_once())
+    # Force exit — async manager may have dangling tasks that prevent clean shutdown
+    import os
+    os._exit(0)

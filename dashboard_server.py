@@ -71,26 +71,18 @@ def make_html():
     # Load trading mode
     cfg = load_config()
     config = cfg  # alias for template
-    trading_mode = cfg.get('mode', 'paper_trading')
     live_cfg = cfg.get('live_trading', {})
-    live_enabled = live_cfg.get('enabled', False)
-    shadow_only = live_cfg.get('shadow_only', False)
-    if live_enabled and shadow_only:
+    shadow_only = live_cfg.get('shadow_only', True)  # Default shadow (paper retired)
+    if shadow_only:
         mode_label = 'SHADOW'
         mode_class = 'mode-shadow'
-    elif trading_mode == 'live_trading' or (live_enabled and not shadow_only and trading_mode != 'dual'):
+    else:
         mode_label = 'LIVE'
         mode_class = 'mode-live'
-    elif trading_mode == 'dual' and live_enabled and not shadow_only:
-        mode_label = 'DUAL (PAPER+LIVE)'
-        mode_class = 'mode-dual'
-    else:
-        mode_label = 'PAPER'
-        mode_class = 'mode-paper'
 
-    # Fetch live USDC balance if live/dual mode
+    # Fetch live USDC balance
     live_balance = None
-    if trading_mode in ('live_trading', 'dual') or live_enabled:
+    if True:  # Always attempt — we're always in shadow or live
         try:
             import yaml as _yaml
             from py_clob_client.client import ClobClient
@@ -680,7 +672,7 @@ def make_html():
     if live_balance is not None:
         live_bal_html = f"""<div class="stats">
   <div class="stat"><div class="label">USDC BALANCE</div><div class="value color-amber">${live_balance:.2f}</div></div>
-  <div class="stat"><div class="label">STATUS</div><div class="value {'color-green' if mode_label in ('LIVE','DUAL (PAPER+LIVE)') else 'color-amber'}">{'ACTIVE' if mode_label in ('LIVE','DUAL (PAPER+LIVE)') else 'SHADOW ONLY'}</div></div>
+  <div class="stat"><div class="label">STATUS</div><div class="value {'color-green' if mode_label == 'LIVE' else 'color-amber'}">{'ACTIVE' if mode_label == 'LIVE' else 'SHADOW ONLY'}</div></div>
 </div>"""
     else:
         live_bal_html = '<div class="stats"><div class="stat"><div class="label">STATUS</div><div class="value color-muted">NOT CONNECTED</div></div></div>'
@@ -695,7 +687,7 @@ def make_html():
     if live_pos_count > 0:
         live_positions_html += f'<p>{live_pos_count} positions with live CLOB orders</p>'
     else:
-        live_positions_html += '<p class="color-muted">No live positions. Switch to DUAL or LIVE mode and fund your account to start.</p>'
+        live_positions_html += '<p class="color-muted">No live positions. Set shadow_only: false in config and fund your account to start live trading.</p>'
 
     live_tab_html_val = live_bal_html + live_positions_html
 
@@ -795,8 +787,6 @@ def make_html():
   /* Mode badge — set dynamically via Python class */
   .mode-shadow {{ color: #fa0; background: #332800; border-color: #fa0; }}
   .mode-live {{ color: #f44; background: #3a1111; border-color: #f44; }}
-  .mode-dual {{ color: #fa0; background: #3a2a00; border-color: #fa0; }}
-  .mode-paper {{ color: #0f0; background: #113311; border-color: #0f0; }}
   /* SSE connection indicator */
   .sse-dot {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #555; vertical-align: middle; margin-right: 4px; transition: background 0.3s; }}
   .sse-dot.connected {{ background: #0f0; }}
@@ -925,12 +915,12 @@ function switchTab(tabName) {{
 </div>
 
 <div class="tab-bar">
-  <div class="tab-btn active" data-tab="paper" onclick="switchTab('paper')">Paper{paper_ann_badge}</div>
+  <div class="tab-btn active" data-tab="positions" onclick="switchTab('positions')">Positions{paper_ann_badge}</div>
   <div class="tab-btn" data-tab="shadow" onclick="switchTab('shadow')">Shadow{shadow_ann_badge}</div>
   <div class="tab-btn" data-tab="live" onclick="switchTab('live')">Live{live_ann_badge}</div>
 </div>
 
-<div id="tab-paper" class="tab-content active">
+<div id="tab-positions" class="tab-content active">
 <h2 class="section-title" id="section-positions" onclick="toggleSection(this)">OPEN POSITIONS ({len(open_pos)})<button class="collapse-all-btn" onclick="event.stopPropagation(); collapseAll()">Collapse All</button></h2>
 <div class="section-content">
 <table>
@@ -965,7 +955,7 @@ function switchTab(tabName) {{
 
 {'<h2 class="section-title collapsed" onclick="toggleSection(this)">CLOSED POSITIONS</h2><div class="section-content hidden">' + closed_html + '</div>' if closed_html else ''}
 
-</div><!-- end tab-paper -->
+</div><!-- end tab-positions -->
 
 <div id="tab-shadow" class="tab-content">
 {shadow_tab_html_val}

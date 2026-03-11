@@ -60,9 +60,9 @@ execution_control:
 fees:
   min_profit_threshold: 0.03
 live_trading:
-  # capital_per_trade now derived dynamically: pct × current_capital (min $10, max $1000)
-  # see arbitrage.capital_per_trade_pct
-  enabled: true
+  # Paper mode retired — shadow is minimum, live when ready
+  enabled: true                        # Always true; shadow_only controls real vs simulated
+  shadow_only: true                    # true=shadow (validate against orderbook), false=LIVE (real money)
   fill_check_interval_secs: 2
   low_balance_pause_usd: 20
   max_capital: 100
@@ -103,18 +103,7 @@ ollama:
   context_window: 128000
   max_tokens: 8192
   model: lfm2.5-thinking:1.2b
-paper_trading:
-  initial_capital: 100
-  max_position_age_hours: 24
-  max_price_drift_pct: 0.1
-  simulated_fill_rate: 0.95
-  simulated_latency: 0.5
-  track_metrics:
-  - total_trades
-  - win_rate
-  - avg_profit_per_trade
-  - prediction_accuracy
-  - max_drawdown
+# paper_trading section removed — shadow mode is now the minimum operating mode
 performance:
   cache:
     enabled: true
