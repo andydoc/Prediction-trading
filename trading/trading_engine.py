@@ -37,18 +37,18 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Set, Optional, Tuple
 
-sys.path.append(str(Path(__file__).parent))
-from paper_trading import PaperTradingEngine
-from live_trading import LiveTradingEngine
-from layer1_market_data.market_data import MarketData
-from layer2_constraint_detection.constraint_detector import ConstraintDetector
-from layer3_arbitrage_math.arbitrage_engine import ArbitrageMathEngine
-from resolution_validator import (
+sys.path.append(str(Path(__file__).parent.parent))  # project root
+from trading.paper_trading import PaperTradingEngine
+from trading.live_trading import LiveTradingEngine
+from market_data.market_data import MarketData
+from constraint_detection.constraint_detector import ConstraintDetector
+from arbitrage_math.arbitrage_engine import ArbitrageMathEngine
+from utilities.resolution_validator import (
     get_validated_resolution_date, get_full_validation,
     _load_cache as load_resolution_cache
 )
-from postponement_detector import check_postponement
-from websocket_manager import (
+from utilities.postponement_detector import check_postponement
+from trading.websocket_manager import (
     WebSocketManager, get_asset_ids_for_constraints,
     get_condition_ids_for_positions
 )
@@ -73,8 +73,8 @@ WORKSPACE    = Path('/home/andydoc/prediction-trader')
 CONFIG_PATH  = WORKSPACE / 'config' / 'config.yaml'
 SECRETS_PATH = WORKSPACE / 'config' / 'secrets.yaml'
 MARKETS_PATH = WORKSPACE / 'data' / 'latest_markets.json'
-CONSTRAINTS_PATH = WORKSPACE / 'layer2_constraint_detection' / 'data' / 'latest_constraints.json'
-OPP_PATH     = WORKSPACE / 'layer3_arbitrage_math' / 'data' / 'latest_opportunities.json'
+CONSTRAINTS_PATH = WORKSPACE / 'constraint_detection' / 'data' / 'latest_constraints.json'
+OPP_PATH     = WORKSPACE / 'arbitrage_math' / 'data' / 'latest_opportunities.json'
 STATUS_PATH  = WORKSPACE / 'data' / 'trading_engine_status.json'
 STATE_DIR    = WORKSPACE / 'data' / 'system_state'
 EXEC_STATE   = STATE_DIR / 'execution_state.json'
@@ -1281,7 +1281,7 @@ class TradingEngine:
                     self._executor, self._process_pending_evals)
                 if opportunities:
                     # Write opportunities to file (dashboard + debug)
-                    from layer3_arbitrage_math.arbitrage_engine import ArbitrageOpportunity
+                    from arbitrage_math.arbitrage_engine import ArbitrageOpportunity
                     OPP_PATH.parent.mkdir(parents=True, exist_ok=True)
                     OPP_PATH.write_text(json.dumps({
                         'opportunities': opportunities,

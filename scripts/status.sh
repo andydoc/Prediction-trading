@@ -22,10 +22,10 @@ if ic: print(f'Return: {((d[\"current_capital\"]+dep)-ic)/ic*100:.1f}%')
 "
 echo ""
 echo "=== Processes ==="
-ps aux | grep -E "main.py|layer[1-4]|dashboard" | grep -v grep | awk '{printf "%-6s %s\n", $2, $NF}'
+ps aux | grep -E "main\.py|trading_engine|dashboard_server|initial_market_scanner" | grep -v grep | awk '{printf "%-6s %s\n", $2, $NF}'
 echo ""
-echo "=== L4 log (last 5) ==="
-tail -5 logs/layer4_$(date +%Y%m%d).log 2>/dev/null || echo "no log yet"
+echo "=== Trading Engine log (last 5) ==="
+tail -5 logs/trading_engine_$(date +%Y%m%d).log 2>/dev/null || echo "no log yet"
 
 if [ "$1" != "--full" ]; then
     exit 0
@@ -45,22 +45,16 @@ du -sh logs/ data/ 2>/dev/null
 
 echo ""
 echo "=== JSON file sizes ==="
-ls -lh data/latest_markets.json 2>/dev/null
-ls -lh layer2_constraint_detection/data/latest_constraints.json 2>/dev/null
-ls -lh layer3_arbitrage_math/data/latest_opportunities.json 2>/dev/null
+ls -lh layer1_market_data/data/polymarket/latest.json 2>/dev/null
 ls -lh data/system_state/execution_state.json 2>/dev/null
 
 echo ""
-echo "=== L3 scan timing ==="
-grep "SCAN COMPLETE" logs/layer3_$(date +%Y%m%d).log 2>/dev/null | tail -3
-
-echo ""
-echo "=== L4 iteration timing ==="
-grep "iter.*Capital" logs/layer4_$(date +%Y%m%d).log 2>/dev/null | tail -3
+echo "=== Trading Engine timing ==="
+grep -E "iter.*Capital|p50|latency" logs/trading_engine_$(date +%Y%m%d).log 2>/dev/null | tail -5
 
 echo ""
 echo "=== Errors today ==="
-for f in logs/layer*$(date +%Y%m%d).log; do
+for f in logs/main_*.log logs/trading_engine_$(date +%Y%m%d).log logs/dashboard_$(date +%Y%m%d).log; do
     c=$(grep -c "ERROR" "$f" 2>/dev/null || echo 0)
     [ "$c" -gt 0 ] && echo "  $(basename $f): $c errors"
 done

@@ -135,18 +135,18 @@ print(f'Cancelled {cancelled} orders')
     ;;
 esac
 
-# Restart L4 + dashboard to pick up changes
+# Restart Trading Engine + dashboard to pick up changes
 echo ""
-echo "Restarting L4 and dashboard..."
-L4_PID=$(ps aux | grep 'layer4_runner' | grep -v grep | awk '{print $2}')
-[ -n "$L4_PID" ] && kill $L4_PID 2>/dev/null && echo "  Killed L4 (pid $L4_PID)"
+echo "Restarting Trading Engine and dashboard..."
+L4_PID=$(ps aux | grep 'trading_engine' | grep -v grep | awk '{print $2}')
+[ -n "$L4_PID" ] && kill $L4_PID 2>/dev/null && echo "  Killed Trading Engine (pid $L4_PID)"
 DASH_PID=$(ps aux | grep 'dashboard_server' | grep -v grep | awk '{print $2}')
 [ -n "$DASH_PID" ] && kill $DASH_PID 2>/dev/null && echo "  Killed dashboard"
 sleep 6
 
 echo ""
 echo "Verifying..."
-tail -5 /home/andydoc/prediction-trader/logs/layer4_$(date +%Y%m%d).log 2>/dev/null
+tail -5 /home/andydoc/prediction-trader/logs/trading_engine_$(date +%Y%m%d).log 2>/dev/null
 curl -s -o /dev/null -w "Dashboard: HTTP %{http_code}\n" http://localhost:5556/
 echo "=========================================="
 echo "  DONE"

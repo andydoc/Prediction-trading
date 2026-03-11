@@ -16,13 +16,13 @@ case "$TARGET" in
     curl -s -o /dev/null -w "Dashboard: HTTP %{http_code}\n" http://localhost:5556/
     ;;
   --l4)
-    echo "Killing L4..."
-    kill $(ps aux | grep layer4_runner | grep -v grep | awk '{print $2}') 2>/dev/null
+    echo "Killing Trading Engine..."
+    kill $(ps aux | grep trading_engine | grep -v grep | awk '{print $2}') 2>/dev/null
     echo "Supervisor will restart in ~5s"
     ;;
   *)
     echo "Killing ALL trader processes..."
-    kill -9 $(ps aux | grep 'main.py\|layer[1-4]_runner\|dashboard_server' | grep -v grep | awk '{print $2}') 2>/dev/null
+    kill -9 $(ps aux | grep -E 'main\.py|trading_engine|dashboard_server|initial_market_scanner' | grep -v grep | awk '{print $2}') 2>/dev/null
     sleep 2
     rm -f /home/andydoc/prediction-trader/*.pid
     echo ""

@@ -13,7 +13,7 @@ echo "Pulling latest code..."
 git pull --ff-only origin main 2>&1 || echo "  WARNING: git pull failed — continuing with local code"
 
 echo "Killing all trader processes..."
-PIDS=$(ps aux | grep -E 'main\.py|layer[1-4]_runner|dashboard_server' | grep -v grep | tr -s ' ' | cut -d' ' -f2)
+PIDS=$(ps aux | grep -E 'main\.py|trading_engine|dashboard_server|initial_market_scanner' | grep -v grep | tr -s ' ' | cut -d' ' -f2)
 if [ -n "$PIDS" ]; then
     echo "  Killing PIDs: $PIDS"
     echo "$PIDS" | xargs kill 2>/dev/null || true
@@ -24,9 +24,9 @@ sleep 3
 
 if [ "$1" = "--clean" ]; then
     echo "Cleaning stale data..."
-    rm -f layer2_constraint_detection/data/latest_constraints.json
-    rm -f layer3_arbitrage_math/data/latest_opportunities.json
-    rm -f layer2_constraint_detection/__pycache__/*.pyc
+    rm -f constraint_detection/data/latest_constraints.json
+    rm -f arbitrage_math/data/latest_opportunities.json
+    rm -f constraint_detection/__pycache__/*.pyc
     echo "  Cleaned L2/L3 cache"
 fi
 
@@ -43,15 +43,15 @@ sleep 15
 
 echo ""
 echo "=== Process check ==="
-ps aux | grep -E 'main\.py|layer[1-4]_runner|dashboard_server' | grep -v grep | tr -s ' ' | cut -d' ' -f2,11
+ps aux | grep -E 'main\.py|trading_engine|dashboard_server' | grep -v grep | tr -s ' ' | cut -d' ' -f2,11
 
 echo ""
-echo "=== L4 startup log (last 10 lines) ==="
-LOGFILE="logs/layer4_$(date +%Y%m%d).log"
+echo "=== Trading Engine log (last 10 lines) ==="
+LOGFILE="logs/trading_engine_$(date +%Y%m%d).log"
 if [ -f "$LOGFILE" ]; then
     tail -10 "$LOGFILE"
 else
-    echo "  L4 log not yet created — try: tail -f $LOGFILE"
+    echo "  Engine log not yet created — try: tail -f $LOGFILE"
 fi
 
 echo ""

@@ -1,7 +1,9 @@
 """Supervisor - Prediction Market Trading System
 
 Startup sequence:
-  1. Initial Market Scanner (initial_market_scanner.py) — runs ONCE, fetches all markets from Gamma API
+  1. Initial Market Scanner (initial_market_scanner.py) — runs ONCE:
+     a. Postponement detection: checks overdue positions via AI web search
+     b. Market scan: fetches all markets from Polymarket Gamma API (synchronous REST)
   2. Trading Engine (trading_engine.py) — event-driven: constraints, arb math, execution via WS
   3. Dashboard (dashboard_server.py) — web UI on port 5556, SSE live updates
 
@@ -44,8 +46,8 @@ logging.basicConfig(level=logging.DEBUG,
 log = logging.getLogger('supervisor')
 
 LAYERS = [
-    {'name': 'trading_engine', 'script': WORKSPACE / 'trading_engine.py', 'restart_delay': 10},
-    {'name': 'dashboard',      'script': WORKSPACE / 'dashboard_server.py', 'restart_delay': 5},
+    {'name': 'trading_engine', 'script': WORKSPACE / 'trading' / 'trading_engine.py', 'restart_delay': 10},
+    {'name': 'dashboard',      'script': WORKSPACE / 'utilities' / 'dashboard_server.py', 'restart_delay': 5},
 ]
 processes = {}
 running = True
@@ -90,21 +92,21 @@ def main():
     log.info(f'PID: {os.getpid()}')
     log.info('=' * 60)
 
-    # --- Run initial market scanner (once, blocking) ---
-    scanner_script = WORKSPACE / 'initial_market_scanner.py'
-    log.info('Running initial market scanner...')
+    # --- Run initial scanner: postponement check + market fetch (synchronous, blocking) ---
+    scanner_script = WORKSPACE / 'utilities' / 'initial_market_scanner.py'
+    log.info('Running initial scanner (postponement check + market fetch)...')
     try:
         scanner_proc = subprocess.run(
             [VENV_PYTHON, str(scanner_script)],
             cwd=str(WORKSPACE),
-            timeout=120,  # 2 min max
+            timeout=300,  # 5 min: allows for postponement AI calls (60s rate limit each)
         )
         if scanner_proc.returncode != 0:
             log.error(f'Scanner failed (exit code {scanner_proc.returncode}). Starting engine anyway (may use stale data).')
         else:
             log.info('Scanner complete — latest_markets.json ready')
     except subprocess.TimeoutExpired:
-        log.warning('Scanner timed out after 120s — starting engine with whatever data is available')
+        log.warning('Scanner timed out after 300s — starting engine with whatever data is available')
 
     # --- Start supervised processes ---
     for layer in LAYERS:

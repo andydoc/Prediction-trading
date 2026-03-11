@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.08  
-> **Last updated**: 2026-03-11 ~12:00 UTC  
+> **Version**: v0.04.09  
+> **Last updated**: 2026-03-11 ~18:00 UTC  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4 GB RAM, Ubuntu 24.04, systemd auto-restart, $100 fresh capital  
@@ -45,7 +45,7 @@ Two persistent processes replace the old four-layer polling pipeline:
 |---------|--------|---------|
 | **Market Scanner** | `layer1_runner.py` | Fetches all active markets from Polymarket Gamma API (33 k+); writes `latest_markets.json`. Runs at startup and on a periodic refresh schedule. |
 | **Trading Engine** | `trading_engine.py` | Event-driven core: constraint detection, arb math, execution, and position management. Reacts to WebSocket price events in real time. |
-| **Dashboard** | `dashboard_server.py` | Web UI on port 5556. Live updates via SSE (no page reload required). |
+| **Dashboard** | `dashboard_server.py` | Web UI on port 5556. Fully dynamic via typed SSE events — positions, opportunities, aggregates, closed positions, system metrics all update in real time with zero page reloads. |
 
 
 **Data flow (Trading Engine):**
@@ -720,6 +720,22 @@ Most recent first. Each entry summarises what changed and why. Full implementati
 
 ---
 
+### v0.04.09 (2026-03-11) — Full SSE Dynamic Dashboard (Zero-Refresh)
+- **REWRITTEN** `dashboard_server.py` — complete rewrite from server-rendered HTML to static shell + JSON SSE events
+- **CHANGED** All data sections now update live via typed SSE events (no page reload needed):
+  - `stats` (every 5s): header metrics, cash, deployed, fees, return, WS/queue/latency stats
+  - `positions` (every 5s): open positions with legs, scenarios, guaranteed payout + aggregate holdings
+  - `opportunities` (every 15s): top 20 scored opportunities with legs and scenarios
+  - `system` (every 10s): process statuses, engine metrics, Rust/WS/queue/latency
+  - `closed` (every 60s): closed positions categorised into resolved/replaced
+  - `shadow` (every 30s): shadow log parsing (would-trade signals, rejection reasons)
+  - `live` (every 30s): USDC balance, mode, live position count
+- **CHANGED** HTML is now a static shell served once; all table rendering done client-side in JS
+- **CHANGED** USDC balance now cached for 60s (was re-fetched on every page load)
+- **CHANGED** All SSE events sent immediately on client connect (no 5s wait for first data)
+- **ARCHIVED** Previous dashboard as `archive/dashboard_server_v1.py`
+- **PRESERVED** All existing features: expandable rows, scenarios, postponement badges, AI validation tags, sell/buy arb detail, aggregate market view
+
 ### v0.04.08 (2026-03-11) — AI Postponement Detection + Config-Driven Prompts
 - **ADDED** `postponement_detector.py` — AI-powered web search for rescheduled events using Anthropic API + web_search tool
 - **ADDED** Two-attempt strategy: if first call finds postponement but no date, retry with context injection and different search strategies (local language, fixture round, official announcements)
@@ -1079,6 +1095,7 @@ Format: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch (e.g. `v
 | `v0.04.02` | EFP queue metric + negRisk tagging |
 | `v0.04.03` | Latency bottleneck analysis + P0/P1 fixes |
 | `v0.04.04` | Dashboard SSE rewrite + exec control removal *(current)* |
+| `v0.04.09` | Full SSE dynamic dashboard (zero-refresh) |
 | `v1.00.00` | First successful live trade |
 
 ### Implementation Steps

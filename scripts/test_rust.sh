@@ -3,7 +3,7 @@ cd /home/andydoc/prediction-trader
 source ../prediction-trader-env/bin/activate
 python -c "
 import time, json, rust_arb
-from layer1_market_data.market_data import MarketData
+from market_data.market_data import MarketData
 from datetime import datetime, timezone
 
 # Simulate realistic constraint eval overhead

@@ -40,3 +40,4 @@ scripts/debug/
 *.zip
 *.bak
 *.backup*
+archive/

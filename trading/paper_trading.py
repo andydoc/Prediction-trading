@@ -23,7 +23,7 @@ from pathlib import Path
 import json
 
 try:
-    from state_store import StateStore
+    from utilities.state_store import StateStore
     HAS_SQLITE = True
 except ImportError:
     HAS_SQLITE = False

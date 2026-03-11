@@ -101,7 +101,7 @@ class MarginalPolytope:
         Enumerate all binary outcome vectors consistent with constraints.
         Returns array of shape (S, N) where S = number of valid scenarios.
         """
-        from layer2_constraint_detection.constraint_detector import RelationshipType
+        from constraint_detection.constraint_detector import RelationshipType
 
         all_outcomes = np.array(list(iterproduct([0, 1], repeat=self.n)))
         valid = []
@@ -118,7 +118,7 @@ class MarginalPolytope:
 
     def _satisfies_constraints(self, outcome: np.ndarray) -> bool:
         """Check if an outcome vector satisfies all constraints."""
-        from layer2_constraint_detection.constraint_detector import RelationshipType
+        from constraint_detection.constraint_detector import RelationshipType
 
         ct = self.constraint_type
 
@@ -373,7 +373,7 @@ class ArbitrageMathEngine:
 
     def _check_constraint_for_arbitrage(self, constraint, markets: List
                                         ) -> Optional[ArbitrageOpportunity]:
-        from layer2_constraint_detection.constraint_detector import RelationshipType
+        from constraint_detection.constraint_detector import RelationshipType
 
         market_dict = {m.market_id: m for m in markets}
         constrained_markets = [market_dict[mid] for mid in constraint.market_ids
@@ -843,7 +843,7 @@ if __name__ == '__main__':
 
     # Synthetic test: 3 mutex markets, prices sum to 0.88 (arb exists)
     from types import SimpleNamespace
-    from layer2_constraint_detection.constraint_detector import RelationshipType
+    from constraint_detection.constraint_detector import RelationshipType
 
     prices_test = [0.30, 0.28, 0.30]   # sum=0.88, should find arb
     market_ids_t = ['m1', 'm2', 'm3']

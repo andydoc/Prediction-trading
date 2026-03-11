@@ -45,13 +45,81 @@ class MarketData:
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'MarketData':
-        """Create from dictionary"""
-        data['end_date'] = datetime.fromisoformat(data['end_date'])
-        data['timestamp'] = datetime.fromisoformat(data['timestamp'])
+        """Create from dictionary (our own to_dict format, not raw API)."""
+        if 'end_date' in data:
+            ed = data['end_date']
+            data['end_date'] = datetime.fromisoformat(ed) if isinstance(ed, str) else ed
+        else:
+            data['end_date'] = datetime.now(timezone.utc)
+        if 'timestamp' in data:
+            ts = data['timestamp']
+            data['timestamp'] = datetime.fromisoformat(ts) if isinstance(ts, str) else ts
+        else:
+            data['timestamp'] = datetime.now(timezone.utc)
         # Handle missing bid/ask fields (L1 data won't have them)
         data.setdefault('outcome_bids', None)
         data.setdefault('outcome_asks', None)
-        return cls(**data)
+        # Handle missing required fields gracefully
+        data.setdefault('market_id', data.get('id', ''))
+        data.setdefault('market_name', data.get('question', 'Unknown'))
+        data.setdefault('question', data.get('market_name', 'Unknown'))
+        data.setdefault('outcome_prices', {})
+        data.setdefault('volume_24h', 0)
+        data.setdefault('liquidity', 0)
+        data.setdefault('categories', [])
+        data.setdefault('metadata', {})
+        data.setdefault('source', 'polymarket')
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+    @classmethod
+    def from_api_response(cls, market: Dict) -> 'MarketData':
+        """Create from raw Polymarket Gamma API response dict."""
+        import json as json_module
+        
+        # Parse outcome prices
+        outcome_prices = {}
+        outcomes = market.get('outcomes', [])
+        prices = market.get('outcomePrices', [])
+        if isinstance(outcomes, str):
+            try: outcomes = json_module.loads(outcomes)
+            except: outcomes = []
+        if isinstance(prices, str):
+            try: prices = json_module.loads(prices)
+            except: prices = []
+        for i, outcome in enumerate(outcomes):
+            if i < len(prices):
+                outcome_prices[outcome] = float(prices[i])
+        
+        # Parse end date
+        end_date_str = market.get('endDate') or market.get('end_date')
+        end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')) \
+                   if end_date_str else datetime.now(timezone.utc)
+        
+        return cls(
+            market_id=str(market.get('id', market.get('market_id', ''))),
+            market_name=market.get('question', 'Unknown'),
+            question=market.get('question', 'Unknown'),
+            outcome_prices=outcome_prices,
+            volume_24h=float(market.get('volume_24h') or market.get('volume24hr') or 0),
+            liquidity=float(market.get('liquidity', 0)),
+            end_date=end_date,
+            categories=market.get('tags', []),
+            metadata={
+                'conditionId': market.get('conditionId', ''),
+                'questionID': market.get('questionID', ''),
+                'negRisk': market.get('negRisk', False),
+                'negRiskMarketID': market.get('negRiskMarketID', ''),
+                'groupItemTitle': market.get('groupItemTitle', ''),
+                'slug': market.get('slug', ''),
+                'clobTokenIds': market.get('clobTokenIds', ''),
+                'enableOrderBook': market.get('enableOrderBook', False),
+                'acceptingOrders': market.get('acceptingOrders', False),
+                'end_date': end_date_str or '',
+                'description': market.get('description', ''),
+            },
+            timestamp=datetime.now(timezone.utc),
+            source='polymarket',
+        )
 
     def get_entry_price(self, outcome: str = 'Yes') -> float:
         """Best available entry price (ask if WS live, else midpoint fallback)."""
@@ -265,7 +333,7 @@ class MarketDataManager:
     def __init__(self, config: Dict, workspace_root: Path):
         self.config = config
         self.workspace_root = Path(workspace_root)
-        self.data_dir = self.workspace_root / 'layer1_market_data' / 'data'
+        self.data_dir = self.workspace_root / 'market_data' / 'data'
         self.logger = logging.getLogger('MarketDataManager')
         self.collectors = []
         

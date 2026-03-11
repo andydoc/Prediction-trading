@@ -324,7 +324,7 @@ if __name__ == '__main__':
     """Quick test: fetch depth for the top opportunity."""
     import sys
     sys.path.append(str(__import__('pathlib').Path(__file__).parent))
-    from layer1_market_data.market_data import MarketData
+    from market_data.market_data import MarketData
 
     async def main():
         logging.basicConfig(level=logging.DEBUG)
@@ -339,7 +339,7 @@ if __name__ == '__main__':
         print(f"Loaded {len(markets)} markets")
 
         # Load opportunities
-        opp_path = workspace / 'layer3_arbitrage_math' / 'data' / 'latest_opportunities.json'
+        opp_path = workspace / 'arbitrage_math' / 'data' / 'latest_opportunities.json'
         opps = json.loads(opp_path.read_text()).get('opportunities', [])
         print(f"Loaded {len(opps)} opportunities")
 
