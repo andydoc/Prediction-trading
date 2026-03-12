@@ -30,6 +30,8 @@ class MarketData:
     source: str  # polymarket, kalshi, etc
     outcome_bids: Dict[str, float] = None   # outcome -> best bid (WS live, exit price)
     outcome_asks: Dict[str, float] = None   # outcome -> best ask (WS live, entry cost)
+    yes_asset_id: str = ''                  # CLOB token ID for YES outcome (normalized from metadata.clobTokenIds)
+    no_asset_id: str = ''                   # CLOB token ID for NO outcome  (normalized from metadata.clobTokenIds)
     
     def to_dict(self) -> Dict:
         """Convert to dictionary for storage"""
@@ -69,6 +71,22 @@ class MarketData:
         data.setdefault('categories', [])
         data.setdefault('metadata', {})
         data.setdefault('source', 'polymarket')
+        # Normalize clobTokenIds if not already done (backward compat with stored data)
+        if not data.get('yes_asset_id') and 'metadata' in data:
+            import json as json_module
+            clob_raw = data['metadata'].get('clobTokenIds', '')
+            clob_ids = []
+            if clob_raw:
+                if isinstance(clob_raw, str):
+                    try: clob_ids = json_module.loads(clob_raw)
+                    except: clob_ids = []
+                elif isinstance(clob_raw, list):
+                    clob_ids = clob_raw
+            data.setdefault('yes_asset_id', str(clob_ids[0]) if len(clob_ids) > 0 else '')
+            data.setdefault('no_asset_id', str(clob_ids[1]) if len(clob_ids) > 1 else '')
+        else:
+            data.setdefault('yes_asset_id', '')
+            data.setdefault('no_asset_id', '')
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
     @classmethod
@@ -95,6 +113,18 @@ class MarketData:
         end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')) \
                    if end_date_str else datetime.now(timezone.utc)
         
+        # Normalize clobTokenIds → yes_asset_id / no_asset_id (parsed once, used everywhere)
+        clob_raw = market.get('clobTokenIds', '')
+        clob_ids = []
+        if clob_raw:
+            if isinstance(clob_raw, str):
+                try: clob_ids = json_module.loads(clob_raw)
+                except: clob_ids = []
+            elif isinstance(clob_raw, list):
+                clob_ids = clob_raw
+        yes_aid = str(clob_ids[0]) if len(clob_ids) > 0 else ''
+        no_aid = str(clob_ids[1]) if len(clob_ids) > 1 else ''
+        
         return cls(
             market_id=str(market.get('id', market.get('market_id', ''))),
             market_name=market.get('question', 'Unknown'),
@@ -119,6 +149,8 @@ class MarketData:
             },
             timestamp=datetime.now(timezone.utc),
             source='polymarket',
+            yes_asset_id=yes_aid,
+            no_asset_id=no_aid,
         )
 
     def get_entry_price(self, outcome: str = 'Yes') -> float:

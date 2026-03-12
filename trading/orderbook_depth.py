@@ -86,22 +86,15 @@ def get_token_id_for_market(market_id: str, market_lookup: Dict, strategy: str) 
         log.warning(f"Market {market_id} not in lookup")
         return None
 
-    clob_ids_raw = md.metadata.get('clobTokenIds', '[]')
-    try:
-        clob_ids = json.loads(clob_ids_raw) if isinstance(clob_ids_raw, str) else clob_ids_raw
-    except (json.JSONDecodeError, TypeError):
-        log.warning(f"Bad clobTokenIds for {market_id}: {clob_ids_raw}")
+    if not md.yes_asset_id:
+        log.warning(f"Market {market_id} has no CLOB token IDs")
         return None
 
-    if not clob_ids or len(clob_ids) < 2:
-        log.warning(f"Market {market_id} has <2 clob tokens")
-        return None
-
-    # YES token = index 0, NO token = index 1
+    # YES token for buy arb, NO token for sell arb
     if 'sell' in strategy.lower():
-        return clob_ids[1]   # NO token for sell arb
+        return md.no_asset_id
     else:
-        return clob_ids[0]   # YES token for buy arb
+        return md.yes_asset_id
 
 
 class OrderBookDepthChecker:

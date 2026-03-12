@@ -316,14 +316,10 @@ def get_asset_ids_for_opportunity(opp_dict: dict, market_lookup: dict) -> list:
         md = market_lookup.get(str(mid))
         if not md:
             continue
-        clob_raw = md.metadata.get('clobTokenIds', '[]') if hasattr(md, 'metadata') else '[]'
-        try:
-            clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
-        except (json.JSONDecodeError, TypeError):
-            continue
-        for tid in (clob_ids or []):
-            if tid:
-                asset_ids.add(tid)
+        if md.yes_asset_id:
+            asset_ids.add(md.yes_asset_id)
+        if md.no_asset_id:
+            asset_ids.add(md.no_asset_id)
     return list(asset_ids)
 
 
@@ -497,19 +493,15 @@ class TradingEngine:
                 md = self.market_lookup.get(str(mid))
                 if not md:
                     continue
-                clob_raw = md.metadata.get('clobTokenIds', '[]') if hasattr(md, 'metadata') else '[]'
-                try:
-                    clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                for tid in (clob_ids or []):
+                for tid in (md.yes_asset_id, md.no_asset_id):
                     if tid:
                         self.asset_to_constraints.setdefault(tid, set()).add(cid)
                         asset_ids_for_constraint.add(tid)
                 # Reverse lookup: asset_id → (market_id, token_index)
-                for idx, tid in enumerate(clob_ids or []):
-                    if tid and tid not in self.asset_to_market:
-                        self.asset_to_market[tid] = (str(mid), idx)  # 0=YES, 1=NO
+                if md.yes_asset_id and md.yes_asset_id not in self.asset_to_market:
+                    self.asset_to_market[md.yes_asset_id] = (str(mid), 0)  # 0=YES
+                if md.no_asset_id and md.no_asset_id not in self.asset_to_market:
+                    self.asset_to_market[md.no_asset_id] = (str(mid), 1)  # 1=NO
 
             self.constraint_to_assets[cid] = asset_ids_for_constraint
 
@@ -530,19 +522,12 @@ class TradingEngine:
                 md = self.market_lookup.get(str(mid))
                 if not md:
                     continue
-                clob_raw = md.metadata.get('clobTokenIds', '[]') if hasattr(md, 'metadata') else '[]'
-                try:
-                    clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                yes_id = clob_ids[0] if clob_ids and len(clob_ids) > 0 else ''
-                no_id = clob_ids[1] if clob_ids and len(clob_ids) > 1 else ''
                 name = md.question[:80] if hasattr(md, 'question') else str(mid)
-                if yes_id:
+                if md.yes_asset_id:
                     markets.append({
                         'market_id': str(mid),
-                        'yes_asset_id': yes_id,
-                        'no_asset_id': no_id,
+                        'yes_asset_id': md.yes_asset_id,
+                        'no_asset_id': md.no_asset_id,
                         'name': name,
                     })
             if len(markets) >= 2:
@@ -937,15 +922,22 @@ class TradingEngine:
             held_cids = get_held_constraint_ids(self.paper_engine)
             held_mids = get_held_market_ids(self.paper_engine)
 
+            t0 = _time.time()
             result = self.rust_ws.evaluate_batch(
                 self.MAX_EVALS_PER_BATCH,
                 held_cids=held_cids,
                 held_mids=held_mids,
                 top_n=20,
             )
+            batch_ms = (_time.time() - t0) * 1000
             n_eval = result['n_evaluated']
             if n_eval == 0:
                 return []
+
+            # Record batch latency for dashboard stats (ms per evaluate_batch call)
+            self._recent_latencies.append(batch_ms)
+            if len(self._recent_latencies) > 200:
+                self._recent_latencies = self._recent_latencies[-200:]
 
             n_urgent = result['n_urgent']
             n_bg = result['n_background']

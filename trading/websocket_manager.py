@@ -825,14 +825,10 @@ def get_asset_ids_for_constraints(constraints: List[Dict],
             md = market_lookup.get(str(mid))
             if not md:
                 continue
-            clob_raw = md.metadata.get('clobTokenIds', '[]') if hasattr(md, 'metadata') else '[]'
-            try:
-                clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
-            except (json.JSONDecodeError, TypeError):
-                continue
-            for tid in (clob_ids or []):
-                if tid:
-                    asset_ids.add(tid)
+            if md.yes_asset_id:
+                asset_ids.add(md.yes_asset_id)
+            if md.no_asset_id:
+                asset_ids.add(md.no_asset_id)
     return list(asset_ids)
 
 
