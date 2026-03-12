@@ -765,9 +765,25 @@ def make_html_shell():
   .sse-dot.disconnected { background: #f44; }
   .sse-dot.reconnecting { background: #fa0; animation: blink 0.8s step-start infinite; }
   @keyframes blink { 50% { opacity: 0; } }
+  /* Splash screen */
+  #splash { position: fixed; inset: 0; background: #0a0a0a; z-index: 9999; display: flex; flex-direction: column; align-items: center; justify-content: center; transition: opacity 0.5s; }
+  #splash.fade-out { opacity: 0; pointer-events: none; }
+  #splash .logo { color: #0f0; font-size: 28px; font-weight: bold; font-family: 'Courier New', monospace; margin-bottom: 30px; }
+  #splash .spinner { width: 40px; height: 40px; border: 3px solid #222; border-top: 3px solid #0f0; border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 20px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #splash .status { color: #888; font-family: 'Courier New', monospace; font-size: 13px; letter-spacing: 1px; }
+  #splash .status.active { color: #0af; }
+  #main-content { opacity: 0; transition: opacity 0.4s; }
+  #main-content.visible { opacity: 1; }
 </style>
 '''
     html += f'''</head><body>
+<div id="splash">
+  <div class="logo">&#x1F4C8; PREDICTION TRADER</div>
+  <div class="spinner"></div>
+  <div id="splash-status" class="status">starting up</div>
+</div>
+<div id="main-content">
 <div class="header">
   <h1>&#x1F4C8; PREDICTION TRADER <span id="mode-badge" class="mode-badge {mode_class}">{mode_label}</span></h1>
   <div class="meta">
@@ -831,6 +847,7 @@ def make_html_shell():
 <div class="footer" style="color:#555;font-size:11px;margin-top:20px;">
   Updated: <span id="last-update">...</span> UTC | <span class="sse-dot" id="sse-dot"></span> Live via SSE
 </div>
+</div><!-- end #main-content -->
 '''
     html += '''<script>
 // === Utility functions ===
@@ -1151,6 +1168,31 @@ function renderLive(d) {
   el.innerHTML = h;
 }
 
+// === Splash screen state machine ===
+var _splashDismissed = false;
+var _dataReceived = {};
+function splashStatus(msg) {
+  var el = document.getElementById('splash-status');
+  if (el) { el.textContent = msg; el.className = 'status active'; }
+}
+function markDataReceived(key) {
+  _dataReceived[key] = true;
+  // Dismiss only when we have stats + positions + system (the visible sections)
+  if (_dataReceived.stats && _dataReceived.positions && _dataReceived.system) {
+    dismissSplash();
+  }
+}
+function dismissSplash() {
+  if (_splashDismissed) return;
+  _splashDismissed = true;
+  var splash = document.getElementById('splash');
+  var main = document.getElementById('main-content');
+  if (splash) splash.classList.add('fade-out');
+  if (main) main.classList.add('visible');
+  setTimeout(function() { if (splash) splash.style.display = 'none'; }, 600);
+}
+document.addEventListener('DOMContentLoaded', function() { splashStatus('connecting...'); });
+
 // === SSE connection manager ===
 (function() {
   var retryDelay = 2000;
@@ -1159,20 +1201,25 @@ function renderLive(d) {
 
   function connect() {
     if (es) { try { es.close(); } catch(e) {} }
+    splashStatus('connecting...');
     es = new EventSource('/stream');
-    es.onopen = function() { retryDelay = 2000; var d=dot(); if(d) d.className='sse-dot connected'; };
+    es.onopen = function() {
+      retryDelay = 2000;
+      var d=dot(); if(d) d.className='sse-dot connected';
+      splashStatus('loading data...');
+    };
 
     es.addEventListener('stats', function(e) {
-      try { renderStats(JSON.parse(e.data)); } catch(ex) { console.warn('stats parse error', ex); }
+      try { renderStats(JSON.parse(e.data)); markDataReceived('stats'); } catch(ex) { console.warn('stats parse error', ex); }
     });
     es.addEventListener('positions', function(e) {
-      try { renderPositions(JSON.parse(e.data)); } catch(ex) { console.warn('positions parse error', ex); }
+      try { renderPositions(JSON.parse(e.data)); markDataReceived('positions'); } catch(ex) { console.warn('positions parse error', ex); }
     });
     es.addEventListener('opportunities', function(e) {
-      try { renderOpportunities(JSON.parse(e.data)); } catch(ex) { console.warn('opp parse error', ex); }
+      try { renderOpportunities(JSON.parse(e.data)); markDataReceived('opportunities'); } catch(ex) { console.warn('opp parse error', ex); }
     });
     es.addEventListener('system', function(e) {
-      try { renderSystem(JSON.parse(e.data)); } catch(ex) { console.warn('system parse error', ex); }
+      try { renderSystem(JSON.parse(e.data)); markDataReceived('system'); } catch(ex) { console.warn('system parse error', ex); }
     });
     es.addEventListener('closed', function(e) {
       try { renderClosed(JSON.parse(e.data)); } catch(ex) { console.warn('closed parse error', ex); }
