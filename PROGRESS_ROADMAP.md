@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.12  
-> **Last updated**: 2026-03-12 ~09:00 UTC  
+> **Version**: v0.04.13  
+> **Last updated**: 2026-03-12 ~09:30 UTC  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4 GB RAM, Ubuntu 24.04, systemd auto-restart, $100 fresh capital  
@@ -224,6 +224,8 @@ The execution control server (`execution_control.py`) and its client were remove
 │   ├── src/book.rs                           ← DashMap concurrent book mirror with EFP drift detection
 │   ├── src/queue.rs                          ← Deduped urgent/background eval queue
 │   ├── src/ws.rs                             ← tokio-tungstenite sharded WS connections
+│   ├── src/arb.rs                            ← Pure Rust arb math (mutex direct + polytope FW)
+│   ├── src/eval.rs                           ← Batch evaluator: drain queue → read books → arb math → opportunities
 │   ├── src/state.rs                          ← rusqlite in-memory DB + GIL-free disk mirror (Phase 8 P4b)
 │   └── Cargo.toml
 
@@ -710,7 +712,7 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 | 8m | `tokio-tungstenite` WS client with local book mirror (replaces Python `websockets`) | ✅ Built + integrated, ABBA-safe single-lock queue |
 | 8n | Rust eval queue with `tokio::select!` instant wake (no polling, no sleep) | ✅ `parking_lot::Mutex<QueueInner>` dedup queue, wired into engine |
 | 8o | `rusqlite` state persistence (WAL mode, incremental updates) | ✅ `RustStateDB` + adapter wired into paper_trading.py, GIL-free backup |
-| 8p | Single Rust binary: WS + queue + eval + state. Python kept for dashboard + resolution validator only. | 🔲 |
+| 8p | Single Rust binary: WS + queue + eval + state. Python kept for dashboard + resolution validator only. | 🔧 Arb math + batch eval built, needs integration |
 | 8q | Full Rust port: dashboard (axum/warp), resolution validator, everything. Zero Python. | 🔲 |
 
 #### Expected Latency by Phase
@@ -732,6 +734,15 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 Most recent first. Each entry summarises what changed and why. Full implementation detail is in the git log.
 
 ---
+
+### v0.04.13 (2026-03-12) — Arb Math Merged into rust_engine (Phase 8 P4c scaffold)
+- **ADDED** `rust_engine/src/arb.rs` — pure Rust arb math (no PyO3 deps): `check_mutex_arb()`, `polytope_arb()`, `build_scenarios()`
+- **ADDED** `rust_engine/src/eval.rs` — batch evaluator: `ConstraintStore`, `evaluate_batch()` (drain queue → read books → arb math → return opportunities)
+- **ADDED** `evaluate_batch()` PyO3 binding: single call replaces drain_evals + sync_prices + per-constraint eval loop
+- **ADDED** `set_constraints()` PyO3 binding: loads constraint definitions (market_ids, asset_ids, names) into Rust ConstraintStore
+- **ADDED** `set_eval_config()` PyO3 binding: updates capital/fees/thresholds as trading state changes
+- **FIXED** DB position sync: 10 positions now match between JSON and SQLite (was 8 due to migration gap)
+- **NOTED** Not yet wired into trading_engine.py — next step is replacing _process_pending_evals
 
 ### v0.04.12 (2026-03-12) — Rust State Integration (Phase 8 P4b wired)
 - **ADDED** `utilities/rust_state_adapter.py` — Python adapter wrapping `RustStateDB` with `StateStore`-compatible API
@@ -1161,6 +1172,7 @@ Format: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch (e.g. `v
 | `v0.04.10` | Dashboard polish + Rust WS scaffold |
 | `v0.04.11` | Rust SQLite state (P4b) + latency verification |
 | `v0.04.12` | Rust state wired into paper_trading.py |
+| `v0.04.13` | Arb math merged into rust_engine (P4c scaffold) |
 | `v1.00.00` | First successful live trade |
 
 ### Implementation Steps

@@ -15,15 +15,18 @@ mod types;
 mod book;
 mod queue;
 mod state;
+mod arb;
+mod eval;
 mod ws;
 
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use book::BookMirror;
 use queue::EvalQueue;
+use eval::{ConstraintStore, EvalConfig, Constraint, MarketRef};
 use types::EngineConfig;
 use ws::WsManager;
 
@@ -34,6 +37,8 @@ struct RustWsEngine {
     book: Arc<BookMirror>,
     eval_queue: Arc<EvalQueue>,
     ws: Arc<WsManager>,
+    constraints: Arc<ConstraintStore>,
+    eval_config: EvalConfig,
     runtime: tokio::runtime::Runtime,
 }
 
@@ -76,10 +81,19 @@ impl RustWsEngine {
 
         let book = Arc::new(BookMirror::new(&cfg));
         let eval_queue = Arc::new(EvalQueue::new());
-        let ws = Arc::new(WsManager::new(cfg, Arc::clone(&book), Arc::clone(&eval_queue)));
+        let ws = Arc::new(WsManager::new(cfg.clone(), Arc::clone(&book), Arc::clone(&eval_queue)));
+        let constraints = Arc::new(ConstraintStore::new());
+
+        let eval_config = EvalConfig {
+            capital: cfg.trade_size_usd,
+            fee_rate: get_float(config, "fee_rate").unwrap_or(0.0001),
+            min_profit_threshold: get_float(config, "min_profit_threshold").unwrap_or(0.03),
+            max_profit_threshold: get_float(config, "max_profit_threshold").unwrap_or(0.30),
+            max_fw_iter: get_int(config, "max_fw_iter").unwrap_or(200) as usize,
+        };
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)   // WS shards + heartbeat
+            .worker_threads(2)
             .enable_all()
             .thread_name("rust-ws")
             .build()
@@ -87,7 +101,7 @@ impl RustWsEngine {
                 format!("Failed to create tokio runtime: {}", e)
             ))?;
 
-        Ok(Self { book, eval_queue, ws, runtime })
+        Ok(Self { book, eval_queue, ws, constraints, eval_config, runtime })
     }
 
     /// Set the asset_id → constraint_id index.
@@ -117,6 +131,88 @@ impl RustWsEngine {
     /// Stop all WS connections.
     fn stop(&self) {
         self.ws.stop();
+    }
+
+    /// Load constraint definitions from Python.
+    /// constraints: list of dicts with keys:
+    ///   constraint_id, constraint_type, is_neg_risk, implications,
+    ///   markets: list of {market_id, yes_asset_id, no_asset_id, name}
+    fn set_constraints(&self, constraints: &Bound<'_, PyList>) -> PyResult<()> {
+        let mut rust_constraints = Vec::new();
+        for item in constraints.iter() {
+            let d: &Bound<'_, PyDict> = item.downcast()?;
+            let cid: String = d.get_item("constraint_id")?.unwrap().extract()?;
+            let ctype: String = d.get_item("constraint_type")?.unwrap().extract()?;
+            let neg_risk: bool = d.get_item("is_neg_risk")?
+                .map(|v| v.extract::<bool>().unwrap_or(false)).unwrap_or(false);
+            let implications: Vec<(usize, usize)> = d.get_item("implications")?
+                .map(|v| v.extract().unwrap_or_default()).unwrap_or_default();
+
+            let markets_list = d.get_item("markets")?.unwrap();
+            let markets_list: &Bound<'_, PyList> = markets_list.downcast()?;
+            let mut markets = Vec::new();
+            for mitem in markets_list.iter() {
+                let md: &Bound<'_, PyDict> = mitem.downcast()?;
+                markets.push(MarketRef {
+                    market_id: md.get_item("market_id")?.unwrap().extract()?,
+                    yes_asset_id: md.get_item("yes_asset_id")?.unwrap().extract()?,
+                    no_asset_id: md.get_item("no_asset_id")?.unwrap().extract()?,
+                    name: md.get_item("name")?.map(|v| v.extract().unwrap_or_default()).unwrap_or_default(),
+                });
+            }
+            rust_constraints.push(Constraint {
+                constraint_id: cid, constraint_type: ctype,
+                markets, is_neg_risk: neg_risk, implications,
+            });
+        }
+        self.constraints.set_constraints(rust_constraints);
+        tracing::info!("Loaded {} constraints into Rust evaluator", self.constraints.len());
+        Ok(())
+    }
+
+    /// Update eval config (called when capital changes).
+    fn set_eval_config(&mut self, capital: f64, fee_rate: f64, min_profit: f64, max_profit: f64) {
+        self.eval_config.capital = capital;
+        self.eval_config.fee_rate = fee_rate;
+        self.eval_config.min_profit_threshold = min_profit;
+        self.eval_config.max_profit_threshold = max_profit;
+    }
+
+    /// THE KEY FUNCTION: drain queue + read books + arb math → opportunities.
+    /// Returns (list_of_opp_dicts, n_urgent, n_background, n_evaluated).
+    /// Each opp dict has the same structure as Python's opportunity dicts.
+    fn evaluate_batch(&self, py: Python<'_>, max_evals: usize) -> PyResult<PyObject> {
+        let (opps, n_urg, n_bg, n_eval) = eval::evaluate_batch(
+            &self.eval_queue, &self.book, &self.constraints, &self.eval_config, max_evals,
+        );
+
+        let result = PyDict::new(py);
+        result.set_item("n_urgent", n_urg)?;
+        result.set_item("n_background", n_bg)?;
+        result.set_item("n_evaluated", n_eval)?;
+
+        let opp_list = PyList::empty(py);
+        for opp in &opps {
+            let d = PyDict::new(py);
+            d.set_item("constraint_id", &opp.constraint_id)?;
+            d.set_item("market_ids", &opp.market_ids)?;
+            d.set_item("market_names", &opp.market_names)?;
+            d.set_item("expected_profit_pct", opp.expected_profit_pct)?;
+            d.set_item("expected_profit", opp.expected_profit)?;
+            d.set_item("fees_estimated", opp.fees_estimated)?;
+            d.set_item("total_capital_required", opp.total_capital_required)?;
+            d.set_item("current_prices", &opp.current_prices)?;
+            d.set_item("optimal_bets", &opp.optimal_bets)?;
+            let meta = PyDict::new(py);
+            meta.set_item("method", &opp.method)?;
+            meta.set_item("neg_risk", opp.neg_risk)?;
+            if let Some(ns) = opp.n_scenarios { meta.set_item("n_scenarios", ns)?; }
+            d.set_item("metadata", meta)?;
+            d.set_item("net_profit", opp.expected_profit)?;
+            opp_list.append(d)?;
+        }
+        result.set_item("opportunities", opp_list)?;
+        Ok(result.into())
     }
 
     /// Drain eval queue: returns list of (constraint_id, urgent, queued_at) tuples.
