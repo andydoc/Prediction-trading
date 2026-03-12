@@ -434,9 +434,72 @@ impl RustPositionManager {
             .map(|e| (e.payout, e.profit)))
     }
 
-    /// Liquidate (replacement close). Returns profit (negative = fees lost).
-    fn liquidate_position(&self, position_id: &str, reason: &str) -> Option<f64> {
-        self.inner.liquidate_position(position_id, reason)
+    /// Calculate what a position is worth if sold now.
+    /// current_bids: {market_id: bid_price_for_held_token}
+    /// Returns dict with sale_proceeds, fees, net_proceeds, profit, resolution_payout.
+    fn calculate_liquidation_value(&self, py: Python<'_>,
+                                    position_id: &str,
+                                    current_bids: HashMap<String, f64>) -> PyResult<PyObject> {
+        match self.inner.calculate_liquidation_value(position_id, &current_bids) {
+            Some(liq) => {
+                let d = PyDict::new(py);
+                d.set_item("position_id", &liq.position_id)?;
+                d.set_item("sale_proceeds", liq.sale_proceeds)?;
+                d.set_item("fees", liq.fees)?;
+                d.set_item("net_proceeds", liq.net_proceeds)?;
+                d.set_item("profit", liq.profit)?;
+                d.set_item("resolution_payout", liq.resolution_payout)?;
+                Ok(d.into())
+            }
+            None => Ok(py.None())
+        }
+    }
+
+    /// Evaluate whether replacing position with a new opportunity is worth it.
+    fn evaluate_replacement(&self, py: Python<'_>,
+                             position_id: &str,
+                             current_bids: HashMap<String, f64>,
+                             replacement_profit: f64) -> PyResult<PyObject> {
+        match self.inner.evaluate_replacement(position_id, &current_bids, replacement_profit) {
+            Some(eval) => {
+                let d = PyDict::new(py);
+                d.set_item("position_id", &eval.position_id)?;
+                d.set_item("net_gain", eval.net_gain)?;
+                d.set_item("worth_replacing", eval.worth_replacing)?;
+                d.set_item("replacement_profit", eval.replacement_profit)?;
+                d.set_item("liquidation_profit", eval.liquidation.profit)?;
+                d.set_item("liquidation_net_proceeds", eval.liquidation.net_proceeds)?;
+                d.set_item("resolution_payout", eval.liquidation.resolution_payout)?;
+                Ok(d.into())
+            }
+            None => Ok(py.None())
+        }
+    }
+
+    /// Check all positions for proactive exit (sell now ≥ 1.2× resolution payout).
+    /// current_bids: {market_id: bid_price}
+    fn check_proactive_exits(&self, py: Python<'_>,
+                              current_bids: HashMap<String, f64>,
+                              exit_multiplier: f64) -> PyResult<PyObject> {
+        let exits = self.inner.check_proactive_exits(&current_bids, exit_multiplier);
+        let list = PyList::empty(py);
+        for exit in &exits {
+            let d = PyDict::new(py);
+            d.set_item("position_id", &exit.position_id)?;
+            d.set_item("ratio", exit.ratio)?;
+            d.set_item("net_proceeds", exit.liquidation.net_proceeds)?;
+            d.set_item("resolution_payout", exit.liquidation.resolution_payout)?;
+            d.set_item("profit", exit.liquidation.profit)?;
+            list.append(d)?;
+        }
+        Ok(list.into())
+    }
+
+    /// Liquidate position by selling shares at current bids.
+    /// Returns (net_proceeds, profit) or None.
+    fn liquidate_position(&self, position_id: &str, reason: &str,
+                           current_bids: HashMap<String, f64>) -> Option<(f64, f64)> {
+        self.inner.liquidate_position(position_id, reason, &current_bids)
     }
 
     /// Check all open positions for resolution.

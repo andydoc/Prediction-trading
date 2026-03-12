@@ -67,6 +67,35 @@ pub struct ResolutionEvent {
     pub profit: f64,
 }
 
+/// Liquidation valuation — what a position is worth if sold now
+#[derive(Debug, Clone)]
+pub struct LiquidationValue {
+    pub position_id: String,
+    pub sale_proceeds: f64,     // Total from selling all shares at current bids
+    pub fees: f64,              // Taker fees on the sale
+    pub net_proceeds: f64,      // sale_proceeds - fees
+    pub profit: f64,            // net_proceeds - total_invested (can be negative)
+    pub resolution_payout: f64, // Guaranteed payout if held to resolution
+}
+
+/// Whether a replacement is worth doing
+#[derive(Debug)]
+pub struct ReplacementEval {
+    pub position_id: String,
+    pub liquidation: LiquidationValue,
+    pub replacement_profit: f64,   // Expected profit of proposed replacement
+    pub net_gain: f64,             // replacement_profit - liquidation cost (negative = not worth it)
+    pub worth_replacing: bool,
+}
+
+/// Proactive exit candidate
+#[derive(Debug)]
+pub struct ProactiveExit {
+    pub position_id: String,
+    pub liquidation: LiquidationValue,
+    pub ratio: f64,  // net_proceeds / resolution_payout (>1.2 = exit)
+}
+
 /// Core position manager — thread-safe, owns all capital accounting
 pub struct PositionManager {
     inner: Mutex<PositionManagerInner>,
@@ -284,35 +313,154 @@ impl PositionManager {
         Some(event)
     }
 
-    // --- Liquidation (replacement close) ---
+    // --- Liquidation valuation ---
 
+    /// Calculate what a position is worth if liquidated (shares sold) right now.
+    /// current_bids: market_id → current bid price for the held token (YES bid for buy arbs, NO bid for sell arbs)
+    pub fn calculate_liquidation_value(
+        &self,
+        position_id: &str,
+        current_bids: &HashMap<String, f64>,
+    ) -> Option<LiquidationValue> {
+        let mgr = self.inner.lock();
+        let position = mgr.open_positions.get(position_id)?;
+
+        let method = position.metadata.get("method")
+            .and_then(|v| v.as_str()).unwrap_or("");
+        let is_sell = method.contains("sell");
+
+        // Calculate shares held and what they sell for at current bids
+        let mut sale_proceeds = 0.0;
+        for (mid, leg) in &position.markets {
+            let shares = if is_sell {
+                // Sell arb: holds NO shares. shares = bet / (1 - entry_yes_price)
+                let no_price = 1.0 - leg.entry_price;
+                if no_price > 0.0 { leg.bet_amount / no_price } else { 0.0 }
+            } else {
+                // Buy arb: holds YES shares. shares = bet / entry_price
+                if leg.entry_price > 0.0 { leg.bet_amount / leg.entry_price } else { 0.0 }
+            };
+
+            let bid = current_bids.get(mid).copied().unwrap_or(0.0);
+            sale_proceeds += shares * bid;
+        }
+
+        let fees = sale_proceeds * mgr.taker_fee;
+        let net_proceeds = sale_proceeds - fees;
+        let total_invested = position.total_capital + position.fees_paid;
+        let profit = net_proceeds - total_invested;
+
+        // Resolution payout: guaranteed amount if held to maturity
+        // For buy arb: one winner pays shares * $1 = bet / price.
+        //   Guaranteed payout = total_capital / sum(prices) (the arb itself).
+        //   Simplification: total_capital + expected_profit is the guaranteed payout.
+        let resolution_payout = position.total_capital + position.expected_profit;
+
+        Some(LiquidationValue {
+            position_id: position_id.to_string(),
+            sale_proceeds,
+            fees,
+            net_proceeds,
+            profit,
+            resolution_payout,
+        })
+    }
+
+    /// Evaluate whether replacing position X with opportunity Y is worth it.
+    /// replacement_profit: expected net profit of the new opportunity.
+    pub fn evaluate_replacement(
+        &self,
+        position_id: &str,
+        current_bids: &HashMap<String, f64>,
+        replacement_profit: f64,
+    ) -> Option<ReplacementEval> {
+        let liq = self.calculate_liquidation_value(position_id, current_bids)?;
+
+        // Cost of liquidation = what we lose vs holding to resolution
+        // If liq.profit is positive, liquidation actually gains money
+        // Net gain = replacement_profit + liq.profit (liq.profit is usually negative)
+        let net_gain = replacement_profit + liq.profit;
+
+        Some(ReplacementEval {
+            position_id: position_id.to_string(),
+            liquidation: liq,
+            replacement_profit,
+            net_gain,
+            worth_replacing: net_gain > 0.0,
+        })
+    }
+
+    /// Check all open positions for proactive exit opportunities.
+    /// current_bids: market_id → current bid price for held tokens.
+    /// Returns positions where selling now yields ≥ exit_multiplier × resolution_payout.
+    pub fn check_proactive_exits(
+        &self,
+        current_bids: &HashMap<String, f64>,
+        exit_multiplier: f64,  // typically 1.2
+    ) -> Vec<ProactiveExit> {
+        let position_ids: Vec<String> = {
+            let mgr = self.inner.lock();
+            mgr.open_positions.keys().cloned().collect()
+        };
+
+        let mut exits = Vec::new();
+        for pid in &position_ids {
+            if let Some(liq) = self.calculate_liquidation_value(pid, current_bids) {
+                if liq.resolution_payout > 0.0 {
+                    let ratio = liq.net_proceeds / liq.resolution_payout;
+                    if ratio >= exit_multiplier {
+                        exits.push(ProactiveExit {
+                            position_id: pid.clone(),
+                            liquidation: liq,
+                            ratio,
+                        });
+                    }
+                }
+            }
+        }
+        exits
+    }
+
+    // --- Liquidation execution (Part A: accurate sale, not just capital return) ---
+
+    /// Execute liquidation: sell all shares at current bid prices.
+    /// current_bids: market_id → bid price for held token.
+    /// Returns (net_proceeds, profit) or None if position not found.
     pub fn liquidate_position(
         &self, position_id: &str, reason: &str,
-    ) -> Option<f64> {
+        current_bids: &HashMap<String, f64>,
+    ) -> Option<(f64, f64)> {
+        // First calculate the value (needs read lock)
+        let liq = self.calculate_liquidation_value(position_id, current_bids)?;
+
         let mut mgr = self.inner.lock();
         let mut position = match mgr.open_positions.remove(position_id) {
             Some(p) => p,
             None => return None,
         };
 
-        // Liquidation: return capital minus fees (no payout from resolution)
-        let refund = position.total_capital;  // Return deployed capital
-        let fees_lost = position.fees_paid;
-        let profit = -fees_lost;  // Only loss is the entry fees
-
         position.status = "closed".to_string();
         position.close_timestamp = Some(now_ts());
-        position.actual_payout = refund;
-        position.actual_profit = profit;
-        position.actual_profit_pct = profit / (position.total_capital + fees_lost);
+        position.actual_payout = liq.net_proceeds;
+        position.actual_profit = liq.profit;
+        position.actual_profit_pct = if position.total_capital > 0.0 {
+            liq.profit / position.total_capital
+        } else { 0.0 };
         position.metadata.insert("close_reason".into(),
             serde_json::Value::String(reason.to_string()));
+        position.metadata.insert("liquidation_sale_proceeds".into(),
+            serde_json::Value::Number(serde_json::Number::from_f64(liq.sale_proceeds).unwrap_or(serde_json::Number::from(0))));
+        position.metadata.insert("liquidation_fees".into(),
+            serde_json::Value::Number(serde_json::Number::from_f64(liq.fees).unwrap_or(serde_json::Number::from(0))));
 
-        mgr.current_capital += refund;
-        mgr.total_actual_profit += profit;
+        mgr.current_capital += liq.net_proceeds;
+        mgr.total_actual_profit += liq.profit;
+        if liq.profit > 0.001 { mgr.winning_trades += 1; }
+        else if liq.profit < -0.001 { mgr.losing_trades += 1; }
+
         mgr.closed_positions.push(position);
 
-        Some(profit)
+        Some((liq.net_proceeds, liq.profit))
     }
 
     // --- Resolution checking: scan open positions for resolved markets ---
