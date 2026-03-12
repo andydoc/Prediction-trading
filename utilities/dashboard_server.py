@@ -152,9 +152,9 @@ def get_stats_json():
         'ws_live': ws_live, 'ws_total': ws_total, 'ws_pct': ws_pct,
         'q_bg': em.get('queue_background', 0),
         'q_urg': em.get('queue_urgent', 0),
-        'lat_p50': em.get('lat_p50_ms', 0),
-        'lat_p95': em.get('lat_p95_ms', 0),
-        'lat_max': em.get('lat_max_ms', 0),
+        'lat_p50': em.get('lat_p50_us', em.get('lat_p50_ms', 0)),
+        'lat_p95': em.get('lat_p95_us', em.get('lat_p95_ms', 0)),
+        'lat_max': em.get('lat_max_us', em.get('lat_max_ms', 0)),
         'has_rust': em.get('has_rust', False),
         'constraints': em.get('constraints', 0),
         'iteration': em.get('iteration', 0),
@@ -1080,10 +1080,10 @@ function renderSystem(d) {
     var qCls = qb<500?'color-green':(qb<2000?'color-amber':'color-red');
     h += '<tr><td class="pl-indent color-dim">Eval Queue</td><td class="'+qCls+'">bg='+qb+'</td>';
     h += '<td>urgent='+qu+' | bg='+qb+'</td></tr>';
-    var lp=m.lat_p50_ms||0, l9=m.lat_p95_ms||0, lm=m.lat_max_ms||0;
-    var lCls = lp<100?'color-green':(lp<1000?'color-amber':'color-red');
-    h += '<tr><td class="pl-indent color-dim">Latency</td><td class="'+lCls+'">p50='+lp+'ms</td>';
-    h += '<td>p50='+lp+'ms | p95='+l9+'ms | max='+lm+'ms</td></tr>';
+    var lp=m.lat_p50_us||m.lat_p50_ms||m.lat_p50||0, l9=m.lat_p95_us||m.lat_p95_ms||m.lat_p95||0, lm=m.lat_max_us||m.lat_max_ms||m.lat_max||0;
+    var lCls = lp<100000?'color-green':(lp<1000000?'color-amber':'color-red');
+    h += '<tr><td class="pl-indent color-dim">Latency</td><td class="'+lCls+'">p50='+lp+'\u03BCs</td>';
+    h += '<td>p50='+lp+'\u03BCs | p95='+l9+'\u03BCs | max='+lm+'\u03BCs</td></tr>';
   }
   h += '<tr><td>Dashboard</td><td class="color-positive">running</td><td>'+esc(d.dashboard_ts)+'</td></tr>';
   sb.innerHTML = h;

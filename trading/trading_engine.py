@@ -418,7 +418,7 @@ class TradingEngine:
         self._last_eval_efp: Dict[str, float] = {}         # asset_id → effective fill price at last eval
         self._constraint_last_eval: Dict[str, float] = {}   # constraint_id → unix time of last eval
         self._constraint_queue_time: Dict[str, float] = {}  # constraint_id → unix time when queued
-        self._recent_latencies: list = []                    # last 200 latency_ms values
+        self._recent_latencies: list = []                    # last 200 latency_μs values (batch eval time)
         self.EFP_DRIFT_THRESHOLD = 0.005                     # $0.005 effective fill price drift → urgent
 
         # Phase 8j: buffer dirty assets from WS callbacks, batch-process in eval loop
@@ -874,7 +874,7 @@ class TradingEngine:
         queue_time = self._constraint_queue_time.pop(constraint_id, None)
         if queue_time:
             latency_ms = (_time.time() - queue_time) * 1000
-            self._recent_latencies.append(latency_ms)
+            self._recent_latencies.append(latency_ms * 1000)  # ms → μs
             if len(self._recent_latencies) > 200:
                 self._recent_latencies = self._recent_latencies[-200:]
 
@@ -934,8 +934,8 @@ class TradingEngine:
             if n_eval == 0:
                 return []
 
-            # Record batch latency for dashboard stats (ms per evaluate_batch call)
-            self._recent_latencies.append(batch_ms)
+            # Record batch latency in μs for dashboard stats
+            self._recent_latencies.append(batch_ms * 1000)  # ms → μs
             if len(self._recent_latencies) > 200:
                 self._recent_latencies = self._recent_latencies[-200:]
 
@@ -1576,7 +1576,7 @@ class TradingEngine:
                             lat_p50 = lats[len(lats) // 2]
                             lat_p95 = lats[int(len(lats) * 0.95)]
                             lat_max = lats[-1]
-                            lat_info = f' lat_ms p50={lat_p50:.0f} p95={lat_p95:.0f} max={lat_max:.0f}'
+                            lat_info = f' lat_\u03bcs p50={lat_p50:.0f} p95={lat_p95:.0f} max={lat_max:.0f}'
                         ws_info = (f' | RustWS: subs={rs.get("ws_subscribed",0)} '
                                    f'msgs={rs.get("ws_msgs",0)} '
                                    f'live={live_count}/{len(self.market_lookup)} '
@@ -1587,9 +1587,9 @@ class TradingEngine:
                             'ws_live': live_count,
                             'queue_urgent': q_urg,
                             'queue_background': q_bg,
-                            'lat_p50_ms': round(lat_p50),
-                            'lat_p95_ms': round(lat_p95),
-                            'lat_max_ms': round(lat_max),
+                            'lat_p50_us': round(lat_p50),
+                            'lat_p95_us': round(lat_p95),
+                            'lat_max_us': round(lat_max),
                         })
                     elif self.ws_manager and self.ws_manager._running:
                         ws_stats = self.ws_manager.get_stats()
@@ -1604,7 +1604,7 @@ class TradingEngine:
                             lat_p50 = lats[len(lats) // 2]
                             lat_p95 = lats[int(len(lats) * 0.95)]
                             lat_max = lats[-1]
-                            lat_info = f' lat_ms p50={lat_p50:.0f} p95={lat_p95:.0f} max={lat_max:.0f}'
+                            lat_info = f' lat_\u03bcs p50={lat_p50:.0f} p95={lat_p95:.0f} max={lat_max:.0f}'
                         ws_info = (f' | WS: subs={len(self.ws_manager._subscribed_assets)} '
                                    f'msgs={ws_stats["market_msgs"]} '
                                    f'live={live_count}/{len(self.market_lookup)} '
@@ -1615,9 +1615,9 @@ class TradingEngine:
                             'ws_live': live_count,
                             'queue_urgent': n_urgent,
                             'queue_background': n_bg,
-                            'lat_p50_ms': round(lat_p50),
-                            'lat_p95_ms': round(lat_p95),
-                            'lat_max_ms': round(lat_max),
+                            'lat_p50_us': round(lat_p50),
+                            'lat_p95_us': round(lat_p95),
+                            'lat_max_us': round(lat_max),
                         })
                     cap = self.paper_engine.current_capital
                     npos = len(self.paper_engine.open_positions)
