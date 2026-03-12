@@ -519,6 +519,53 @@ class TradingEngine:
                  f'{len(self.market_to_constraint)} market_ids mapped, '
                  f'{len(self.asset_to_market)} asset→market reverse lookups')
 
+    def _load_constraints_into_rust(self):
+        """Build constraint list with full market refs and load into Rust evaluator."""
+        if not self.rust_ws:
+            return
+        rust_constraints = []
+        for c in self.constraints:
+            markets = []
+            for mid in c.market_ids:
+                md = self.market_lookup.get(str(mid))
+                if not md:
+                    continue
+                clob_raw = md.metadata.get('clobTokenIds', '[]') if hasattr(md, 'metadata') else '[]'
+                try:
+                    clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                yes_id = clob_ids[0] if clob_ids and len(clob_ids) > 0 else ''
+                no_id = clob_ids[1] if clob_ids and len(clob_ids) > 1 else ''
+                name = md.question[:80] if hasattr(md, 'question') else str(mid)
+                if yes_id:
+                    markets.append({
+                        'market_id': str(mid),
+                        'yes_asset_id': yes_id,
+                        'no_asset_id': no_id,
+                        'name': name,
+                    })
+            if len(markets) >= 2:
+                neg_risk_id = c.metadata.get('negRiskMarketID', '') if hasattr(c, 'metadata') else ''
+                rust_constraints.append({
+                    'constraint_id': c.constraint_id,
+                    'constraint_type': c.constraint_type,
+                    'is_neg_risk': bool(neg_risk_id),
+                    'implications': [],
+                    'markets': markets,
+                })
+        self.rust_ws.set_constraints(rust_constraints)
+        # Also set eval config with current capital
+        cap = dynamic_capital(self.paper_engine.current_capital, self.capital_pct)
+        arb_cfg = self.config.get('arbitrage', {})
+        self.rust_ws.set_eval_config(
+            cap,
+            arb_cfg.get('fees', {}).get('polymarket_taker_fee', 0.0001),
+            arb_cfg.get('min_profit_threshold', 0.03),
+            arb_cfg.get('max_profit_threshold', 0.30),
+        )
+        log.info(f'Loaded {len(rust_constraints)} constraints into Rust evaluator (capital=${cap:.2f})')
+
     # --- WS Callback Registration ---
 
     def _register_ws_callbacks(self):
@@ -859,34 +906,29 @@ class TradingEngine:
           - Python WS mode: batch-process dirty assets, then drain Python queues
         Returns list of opportunity dicts.
         """
-        # === Rust WS path: queue + book mirror managed in Rust ===
+        # === Rust WS path: full eval pipeline in Rust (Phase 8 P4c) ===
         if self.rust_ws:
-            evals = self.rust_ws.drain_evals(self.MAX_EVALS_PER_BATCH)
-            if not evals:
+            # Update capital for Rust evaluator (changes as positions open/close)
+            cap = dynamic_capital(self.paper_engine.current_capital, self.capital_pct)
+            arb_cfg = self.config.get('arbitrage', {})
+            self.rust_ws.set_eval_config(
+                cap,
+                arb_cfg.get('fees', {}).get('polymarket_taker_fee', 0.0001),
+                arb_cfg.get('min_profit_threshold', 0.03),
+                arb_cfg.get('max_profit_threshold', 0.30),
+            )
+
+            result = self.rust_ws.evaluate_batch(self.MAX_EVALS_PER_BATCH)
+            n_eval = result['n_evaluated']
+            if n_eval == 0:
                 return []
 
-            batch = [cid for cid, _urgent, _qt in evals]
-            n_urgent = sum(1 for _, u, _ in evals if u)
-            n_bg = len(batch) - n_urgent
+            n_urgent = result['n_urgent']
+            n_bg = result['n_background']
+            log.debug(f'Rust eval batch: {n_urgent} urgent + {n_bg} background')
 
-            if batch:
-                log.debug(f'Rust eval batch: {n_urgent} urgent + {n_bg} background')
-
-            # Sync Rust book prices → MarketData for all constraints in batch
-            self._sync_rust_prices_for_batch(batch)
-
-            # Record queue times for latency tracking (from Rust queued_at timestamp)
-            now = _time.time()
-            for cid, _urgent, queued_at in evals:
-                self._constraint_last_eval[cid] = now
-                # Use Rust queue timestamp for latency measurement
-                self._constraint_queue_time[cid] = queued_at
-
-            opportunities = []
-            for cid in batch:
-                opp = self._evaluate_constraint(cid)
-                if opp:
-                    opportunities.append(opp)
+            # Convert Rust opportunity dicts to the format expected by _try_enter_or_replace
+            opportunities = list(result['opportunities'])
             return opportunities
 
         # === Python WS path (fallback) ===
@@ -1331,6 +1373,9 @@ class TradingEngine:
                               in self.asset_to_constraints.items()}
                 self.rust_ws.set_asset_index(rust_index)
 
+                # Load constraint definitions into Rust evaluator (Phase 8 P4c)
+                self._load_constraints_into_rust()
+
                 # Start WS connections (non-blocking, spawns tokio tasks)
                 self.rust_ws.start(all_assets)
                 log.info(f'Rust WS engine started: {len(all_assets)} assets')
@@ -1437,6 +1482,7 @@ class TradingEngine:
                         rust_index = {aid: list(cids) for aid, cids
                                       in self.asset_to_constraints.items()}
                         self.rust_ws.set_asset_index(rust_index)
+                        self._load_constraints_into_rust()
                         self.rust_ws.start(all_assets)
                         log.info(f'Rust WS re-indexed: {len(all_assets)} assets')
                     elif self.ws_manager and self.ws_manager._running:
