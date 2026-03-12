@@ -455,6 +455,7 @@ Pre-requisites before any real money moves:
 | 3.2 | WhatsApp notifications via OpenClaw (trade alerts, errors, daily summary) | 🔲 |
 | 3.3 | Multi-machine coordination strategy (replaces removed exec control server) | 🔲 |
 | 3.4 | File structure reorganisation (runners into layer dirs, services area) | ⏸ Phase 3 only — do not refactor during active trading |
+| 3.5 | Separate Anthropic API keys for postponement detector vs resolution validator (avoids shared 30k token/min rate limit) | 🔲 |
 
 ---
 

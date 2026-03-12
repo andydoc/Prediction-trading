@@ -249,7 +249,11 @@ def get_positions_json():
                 if eff_dt.tzinfo is None:
                     eff_dt = eff_dt.replace(tzinfo=timezone.utc)
                 pos_resolve_dt = eff_dt
-                postpone_info = {'reason': pp.get('reason', 'postponed')[:80]}
+                pp_status = pp.get('status', 'postponed')  # 'played' or 'postponed'
+                postpone_info = {
+                    'reason': pp.get('reason', 'postponed')[:80],
+                    'status': pp_status,
+                }
             except:
                 pass
 
@@ -929,7 +933,13 @@ function renderPositions(d) {
   d.positions.forEach(function(p) {
     var key = p.short_name;  // stable key for expand persistence
     var resolveHtml = esc(p.resolve);
-    if (p.postpone) resolveHtml += ' <span class="bad" title="'+esc(p.postpone.reason)+'">&#9888; POSTPONED</span>';
+    if (p.postpone) {
+      if (p.postpone.status === 'played') {
+        resolveHtml += ' <span class="color-amber" title="'+esc(p.postpone.reason)+'">&#9200; result awaited</span>';
+      } else {
+        resolveHtml += ' <span class="bad" title="'+esc(p.postpone.reason)+'">&#9888; POSTPONED</span>';
+      }
+    }
     h += '<tr id="pos-row-'+p.idx+'" class="pos-row" data-key="'+esc(key)+'" onclick="toggleRow(\\\'pos\\\','+p.idx+')">';
     h += '<td>'+p.idx+'</td>';
     h += '<td title="'+esc(p.full_names.join(' | '))+'">'+esc(p.short_name)+'</td>';
