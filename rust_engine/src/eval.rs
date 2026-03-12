@@ -8,6 +8,7 @@
 ///
 /// This eliminates all Python↔Rust round-trips per eval.
 use std::collections::HashMap;
+use std::collections::HashSet;
 use dashmap::DashMap;
 use crate::arb::{self, ArbResult};
 use crate::book::BookMirror;
@@ -23,6 +24,8 @@ pub struct Constraint {
     pub markets: Vec<MarketRef>,
     pub is_neg_risk: bool,
     pub implications: Vec<(usize, usize)>,
+    /// Earliest resolution date as unix timestamp (from market end_date). 0 = unknown.
+    pub end_date_ts: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +72,7 @@ pub struct EvalConfig {
     pub max_fw_iter: usize,
 }
 
-/// A found opportunity — returned to Python.
+/// A found opportunity — returned to Python, pre-ranked.
 #[derive(Debug, Clone)]
 pub struct Opportunity {
     pub constraint_id: String,
@@ -84,27 +87,47 @@ pub struct Opportunity {
     pub optimal_bets: HashMap<String, f64>,
     pub neg_risk: bool,
     pub n_scenarios: Option<usize>,
+    /// Hours until resolution (0 = unknown)
+    pub hours_to_resolve: f64,
+    /// Score = profit_pct / effective_hours (higher = better)
+    pub score: f64,
 }
 
 /// Evaluate a batch of constraints from the queue.
-/// Returns (opportunities, n_urgent, n_background, n_evaluated).
+/// Filters held positions, scores by profit/hours, returns top-N ranked.
+/// Returns (opportunities, n_urgent, n_background, n_evaluated, n_skipped_held).
 pub fn evaluate_batch(
     queue: &EvalQueue,
     book: &BookMirror,
     store: &ConstraintStore,
     config: &EvalConfig,
     max_evals: usize,
-) -> (Vec<Opportunity>, usize, usize, usize) {
+    held_cids: &HashSet<String>,
+    held_mids: &HashSet<String>,
+    top_n: usize,
+) -> (Vec<Opportunity>, usize, usize, usize, usize) {
     let entries = queue.drain(max_evals);
     if entries.is_empty() {
-        return (vec![], 0, 0, 0);
+        return (vec![], 0, 0, 0, 0);
     }
 
     let n_urgent = entries.iter().filter(|e| e.urgent).count();
     let n_bg = entries.len() - n_urgent;
     let mut opportunities = Vec::new();
+    let mut n_skipped_held = 0usize;
+
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
 
     for entry in &entries {
+        // Skip constraints already held
+        if held_cids.contains(&entry.constraint_id) {
+            n_skipped_held += 1;
+            continue;
+        }
+
         let constraint = match store.get(&entry.constraint_id) {
             Some(c) => c,
             None => continue,
@@ -112,6 +135,14 @@ pub fn evaluate_batch(
 
         let n = constraint.markets.len();
         if n < 2 { continue; }
+
+        // Skip if any market in this constraint is already held
+        let has_held_market = constraint.markets.iter()
+            .any(|m| held_mids.contains(&m.market_id));
+        if has_held_market {
+            n_skipped_held += 1;
+            continue;
+        }
 
         // Read YES ask prices from book mirror
         let mut yes_prices = Vec::with_capacity(n);
@@ -163,6 +194,18 @@ pub fn evaluate_batch(
                 current_prices.insert(mid.clone(), yes_prices[i]);
             }
 
+            // Compute hours to resolution
+            let hours = if constraint.end_date_ts > now_ts {
+                (constraint.end_date_ts - now_ts) / 3600.0
+            } else if constraint.end_date_ts > 0.0 {
+                0.01  // already past — resolve imminently
+            } else {
+                24.0 * 30.0  // unknown — assume 30 days (will be filtered by Python max_days)
+            };
+
+            // Score: profit_pct / effective_hours (higher = better)
+            let score = arb.profit_pct / hours.max(0.01);
+
             opportunities.push(Opportunity {
                 constraint_id: constraint.constraint_id.clone(),
                 market_ids: market_ids.clone(),
@@ -176,9 +219,15 @@ pub fn evaluate_batch(
                 optimal_bets,
                 neg_risk: arb.neg_risk,
                 n_scenarios: arb.n_scenarios,
+                hours_to_resolve: hours,
+                score,
             });
         }
     }
 
-    (opportunities, n_urgent, n_bg, entries.len())
+    // Sort by score descending, return top N
+    opportunities.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    opportunities.truncate(top_n);
+
+    (opportunities, n_urgent, n_bg, entries.len(), n_skipped_held)
 }

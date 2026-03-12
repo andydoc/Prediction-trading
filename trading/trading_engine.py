@@ -547,12 +547,27 @@ class TradingEngine:
                     })
             if len(markets) >= 2:
                 neg_risk_id = c.metadata.get('negRiskMarketID', '') if hasattr(c, 'metadata') else ''
+                # Find earliest end_date across markets in this constraint
+                end_ts = 0.0
+                for mid in c.market_ids:
+                    md = self.market_lookup.get(str(mid))
+                    if md and hasattr(md, 'end_date') and md.end_date:
+                        try:
+                            edt = datetime.fromisoformat(str(md.end_date))
+                            if edt.tzinfo is None:
+                                edt = edt.replace(tzinfo=timezone.utc)
+                            ts = edt.timestamp()
+                            if end_ts == 0 or ts < end_ts:
+                                end_ts = ts
+                        except (ValueError, TypeError):
+                            pass
                 rust_constraints.append({
                     'constraint_id': c.constraint_id,
-                    'constraint_type': c.constraint_type,
+                    'constraint_type': c.relationship_type.value,
                     'is_neg_risk': bool(neg_risk_id),
                     'implications': [],
                     'markets': markets,
+                    'end_date_ts': end_ts,
                 })
         self.rust_ws.set_constraints(rust_constraints)
         # Also set eval config with current capital
@@ -918,16 +933,27 @@ class TradingEngine:
                 arb_cfg.get('max_profit_threshold', 0.30),
             )
 
-            result = self.rust_ws.evaluate_batch(self.MAX_EVALS_PER_BATCH)
+            # Pass held positions so Rust skips them (zero-cost vs Python post-filter)
+            held_cids = get_held_constraint_ids(self.paper_engine)
+            held_mids = get_held_market_ids(self.paper_engine)
+
+            result = self.rust_ws.evaluate_batch(
+                self.MAX_EVALS_PER_BATCH,
+                held_cids=held_cids,
+                held_mids=held_mids,
+                top_n=20,
+            )
             n_eval = result['n_evaluated']
             if n_eval == 0:
                 return []
 
             n_urgent = result['n_urgent']
             n_bg = result['n_background']
-            log.debug(f'Rust eval batch: {n_urgent} urgent + {n_bg} background')
+            n_held = result.get('n_skipped_held', 0)
+            n_opps = len(result.get('opportunities', []))
+            log.debug(f'Rust eval batch: {n_urgent} urgent + {n_bg} background (held={n_held}) opps={n_opps}')
 
-            # Convert Rust opportunity dicts to the format expected by _try_enter_or_replace
+            # Opportunities are pre-ranked by Rust (score = profit_pct / hours)
             opportunities = list(result['opportunities'])
             return opportunities
 

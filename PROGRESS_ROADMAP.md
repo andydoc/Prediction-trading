@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.14  
-> **Last updated**: 2026-03-12 ~09:50 UTC  
+> **Version**: v0.04.15  
+> **Last updated**: 2026-03-12 ~12:00 UTC  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4 GB RAM, Ubuntu 24.04, systemd auto-restart, $100 fresh capital  
@@ -736,7 +736,7 @@ Most recent first. Each entry summarises what changed and why. Full implementati
 
 ---
 
-### v0.04.14 (2026-03-12) — Rust Eval Pipeline Wired (Phase 8 P4c integration complete)
+### v0.04.15 (2026-03-12) — Rust Eval Pipeline Wired (Phase 8 P4c integration complete)
 - **ADDED** `_load_constraints_into_rust()`: builds constraint+market data, loads into Rust evaluator with `set_constraints()` + `set_eval_config()`
 - **CHANGED** `_process_pending_evals` Rust path: replaces drain→sync→Python-eval with single `evaluate_batch()` call. Full pipeline WS→book→queue→arb math runs in Rust, returns opportunity dicts directly.
 - **CHANGED** Capital/thresholds updated on every eval batch (tracks position changes)
@@ -1012,7 +1012,7 @@ L1 had a hard cap of 10,000 markets. Polymarket had ~33,800. The two missing out
 
 > **Note:** All figures below are from the laptop instance. The VPS was deployed with $100 fresh capital but is not currently running (paused during architecture work). Combined performance view is a future feature.
 
-### Current State (laptop, v0.04.14, 2026-03-12)
+### Current State (laptop, v0.04.15, 2026-03-12)
 
 | Metric | Value |
 |--------|-------|
@@ -1054,7 +1054,7 @@ L1 had a hard cap of 10,000 markets. Polymarket had ~33,800. The two missing out
 - **Tail latency collapsed.** Python p90 was 195ms (steady) / 5s (overall) / 85s (reconnect). Rust p95-of-p95s is 53ms — a 97% reduction in worst-case latency.
 - **Higher message throughput.** 2,148 msg/s vs 1,700 msg/s (26% more) because Rust processes WS messages without GIL contention.
 
-**Rust Full Pipeline (v0.04.14 P4c, evaluate_batch, 2026-03-12):**
+**Rust Full Pipeline (v0.04.15 P4c, evaluate_batch, 2026-03-12):**
 
 | Metric | Rust WS + Python eval (P4a) | Full Rust pipeline (P4c) | Improvement |
 |--------|---:|---:|---:|
@@ -1192,7 +1192,7 @@ Format: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch (e.g. `v
 | `v0.04.10` | Dashboard polish + Rust WS scaffold |
 | `v0.04.11` | Rust SQLite state (P4b) + latency verification |
 | `v0.04.12` | Rust state wired into paper_trading.py |
-| `v0.04.14` | Rust eval pipeline wired — full hot path in Rust |
+| `v0.04.15` | Rust eval pipeline wired — full hot path in Rust |
 | `v0.04.13` | Arb math merged into rust_engine (P4c scaffold) |
 | `v1.00.00` | First successful live trade |
 

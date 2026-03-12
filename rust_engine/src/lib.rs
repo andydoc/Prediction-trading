@@ -163,6 +163,8 @@ impl RustWsEngine {
             rust_constraints.push(Constraint {
                 constraint_id: cid, constraint_type: ctype,
                 markets, is_neg_risk: neg_risk, implications,
+                end_date_ts: d.get_item("end_date_ts")?
+                    .map(|v| v.extract::<f64>().unwrap_or(0.0)).unwrap_or(0.0),
             });
         }
         self.constraints.set_constraints(rust_constraints);
@@ -178,18 +180,27 @@ impl RustWsEngine {
         self.eval_config.max_profit_threshold = max_profit;
     }
 
-    /// THE KEY FUNCTION: drain queue + read books + arb math → opportunities.
-    /// Returns (list_of_opp_dicts, n_urgent, n_background, n_evaluated).
-    /// Each opp dict has the same structure as Python's opportunity dicts.
-    fn evaluate_batch(&self, py: Python<'_>, max_evals: usize) -> PyResult<PyObject> {
-        let (opps, n_urg, n_bg, n_eval) = eval::evaluate_batch(
-            &self.eval_queue, &self.book, &self.constraints, &self.eval_config, max_evals,
+    /// THE KEY FUNCTION: drain queue + read books + arb math → pre-ranked opportunities.
+    /// held_cids/held_mids filter out already-held positions in Rust (zero-cost).
+    /// Returns {opportunities, n_urgent, n_background, n_evaluated, n_skipped_held}.
+    #[pyo3(signature = (max_evals, held_cids=None, held_mids=None, top_n=20))]
+    fn evaluate_batch(&self, py: Python<'_>, max_evals: usize,
+                      held_cids: Option<std::collections::HashSet<String>>,
+                      held_mids: Option<std::collections::HashSet<String>>,
+                      top_n: usize) -> PyResult<PyObject> {
+        let empty_set = std::collections::HashSet::new();
+        let hc = held_cids.as_ref().unwrap_or(&empty_set);
+        let hm = held_mids.as_ref().unwrap_or(&empty_set);
+        let (opps, n_urg, n_bg, n_eval, n_held) = eval::evaluate_batch(
+            &self.eval_queue, &self.book, &self.constraints, &self.eval_config,
+            max_evals, hc, hm, top_n,
         );
 
         let result = PyDict::new(py);
         result.set_item("n_urgent", n_urg)?;
         result.set_item("n_background", n_bg)?;
         result.set_item("n_evaluated", n_eval)?;
+        result.set_item("n_skipped_held", n_held)?;
 
         let opp_list = PyList::empty(py);
         for opp in &opps {
@@ -203,6 +214,8 @@ impl RustWsEngine {
             d.set_item("total_capital_required", opp.total_capital_required)?;
             d.set_item("current_prices", &opp.current_prices)?;
             d.set_item("optimal_bets", &opp.optimal_bets)?;
+            d.set_item("hours_to_resolve", opp.hours_to_resolve)?;
+            d.set_item("score", opp.score)?;
             let meta = PyDict::new(py);
             meta.set_item("method", &opp.method)?;
             meta.set_item("neg_risk", opp.neg_risk)?;
