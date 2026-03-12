@@ -23,6 +23,11 @@ from pathlib import Path
 import json
 
 try:
+    from utilities.rust_state_adapter import RustStateAdapter, HAS_RUST_STATE
+except ImportError:
+    HAS_RUST_STATE = False
+
+try:
     from utilities.state_store import StateStore
     HAS_SQLITE = True
 except ImportError:
@@ -143,13 +148,21 @@ class PaperTradingEngine:
         self.latest_market_data = {}
         
         # SQLite state store (in-memory + disk backup)
-        self._state_store: Optional['StateStore'] = None
+        # Priority: Rust adapter (GIL-free backup) → Python StateStore → None
+        self._state_store = None
         self._save_counter = 0  # Track save cycles for JSON compat frequency
-        if HAS_SQLITE:
+        db_path = Path(workspace_root) / 'data' / 'system_state' / 'execution_state.db'
+        if HAS_RUST_STATE:
             try:
-                db_path = Path(workspace_root) / 'data' / 'system_state' / 'execution_state.db'
+                self._state_store = RustStateAdapter(str(db_path))
+                self.logger.info(f'Rust state store initialized: {db_path}')
+            except Exception as e:
+                self.logger.warning(f'Rust state store failed: {e}')
+                self._state_store = None
+        if self._state_store is None and HAS_SQLITE:
+            try:
                 self._state_store = StateStore(str(db_path))
-                self.logger.info(f'SQLite state store initialized: {db_path}')
+                self.logger.info(f'Python SQLite state store initialized: {db_path}')
             except Exception as e:
                 self.logger.warning(f'SQLite state store failed, using JSON fallback: {e}')
                 self._state_store = None

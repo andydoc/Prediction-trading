@@ -29,14 +29,14 @@ impl StateDB {
         mem_conn.execute_batch("
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=OFF;
-            CREATE TABLE IF NOT EXISTS state (
+            CREATE TABLE IF NOT EXISTS scalars (
                 key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
+                value REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS positions (
                 position_id TEXT PRIMARY KEY,
                 status TEXT NOT NULL DEFAULT 'open',
-                data JSON NOT NULL,
+                data TEXT NOT NULL,
                 opened_at TEXT,
                 closed_at TEXT
             );
@@ -52,31 +52,41 @@ impl StateDB {
 
     // --- Scalar state (capital, counters) ---
 
-    pub fn set_scalar(&self, key: &str, value: &str) {
+    pub fn set_scalar(&self, key: &str, value: f64) {
         let db = self.mem.lock();
         let _ = db.execute(
-            "INSERT OR REPLACE INTO state (key, value) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO scalars (key, value) VALUES (?1, ?2)",
             params![key, value],
         );
     }
 
-    pub fn get_scalar(&self, key: &str) -> Option<String> {
+    pub fn get_scalar(&self, key: &str) -> Option<f64> {
         let db = self.mem.lock();
         db.query_row(
-            "SELECT value FROM state WHERE key = ?1",
+            "SELECT value FROM scalars WHERE key = ?1",
             params![key],
             |row| row.get(0),
         ).ok()
     }
 
-    pub fn set_scalars(&self, pairs: &[(String, String)]) {
+    pub fn set_scalars(&self, pairs: &[(String, f64)]) {
         let db = self.mem.lock();
         for (k, v) in pairs {
             let _ = db.execute(
-                "INSERT OR REPLACE INTO state (key, value) VALUES (?1, ?2)",
+                "INSERT OR REPLACE INTO scalars (key, value) VALUES (?1, ?2)",
                 params![k, v],
             );
         }
+    }
+
+    pub fn get_all_scalars(&self) -> Vec<(String, f64)> {
+        let db = self.mem.lock();
+        let mut stmt = db.prepare("SELECT key, value FROM scalars").unwrap();
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        }).unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
     }
 
     // --- Position CRUD ---

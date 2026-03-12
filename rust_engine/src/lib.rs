@@ -198,16 +198,20 @@ impl RustStateDB {
         Ok(Self { inner })
     }
 
-    fn set_scalar(&self, key: &str, value: &str) {
+    fn set_scalar(&self, key: &str, value: f64) {
         self.inner.set_scalar(key, value);
     }
 
-    fn get_scalar(&self, key: &str) -> Option<String> {
+    fn get_scalar(&self, key: &str) -> Option<f64> {
         self.inner.get_scalar(key)
     }
 
-    fn set_scalars(&self, pairs: Vec<(String, String)>) {
+    fn set_scalars(&self, pairs: Vec<(String, f64)>) {
         self.inner.set_scalars(&pairs);
+    }
+
+    fn get_all_scalars(&self) -> Vec<(String, f64)> {
+        self.inner.get_all_scalars()
     }
 
     fn save_position(&self, position_id: &str, status: &str, data_json: &str,
@@ -229,6 +233,10 @@ impl RustStateDB {
 
     fn load_closed(&self) -> Vec<String> {
         self.inner.load_closed()
+    }
+
+    fn load_by_status(&self, status: &str) -> Vec<String> {
+        self.inner.load_by_status(status)
     }
 
     fn count_by_status(&self) -> Vec<(String, i64)> {

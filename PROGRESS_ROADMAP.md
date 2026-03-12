@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.11  
-> **Last updated**: 2026-03-12 ~08:30 UTC  
+> **Version**: v0.04.12  
+> **Last updated**: 2026-03-12 ~09:00 UTC  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4 GB RAM, Ubuntu 24.04, systemd auto-restart, $100 fresh capital  
@@ -709,7 +709,7 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 |---|------|--------|
 | 8m | `tokio-tungstenite` WS client with local book mirror (replaces Python `websockets`) | ✅ Built + integrated, ABBA-safe single-lock queue |
 | 8n | Rust eval queue with `tokio::select!` instant wake (no polling, no sleep) | ✅ `parking_lot::Mutex<QueueInner>` dedup queue, wired into engine |
-| 8o | `rusqlite` state persistence (WAL mode, incremental updates) | ✅ `RustStateDB` PyO3 class, GIL-free disk mirror via `py.allow_threads()` |
+| 8o | `rusqlite` state persistence (WAL mode, incremental updates) | ✅ `RustStateDB` + adapter wired into paper_trading.py, GIL-free backup |
 | 8p | Single Rust binary: WS + queue + eval + state. Python kept for dashboard + resolution validator only. | 🔲 |
 | 8q | Full Rust port: dashboard (axum/warp), resolution validator, everything. Zero Python. | 🔲 |
 
@@ -732,6 +732,13 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 Most recent first. Each entry summarises what changed and why. Full implementation detail is in the git log.
 
 ---
+
+### v0.04.12 (2026-03-12) — Rust State Integration (Phase 8 P4b wired)
+- **ADDED** `utilities/rust_state_adapter.py` — Python adapter wrapping `RustStateDB` with `StateStore`-compatible API
+- **CHANGED** `paper_trading.py` — tries Rust adapter first, falls back to Python `StateStore`
+- **FIXED** Schema match: Rust uses `scalars` table with `REAL` values (matching Python DB) + `get_all_scalars()` + `load_by_status()`
+- **VERIFIED** Production: `Rust state store initialized`, capital=$30.51, 8 open, 1287 closed loaded correctly
+- **VERIFIED** GIL-free backup: `State backed up to disk in 52.9ms (Rust)` via `py.allow_threads()`
 
 ### v0.04.11 (2026-03-12) — Rust SQLite State (Phase 8 P4b) + Latency Verification
 - **ADDED** `rust_engine/src/state.rs` — `RustStateDB` with in-memory SQLite + `rusqlite::backup` disk mirror
@@ -1153,6 +1160,7 @@ Format: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch (e.g. `v
 | `v0.04.09` | Full SSE dynamic dashboard (zero-refresh) |
 | `v0.04.10` | Dashboard polish + Rust WS scaffold |
 | `v0.04.11` | Rust SQLite state (P4b) + latency verification |
+| `v0.04.12` | Rust state wired into paper_trading.py |
 | `v1.00.00` | First successful live trade |
 
 ### Implementation Steps
