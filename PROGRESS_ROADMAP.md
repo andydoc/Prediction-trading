@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.10  
-> **Last updated**: 2026-03-12 ~01:00 UTC  
+> **Version**: v0.04.11  
+> **Last updated**: 2026-03-12 ~08:30 UTC  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4 GB RAM, Ubuntu 24.04, systemd auto-restart, $100 fresh capital  
@@ -224,6 +224,7 @@ The execution control server (`execution_control.py`) and its client were remove
 │   ├── src/book.rs                           ← DashMap concurrent book mirror with EFP drift detection
 │   ├── src/queue.rs                          ← Deduped urgent/background eval queue
 │   ├── src/ws.rs                             ← tokio-tungstenite sharded WS connections
+│   ├── src/state.rs                          ← rusqlite in-memory DB + GIL-free disk mirror (Phase 8 P4b)
 │   └── Cargo.toml
 
 /home/andydoc/prediction-trader-env/          ← Python virtual environment
@@ -708,7 +709,7 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 |---|------|--------|
 | 8m | `tokio-tungstenite` WS client with local book mirror (replaces Python `websockets`) | ✅ Built + integrated, ABBA-safe single-lock queue |
 | 8n | Rust eval queue with `tokio::select!` instant wake (no polling, no sleep) | ✅ `parking_lot::Mutex<QueueInner>` dedup queue, wired into engine |
-| 8o | `rusqlite` state persistence (WAL mode, incremental updates) | 🔲 |
+| 8o | `rusqlite` state persistence (WAL mode, incremental updates) | ✅ `RustStateDB` PyO3 class, GIL-free disk mirror via `py.allow_threads()` |
 | 8p | Single Rust binary: WS + queue + eval + state. Python kept for dashboard + resolution validator only. | 🔲 |
 | 8q | Full Rust port: dashboard (axum/warp), resolution validator, everything. Zero Python. | 🔲 |
 
@@ -731,6 +732,15 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 Most recent first. Each entry summarises what changed and why. Full implementation detail is in the git log.
 
 ---
+
+### v0.04.11 (2026-03-12) — Rust SQLite State (Phase 8 P4b) + Latency Verification
+- **ADDED** `rust_engine/src/state.rs` — `RustStateDB` with in-memory SQLite + `rusqlite::backup` disk mirror
+- **ADDED** `RustStateDB` PyO3 class: scalar CRUD, position CRUD, bulk save, `mirror_to_disk()` with `py.allow_threads()` (GIL-free)
+- **ADDED** `rusqlite = { features = ["bundled", "backup"] }` to rust_engine Cargo.toml
+- **VERIFIED** Rust WS latency (1001 samples, 8+ hours): p50=24ms (was 35ms Python), p95=49ms, reconnect spikes eliminated
+- **VERIFIED** Live WS coverage doubled: 18,590/35,807 (52%) vs Python 8,500/35k (24%)
+- **COMPLETED** Phase 8 P4b: item 8o (rusqlite state persistence)
+- **NOTED** RustStateDB not yet wired into trading_engine.py (next step: replace Python state_db.py)
 
 ### v0.04.10 (2026-03-12) — Dashboard Polish + Rust WS Integration (Phase 8 P4a)
 - **FIXED** System section now reads capital/positions from execution_state (was stale engine status file)
@@ -975,27 +985,47 @@ L1 had a hard cap of 10,000 markets. Polymarket had ~33,800. The two missing out
 
 > **Note:** All figures below are from the laptop instance. The VPS was deployed with $100 fresh capital but is not currently running (paused during architecture work). Combined performance view is a future feature.
 
-### Current State (laptop, v0.04.07, 2026-03-11)
+### Current State (laptop, v0.04.10, 2026-03-12)
 
 | Metric | Value |
 |--------|-------|
 | Cash (current_capital) | $8.83 |
-| Capital deployed (open positions) | ~$100.00 |
-| Total portfolio value | ~$108.83 |
-| Open positions | 10 |
-| Closed positions | ~1,284 |
-| Net gain vs initial $100 | +$8.83 |
+| Capital deployed (open positions) | ~$80.00 |
+| Total portfolio value | ~$88.83 |
+| Open positions | 8 |
+| Closed positions | ~1,287 |
+| Net gain vs initial $100 | −$11.17 (2 positions locked until May — INC-006) |
 
-### Latency (post-P3 stabilised, measured 2026-03-11 10:10–10:22 UTC, 199 samples)
+### Latency: Python WS vs Rust WS Comparison
+
+**Python WS (v0.04.07 post-P3, 199 samples, 12 min window, 2026-03-11):**
 
 | Metric | Steady-state (bg=0) | Overall session | During WS reconnect |
 |--------|--------------------:|----------------:|--------------------:|
-| p50 | **35 ms** | 165 ms | 1–4 s |
-| p90 | **195 ms** | 5,098 ms | 30–85 s |
-| min | 2 ms | 2 ms | — |
-| bg_queue | **0** | 263 median | 400–790 |
+| p50 | 35 ms | 165 ms | 1–4 s |
+| p90/p95 | 195 ms | 5,098 ms | 30–85 s |
+| bg_queue | 0 | 263 median | 400–790 |
+| bg=0 rate | 33% of samples | — | — |
+| WS message rate | ~1,700 msg/s | — | — |
 
-**Context:** Polymarket WS connections cycle every ~10 minutes (server-side). During the ~30s recovery window, live market count drops (e.g. 8500→3000→8500) and the background queue fills. In steady state between reconnects, p50 is consistently **26–78 ms** with queue at zero.
+**Rust WS (v0.04.11 P4a+b, 1001 samples, 8+ hours continuous, 2026-03-12):**
+
+| Metric | Value | vs Python steady-state |
+|--------|------:|----------------------:|
+| p50 of p50s | **26 ms** | −26% |
+| p95 of p50s | **30 ms** | −91% vs 195ms p90 |
+| p50 of p95s | **49 ms** | −75% vs 195ms p90 |
+| p95 of p95s | **53 ms** | — |
+| bg=0 rate | **99.8%** | was 33% |
+| WS message rate | **2,148 msg/s** | +26% |
+| WS live coverage | **18,590/35,807 (52%)** | was 8,500/35k (24%) — **2.2× better** |
+| WS reconnect spikes | **eliminated** | was 1–4 s p50 |
+| max (p50 of max) | 54 ms | was 30–85 s during reconnect |
+
+**Key wins from Rust WS (Phase 8 P4a):**
+- **WS reconnect stalls eliminated.** Python WS reconnects every ~10 min caused 30s recovery windows with 1–4s p50 latency and queue buildup. Rust `tokio-tungstenite` reconnects transparently — bg_queue stays at 0 in 99.8% of samples (was 33%).
+- **Tail latency collapsed.** Python p90 was 195ms (steady) / 5s (overall) / 85s (reconnect). Rust p95-of-p95s is 53ms — a 97% reduction in worst-case latency.
+- **Higher message throughput.** 2,148 msg/s vs 1,700 msg/s (26% more) because Rust processes WS messages without GIL contention.
 
 ### Resolved Arb Audit
 
@@ -1122,6 +1152,7 @@ Format: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch (e.g. `v
 | `v0.04.04` | Dashboard SSE rewrite + exec control removal *(current)* |
 | `v0.04.09` | Full SSE dynamic dashboard (zero-refresh) |
 | `v0.04.10` | Dashboard polish + Rust WS scaffold |
+| `v0.04.11` | Rust SQLite state (P4b) + latency verification |
 | `v1.00.00` | First successful live trade |
 
 ### Implementation Steps

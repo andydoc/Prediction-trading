@@ -21,3 +21,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
+rusqlite = { version = "0.33", features = ["bundled", "backup"] }

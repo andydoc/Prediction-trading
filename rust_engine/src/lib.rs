@@ -14,6 +14,7 @@
 mod types;
 mod book;
 mod queue;
+mod state;
 mod ws;
 
 use pyo3::prelude::*;
@@ -181,6 +182,80 @@ impl RustWsEngine {
     }
 }
 
+// === RustStateDB: SQLite state persistence (Phase 8 P4b) ===
+
+#[pyclass]
+struct RustStateDB {
+    inner: state::StateDB,
+}
+
+#[pymethods]
+impl RustStateDB {
+    #[new]
+    fn new(disk_path: &str) -> PyResult<Self> {
+        let inner = state::StateDB::new(disk_path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        Ok(Self { inner })
+    }
+
+    fn set_scalar(&self, key: &str, value: &str) {
+        self.inner.set_scalar(key, value);
+    }
+
+    fn get_scalar(&self, key: &str) -> Option<String> {
+        self.inner.get_scalar(key)
+    }
+
+    fn set_scalars(&self, pairs: Vec<(String, String)>) {
+        self.inner.set_scalars(&pairs);
+    }
+
+    fn save_position(&self, position_id: &str, status: &str, data_json: &str,
+                     opened_at: Option<&str>, closed_at: Option<&str>) {
+        self.inner.save_position(position_id, status, data_json, opened_at, closed_at);
+    }
+
+    fn save_positions_bulk(&self, rows: Vec<(String, String, String, Option<String>, Option<String>)>) {
+        self.inner.save_positions_bulk(&rows);
+    }
+
+    fn delete_position(&self, position_id: &str) {
+        self.inner.delete_position(position_id);
+    }
+
+    fn load_open(&self) -> Vec<String> {
+        self.inner.load_open()
+    }
+
+    fn load_closed(&self) -> Vec<String> {
+        self.inner.load_closed()
+    }
+
+    fn count_by_status(&self) -> Vec<(String, i64)> {
+        self.inner.count_by_status()
+    }
+
+    fn get_open_position_ids(&self) -> Vec<String> {
+        self.inner.get_open_position_ids()
+    }
+
+    /// Mirror in-memory DB to disk. Returns elapsed ms.
+    /// This is the key win: runs WITHOUT the GIL.
+    fn mirror_to_disk(&self, py: Python<'_>) -> f64 {
+        py.allow_threads(|| self.inner.mirror_to_disk())
+    }
+
+    /// Load disk DB into memory. Returns elapsed ms.
+    fn load_from_disk(&self) -> PyResult<f64> {
+        self.inner.load_from_disk()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
+    fn dirty_count(&self) -> usize {
+        self.inner.dirty_count()
+    }
+}
+
 // --- Helper functions for extracting config from PyDict ---
 fn get_str(d: &Bound<'_, PyDict>, key: &str) -> Option<String> {
     d.get_item(key).ok().flatten().and_then(|v| v.extract::<String>().ok())
@@ -196,5 +271,6 @@ fn get_float(d: &Bound<'_, PyDict>, key: &str) -> Option<f64> {
 #[pymodule]
 fn rust_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RustWsEngine>()?;
+    m.add_class::<RustStateDB>()?;
     Ok(())
 }
