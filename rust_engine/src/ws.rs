@@ -197,15 +197,27 @@ async fn connect_and_run(
     tracing::info!("Shard {}: connected, subscribing {} assets", shard_id, assets.len());
 
     // Subscribe in batches of 500 (Polymarket limit)
-    for chunk in assets.chunks(500) {
+    for (batch_idx, chunk) in assets.chunks(500).enumerate() {
         let asset_list: Vec<Value> = chunk.iter()
             .map(|a| Value::String(a.clone()))
             .collect();
-        let sub_msg = serde_json::json!({
-            "type": "subscribe",
-            "channel": "market",
-            "assets_ids": asset_list,
-        });
+        let sub_msg = if batch_idx == 0 {
+            // First batch: use "type": "market"
+            serde_json::json!({
+                "assets_ids": asset_list,
+                "type": "market",
+                "custom_feature_enabled": true,
+                "initial_dump": true,
+            })
+        } else {
+            // Subsequent batches: use "operation": "subscribe"
+            serde_json::json!({
+                "assets_ids": asset_list,
+                "operation": "subscribe",
+                "custom_feature_enabled": true,
+                "initial_dump": true,
+            })
+        };
         sink.send(WsMessage::Text(sub_msg.to_string())).await?;
         // Small delay between batches to avoid server throttle
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -220,10 +232,9 @@ async fn connect_and_run(
 
     loop {
         tokio::select! {
-            // Heartbeat tick
+            // Heartbeat tick — Polymarket expects plain text "PING"
             _ = heartbeat_interval.tick() => {
-                let ping = serde_json::json!({"type": "ping"});
-                if let Err(e) = sink.send(WsMessage::Text(ping.to_string())).await {
+                if let Err(e) = sink.send(WsMessage::Text("PING".to_string())).await {
                     tracing::warn!("Shard {}: heartbeat send failed: {}", shard_id, e);
                     return Err(Box::new(e));
                 }
@@ -271,14 +282,20 @@ async fn connect_and_run(
 
 /// Parse and dispatch a single WS message.
 fn handle_message(
-    _shard_id: usize,
+    shard_id: usize,
     text: &str,
     book: &Arc<BookMirror>,
     queue: &Arc<EvalQueue>,
     resolved: &Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
 ) {
-    // Fast path: skip pong and subscription confirmations
-    if text.starts_with("{\"type\":\"pong\"") || text.starts_with("[{\"type\":\"pong\"") {
+    // Debug: log first 200 chars of every message for diagnosis
+    tracing::debug!("Shard {} raw msg: {}", shard_id, &text[..text.len().min(200)]);
+    // Fast path: skip PONG (plain text response to our PING) and subscription confirmations
+    let trimmed = text.trim();
+    if trimmed == "PONG"
+        || trimmed.starts_with("{\"type\":\"pong\"")
+        || trimmed.starts_with("[{\"type\":\"pong\"")
+    {
         return;
     }
 
@@ -312,7 +329,9 @@ fn handle_message(
             "best_bid_ask" => handle_best_bid_ask(msg, book, queue, now),
             "market_resolved" => handle_resolved(msg, resolved, now),
             "last_trade_price" | "pong" | "" => {} // ignore
-            _ => {} // unknown event type
+            _ => {
+                tracing::debug!("Unknown event_type: '{}' in: {}", event_type, &text[..text.len().min(150)]);
+            }
         }
     }
 }

@@ -494,10 +494,12 @@ def get_opportunities_json():
         })
 
     result.sort(key=lambda x: x.get('score', 0) if x.get('score', 0) >= 0 else -999999, reverse=True)
-    # Re-index after sort
+    # Filter out past opportunities (score < 0)
+    result = [r for r in result if not r.get('is_past', False)]
+    # Re-index after sort/filter
     for i, r in enumerate(result):
         r['idx'] = i + 1
-    return {'opportunities': result[:20], 'total_found': len(opps)}
+    return {'opportunities': result[:20], 'total_found': len(result)}
 
 def get_closed_json():
     """Closed positions categorised into resolved/replaced."""
@@ -530,9 +532,19 @@ def get_closed_json():
             except:
                 pass
 
+        # Format close timestamp
+        close_dt_str = '?'
+        if close_ts:
+            try:
+                close_dt = datetime.fromtimestamp(float(close_ts), tz=timezone.utc)
+                close_dt_str = close_dt.strftime('%d/%m/%Y %H:%M:%S')
+            except Exception:
+                pass
+
         row = {
             'name': short_name, 'deployed': round(cl_deployed, 2),
             'pnl': round(actual, 2), 'hold': hold_str,
+            'closed_at': close_dt_str,
         }
         if reason in ('resolved', 'expired'):
             cats['resolved'].append(row)
@@ -570,6 +582,11 @@ def get_system_json():
     engine_status = load_json(ENGINE_STATUS)
     em = engine_status.get('metrics', {})
 
+    # Read live capital/positions from execution_state (not stale engine status)
+    state = load_execution_state()
+    live_cap = state.get('current_capital', 0)
+    live_open = len(state.get('open_positions', []))
+
     return {
         'scanner': {
             'status': l1_status.get('status', '?'),
@@ -578,8 +595,8 @@ def get_system_json():
         'engine': {
             'status': engine_status.get('status', '?'),
             'ts': _fmt_ts(engine_status.get('timestamp', '')),
-            'capital': engine_status.get('capital', 0),
-            'positions': engine_status.get('positions', engine_status.get('open_positions', 0)),
+            'capital': live_cap,
+            'positions': live_open,
         },
         'metrics': em,
         'dashboard_ts': now.strftime('%d/%m/%Y %H:%M'),
@@ -588,7 +605,10 @@ def get_system_json():
 def get_shadow_json():
     """Shadow tab: parse recent log files for SHADOW entries."""
     try:
-        log_files = sorted(glob.glob(str(WORKSPACE / 'logs' / 'layer4_*.log')), reverse=True)[:2]
+        log_files = sorted(glob.glob(str(WORKSPACE / 'logs' / 'trading_engine_*.log')), reverse=True)[:2]
+        # Fallback to old name if no new-format logs found
+        if not log_files:
+            log_files = sorted(glob.glob(str(WORKSPACE / 'logs' / 'layer4_*.log')), reverse=True)[:2]
         shadow_entries = []
         for lf in log_files:
             with open(lf) as f:
@@ -613,7 +633,13 @@ def get_shadow_json():
 
         trades_list = []
         for e in would_trade[-10:]:
-            parts = e.split(' - [L4] INFO - ')
+            # Handle both old [L4] and new [ENGINE] log format
+            for delim in [' - [ENGINE] INFO - ', ' - [L4] INFO - ']:
+                if delim in e:
+                    parts = e.split(delim)
+                    break
+            else:
+                parts = [e]
             ts = parts[0][:19] if parts else ''
             msg = parts[1][:120] if len(parts) > 1 else e[:120]
             trades_list.append({'ts': ts, 'msg': msg})
@@ -705,7 +731,8 @@ def make_html_shell():
   .section-title::before { content: '\\25BC \\00a0'; font-size: 10px; }
   .section-title.collapsed::before { content: '\\25B6 \\00a0'; font-size: 10px; }
   .section-content.hidden { display: none; }
-  .collapse-all-btn { background: #333; color: #0af; border: 1px solid #0af; padding: 2px 10px; font-size: 11px; cursor: pointer; margin-left: 12px; font-family: 'Courier New', monospace; border-radius: 4px; vertical-align: middle; }
+  .collapse-all-btn { background: #333; color: #0af; border: 1px solid #0af; padding: 2px 10px; font-size: 11px; cursor: pointer; margin-left: 12px; font-family: 'Courier New', monospace; border-radius: 4px; vertical-align: middle; display: none; }
+  .collapse-all-btn.visible { display: inline-block; }
   .collapse-all-btn:hover { background: #0af; color: #000; }
   .tab-bar { display: flex; gap: 0; margin: 12px 0 0 0; border-bottom: 2px solid #333; }
   .tab-btn { padding: 8px 20px; background: #111; color: #888; border: 1px solid #333; border-bottom: none; cursor: pointer; font-family: 'Courier New', monospace; font-size: 13px; font-weight: bold; letter-spacing: 0.5px; border-radius: 6px 6px 0 0; margin-right: 2px; transition: all 0.15s; }
@@ -751,7 +778,7 @@ def make_html_shell():
 
 <div id="tab-positions" class="tab-content active">
   <h2 class="section-title" onclick="toggleSection(this)">OPEN POSITIONS (<span id="pos-count">0</span>)
-    <button class="collapse-all-btn" onclick="event.stopPropagation(); collapseAll()">Collapse All</button>
+    <button id="pos-collapse-btn" class="collapse-all-btn" onclick="event.stopPropagation(); collapseAll('pos')">Collapse All</button>
   </h2>
   <div class="section-content">
     <table><thead>
@@ -767,7 +794,9 @@ def make_html_shell():
     </thead><tbody id="agg-body"></tbody></table>
   </div>
 
-  <h2 class="section-title collapsed" onclick="toggleSection(this)">OPPORTUNITIES (<span id="opp-total">0</span> found, top 20 by score)</h2>
+  <h2 class="section-title collapsed" onclick="toggleSection(this)">OPPORTUNITIES (<span id="opp-total">0</span> found, top 20 by score)
+    <button id="opp-collapse-btn" class="collapse-all-btn" onclick="event.stopPropagation(); collapseAll('opp')">Collapse All</button>
+  </h2>
   <div class="section-content hidden">
     <table><thead>
       <tr><th>#</th><th>Profit%</th><th>Resolves</th><th>Strategy</th><th>Score</th><th>Market</th></tr>
@@ -803,15 +832,27 @@ function switchTab(name) {
   document.querySelectorAll('.tab-btn').forEach(b => { if(b.getAttribute('data-tab')===name) b.classList.add('active'); });
   window.location.hash = name;
 }
-function collapseAll() {
-  document.querySelectorAll('#positions-body .detail-row.show').forEach(r => r.classList.remove('show'));
-  document.querySelectorAll('#positions-body .pos-row.expanded').forEach(r => r.classList.remove('expanded'));
+function collapseAll(prefix) {
+  var container = prefix === 'opp' ? '#opp-body' : '#positions-body';
+  document.querySelectorAll(container+' .detail-row.show').forEach(r => r.classList.remove('show'));
+  document.querySelectorAll(container+' .pos-row.expanded').forEach(r => r.classList.remove('expanded'));
+  updateCollapseBtn(prefix);
+}
+function updateCollapseBtn(prefix) {
+  var container = prefix === 'opp' ? '#opp-body' : '#positions-body';
+  var btnId = prefix === 'opp' ? 'opp-collapse-btn' : 'pos-collapse-btn';
+  var btn = document.getElementById(btnId);
+  if (btn) {
+    var hasExpanded = document.querySelectorAll(container+' .detail-row.show').length > 0;
+    btn.classList.toggle('visible', hasExpanded);
+  }
 }
 function toggleRow(prefix, idx) {
   var d = document.getElementById(prefix+'-detail-'+idx);
   var m = document.getElementById(prefix+'-row-'+idx);
   if(d) d.classList.toggle('show');
   if(m) m.classList.toggle('expanded');
+  updateCollapseBtn(prefix);
 }
 (function(){ var h=window.location.hash.replace('#',''); if(h && document.getElementById('tab-'+h)) switchTab(h); })();
 
@@ -996,15 +1037,17 @@ function renderClosed(d) {
     if (!cat || cat.rows.length === 0) return;
     var cls = cat.collapsed ? 'collapsed' : '';
     var hide = cat.collapsed ? 'hidden' : '';
+    var dateCol = (key === 'resolved') ? 'Resolved' : 'Replaced';
     h += '<h3 class="sub-section-title '+cls+'" onclick="toggleSection(this)">'+esc(cat.label)+' ('+cat.rows.length+')</h3>';
     h += '<div class="section-content '+hide+'"><table>';
-    h += '<tr><th>Market</th><th>Deployed</th><th>P&amp;L</th><th>Held</th></tr>';
+    h += '<tr><th>Market</th><th>Deployed</th><th>P&amp;L</th><th>Held</th><th>'+dateCol+'</th></tr>';
     cat.rows.forEach(function(r) {
       var cls2 = r.pnl > 0.01 ? 'good' : (r.pnl < -0.01 ? 'bad' : '');
       h += '<tr class="'+cls2+'"><td>'+esc(r.name)+'</td>';
       h += '<td>$'+r.deployed.toFixed(2)+'</td>';
       h += '<td>$'+(r.pnl>=0?'+':'')+r.pnl.toFixed(2)+'</td>';
-      h += '<td>'+esc(r.hold)+'</td></tr>';
+      h += '<td>'+esc(r.hold)+'</td>';
+      h += '<td>'+esc(r.closed_at||'?')+'</td></tr>';
     });
     h += '</table></div>';
   });

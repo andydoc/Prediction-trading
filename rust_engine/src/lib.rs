@@ -17,7 +17,7 @@ mod queue;
 mod ws;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::PyDict;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -49,10 +49,13 @@ impl RustWsEngine {
     ///   trade_size_usd: float (default: 10.0)
     #[new]
     fn new(config: &Bound<'_, PyDict>) -> PyResult<Self> {
+        // Install rustls crypto provider (required by rustls 0.23+)
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         // Initialize tracing (logs to stderr, picked up by Python logging)
         let _ = tracing_subscriber::fmt()
             .with_target(false)
-            .with_env_filter("rust_engine=info")
+            .with_env_filter("rust_engine=debug")
             .try_init();
 
         let cfg = EngineConfig {
@@ -115,12 +118,12 @@ impl RustWsEngine {
         self.ws.stop();
     }
 
-    /// Drain eval queue: returns list of (constraint_id, urgent) tuples.
+    /// Drain eval queue: returns list of (constraint_id, urgent, queued_at) tuples.
     /// Called by Python's eval loop (replaces _process_dirty_assets).
-    fn drain_evals(&self, max: usize) -> Vec<(String, bool)> {
+    fn drain_evals(&self, max: usize) -> Vec<(String, bool, f64)> {
         self.eval_queue.drain(max)
             .into_iter()
-            .map(|e| (e.constraint_id, e.urgent))
+            .map(|e| (e.constraint_id, e.urgent, e.queued_at))
             .collect()
     }
 

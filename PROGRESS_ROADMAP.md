@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.09  
-> **Last updated**: 2026-03-11 ~21:20 UTC  
+> **Version**: v0.04.10  
+> **Last updated**: 2026-03-12 ~01:00 UTC  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4 GB RAM, Ubuntu 24.04, systemd auto-restart, $100 fresh capital  
@@ -732,6 +732,15 @@ Most recent first. Each entry summarises what changed and why. Full implementati
 
 ---
 
+### v0.04.10 (2026-03-12) — Dashboard Polish + Rust WS Scaffold
+- **FIXED** System section now reads capital/positions from execution_state (was stale engine status file)
+- **FIXED** Shadow tab log parsing: reads `trading_engine_*.log` (was `layer4_*.log`); splits on `[ENGINE]` (was `[L4]`)
+- **FIXED** Collapse All button hidden by default, shows only when rows are expanded; added to Opportunities section too
+- **CHANGED** Past opportunities (score < 0) no longer displayed in dashboard
+- **ADDED** Closed positions tables: "Resolved" and "Replaced" date columns in dd/mm/yyyy hh:mm:ss format
+- **ADDED** `rust_engine/` crate: WS client + book mirror + eval queue (Phase 8 P4a scaffold, builds + installs)
+- **DISABLED** Rust WS integration in trading engine (deadlock under investigation — falls back to Python WS)
+
 ### v0.04.09 (2026-03-11) — Full SSE Dynamic Dashboard (Zero-Refresh)
 - **REWRITTEN** `dashboard_server.py` — complete rewrite from server-rendered HTML to static shell + JSON SSE events
 - **CHANGED** All data sections now update live via typed SSE events (no page reload needed):
@@ -1108,6 +1117,7 @@ Format: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch (e.g. `v
 | `v0.04.03` | Latency bottleneck analysis + P0/P1 fixes |
 | `v0.04.04` | Dashboard SSE rewrite + exec control removal *(current)* |
 | `v0.04.09` | Full SSE dynamic dashboard (zero-refresh) |
+| `v0.04.10` | Dashboard polish + Rust WS scaffold |
 | `v1.00.00` | First successful live trade |
 
 ### Implementation Steps

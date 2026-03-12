@@ -4,16 +4,21 @@
 /// Two priority levels:
 ///   - Urgent: EFP drift > threshold (process first)
 ///   - Background: stale data refresh, periodic re-eval
+///
+/// Uses a single Mutex over all state to prevent lock ordering deadlocks.
 use std::collections::HashSet;
 use parking_lot::Mutex;
 
-/// Thread-safe eval queue with deduplication.
+/// All queue state under a single lock — prevents ABBA deadlocks.
+struct QueueInner {
+    urgent: Vec<QueueEntry>,
+    background: Vec<QueueEntry>,
+    urgent_set: HashSet<String>,
+    bg_set: HashSet<String>,
+}
+
 pub struct EvalQueue {
-    urgent: Mutex<Vec<QueueEntry>>,
-    background: Mutex<Vec<QueueEntry>>,
-    /// Track which constraint_ids are already queued (dedup).
-    urgent_set: Mutex<HashSet<String>>,
-    bg_set: Mutex<HashSet<String>>,
+    inner: Mutex<QueueInner>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,20 +28,22 @@ pub struct QueueEntry {
     pub queued_at: f64,
 }
 
-/// Result returned to Python from drain.
 #[derive(Debug, Clone)]
 pub struct DrainResult {
     pub constraint_id: String,
     pub urgent: bool,
+    pub queued_at: f64,
 }
 
 impl EvalQueue {
     pub fn new() -> Self {
         Self {
-            urgent: Mutex::new(Vec::new()),
-            background: Mutex::new(Vec::new()),
-            urgent_set: Mutex::new(HashSet::new()),
-            bg_set: Mutex::new(HashSet::new()),
+            inner: Mutex::new(QueueInner {
+                urgent: Vec::new(),
+                background: Vec::new(),
+                urgent_set: HashSet::new(),
+                bg_set: HashSet::new(),
+            }),
         }
     }
 
@@ -53,54 +60,49 @@ impl EvalQueue {
             queued_at: now,
         };
 
+        let mut q = self.inner.lock();
         if urgent {
-            let mut set = self.urgent_set.lock();
-            if set.insert(constraint_id.to_string()) {
-                self.urgent.lock().push(entry);
+            if q.urgent_set.insert(constraint_id.to_string()) {
+                q.urgent.push(entry);
             }
-            // Also remove from background if it was there
-            self.bg_set.lock().remove(constraint_id);
+            q.bg_set.remove(constraint_id);
         } else {
-            let mut set = self.bg_set.lock();
-            // Don't add to background if already in urgent
-            if !self.urgent_set.lock().contains(constraint_id) {
-                if set.insert(constraint_id.to_string()) {
-                    self.background.lock().push(entry);
+            if !q.urgent_set.contains(constraint_id) {
+                if q.bg_set.insert(constraint_id.to_string()) {
+                    q.background.push(entry);
                 }
             }
         }
     }
 
     /// Drain up to `max` entries, urgent first then background.
-    /// Returns entries for Python to evaluate.
     pub fn drain(&self, max: usize) -> Vec<DrainResult> {
+        let mut q = self.inner.lock();
         let mut results = Vec::with_capacity(max);
 
         // Drain urgent first
-        {
-            let mut q = self.urgent.lock();
-            let mut set = self.urgent_set.lock();
-            let take = q.len().min(max);
-            for entry in q.drain(..take) {
-                set.remove(&entry.constraint_id);
-                results.push(DrainResult {
-                    constraint_id: entry.constraint_id,
-                    urgent: true,
-                });
-            }
+        let take = q.urgent.len().min(max);
+        let urgent_entries: Vec<QueueEntry> = q.urgent.drain(..take).collect();
+        for entry in urgent_entries {
+            q.urgent_set.remove(&entry.constraint_id);
+            results.push(DrainResult {
+                constraint_id: entry.constraint_id,
+                urgent: true,
+                queued_at: entry.queued_at,
+            });
         }
 
         // Fill remainder from background
         let remaining = max.saturating_sub(results.len());
         if remaining > 0 {
-            let mut q = self.background.lock();
-            let mut set = self.bg_set.lock();
-            let take = q.len().min(remaining);
-            for entry in q.drain(..take) {
-                set.remove(&entry.constraint_id);
+            let take = q.background.len().min(remaining);
+            let bg_entries: Vec<QueueEntry> = q.background.drain(..take).collect();
+            for entry in bg_entries {
+                q.bg_set.remove(&entry.constraint_id);
                 results.push(DrainResult {
                     constraint_id: entry.constraint_id,
                     urgent: false,
+                    queued_at: entry.queued_at,
                 });
             }
         }
@@ -110,14 +112,16 @@ impl EvalQueue {
 
     /// Queue depths for monitoring.
     pub fn depths(&self) -> (usize, usize) {
-        (self.urgent.lock().len(), self.background.lock().len())
+        let q = self.inner.lock();
+        (q.urgent.len(), q.background.len())
     }
 
     /// Clear all queues.
     pub fn clear(&self) {
-        self.urgent.lock().clear();
-        self.background.lock().clear();
-        self.urgent_set.lock().clear();
-        self.bg_set.lock().clear();
+        let mut q = self.inner.lock();
+        q.urgent.clear();
+        q.background.clear();
+        q.urgent_set.clear();
+        q.bg_set.clear();
     }
 }

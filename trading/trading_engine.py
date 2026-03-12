@@ -59,6 +59,12 @@ try:
 except ImportError:
     HAS_RUST = False
 
+try:
+    import rust_engine
+    HAS_RUST_WS = False  # Disabled: Rust WS causes deadlock (P4a integration WIP — see INC-007)
+except ImportError:
+    HAS_RUST_WS = False
+
 # Load .env file for API keys
 _env_file = Path(__file__).parent / '.env'
 if _env_file.exists():
@@ -368,6 +374,7 @@ class TradingEngine:
         self.paper_engine = PaperTradingEngine(config, WORKSPACE)
         self.live_engine: Optional[LiveTradingEngine] = None
         self.ws_manager: Optional[WebSocketManager] = None
+        self.rust_ws = None  # rust_engine.RustWsEngine (Phase 8 P4a)
 
         # Config
         arb_cfg = config.get('arbitrage', {})
@@ -747,6 +754,51 @@ class TradingEngine:
     # Event Processing — the heart of the event-driven engine
     # =================================================================
 
+    def _sync_rust_prices_for_batch(self, constraint_ids: list):
+        """
+        Sync Rust book mirror prices → Python MarketData objects for a batch of constraints.
+        Called before arb math evaluation when using Rust WS engine.
+        
+        For each constraint's markets, reads best_ask/best_bid from Rust and updates
+        the MarketData outcome_asks/outcome_bids in-place — same effect as
+        _update_market_price_from_ws() but pulling from Rust instead of Python WS callbacks.
+        """
+        if not self.rust_ws:
+            return
+        seen_assets = set()
+        for cid in constraint_ids:
+            for asset_id in self.constraint_to_assets.get(cid, ()):
+                if asset_id in seen_assets:
+                    continue
+                seen_assets.add(asset_id)
+                mapping = self.asset_to_market.get(asset_id)
+                if not mapping:
+                    continue
+                market_id, token_index = mapping
+                md = self.market_lookup.get(market_id)
+                if not md:
+                    continue
+                best_bid = self.rust_ws.get_best_bid(asset_id)
+                best_ask = self.rust_ws.get_best_ask(asset_id)
+                if best_ask <= 0 and best_bid <= 0:
+                    continue
+                if token_index == 0:  # YES token
+                    if best_ask > 0:
+                        md.outcome_asks = md.outcome_asks or {}
+                        md.outcome_asks['Yes'] = best_ask
+                    if best_bid > 0:
+                        md.outcome_bids = md.outcome_bids or {}
+                        md.outcome_bids['Yes'] = best_bid
+                    md._has_live_prices = True
+                elif token_index == 1:  # NO token
+                    if best_ask > 0:
+                        md.outcome_asks = md.outcome_asks or {}
+                        md.outcome_asks['No'] = best_ask
+                    if best_bid > 0:
+                        md.outcome_bids = md.outcome_bids or {}
+                        md.outcome_bids['No'] = best_bid
+                    md._has_live_prices = True
+
     def _all_markets_live(self, market_ids: list) -> bool:
         """Check that ALL markets in a group have live WS bid/ask data."""
         for mid in market_ids:
@@ -803,11 +855,41 @@ class TradingEngine:
     def _process_pending_evals(self) -> List[dict]:
         """
         Process constraints from priority queues:
-          1. Batch-process dirty assets from WS callbacks (Phase 8j)
-          2. ALL urgent evals first (price drift / book depth change)
-          3. Background evals fill remaining batch capacity (stale re-checks)
+          - Rust WS mode: drain evals from Rust queue, sync prices, then evaluate
+          - Python WS mode: batch-process dirty assets, then drain Python queues
         Returns list of opportunity dicts.
         """
+        # === Rust WS path: queue + book mirror managed in Rust ===
+        if self.rust_ws:
+            evals = self.rust_ws.drain_evals(self.MAX_EVALS_PER_BATCH)
+            if not evals:
+                return []
+
+            batch = [cid for cid, _urgent, _qt in evals]
+            n_urgent = sum(1 for _, u, _ in evals if u)
+            n_bg = len(batch) - n_urgent
+
+            if batch:
+                log.debug(f'Rust eval batch: {n_urgent} urgent + {n_bg} background')
+
+            # Sync Rust book prices → MarketData for all constraints in batch
+            self._sync_rust_prices_for_batch(batch)
+
+            # Record queue times for latency tracking (from Rust queued_at timestamp)
+            now = _time.time()
+            for cid, _urgent, queued_at in evals:
+                self._constraint_last_eval[cid] = now
+                # Use Rust queue timestamp for latency measurement
+                self._constraint_queue_time[cid] = queued_at
+
+            opportunities = []
+            for cid in batch:
+                opp = self._evaluate_constraint(cid)
+                if opp:
+                    opportunities.append(opp)
+            return opportunities
+
+        # === Python WS path (fallback) ===
         # Phase 8j: batch-process all WS-buffered dirty assets into queue
         self._process_dirty_assets()
 
@@ -1226,36 +1308,66 @@ class TradingEngine:
                 self.live_engine = None
 
         # 6. Start WS manager + subscribe
-        try:
-            self.ws_manager = WebSocketManager(config=self.config, secrets=self.secrets)
+        all_assets = list(self.asset_to_constraints.keys())
 
-            # Wire user channel auth from live engine creds
-            if self.live_engine and hasattr(self.live_engine, 'client'):
-                try:
-                    creds = self.live_engine.client.get_api_creds()
-                    if creds and creds.api_key:
-                        self.ws_manager._user_auth = {
-                            'apiKey': creds.api_key,
-                            'secret': creds.api_secret,
-                            'passphrase': creds.api_passphrase,
-                        }
-                        log.info(f'WS user auth from live engine (key={creds.api_key[:8]}...)')
-                except Exception:
-                    pass
+        # 6a. Try Rust WS engine first (Phase 8 P4a — no GIL, full async)
+        if HAS_RUST_WS and all_assets:
+            try:
+                ws_cfg = self.config.get('websocket', {})
+                rust_cfg = {
+                    'ws_url': ws_cfg.get('market_url',
+                        'wss://ws-subscriptions-clob.polymarket.com/ws/market'),
+                    'assets_per_shard': ws_cfg.get('assets_per_shard', 2000),
+                    'heartbeat_interval_secs': ws_cfg.get('heartbeat_interval', 10),
+                    'efp_drift_threshold': self.EFP_DRIFT_THRESHOLD,
+                    'efp_stale_secs': 5.0,
+                    'trade_size_usd': dynamic_capital(
+                        self.paper_engine.current_capital, self.capital_pct),
+                }
+                self.rust_ws = rust_engine.RustWsEngine(rust_cfg)
 
-            self._register_ws_callbacks()
+                # Build asset→constraint index for Rust (converts sets to lists)
+                rust_index = {aid: list(cids) for aid, cids
+                              in self.asset_to_constraints.items()}
+                self.rust_ws.set_asset_index(rust_index)
 
-            # Subscribe all constraint group assets
-            all_assets = list(self.asset_to_constraints.keys())
-            if all_assets:
-                await self.ws_manager.subscribe_assets(all_assets)
-                log.info(f'WS: pre-subscribed {len(all_assets)} assets from index')
+                # Start WS connections (non-blocking, spawns tokio tasks)
+                self.rust_ws.start(all_assets)
+                log.info(f'Rust WS engine started: {len(all_assets)} assets')
+            except Exception as e:
+                log.warning(f'Rust WS engine failed: {e} — falling back to Python WS')
+                self.rust_ws = None
 
-            await self.ws_manager.start()
-            log.info('WebSocket manager started')
-        except Exception as e:
-            log.warning(f'WS manager failed: {e} — running without live prices')
-            self.ws_manager = None
+        # 6b. Python WS fallback (if Rust WS not available or failed)
+        if not self.rust_ws:
+            try:
+                self.ws_manager = WebSocketManager(config=self.config, secrets=self.secrets)
+
+                # Wire user channel auth from live engine creds
+                if self.live_engine and hasattr(self.live_engine, 'client'):
+                    try:
+                        creds = self.live_engine.client.get_api_creds()
+                        if creds and creds.api_key:
+                            self.ws_manager._user_auth = {
+                                'apiKey': creds.api_key,
+                                'secret': creds.api_secret,
+                                'passphrase': creds.api_passphrase,
+                            }
+                            log.info(f'WS user auth from live engine (key={creds.api_key[:8]}...)')
+                    except Exception:
+                        pass
+
+                self._register_ws_callbacks()
+
+                if all_assets:
+                    await self.ws_manager.subscribe_assets(all_assets)
+                    log.info(f'WS: pre-subscribed {len(all_assets)} assets from index')
+
+                await self.ws_manager.start()
+                log.info('Python WebSocket manager started')
+            except Exception as e:
+                log.warning(f'WS manager failed: {e} — running without live prices')
+                self.ws_manager = None
 
         # Weekly delay table update
         trigger_weekly_delay_update()
@@ -1319,14 +1431,25 @@ class TradingEngine:
                         self.load_and_detect_constraints()
                         self.build_index()
                     await loop.run_in_executor(self._executor, _rebuild)
-                    # Re-subscribe all assets
-                    if self.ws_manager and self.ws_manager._running:
-                        all_assets = list(self.asset_to_constraints.keys())
+                    # Re-subscribe / re-index all assets
+                    all_assets = list(self.asset_to_constraints.keys())
+                    if self.rust_ws and all_assets:
+                        rust_index = {aid: list(cids) for aid, cids
+                                      in self.asset_to_constraints.items()}
+                        self.rust_ws.set_asset_index(rust_index)
+                        self.rust_ws.start(all_assets)
+                        log.info(f'Rust WS re-indexed: {len(all_assets)} assets')
+                    elif self.ws_manager and self.ws_manager._running:
                         if all_assets:
                             await self.ws_manager.subscribe_assets(all_assets)
                     self._last_constraint_rebuild = now
 
                 # --- WS resolved markets → force monitor pass ---
+                # Drain Rust WS resolved events into the same set
+                if self.rust_ws:
+                    for cid, _aid in self.rust_ws.drain_resolved():
+                        if cid:
+                            self._ws_resolved_markets.add(cid)
                 if self._ws_resolved_markets:
                     resolved = list(self._ws_resolved_markets)
                     self._ws_resolved_markets.clear()
@@ -1345,20 +1468,29 @@ class TradingEngine:
                     npos = len(self.paper_engine.open_positions)
                     write_status('running', cap, npos)
 
-                # --- Phase 8l: Stale-asset WS re-subscribe sweep (every 60s) ---
-                if (now - self._last_stale_sweep) >= 60.0 and self.ws_manager:
-                    stale_threshold = 30.0  # seconds
-                    stale_assets = []
-                    for asset_id in self.asset_to_constraints:
-                        book = self.ws_manager.get_book(asset_id)
-                        if book and book.last_update > 0:
-                            age = now - book.last_update
-                            if age > stale_threshold:
-                                stale_assets.append(asset_id)
-                    if stale_assets:
-                        log.info(f'Stale re-subscribe: {len(stale_assets)} assets >30s old')
-                        await self.ws_manager.subscribe_assets(stale_assets)
-                    self._last_stale_sweep = now
+                # --- Phase 8l: Stale-asset re-subscribe sweep (every 60s) ---
+                if (now - self._last_stale_sweep) >= 60.0:
+                    if self.rust_ws:
+                        # Rust tracks staleness internally
+                        stale_assets = self.rust_ws.get_stale_assets(30.0)
+                        if stale_assets:
+                            log.info(f'Rust stale assets: {len(stale_assets)} >30s old (re-subscribe not yet implemented)')
+                            # TODO P4a: Add per-shard mpsc channels for dynamic re-subscribe
+                            # For now, stale books are expected for low-volume markets
+                        self._last_stale_sweep = now
+                    elif self.ws_manager:
+                        stale_threshold = 30.0  # seconds
+                        stale_assets = []
+                        for asset_id in self.asset_to_constraints:
+                            book = self.ws_manager.get_book(asset_id)
+                            if book and book.last_update > 0:
+                                age = now - book.last_update
+                                if age > stale_threshold:
+                                    stale_assets.append(asset_id)
+                        if stale_assets:
+                            log.info(f'Stale re-subscribe: {len(stale_assets)} assets >30s old')
+                            await self.ws_manager.subscribe_assets(stale_assets)
+                        self._last_stale_sweep = now
 
                 # --- Stats logging (every ~30s) ---
                 if (now - getattr(self, '_last_stats_log', 0)) >= 30.0:
@@ -1369,7 +1501,33 @@ class TradingEngine:
                         'constraints': len(self.constraints) if self.constraints else 0,
                         'markets_total': len(self.market_lookup),
                     }
-                    if self.ws_manager and self.ws_manager._running:
+                    if self.rust_ws:
+                        rs = self.rust_ws.stats()
+                        q_urg, q_bg = self.rust_ws.queue_depths()
+                        live_count = rs.get('ws_live', 0)
+                        lat_info = ''
+                        lat_p50 = lat_p95 = lat_max = 0
+                        if self._recent_latencies:
+                            lats = sorted(self._recent_latencies)
+                            lat_p50 = lats[len(lats) // 2]
+                            lat_p95 = lats[int(len(lats) * 0.95)]
+                            lat_max = lats[-1]
+                            lat_info = f' lat_ms p50={lat_p50:.0f} p95={lat_p95:.0f} max={lat_max:.0f}'
+                        ws_info = (f' | RustWS: subs={rs.get("ws_subscribed",0)} '
+                                   f'msgs={rs.get("ws_msgs",0)} '
+                                   f'live={live_count}/{len(self.market_lookup)} '
+                                   f'urgent={q_urg} bg={q_bg}{lat_info}')
+                        engine_metrics.update({
+                            'ws_subscribed': rs.get('ws_subscribed', 0),
+                            'ws_msgs': rs.get('ws_msgs', 0),
+                            'ws_live': live_count,
+                            'queue_urgent': q_urg,
+                            'queue_background': q_bg,
+                            'lat_p50_ms': round(lat_p50),
+                            'lat_p95_ms': round(lat_p95),
+                            'lat_max_ms': round(lat_max),
+                        })
+                    elif self.ws_manager and self.ws_manager._running:
                         ws_stats = self.ws_manager.get_stats()
                         n_urgent = len(self._urgent_evals)
                         n_bg = len(self._background_evals)
@@ -1424,6 +1582,9 @@ class TradingEngine:
 
         # --- Shutdown ---
         log.info('Trading Engine shutting down...')
+        if self.rust_ws:
+            self.rust_ws.stop()
+            log.info('Rust WS engine stopped')
         if self.ws_manager:
             await self.ws_manager.stop()
         STATE_DIR.mkdir(parents=True, exist_ok=True)
