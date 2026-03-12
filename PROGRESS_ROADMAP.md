@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.17  
-> **Last updated**: 2026-03-12 ~16:30 UTC  
+> **Version**: v0.04.18  
+> **Last updated**: 2026-03-12 ~17:40 UTC  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4 GB RAM, Ubuntu 24.04, systemd auto-restart, $100 fresh capital  
@@ -715,7 +715,7 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 | 8n | Rust eval queue with `tokio::select!` instant wake (no polling, no sleep) | ✅ `parking_lot::Mutex<QueueInner>` dedup queue, wired into engine |
 | 8o | `rusqlite` state persistence (WAL mode, incremental updates) | ✅ `RustStateDB` + adapter wired into paper_trading.py, GIL-free backup |
 | 8p | Single Rust binary: WS + queue + eval + state. Python kept for dashboard + resolution validator only. | ✅ Eval pipeline wired: WS→book→queue→arb math all in Rust. Python only for position lifecycle + dashboard. |
-| 8q | Full Rust port: dashboard (axum/warp), resolution validator, everything. Zero Python. | 🔧 8q-1: RustPositionManager + accurate liquidation + proactive exit, needs wiring |
+| 8q | Full Rust port: dashboard (axum/warp), resolution validator, everything. Zero Python. | 🔧 8q-1 + 8q-2: RustPositionManager built, tested, and wired into trading engine. Dashboard + resolution validator remain Python. |
 
 #### Expected Latency by Phase
 
@@ -736,6 +736,16 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 Most recent first. Each entry summarises what changed and why. Full implementation detail is in the git log.
 
 ---
+
+### v0.04.18 (2026-03-12) — Wire RustPositionManager into Trading Engine (Phase 8q-2)
+- **WIRED** `RustPositionManager` into `trading_engine.py`: entry, liquidation, replacement, proactive exit, state save
+- **ADDED** `_enter_via_rust()`: calls `rust_pm.enter_position()` with full leg data
+- **ADDED** `_liquidate_via_rust()`: sells shares at current bid prices (accurate P&L)
+- **CHANGED** Replacement logic: uses `evaluate_replacement(pid, bids, repl_profit)` — compares liquidation value vs new opportunity
+- **ADDED** `_check_proactive_exits()`: scans positions for sell ≥1.2× resolution payout, runs on monitoring interval
+- **CHANGED** State save path: Rust PM → `export_state()` → adapter → SQLite (GIL-free backup)
+- **CHANGED** Rust PM initialised with `import_positions()` from existing SQLite state at startup
+- **VERIFIED** Running in production: 7 open, 1288 closed, state saving every 30s
 
 ### v0.04.17 (2026-03-12) — Accurate Liquidation + Proactive Exit (Phase 8q-1 enhanced)
 - **CHANGED** `liquidate_position` now sells shares at current bids (was: simple capital return minus fees)
@@ -1215,6 +1225,7 @@ Format: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch (e.g. `v
 | `v0.04.15` | Held filtering + scoring + top-N ranking in Rust |
 | `v0.04.16` | Rust position manager (8q-1) + latency μs fix + clobTokenIds normalisation |
 | `v0.04.17` | Accurate liquidation (sell shares at bids) + proactive exit (≥1.2× resolution) |
+| `v0.04.18` | Wire RustPositionManager into trading engine (8q-2) |
 | `v1.00.00` | First successful live trade |
 
 ### Implementation Steps
