@@ -17,6 +17,7 @@ mod queue;
 mod state;
 mod arb;
 mod eval;
+mod position;
 mod ws;
 
 use pyo3::prelude::*;
@@ -373,6 +374,112 @@ impl RustStateDB {
     }
 }
 
+// === RustPositionManager: position lifecycle (Phase 8q-1) ===
+
+#[pyclass]
+struct RustPositionManager {
+    inner: position::PositionManager,
+}
+
+#[pymethods]
+impl RustPositionManager {
+    #[new]
+    fn new(initial_capital: f64, taker_fee: f64) -> Self {
+        Self { inner: position::PositionManager::new(initial_capital, taker_fee) }
+    }
+
+    fn current_capital(&self) -> f64 { self.inner.current_capital() }
+    fn initial_capital(&self) -> f64 { self.inner.initial_capital() }
+    fn open_count(&self) -> usize { self.inner.open_count() }
+    fn closed_count(&self) -> usize { self.inner.closed_count() }
+
+    /// Enter a new position. Returns dict with position data or error.
+    fn enter_position(
+        &self, py: Python<'_>,
+        opportunity_id: &str, constraint_id: &str,
+        strategy: &str, method: &str,
+        market_ids: Vec<String>, market_names: Vec<String>,
+        current_prices: HashMap<String, f64>,
+        optimal_bets: HashMap<String, f64>,
+        expected_profit: f64, expected_profit_pct: f64,
+        is_sell: bool,
+    ) -> PyResult<PyObject> {
+        let result = self.inner.enter_position(
+            opportunity_id, constraint_id, strategy, method,
+            &market_ids, &market_names, &current_prices, &optimal_bets,
+            expected_profit, expected_profit_pct, is_sell,
+        );
+        let d = PyDict::new(py);
+        match result {
+            position::EntryResult::Entered(pos) => {
+                d.set_item("ok", true)?;
+                d.set_item("position_id", &pos.position_id)?;
+                d.set_item("total_capital", pos.total_capital)?;
+                d.set_item("fees_paid", pos.fees_paid)?;
+                d.set_item("data", serde_json::to_string(&pos).unwrap_or_default())?;
+            }
+            position::EntryResult::InsufficientCapital { available, required } => {
+                d.set_item("ok", false)?;
+                d.set_item("reason", "insufficient_capital")?;
+                d.set_item("available", available)?;
+                d.set_item("required", required)?;
+            }
+        }
+        Ok(d.into())
+    }
+
+    /// Close position on market resolution.
+    fn close_on_resolution(&self, position_id: &str, winning_market_id: &str) -> PyResult<Option<(f64, f64)>> {
+        Ok(self.inner.close_on_resolution(position_id, winning_market_id)
+            .map(|e| (e.payout, e.profit)))
+    }
+
+    /// Liquidate (replacement close). Returns profit (negative = fees lost).
+    fn liquidate_position(&self, position_id: &str, reason: &str) -> Option<f64> {
+        self.inner.liquidate_position(position_id, reason)
+    }
+
+    /// Check all open positions for resolution.
+    fn check_resolutions(&self, market_prices: HashMap<String, HashMap<String, f64>>) -> Vec<(String, String)> {
+        self.inner.check_resolutions(&market_prices)
+    }
+
+    /// Get held constraint IDs (for filtering in evaluate_batch).
+    fn get_held_constraint_ids(&self) -> std::collections::HashSet<String> {
+        self.inner.get_held_constraint_ids()
+    }
+
+    /// Get held market IDs.
+    fn get_held_market_ids(&self) -> std::collections::HashSet<String> {
+        self.inner.get_held_market_ids()
+    }
+
+    /// Get open positions as JSON strings.
+    fn get_open_positions_json(&self) -> Vec<String> {
+        self.inner.get_open_positions_json()
+    }
+
+    fn get_closed_positions_json(&self) -> Vec<String> {
+        self.inner.get_closed_positions_json()
+    }
+
+    fn get_open_position_ids(&self) -> Vec<String> {
+        self.inner.get_open_position_ids()
+    }
+
+    fn get_performance_metrics(&self) -> HashMap<String, f64> {
+        self.inner.get_performance_metrics()
+    }
+
+    /// Import existing state (JSON position strings from StateDB).
+    fn import_positions(
+        &self, open_json: Vec<String>, closed_json: Vec<String>,
+        capital: f64, initial_capital: f64,
+    ) {
+        self.inner.import_positions_json(&open_json, &closed_json, capital, initial_capital);
+    }
+}
+
 // --- Helper functions for extracting config from PyDict ---
 fn get_str(d: &Bound<'_, PyDict>, key: &str) -> Option<String> {
     d.get_item(key).ok().flatten().and_then(|v| v.extract::<String>().ok())
@@ -389,5 +496,6 @@ fn get_float(d: &Bound<'_, PyDict>, key: &str) -> Option<f64> {
 fn rust_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RustWsEngine>()?;
     m.add_class::<RustStateDB>()?;
+    m.add_class::<RustPositionManager>()?;
     Ok(())
 }

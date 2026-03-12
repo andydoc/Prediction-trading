@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.15  
-> **Last updated**: 2026-03-12 ~12:00 UTC  
+> **Version**: v0.04.16  
+> **Last updated**: 2026-03-12 ~16:00 UTC  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4 GB RAM, Ubuntu 24.04, systemd auto-restart, $100 fresh capital  
@@ -226,6 +226,7 @@ The execution control server (`execution_control.py`) and its client were remove
 │   ├── src/ws.rs                             ← tokio-tungstenite sharded WS connections
 │   ├── src/arb.rs                            ← Pure Rust arb math (mutex direct + polytope FW)
 │   ├── src/eval.rs                           ← Batch evaluator: drain queue → read books → arb math → opportunities
+│   ├── src/position.rs                       ← Position lifecycle: entry, resolution, liquidation, capital (Phase 8q-1)
 │   ├── src/state.rs                          ← rusqlite in-memory DB + GIL-free disk mirror (Phase 8 P4b)
 │   └── Cargo.toml
 
@@ -714,7 +715,7 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 | 8n | Rust eval queue with `tokio::select!` instant wake (no polling, no sleep) | ✅ `parking_lot::Mutex<QueueInner>` dedup queue, wired into engine |
 | 8o | `rusqlite` state persistence (WAL mode, incremental updates) | ✅ `RustStateDB` + adapter wired into paper_trading.py, GIL-free backup |
 | 8p | Single Rust binary: WS + queue + eval + state. Python kept for dashboard + resolution validator only. | ✅ Eval pipeline wired: WS→book→queue→arb math all in Rust. Python only for position lifecycle + dashboard. |
-| 8q | Full Rust port: dashboard (axum/warp), resolution validator, everything. Zero Python. | 🔲 |
+| 8q | Full Rust port: dashboard (axum/warp), resolution validator, everything. Zero Python. | 🔧 8q-1: RustPositionManager built + tested, needs wiring |
 
 #### Expected Latency by Phase
 
@@ -735,6 +736,14 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 Most recent first. Each entry summarises what changed and why. Full implementation detail is in the git log.
 
 ---
+
+### v0.04.16 (2026-03-12) — Rust Position Manager (Phase 8q-1)
+- **ADDED** `rust_engine/src/position.rs` — full position lifecycle in Rust: entry, resolution, liquidation, capital accounting
+- **ADDED** `RustPositionManager` PyO3 class with full API: enter, close, liquidate, check resolutions, held filtering, state import/export
+- **TESTED** Buy/sell arb payout math, liquidation, held-position tracking, state round-trip all verified
+- **FIXED** Latency display: μs throughout engine + dashboard (was frozen at 0 since evaluate_batch wired)
+- **FIXED** MarketData.yes_asset_id/no_asset_id normalised at parse time (eliminated 8+ clobTokenIds re-parse sites)
+- **NOTED** Not yet wired into trading_engine.py (next step: replace paper_trading.py calls)
 
 ### v0.04.15 (2026-03-12) — Rust Eval Pipeline Wired (Phase 8 P4c integration complete)
 - **ADDED** `_load_constraints_into_rust()`: builds constraint+market data, loads into Rust evaluator with `set_constraints()` + `set_eval_config()`
@@ -1192,8 +1201,10 @@ Format: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch (e.g. `v
 | `v0.04.10` | Dashboard polish + Rust WS scaffold |
 | `v0.04.11` | Rust SQLite state (P4b) + latency verification |
 | `v0.04.12` | Rust state wired into paper_trading.py |
-| `v0.04.15` | Rust eval pipeline wired — full hot path in Rust |
 | `v0.04.13` | Arb math merged into rust_engine (P4c scaffold) |
+| `v0.04.14` | Rust eval pipeline wired — full hot path in Rust |
+| `v0.04.15` | Held filtering + scoring + top-N ranking in Rust |
+| `v0.04.16` | Rust position manager (8q-1) + latency μs fix + clobTokenIds normalisation |
 | `v1.00.00` | First successful live trade |
 
 ### Implementation Steps
