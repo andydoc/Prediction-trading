@@ -321,14 +321,18 @@ def get_positions_json():
         short_name = mkt_vals[0][1].get('name', '?')[:40] if mkt_vals else '?'
         full_names = [v.get('name', '?') for _, v in mkt_vals]
 
-        # Format entry timestamp as dd/mm/yyyy hh:mm
+        # Format entry timestamp as dd/mm/yyyy hh:mm (handles ISO strings and Unix timestamps)
         entry_ts_fmt = '?'
         if entry_ts:
             try:
                 _edt = datetime.fromisoformat(str(entry_ts))
                 entry_ts_fmt = _edt.strftime('%d/%m/%Y %H:%M')
             except Exception:
-                entry_ts_fmt = str(entry_ts)[:16]
+                try:
+                    _edt = datetime.fromtimestamp(float(entry_ts), tz=timezone.utc)
+                    entry_ts_fmt = _edt.strftime('%d/%m/%Y %H:%M')
+                except Exception:
+                    entry_ts_fmt = str(entry_ts)[:16]
 
         positions.append({
             'idx': idx, 'short_name': short_name, 'full_names': full_names,
@@ -520,13 +524,26 @@ def get_closed_json():
         close_ts = p.get('close_timestamp', 0)
         hold_str = '?'
         reason = p.get('metadata', {}).get('close_reason', 'resolved')
+        strategy = p.get('metadata', {}).get('strategy', '?')
+        method = p.get('metadata', {}).get('method', '')
+        is_sell = 'sell' in method.lower() if method else False
 
-        if entry_iso and close_ts:
+        # Parse entry timestamp (ISO or Unix)
+        entry_dt = None
+        if entry_iso:
             try:
                 entry_dt = datetime.fromisoformat(str(entry_iso))
                 if entry_dt.tzinfo is None:
                     entry_dt = entry_dt.replace(tzinfo=timezone.utc)
-                secs = close_ts - entry_dt.timestamp()
+            except Exception:
+                try:
+                    entry_dt = datetime.fromtimestamp(float(entry_iso), tz=timezone.utc)
+                except Exception:
+                    pass
+
+        if entry_dt and close_ts:
+            try:
+                secs = float(close_ts) - entry_dt.timestamp()
                 if secs < 3600:
                     hold_str = f'{secs/60:.0f}m'
                 elif secs < 86400:
@@ -545,10 +562,34 @@ def get_closed_json():
             except Exception:
                 pass
 
+        # Build legs data (same format as open positions)
+        legs = []
+        for mid, mdata in p.get('markets', {}).items():
+            name = mdata.get('name', '?')
+            bet = mdata.get('bet_amount', mdata.get('entry_price', 0) * cl_deployed / max(len(p.get('markets', {})), 1))
+            ep = mdata.get('entry_price', 0)
+            if is_sell:
+                no_price = 1.0 - ep
+                shares = bet / no_price if no_price > 0 else 0
+                side = 'NO'
+                payout = shares * 1.0
+            else:
+                shares = bet / ep if ep > 0 else 0
+                side = 'YES'
+                payout = shares * 1.0
+            legs.append({
+                'name': name, 'bet': round(bet, 2), 'side': side,
+                'price': round(ep, 3), 'shares': f'{shares:.2f}',
+                'payout': round(payout, 2),
+            })
+
+        full_names = [mdata.get('name', '?') for mdata in p.get('markets', {}).values()]
+
         row = {
             'name': short_name, 'deployed': round(cl_deployed, 2),
             'pnl': round(actual, 2), 'hold': hold_str,
-            'closed_at': close_dt_str,
+            'closed_at': close_dt_str, 'strategy': strategy,
+            'legs': legs, 'full_names': full_names,
             '_sort_ts': float(close_ts) if close_ts else 0,
         }
         if reason in ('resolved', 'expired'):
@@ -571,7 +612,7 @@ def get_closed_json():
             'resolved': {'label': 'Resolved', 'rows': cats['resolved'], 'collapsed': False},
             'replaced_profit': {'label': 'Replaced with Profit', 'rows': cats['replaced_profit'], 'collapsed': False},
             'replaced_loss': {'label': 'Replaced with Loss', 'rows': cats['replaced_loss'], 'collapsed': False},
-            'replaced_even': {'label': 'Replaced at Breakeven', 'rows': cats['replaced_even'], 'collapsed': True},
+            'replaced_even': {'label': 'Closed Early', 'rows': cats['replaced_even'], 'collapsed': True},
         },
         'total_closed': len(closed_pos),
     }
@@ -837,7 +878,9 @@ def make_html_shell():
     </thead><tbody id="system-body"></tbody></table>
   </div>
 
-  <h2 class="section-title collapsed" onclick="toggleSection(this)">CLOSED POSITIONS (<span id="closed-count">0</span>)</h2>
+  <h2 class="section-title collapsed" onclick="toggleSection(this)">CLOSED POSITIONS (<span id="closed-count">0</span>)
+    <button id="cl-collapse-btn" class="collapse-all-btn" onclick="event.stopPropagation(); collapseAll('cl')">Collapse All</button>
+  </h2>
   <div class="section-content hidden" id="closed-container"></div>
 </div><!-- end tab-positions -->
 
@@ -861,14 +904,14 @@ function switchTab(name) {
   window.location.hash = name;
 }
 function collapseAll(prefix) {
-  var container = prefix === 'opp' ? '#opp-body' : '#positions-body';
+  var container = prefix === 'opp' ? '#opp-body' : (prefix === 'cl' ? '#closed-container' : '#positions-body');
   document.querySelectorAll(container+' .detail-row.show').forEach(r => r.classList.remove('show'));
   document.querySelectorAll(container+' .pos-row.expanded').forEach(r => r.classList.remove('expanded'));
   updateCollapseBtn(prefix);
 }
 function updateCollapseBtn(prefix) {
-  var container = prefix === 'opp' ? '#opp-body' : '#positions-body';
-  var btnId = prefix === 'opp' ? 'opp-collapse-btn' : 'pos-collapse-btn';
+  var container = prefix === 'opp' ? '#opp-body' : (prefix === 'cl' ? '#closed-container' : '#positions-body');
+  var btnId = prefix === 'opp' ? 'opp-collapse-btn' : (prefix === 'cl' ? 'cl-collapse-btn' : 'pos-collapse-btn');
   var btn = document.getElementById(btnId);
   if (btn) {
     var hasExpanded = document.querySelectorAll(container+' .detail-row.show').length > 0;
@@ -1093,7 +1136,9 @@ function renderClosed(d) {
   document.getElementById('closed-count').textContent = d.total_closed;
   var cc = document.getElementById('closed-container');
   if (!cc) return;
+  var expanded = getExpandedKeys('closed-container');
   var h = '';
+  var ridx = 0;
   var order = ['resolved','replaced_profit','replaced_loss','replaced_even'];
   order.forEach(function(key) {
     var cat = d.categories[key];
@@ -1103,18 +1148,33 @@ function renderClosed(d) {
     var dateCol = (key === 'resolved') ? 'Resolved' : 'Replaced';
     h += '<h3 class="sub-section-title '+cls+'" onclick="toggleSection(this)">'+esc(cat.label)+' ('+cat.rows.length+')</h3>';
     h += '<div class="section-content '+hide+'"><table>';
-    h += '<tr><th>Market</th><th>Deployed</th><th>P&amp;L</th><th>Held</th><th>'+dateCol+'</th></tr>';
+    h += '<tr><th>Market</th><th>Strategy</th><th>Deployed</th><th>P&amp;L</th><th>Held</th><th>'+dateCol+'</th></tr>';
     cat.rows.forEach(function(r) {
+      ridx++;
+      var rkey = r.name;
       var cls2 = r.pnl > 0.01 ? 'good' : (r.pnl < -0.01 ? 'bad' : '');
-      h += '<tr class="'+cls2+'"><td>'+esc(r.name)+'</td>';
+      h += '<tr id="cl-row-'+ridx+'" class="pos-row '+cls2+'" data-key="'+esc(rkey)+'" onclick="toggleRow(\\\'cl\\\','+ridx+')">';
+      h += '<td title="'+esc((r.full_names||[]).join(' | '))+'">'+esc(r.name)+'</td>';
+      h += '<td>'+esc(r.strategy||'?')+'</td>';
       h += '<td>$'+r.deployed.toFixed(2)+'</td>';
       h += '<td>$'+(r.pnl>=0?'+':'')+r.pnl.toFixed(2)+'</td>';
       h += '<td>'+esc(r.hold)+'</td>';
       h += '<td>'+esc(r.closed_at||'?')+'</td></tr>';
+      // Detail row with legs
+      h += '<tr id="cl-detail-'+ridx+'" class="detail-row" data-key="'+esc(rkey)+'"><td colspan="6">';
+      if (r.legs && r.legs.length > 0) {
+        r.legs.forEach(function(l) {
+          h += '<div class="leg"><span class="amt">$'+(l.bet||0).toFixed(2)+'</span> buying '+esc(l.side)+' ';
+          h += '<span class="mkt">'+esc(l.name)+'</span> ('+esc(l.side)+' @ '+(l.price||0).toFixed(3)+', '+esc(l.shares)+' shares) ';
+          h += '&rarr; payout <span class="win">$'+(l.payout||0).toFixed(2)+'</span></div>';
+        });
+      }
+      h += '</td></tr>';
     });
     h += '</table></div>';
   });
   cc.innerHTML = h;
+  restoreExpanded('closed-container', expanded, 'cl');
 }
 
 // === Shadow tab renderer ===

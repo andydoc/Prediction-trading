@@ -658,16 +658,18 @@ class TradingEngine:
         return {'success': False, 'reason': 'no_rust_pm'}
 
     def _save_state(self):
-        """Save state from rust_pm or paper_engine. Handles the dual path."""
+        """Save state from rust_pm or paper_engine. SQLite is the sole source of truth."""
         import time as _t
         t0 = _t.time()
         if self.rust_pm and self.paper_engine._state_store:
             store = self.paper_engine._state_store
-            # Sync scalars from rust_pm
+            cap = self.rust_pm.current_capital()
+            init_cap = self.rust_pm.initial_capital()
             perf = self.rust_pm.get_performance_metrics()
+            # Sync scalars
             store.save_scalars({
-                'current_capital': self.rust_pm.current_capital(),
-                'initial_capital': self.rust_pm.initial_capital(),
+                'current_capital': cap,
+                'initial_capital': init_cap,
             })
             for k in ('total_trades', 'winning_trades', 'losing_trades',
                       'total_actual_profit', 'total_expected_profit'):
@@ -685,14 +687,19 @@ class TradingEngine:
             # Sync closed — incremental
             counts = store.count_by_status()
             db_closed = counts.get('closed', 0)
-            all_closed = self.rust_pm.get_closed_positions_json()
-            if len(all_closed) > db_closed:
-                new_closed = [json.loads(j) for j in all_closed[db_closed:]]
-                store.upsert_positions_bulk(new_closed, 'closed')
+            all_closed_jsons = self.rust_pm.get_closed_positions_json()
+            all_closed_dicts = [json.loads(j) for j in all_closed_jsons]
+            if len(all_closed_dicts) > db_closed:
+                store.upsert_positions_bulk(all_closed_dicts[db_closed:], 'closed')
             store.backup_to_disk()
+
+            # Keep paper_engine in sync (monitoring + dashboard helpers still read it)
+            self.paper_engine.current_capital = cap
+            self.paper_engine.initial_capital = init_cap
+
             ms = (_t.time() - t0) * 1000
             log.info(f'Saved state (Rust PM → SQLite): {len(open_dicts)} open, '
-                     f'{len(all_closed)} closed [{ms:.0f}ms]')
+                     f'{len(all_closed_dicts)} closed [{ms:.0f}ms]')
         else:
             self.paper_engine.save_state(EXEC_STATE)
 
@@ -1581,7 +1588,7 @@ class TradingEngine:
         self._running = True
         write_status('starting')
 
-        # 1. Load execution state
+        # 1. Load execution state (SQLite is the source of truth)
         if EXEC_STATE.exists():
             try:
                 self.paper_engine.load_state(EXEC_STATE)
@@ -1742,8 +1749,8 @@ class TradingEngine:
                     if self.paper_engine.open_positions:
                         markets_list = list(self.market_lookup.values())
                         await self.paper_engine.monitor_positions(markets_list)
-                    # Proactive exit: sell if market offers ≥1.2× resolution payout
-                    self._check_proactive_exits()
+                    # Proactive exit: DISABLED — needs validation before production use
+                    # self._check_proactive_exits()
                     self._last_monitor = now
 
                 # --- Check for postponed events (periodic, threaded) ---

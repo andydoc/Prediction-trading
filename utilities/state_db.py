@@ -40,13 +40,22 @@ def read_state_from_disk(db_path: str) -> Optional[dict]:
         db = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
         db.execute('PRAGMA query_only=ON')
         
-        # Scalars
+        # Scalars — handle both Rust schema ('scalars' table, REAL values)
+        # and legacy schema ('state' table, TEXT/JSON values)
         scalars = {}
-        for row in db.execute('SELECT key, value FROM state').fetchall():
+        for table in ('scalars', 'state'):
             try:
-                scalars[row[0]] = json.loads(row[1])
-            except:
-                scalars[row[0]] = row[1]
+                for row in db.execute(f'SELECT key, value FROM {table}').fetchall():
+                    try:
+                        scalars[row[0]] = float(row[1])
+                    except (ValueError, TypeError):
+                        try:
+                            scalars[row[0]] = json.loads(str(row[1]))
+                        except:
+                            scalars[row[0]] = row[1]
+                break  # found a working table
+            except Exception:
+                continue  # try next table name
         
         # Open positions
         open_pos = []
