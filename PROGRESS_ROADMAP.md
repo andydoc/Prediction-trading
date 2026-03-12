@@ -706,8 +706,8 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 
 | # | Item | Status |
 |---|------|--------|
-| 8m | `tokio-tungstenite` WS client with local book mirror (replaces Python `websockets`) | 🔧 Crate built + installed, not yet wired |
-| 8n | Rust eval queue with `tokio::select!` instant wake (no polling, no sleep) | 🔧 Queue built, needs integration |
+| 8m | `tokio-tungstenite` WS client with local book mirror (replaces Python `websockets`) | ✅ Built + integrated, ABBA-safe single-lock queue |
+| 8n | Rust eval queue with `tokio::select!` instant wake (no polling, no sleep) | ✅ `parking_lot::Mutex<QueueInner>` dedup queue, wired into engine |
 | 8o | `rusqlite` state persistence (WAL mode, incremental updates) | 🔲 |
 | 8p | Single Rust binary: WS + queue + eval + state. Python kept for dashboard + resolution validator only. | 🔲 |
 | 8q | Full Rust port: dashboard (axum/warp), resolution validator, everything. Zero Python. | 🔲 |
@@ -732,14 +732,18 @@ Most recent first. Each entry summarises what changed and why. Full implementati
 
 ---
 
-### v0.04.10 (2026-03-12) — Dashboard Polish + Rust WS Scaffold
+### v0.04.10 (2026-03-12) — Dashboard Polish + Rust WS Integration (Phase 8 P4a)
 - **FIXED** System section now reads capital/positions from execution_state (was stale engine status file)
 - **FIXED** Shadow tab log parsing: reads `trading_engine_*.log` (was `layer4_*.log`); splits on `[ENGINE]` (was `[L4]`)
 - **FIXED** Collapse All button hidden by default, shows only when rows are expanded; added to Opportunities section too
+- **FIXED** Expanded rows persist across SSE updates (save/restore by `data-key` attribute)
 - **CHANGED** Past opportunities (score < 0) no longer displayed in dashboard
-- **ADDED** Closed positions tables: "Resolved" and "Replaced" date columns in dd/mm/yyyy hh:mm:ss format
-- **ADDED** `rust_engine/` crate: WS client + book mirror + eval queue (Phase 8 P4a scaffold, builds + installs)
-- **DISABLED** Rust WS integration in trading engine (deadlock under investigation — falls back to Python WS)
+- **CHANGED** Closed positions tables sorted latest first; added "Resolved"/"Replaced" date columns (dd/mm/yyyy hh:mm:ss)
+- **COMPLETED** Phase 8 P4a: `rust_engine/` crate integrated into trading engine
+  - `tokio-tungstenite` sharded WS connections replace Python `websockets` (8m ✅)
+  - `parking_lot::Mutex<QueueInner>` ABBA-safe eval queue replaces Python dirty-asset buffering (8n ✅)
+  - `DashMap` book mirror with EFP drift detection feeds constraint evals
+  - Python still handles arb math, position management, dashboard, AI validation
 
 ### v0.04.09 (2026-03-11) — Full SSE Dynamic Dashboard (Zero-Refresh)
 - **REWRITTEN** `dashboard_server.py` — complete rewrite from server-rendered HTML to static shell + JSON SSE events

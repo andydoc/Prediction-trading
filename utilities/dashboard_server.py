@@ -545,6 +545,7 @@ def get_closed_json():
             'name': short_name, 'deployed': round(cl_deployed, 2),
             'pnl': round(actual, 2), 'hold': hold_str,
             'closed_at': close_dt_str,
+            '_sort_ts': float(close_ts) if close_ts else 0,
         }
         if reason in ('resolved', 'expired'):
             cats['resolved'].append(row)
@@ -554,6 +555,12 @@ def get_closed_json():
             cats['replaced_loss'].append(row)
         else:
             cats['replaced_even'].append(row)
+
+    # Sort each category latest first
+    for cat in cats.values():
+        cat.sort(key=lambda r: r.get('_sort_ts', 0), reverse=True)
+        for r in cat:
+            r.pop('_sort_ts', None)  # remove sort key from JSON output
 
     return {
         'categories': {
@@ -856,6 +863,28 @@ function toggleRow(prefix, idx) {
 }
 (function(){ var h=window.location.hash.replace('#',''); if(h && document.getElementById('tab-'+h)) switchTab(h); })();
 
+// === Expand state helpers: save/restore across SSE updates ===
+function getExpandedKeys(tbodyId) {
+  var keys = new Set();
+  document.querySelectorAll('#'+tbodyId+' .detail-row.show').forEach(function(r) {
+    var k = r.getAttribute('data-key');
+    if (k) keys.add(k);
+  });
+  return keys;
+}
+function restoreExpanded(tbodyId, keys, prefix) {
+  if (!keys || keys.size === 0) return;
+  document.querySelectorAll('#'+tbodyId+' .detail-row').forEach(function(r) {
+    var k = r.getAttribute('data-key');
+    if (k && keys.has(k)) {
+      r.classList.add('show');
+      var prev = r.previousElementSibling;
+      if (prev) prev.classList.add('expanded');
+    }
+  });
+  updateCollapseBtn(prefix);
+}
+
 // === Stats bar renderer ===
 function renderStats(d) {
   var bar = document.getElementById('stats-bar');
@@ -894,11 +923,14 @@ function renderPositions(d) {
   document.getElementById('pos-count').textContent = d.pos_count;
   var tb = document.getElementById('positions-body');
   if (!tb) return;
+  // Save expanded state before rebuild
+  var expanded = getExpandedKeys('positions-body');
   var h = '';
   d.positions.forEach(function(p) {
+    var key = p.short_name;  // stable key for expand persistence
     var resolveHtml = esc(p.resolve);
     if (p.postpone) resolveHtml += ' <span class="bad" title="'+esc(p.postpone.reason)+'">&#9888; POSTPONED</span>';
-    h += '<tr id="pos-row-'+p.idx+'" class="pos-row" onclick="toggleRow(\\\'pos\\\','+p.idx+')">';
+    h += '<tr id="pos-row-'+p.idx+'" class="pos-row" data-key="'+esc(key)+'" onclick="toggleRow(\\\'pos\\\','+p.idx+')">';
     h += '<td>'+p.idx+'</td>';
     h += '<td title="'+esc(p.full_names.join(' | '))+'">'+esc(p.short_name)+'</td>';
     h += '<td>'+esc(p.strategy)+'</td>';
@@ -909,7 +941,7 @@ function renderPositions(d) {
     h += '<td>'+esc(p.status)+'</td>';
     h += '<td>'+esc(p.entry_ts)+'</td></tr>';
     // Detail row with legs
-    h += '<tr id="pos-detail-'+p.idx+'" class="detail-row"><td colspan="9">';
+    h += '<tr id="pos-detail-'+p.idx+'" class="detail-row" data-key="'+esc(key)+'"><td colspan="9">';
     p.legs.forEach(function(l) {
       h += '<div class="leg"><span class="amt">$'+l.bet.toFixed(2)+'</span> buying '+l.side+' ';
       h += '<span class="mkt">'+esc(l.name)+'</span> ';
@@ -937,6 +969,7 @@ function renderPositions(d) {
   });
   if (d.positions.length === 0) h = '<tr><td colspan="9" class="color-muted">No open positions</td></tr>';
   tb.innerHTML = h;
+  restoreExpanded('positions-body', expanded, 'pos');
 
   // Aggregates
   document.getElementById('agg-count').textContent = d.agg_market_count;
@@ -959,19 +992,21 @@ function renderOpportunities(d) {
   document.getElementById('opp-total').textContent = d.total_found;
   var ob = document.getElementById('opp-body');
   if (!ob) return;
+  var expanded = getExpandedKeys('opp-body');
   var h = '';
   d.opportunities.forEach(function(o) {
+    var key = o.short_name;
     var css = o.is_held ? 'dup-opp' : (o.is_past ? 'bad' : '');
     var held = o.is_held ? ' [HELD]' : '';
     var valTag = o.validated ? '<span class="val-tag vtick">&#10003;</span>' : '<span class="val-tag vapi">[API]</span>';
     var resolveHtml = (o.resolve === 'PAST' ? '<span class="bad">PAST</span>' : esc(o.resolve)) + valTag;
-    h += '<tr id="opp-row-'+o.idx+'" class="pos-row '+css+'" onclick="toggleRow(\\\'opp\\\','+o.idx+')">';
+    h += '<tr id="opp-row-'+o.idx+'" class="pos-row '+css+'" data-key="'+esc(key)+'" onclick="toggleRow(\\\'opp\\\','+o.idx+')">';
     h += '<td>'+o.idx+'</td><td>'+o.profit_pct.toFixed(1)+'%</td>';
     h += '<td>'+resolveHtml+'</td><td>'+esc(o.strategy)+'</td>';
     h += '<td>'+o.score.toFixed(2)+'</td>';
     h += '<td title="'+esc(o.full_names.join(' | '))+'">'+esc(o.short_name)+held+'</td></tr>';
     // Detail row
-    h += '<tr id="opp-detail-'+o.idx+'" class="detail-row"><td colspan="6">';
+    h += '<tr id="opp-detail-'+o.idx+'" class="detail-row" data-key="'+esc(key)+'"><td colspan="6">';
     o.legs.forEach(function(l) {
       h += '<div class="leg"><span class="amt">$'+l.bet.toFixed(2)+'</span> buying '+l.side+' ';
       h += '<span class="mkt">'+esc(l.name)+'</span> ('+l.side+' @ '+l.price.toFixed(3)+', '+l.shares+' shares) ';
@@ -992,6 +1027,7 @@ function renderOpportunities(d) {
   });
   if (d.opportunities.length === 0) h = '<tr><td colspan="6" class="color-muted">No opportunities</td></tr>';
   ob.innerHTML = h;
+  restoreExpanded('opp-body', expanded, 'opp');
 }
 
 // === System renderer ===

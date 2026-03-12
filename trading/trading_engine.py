@@ -61,7 +61,7 @@ except ImportError:
 
 try:
     import rust_engine
-    HAS_RUST_WS = False  # Disabled: Rust WS causes deadlock (P4a integration WIP — see INC-007)
+    HAS_RUST_WS = True  # Phase 8 P4a: Rust WS engine with ABBA-safe single-lock queue
 except ImportError:
     HAS_RUST_WS = False
 
