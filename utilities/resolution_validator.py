@@ -35,22 +35,27 @@ Instructions:
 1. Read the rules carefully for ALL resolution scenarios
 2. Identify the LATEST date by which this market MUST resolve (including extensions, fallbacks, "if results not known by X" clauses)
 3. If no explicit latest date exists, use the API end date
-4. Check if the rules mention ANY outcome that could win but is NOT a named candidate. Examples:
-   - "Other" outcome (e.g. "resolves to Other if no primary takes place")
-   - "None" or "No winner" scenarios
-   - Runoff/second round clauses where a different candidate could emerge
-   - Cancellation scenarios where no listed candidate wins
-   - "Field" or catch-all outcomes
+4. Check if the rules mention ANY outcome that could occur but is NOT covered by any named market in the group. Examples:
+   - "Resolves to Other if no primary takes place" → has_unrepresented_outcome: true (explicit "Other" catch-all)
+   - "Including any potential run-off" + only 2 candidates listed → has_unrepresented_outcome: true (runoff could produce different winner)
+   - Netflix rankings where unlisted movies could place → has_unrepresented_outcome: true
+
+CRITICAL — DO NOT flag these as unrepresented outcomes:
+   - Sports match timing rules ("after 80 minutes", "after 90 minutes", "at full time") — these define WHEN the result is read, not extra outcomes. Win/Draw/Lose is always exhaustive at any timepoint.
+   - Cancellation or void clauses ("if canceled, resolves to No") — this is an event-level risk, not a missing match outcome. A canceled match doesn't create a fourth result between Win/Draw/Lose.
+   - Postponement clauses ("remains open until played") — not an outcome, just a delay.
+   - Standard Yes/No market structure where "Otherwise resolves to No" — "No" already covers all non-winning outcomes.
+
 5. Return ONLY a JSON object, no other text:
 
 {{"latest_resolution_date": "YYYY-MM-DD", "confidence": "high|medium|low", "has_unrepresented_outcome": true|false, "unrepresented_outcome_reason": "explanation if true, empty string if false", "reasoning": "one sentence about the date"}}
 
-Examples of what to look for:
+Examples:
 - "If no election by Dec 31, resolves to X" → latest is Dec 31
-- "If results not known by March 31, 2027" → latest is March 31, 2027
 - "Resolves when official results released, no later than June 30" → latest is June 30
 - "If no primary takes place, resolves to Other" → has_unrepresented_outcome: true
-- "Including any potential run-off" + only 2 candidates listed → has_unrepresented_outcome: true (runoff could produce different winner)
+- "Result after 80 minutes of play, canceled → No" → has_unrepresented_outcome: false (timing rule + cancellation, NOT a missing outcome)
+- "Top Netflix movie this week" with only 5 movies listed → has_unrepresented_outcome: true (unlisted movie could win)
 """
 
 
