@@ -116,7 +116,7 @@ class PaperTradingEngine:
     """
     
     def __init__(self, config: Dict, workspace_root: Path):
-        self.config = config.get('paper_trading', {})
+        self.config = config.get('live_trading', config.get('paper_trading', {}))
         self.full_config = config
         self.workspace_root = Path(workspace_root)
         self.logger = logging.getLogger('CompletePaperTrading')

@@ -65,6 +65,7 @@ live_trading:
   shadow_only: true                    # true=shadow (validate against orderbook), false=LIVE (real money)
   fill_check_interval_secs: 2
   low_balance_pause_usd: 20
+  initial_capital: 100
   max_capital: 100
   max_positions: 11
   max_price_drift_pct: 0.05
