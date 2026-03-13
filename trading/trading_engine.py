@@ -83,7 +83,7 @@ CONSTRAINTS_PATH = WORKSPACE / 'constraint_detection' / 'data' / 'latest_constra
 OPP_PATH     = WORKSPACE / 'arbitrage_math' / 'data' / 'latest_opportunities.json'
 STATUS_PATH  = WORKSPACE / 'data' / 'trading_engine_status.json'
 STATE_DIR    = WORKSPACE / 'data' / 'system_state'
-EXEC_STATE   = STATE_DIR / 'execution_state.json'
+EXEC_STATE   = STATE_DIR / 'execution_state.db'
 P95_JSON_PATH = WORKSPACE / 'data' / 'resolution_delay_p95.json'
 
 # --- Logging ---
@@ -1636,22 +1636,6 @@ class TradingEngine:
             except Exception as e:
                 log.warning(f'Could not load state: {e}')
 
-        # 1b. Initialize positions in Rust WS engine (merged — no separate RustPositionManager)
-        if self.rust_ws:
-            try:
-                fee_rate = self.config.get('arbitrage', {}).get('fees', {}).get('polymarket_taker_fee', 0.0001)
-                self.rust_ws.init_positions(self.paper_engine.initial_capital, fee_rate)
-                # Import existing positions from paper engine
-                open_jsons = [json.dumps(p.to_dict()) for p in self.paper_engine.open_positions.values()]
-                closed_jsons = [json.dumps(p.to_dict()) for p in self.paper_engine.closed_positions]
-                self.rust_ws.import_positions(open_jsons, closed_jsons,
-                                             self.paper_engine.current_capital,
-                                             self.paper_engine.initial_capital)
-                log.info(f'Rust PM initialised: ${self.rust_ws.current_capital():.2f} capital, '
-                         f'{self.rust_ws.pm_open_count()} open, {self.rust_ws.pm_closed_count()} closed')
-            except Exception as e:
-                log.warning(f'Rust PM init failed: {e}')
-
         # 2. Wait for markets (Market Scanner must have run at least once)
         log.info('Waiting for Market Scanner output...')
         while self._running and not MARKETS_PATH.exists():
@@ -1712,6 +1696,17 @@ class TradingEngine:
                 # Start WS connections + dashboard (non-blocking, spawns tokio tasks)
                 self.rust_ws.start(all_assets, dashboard_port=5556)
                 log.info(f'Rust WS engine + dashboard started: {len(all_assets)} assets')
+
+                # Import positions from paper_engine into Rust PM
+                fee_rate = self.config.get('arbitrage', {}).get('fees', {}).get('polymarket_taker_fee', 0.0001)
+                self.rust_ws.init_positions(self.paper_engine.initial_capital, fee_rate)
+                open_jsons = [json.dumps(p.to_dict()) for p in self.paper_engine.open_positions.values()]
+                closed_jsons = [json.dumps(p.to_dict()) for p in self.paper_engine.closed_positions]
+                self.rust_ws.import_positions(open_jsons, closed_jsons,
+                                             self.paper_engine.current_capital,
+                                             self.paper_engine.initial_capital)
+                log.info(f'Rust PM initialised: ${self.rust_ws.current_capital():.2f} capital, '
+                         f'{self.rust_ws.pm_open_count()} open, {self.rust_ws.pm_closed_count()} closed')
             except Exception as e:
                 log.warning(f'Rust WS engine failed: {e} — falling back to Python WS')
                 self.rust_ws = None
@@ -1770,11 +1765,11 @@ class TradingEngine:
                 opportunities = await loop.run_in_executor(
                     self._executor, self._process_pending_evals)
                 if opportunities:
-                    # Filter out AI-rejected constraints before dashboard display
+                    await self._try_enter_or_replace(opportunities)
+
+                    # Push to dashboard AFTER validation — rejected opps filtered out
                     display_opps = [o for o in opportunities
                                     if o.get('constraint_id', '') not in self._ai_rejected_cids]
-
-                    # Write to file (debug) and push to dashboard (pre-validation view)
                     OPP_PATH.parent.mkdir(parents=True, exist_ok=True)
                     OPP_PATH.write_text(json.dumps({
                         'opportunities': display_opps,
@@ -1784,8 +1779,6 @@ class TradingEngine:
                     if self.rust_ws:
                         opp_jsons = [json.dumps(o, default=str) for o in display_opps]
                         self.rust_ws.set_recent_opps(opp_jsons)
-
-                    await self._try_enter_or_replace(opportunities)
 
                 # --- Monitor open positions (periodic) ---
                 if (now - self._last_monitor) >= self.MONITOR_INTERVAL:

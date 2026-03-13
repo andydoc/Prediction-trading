@@ -18,6 +18,23 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Set
+
+
+def _parse_timestamp(val) -> datetime:
+    """Parse a timestamp that may be ISO string, Unix float string, or float."""
+    if val is None:
+        return datetime.now(timezone.utc)
+    if isinstance(val, (int, float)):
+        return datetime.fromtimestamp(val, tz=timezone.utc)
+    s = str(val)
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return datetime.fromtimestamp(float(s), tz=timezone.utc)
+    except (ValueError, TypeError):
+        return datetime.now(timezone.utc)
 from enum import Enum
 from pathlib import Path
 import json
@@ -836,7 +853,7 @@ class PaperTradingEngine:
             expected_profit=p_dict.get('expected_profit', 0),
             expected_profit_pct=p_dict.get('expected_profit_pct', 0),
             fees_paid=p_dict.get('fees_paid', 0),
-            entry_timestamp=datetime.fromisoformat(p_dict['entry_timestamp']) if p_dict.get('entry_timestamp') else datetime.now(timezone.utc),
+            entry_timestamp=_parse_timestamp(p_dict.get('entry_timestamp')),
             entry_prices=p_dict.get('entry_prices', {}),
             status=PositionStatus(p_dict.get('status', 'open')),
             close_timestamp=p_dict.get('close_timestamp'),
@@ -844,7 +861,7 @@ class PaperTradingEngine:
             actual_profit_pct=p_dict.get('actual_profit_pct', 0),
             actual_payout=p_dict.get('actual_payout', 0),
             winning_market=p_dict.get('winning_market'),
-            resolved_at=datetime.fromisoformat(p_dict['resolved_at']) if p_dict.get('resolved_at') else None,
+            resolved_at=_parse_timestamp(p_dict['resolved_at']) if p_dict.get('resolved_at') else None,
             profit_delta=p_dict.get('profit_delta', 0),
             profit_accuracy=p_dict.get('profit_accuracy', 0),
             metadata=p_dict.get('metadata', {}),
@@ -867,7 +884,7 @@ class PaperTradingEngine:
                     expected_profit=p_dict.get('expected_profit', 0),
                     expected_profit_pct=p_dict.get('expected_profit_pct', 0),
                     fees_paid=p_dict.get('fees_paid', 0),
-                    entry_timestamp=datetime.fromisoformat(p_dict['entry_timestamp']) if p_dict.get('entry_timestamp') else datetime.now(timezone.utc),
+                    entry_timestamp=_parse_timestamp(p_dict.get('entry_timestamp')),
                     entry_prices=p_dict.get('entry_prices', {}),
                     status=PositionStatus(p_dict.get('status', 'closed')),
                     close_timestamp=p_dict.get('close_timestamp'),
@@ -889,7 +906,7 @@ class PaperTradingEngine:
                     expected_profit=p_dict.get('expected_profit', 0),
                     expected_profit_pct=p_dict.get('expected_profit_pct', 0),
                     fees_paid=p_dict.get('fees_paid', 0),
-                    entry_timestamp=datetime.fromisoformat(p_dict['entry_timestamp']) if p_dict.get('entry_timestamp') else datetime.now(timezone.utc),
+                    entry_timestamp=_parse_timestamp(p_dict.get('entry_timestamp')),
                     entry_prices=p_dict.get('entry_prices', {}),
                     status=PositionStatus(p_dict.get('status', 'open')),
                     metadata=p_dict.get('metadata', {}),
