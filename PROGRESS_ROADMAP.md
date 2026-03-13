@@ -1,9 +1,9 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.24  
-> **Last updated**: 2026-03-13 ~16:10 UTC  
-> **Mode**: SHADOW (fresh $100 capital)  
+> **Version**: v0.04.14  
+> **Last updated**: 2026-03-12 ~09:50 UTC  
+> **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4 GB RAM, Ubuntu 24.04, systemd auto-restart, $100 fresh capital  
 > **Git**: https://github.com/andydoc/Prediction-trading (branch: `main`)
@@ -45,7 +45,7 @@ Two persistent processes replace the old four-layer polling pipeline:
 |---------|--------|---------|
 | **Market Scanner** | `layer1_runner.py` | Fetches all active markets from Polymarket Gamma API (33 k+); writes `latest_markets.json`. Runs at startup and on a periodic refresh schedule. |
 | **Trading Engine** | `trading_engine.py` | Event-driven core: constraint detection, arb math, execution, and position management. Reacts to WebSocket price events in real time. |
-| **Dashboard** | `rust_engine/src/dashboard.rs` | Rust axum server on port 5556, embedded in engine process. Reads PositionManager via `Arc<Mutex<>>` — zero disk reads. SSE events: stats, positions, opps, system, closed. |
+| **Dashboard** | `dashboard_server.py` | Web UI on port 5556. Fully dynamic via typed SSE events — positions, opportunities, aggregates, closed positions, system metrics all update in real time with zero page reloads. |
 
 
 **Data flow (Trading Engine):**
@@ -170,7 +170,7 @@ The execution control server (`execution_control.py`) and its client were remove
 ├── live_trading.py                           ← Live CLOB trading engine
 ├── resolution_validator.py                   ← AI-powered resolution date validation (Anthropic API)
 ├── postponement_detector.py                  ← AI web search for rescheduled events (2-attempt with context injection)
-├── archive/dashboard_server.py.bak             ← Archived Python dashboard (replaced by Rust axum in rust_engine/src/dashboard.rs)
+├── dashboard_server.py                       ← Web dashboard (port 5556, SSE live updates)
 ├── orderbook_depth.py                        ← Phase 5a: CLOB book depth analysis
 ├── state_db.py                               ← SQLite in-memory state + WAL disk mirror (Phase 8e/8f)
 ├── websocket_manager.py                      ← Phase 6: WS market+user channels, local book mirror
@@ -226,10 +226,7 @@ The execution control server (`execution_control.py`) and its client were remove
 │   ├── src/ws.rs                             ← tokio-tungstenite sharded WS connections
 │   ├── src/arb.rs                            ← Pure Rust arb math (mutex direct + polytope FW)
 │   ├── src/eval.rs                           ← Batch evaluator: drain queue → read books → arb math → opportunities
-│   ├── src/position.rs                       ← Position lifecycle: entry, resolution, liquidation, capital (Phase 8q-1)
-│   ├── src/dashboard.rs                      ← Axum HTTP+SSE dashboard server, runs in engine process (Phase 8q-3)
 │   ├── src/state.rs                          ← rusqlite in-memory DB + GIL-free disk mirror (Phase 8 P4b)
-│   ├── static/dashboard.html                 ← Dashboard HTML (compiled into binary via include_str!)
 │   └── Cargo.toml
 
 /home/andydoc/prediction-trader-env/          ← Python virtual environment
@@ -716,32 +713,8 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 | 8m | `tokio-tungstenite` WS client with local book mirror (replaces Python `websockets`) | ✅ Built + integrated, ABBA-safe single-lock queue |
 | 8n | Rust eval queue with `tokio::select!` instant wake (no polling, no sleep) | ✅ `parking_lot::Mutex<QueueInner>` dedup queue, wired into engine |
 | 8o | `rusqlite` state persistence (WAL mode, incremental updates) | ✅ `RustStateDB` + adapter wired into paper_trading.py, GIL-free backup |
-| 8p | Single Rust binary: WS + queue + eval + state + positions + dashboard. Python kept for orchestrator + AI validators only. | ✅ Hot path fully in Rust. Python remains for: orchestrator loop, resolution validator (Anthropic API), postponement detector, market scanner, constraint detector. |
-| 8q-1 | Rust Position Manager: entry, resolution, liquidation, capital accounting | ✅ `position.rs` — `PositionManager` with accurate payout math, held filtering, state import/export (v0.04.16) |
-| 8q-2 | Wire RustPM into trading_engine.py: replace all paper_trading.py position calls | ✅ entry, liquidation, replacement, proactive exit, state save all via Rust PM (v0.04.18) |
-| 8q-3 | Rust axum dashboard: serves from engine process, zero disk reads | ✅ `dashboard.rs` ~700 lines, SSE, `Arc<Mutex<PositionManager>>` direct read, port 5556 (v0.04.20) |
-| 8q-4 | Shares stored at entry with correct NO book prices; display price = bet/shares | ✅ Fixes $338 phantom payout at extreme prices; `current_no_prices` flows through full chain (v0.04.21) |
-| 8q-5 | AI validator prompt fix + pre-filter: rejected opps never shown on dashboard | ✅ Sports timing rules not flagged; `_ai_rejected_cids` cache; dashboard shows only validated opps (v0.04.22–23) |
-| 8q-6 | State persistence across restarts: EXEC_STATE→.db, Rust PM import after rust_ws created | ✅ Positions survive restart; `_save_state()` on every entry; graceful SIGTERM stop (v0.04.24) |
-| 8q-7 | Remove paper_engine middleman: Rust loads SQLite directly, replace all `paper_engine.current_capital` reads with `rust_ws`, remove Python fallback paths | 📋 Planned |
-| 8q-8 | Port resolution validator to Rust: `reqwest` + Anthropic API JSON POST, cache in SQLite table | 📋 Planned |
-| 8q-9 | Port postponement detector to Rust: `reqwest` + Anthropic API with tool_use (web search) | 📋 Planned |
-| 8q-10 | Port market scanner to Rust: Polymarket REST pagination via `reqwest` + `serde` | 📋 Planned |
-| 8q-11 | Port constraint detector to Rust: `HashSet` logic, no I/O | 📋 Planned |
-| 8q-12 | Port main orchestrator loop to Rust: `tokio` event loop replaces Python `asyncio` | 📋 Planned |
-| 8q-13 | Port config loading to Rust: `serde_yaml` for config.yaml + prompts.yaml (hot-reloadable) | 📋 Planned |
-| 8q-14 | Port logging to Rust: `tracing` crate with structured log output | 📋 Planned |
-| 8q-15 | **Single compiled binary**: zero Python, zero venv — deploy by copying one .exe + config.yaml + prompts.yaml. Persistence via execution_state.db + resolution_cache/ | 📋 Planned — endgame |
-
-### Phase 9 — Admin, Observability & Automation (TODO)
-
-| # | Item | Status |
-|---|------|--------|
-| 9a | Admin tab on dashboard (configuration panel, log viewer) | 📋 Planned |
-| 9b | AI rejection report page (:5557) — full rules + AI decision per rejected constraint | 📋 Planned |
-| 9c | Manual review: mark checked rejections, remove from list | 📋 Planned |
-| 9d | Route rejection review to AI automatically, only inform operator of exceptions | 📋 Planned |
-| 9e | Oracle Cloud ARM instance provisioning + deployment | 📋 Planned |
+| 8p | Single Rust binary: WS + queue + eval + state. Python kept for dashboard + resolution validator only. | ✅ Eval pipeline wired: WS→book→queue→arb math all in Rust. Python only for position lifecycle + dashboard. |
+| 8q | Full Rust port: dashboard (axum/warp), resolution validator, everything. Zero Python. | 🔲 |
 
 #### Expected Latency by Phase
 
@@ -763,81 +736,7 @@ Most recent first. Each entry summarises what changed and why. Full implementati
 
 ---
 
-### v0.04.24 (2026-03-13) — State Persistence Across Restarts (Phase 8q-6)
-- **CRITICAL FIX** `EXEC_STATE` pointed at `.json` (deleted) not `.db` — state never loaded on restart
-- **CRITICAL FIX** Rust PM `init_positions` + `import_positions` was called before `rust_ws` created (always None)
-- **MOVED** Position import to after `rust_ws.start()` where `rust_ws` actually exists
-- **REMOVED** Dead init block that never ran (self.rust_ws was None at that point)
-- **ADDED** `_parse_timestamp()` helper in paper_trading.py: handles ISO strings, Unix float strings, raw floats
-- **FIXED** `fromisoformat` crash on Unix float timestamps like `1773414173.201907`
-- **RESULT** Positions survive restart: capital, open positions, and closed positions all persist correctly
-
-### v0.04.23 (2026-03-13) — AI Pre-filter + Replacement Iteration Fix
-- **ADDED** `_ai_rejected_cids` cache: AI-rejected constraints never shown on dashboard
-- **FIXED** Replacement iteration: `excluded_pids` skips unprofitable positions, tries next worst; handles exhaustion per-opp
-- **FIXED** Python fallback path indentation in replacement block; removed orphaned else:break
-
-### v0.04.22 (2026-03-13) — Fix AI Validator False Rejections on Sports Markets
-- **FIXED** AI prompt: sports timing rules (80min rugby, 90min football) are NOT unrepresented outcomes
-- **ADDED** "CRITICAL — DO NOT flag these" section: cancellation, postponement, timing, extra time
-- **CLEARED** 707 cached AI validation results to force re-evaluation with improved prompt
-- **RESULT** Previously rejected sports opportunities (Toulouse, Allen Waters) now enter correctly
-
-### v0.04.21 (2026-03-13) — Fix Shares, Resolve Dates, State Persistence
-- **CRITICAL FIX** `MarketLeg.shares` stored at entry with correct NO book prices (fixes $338 phantom payout)
-- **ADDED** `current_no_prices` flows through: Opportunity → Python → enter_position → MarketLeg
-- **FIXED** Dashboard display price = bet/shares (actual cost per token, not 1-YES_ask)
-- **FIXED** Opportunity `resolve` field name (was `resolves`, JS reads `resolve`)
-- **ADDED** `end_date_ts <= 0` filter in Rust evaluator (untradeable constraints)
-- **ADDED** `max_hours` config in EvalConfig (default 1440h = 60 days)
-- **ADDED** `_save_state()` after every position entry and replacement (survives kill -9)
-- **FIXED** `scripts/stop.sh`: SIGTERM first, SIGKILL fallback after 5s
-
-### v0.04.20 (2026-03-13) — Rust Axum Dashboard — Zero Disk Reads, Single Process
-- **NEW** `rust_engine/src/dashboard.rs` (~650 lines): axum HTTP server on port 5556
-- **MERGED** `RustPositionManager` into `RustWsEngine` (single PyO3 class)
-- **REMOVED** `utilities/dashboard_server.py` (1400 lines → archive/)
-- **REMOVED** Dashboard from `main.py` supervisor (one fewer process)
-- **ARCHITECTURE** Dashboard reads `Arc<Mutex<PositionManager>>` directly — zero disk, zero IPC
-- **ADDED** SSE: stats(5s), positions(5s), opps(15s), system(10s), closed(60s)
-- **ADDED** Guaranteed payout from leg min-scenario (not exp_profit)
-- **ADDED** Score = profit_pct / hours × 1000; strategy formatting; entry timestamp parsing
-- **ADDED** Held opportunities greyed out (is_held flag)
-- **ADDED** Constraint end_date_ts for resolve times in both positions and opportunities
-
-### v0.04.19 (2026-03-13) — Fresh $100 Reset + Cash Accounting Fix
-- **FIXED** SQLite is sole source of truth (not JSON)
-- **FIXED** `_save_state` writes SQLite only; `paper_engine.current_capital` kept in sync
-- **ADDED** Dashboard: entry timestamps handle ISO+Unix, expandable closed rows, "Closed Early" label
-
-### v0.04.18 (2026-03-12) — Wire RustPositionManager into Trading Engine (Phase 8q-2)
-- **WIRED** `RustPositionManager` into `trading_engine.py`: entry, liquidation, replacement, proactive exit, state save
-- **ADDED** `_enter_via_rust()`: calls `rust_pm.enter_position()` with full leg data
-- **ADDED** `_liquidate_via_rust()`: sells shares at current bid prices (accurate P&L)
-- **CHANGED** Replacement logic: uses `evaluate_replacement(pid, bids, repl_profit)` — compares liquidation value vs new opportunity
-- **ADDED** `_check_proactive_exits()`: scans positions for sell ≥1.2× resolution payout, runs on monitoring interval
-- **CHANGED** State save path: Rust PM → `export_state()` → adapter → SQLite (GIL-free backup)
-- **CHANGED** Rust PM initialised with `import_positions()` from existing SQLite state at startup
-- **VERIFIED** Running in production: 7 open, 1288 closed, state saving every 30s
-
-### v0.04.17 (2026-03-12) — Accurate Liquidation + Proactive Exit (Phase 8q-1 enhanced)
-- **CHANGED** `liquidate_position` now sells shares at current bids (was: simple capital return minus fees)
-  - Calculates actual shares held (YES for buy arbs, NO for sell arbs)
-  - Sells at current bid prices, deducts taker fees, records real P&L
-- **ADDED** `evaluate_replacement(position_id, bids, replacement_profit)` — compares liquidation value vs proposed replacement: `net_gain = replacement_profit + liquidation_profit`
-- **ADDED** `check_proactive_exits(bids, 1.2)` — scans all positions where selling now returns ≥1.2× resolution payout
-- **ADDED** `LiquidationValue`, `ReplacementEval`, `ProactiveExit` structs
-- **TESTED** 6 scenarios: dropped/improved prices, proactive exit trigger/no-trigger, buy/sell arb liquidation
-
-### v0.04.16 (2026-03-12) — Rust Position Manager (Phase 8q-1)
-- **ADDED** `rust_engine/src/position.rs` — full position lifecycle in Rust: entry, resolution, liquidation, capital accounting
-- **ADDED** `RustPositionManager` PyO3 class with full API: enter, close, liquidate, check resolutions, held filtering, state import/export
-- **TESTED** Buy/sell arb payout math, liquidation, held-position tracking, state round-trip all verified
-- **FIXED** Latency display: μs throughout engine + dashboard (was frozen at 0 since evaluate_batch wired)
-- **FIXED** MarketData.yes_asset_id/no_asset_id normalised at parse time (eliminated 8+ clobTokenIds re-parse sites)
-- **NOTED** Not yet wired into trading_engine.py (next step: replace paper_trading.py calls)
-
-### v0.04.15 (2026-03-12) — Rust Eval Pipeline Wired (Phase 8 P4c integration complete)
+### v0.04.14 (2026-03-12) — Rust Eval Pipeline Wired (Phase 8 P4c integration complete)
 - **ADDED** `_load_constraints_into_rust()`: builds constraint+market data, loads into Rust evaluator with `set_constraints()` + `set_eval_config()`
 - **CHANGED** `_process_pending_evals` Rust path: replaces drain→sync→Python-eval with single `evaluate_batch()` call. Full pipeline WS→book→queue→arb math runs in Rust, returns opportunity dicts directly.
 - **CHANGED** Capital/thresholds updated on every eval batch (tracks position changes)
@@ -1113,7 +1012,7 @@ L1 had a hard cap of 10,000 markets. Polymarket had ~33,800. The two missing out
 
 > **Note:** All figures below are from the laptop instance. The VPS was deployed with $100 fresh capital but is not currently running (paused during architecture work). Combined performance view is a future feature.
 
-### Current State (laptop, v0.04.15, 2026-03-12)
+### Current State (laptop, v0.04.14, 2026-03-12)
 
 | Metric | Value |
 |--------|-------|
@@ -1155,7 +1054,7 @@ L1 had a hard cap of 10,000 markets. Polymarket had ~33,800. The two missing out
 - **Tail latency collapsed.** Python p90 was 195ms (steady) / 5s (overall) / 85s (reconnect). Rust p95-of-p95s is 53ms — a 97% reduction in worst-case latency.
 - **Higher message throughput.** 2,148 msg/s vs 1,700 msg/s (26% more) because Rust processes WS messages without GIL contention.
 
-**Rust Full Pipeline (v0.04.15 P4c, evaluate_batch, 2026-03-12):**
+**Rust Full Pipeline (v0.04.14 P4c, evaluate_batch, 2026-03-12):**
 
 | Metric | Rust WS + Python eval (P4a) | Full Rust pipeline (P4c) | Improvement |
 |--------|---:|---:|---:|
@@ -1293,18 +1192,8 @@ Format: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch (e.g. `v
 | `v0.04.10` | Dashboard polish + Rust WS scaffold |
 | `v0.04.11` | Rust SQLite state (P4b) + latency verification |
 | `v0.04.12` | Rust state wired into paper_trading.py |
-| `v0.04.13` | Arb math merged into rust_engine (P4c scaffold) |
 | `v0.04.14` | Rust eval pipeline wired — full hot path in Rust |
-| `v0.04.15` | Held filtering + scoring + top-N ranking in Rust |
-| `v0.04.16` | Rust position manager (8q-1) + latency μs fix + clobTokenIds normalisation |
-| `v0.04.17` | Accurate liquidation (sell shares at bids) + proactive exit (≥1.2× resolution) |
-| `v0.04.18` | Wire RustPositionManager into trading engine (8q-2) |
-| `v0.04.19` | Fresh $100 reset + cash accounting fix |
-| `v0.04.20` | Rust axum dashboard — zero disk reads, single process (8q-3) |
-| `v0.04.21` | Fix shares, resolve dates, state persistence (8q-4) |
-| `v0.04.22` | Fix AI validator false rejections on sports markets (8q-5) |
-| `v0.04.23` | AI pre-filter + replacement iteration fix (8q-5) |
-| `v0.04.24` | State persistence across restarts (8q-6) |
+| `v0.04.13` | Arb math merged into rust_engine (P4c scaffold) |
 | `v1.00.00` | First successful live trade |
 
 ### Implementation Steps
@@ -1326,3 +1215,4 @@ git push -u origin dev
 *Laptop: WSL Ubuntu (authoritative) · VPS: ZAP-Hosting 193.23.127.99 · Desktop: dormant*  
 *Dashboard: http://localhost:5556 (laptop) · http://193.23.127.99:5556 (VPS)*  
 *Git: https://github.com/andydoc/Prediction-trading (branch: main)*
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
