@@ -5,7 +5,7 @@ Startup sequence:
      a. Postponement detection: checks overdue positions via AI web search
      b. Market scan: fetches all markets from Polymarket Gamma API (synchronous REST)
   2. Trading Engine (trading_engine.py) — event-driven: constraints, arb math, execution via WS
-  3. Dashboard (dashboard_server.py) — web UI on port 5556, SSE live updates
+  3. Dashboard (Rust axum, port 5556) — starts automatically inside trading_engine
 
 The scanner populates latest_markets.json which the trading engine needs at startup.
 After that, WS handles all ongoing market discovery and price monitoring.
@@ -47,7 +47,7 @@ log = logging.getLogger('supervisor')
 
 LAYERS = [
     {'name': 'trading_engine', 'script': WORKSPACE / 'trading' / 'trading_engine.py', 'restart_delay': 10},
-    {'name': 'dashboard',      'script': WORKSPACE / 'utilities' / 'dashboard_server.py', 'restart_delay': 5},
+    # Dashboard now runs inside trading_engine (Rust axum server, same process)
 ]
 processes = {}
 running = True

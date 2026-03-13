@@ -19,6 +19,7 @@ mod arb;
 mod eval;
 mod position;
 mod ws;
+mod dashboard;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -30,9 +31,12 @@ use queue::EvalQueue;
 use eval::{ConstraintStore, EvalConfig, Constraint, MarketRef};
 use types::EngineConfig;
 use ws::WsManager;
+use position::PositionManager;
+use dashboard::{DashboardState, EngineMetrics};
 
 /// The tokio runtime lives here — one per engine instance.
 /// Python calls methods on this; all async work happens on the Rust runtime.
+/// Owns ALL hot-path state: WS, books, evals, positions, dashboard.
 #[pyclass]
 struct RustWsEngine {
     book: Arc<BookMirror>,
@@ -41,6 +45,13 @@ struct RustWsEngine {
     constraints: Arc<ConstraintStore>,
     eval_config: EvalConfig,
     runtime: tokio::runtime::Runtime,
+    // Position management (shared with dashboard via Arc<Mutex>)
+    positions: Arc<parking_lot::Mutex<PositionManager>>,
+    // Dashboard state
+    engine_metrics: Arc<parking_lot::Mutex<EngineMetrics>>,
+    recent_opps: Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
+    mode: String,
+    start_time: chrono::DateTime<chrono::Utc>,
 }
 
 #[pymethods]
@@ -102,7 +113,14 @@ impl RustWsEngine {
                 format!("Failed to create tokio runtime: {}", e)
             ))?;
 
-        Ok(Self { book, eval_queue, ws, constraints, eval_config, runtime })
+        Ok(Self {
+            book, eval_queue, ws, constraints, eval_config, runtime,
+            positions: Arc::new(parking_lot::Mutex::new(PositionManager::new(100.0, 0.0001))),
+            engine_metrics: Arc::new(parking_lot::Mutex::new(EngineMetrics::default())),
+            recent_opps: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            mode: "shadow".to_string(),
+            start_time: chrono::Utc::now(),
+        })
     }
 
     /// Set the asset_id → constraint_id index.
@@ -119,13 +137,33 @@ impl RustWsEngine {
         Ok(())
     }
 
-    /// Start WS connections for the given asset IDs.
+    /// Start WS connections for the given asset IDs AND the dashboard server.
     /// Non-blocking: spawns tokio tasks and returns immediately.
-    fn start(&self, asset_ids: Vec<String>) -> PyResult<()> {
+    #[pyo3(signature = (asset_ids, dashboard_port=5556))]
+    fn start(&self, asset_ids: Vec<String>, dashboard_port: u16) -> PyResult<()> {
         let ws = Arc::clone(&self.ws);
         self.runtime.spawn(async move {
             ws.start(asset_ids).await;
         });
+
+        // Start dashboard on same tokio runtime (port=0 means skip, used on re-subscribe)
+        if dashboard_port > 0 {
+            let dash_state = DashboardState {
+                positions: Arc::clone(&self.positions),
+                book: Arc::clone(&self.book),
+                eval_queue: Arc::clone(&self.eval_queue),
+                ws: Arc::clone(&self.ws),
+                constraints: Arc::clone(&self.constraints),
+                engine_metrics: Arc::clone(&self.engine_metrics),
+                recent_opps: Arc::clone(&self.recent_opps),
+                mode: self.mode.clone(),
+                start_time: self.start_time,
+            };
+            self.runtime.spawn(async move {
+                dashboard::start(dash_state, dashboard_port).await;
+            });
+        }
+
         Ok(())
     }
 
@@ -290,6 +328,183 @@ impl RustWsEngine {
         dict.set_item("book_count", self.book.live_count())?;
         Ok(dict.into())
     }
+
+    // =================================================================
+    // Position management (merged from RustPositionManager)
+    // =================================================================
+
+    /// Initialize position manager with correct capital (called after state load).
+    fn init_positions(&self, initial_capital: f64, taker_fee: f64) {
+        let mut pm = self.positions.lock();
+        *pm = PositionManager::new(initial_capital, taker_fee);
+    }
+
+    fn current_capital(&self) -> f64 { self.positions.lock().current_capital() }
+    fn initial_capital(&self) -> f64 { self.positions.lock().initial_capital() }
+    fn pm_open_count(&self) -> usize { self.positions.lock().open_count() }
+    fn pm_closed_count(&self) -> usize { self.positions.lock().closed_count() }
+
+    fn enter_position(
+        &self, py: Python<'_>,
+        opportunity_id: &str, constraint_id: &str,
+        strategy: &str, method: &str,
+        market_ids: Vec<String>, market_names: Vec<String>,
+        current_prices: HashMap<String, f64>,
+        optimal_bets: HashMap<String, f64>,
+        expected_profit: f64, expected_profit_pct: f64,
+        is_sell: bool,
+    ) -> PyResult<PyObject> {
+        let result = self.positions.lock().enter_position(
+            opportunity_id, constraint_id, strategy, method,
+            &market_ids, &market_names, &current_prices, &optimal_bets,
+            expected_profit, expected_profit_pct, is_sell,
+        );
+        let d = PyDict::new(py);
+        match result {
+            position::EntryResult::Entered(pos) => {
+                d.set_item("ok", true)?;
+                d.set_item("position_id", &pos.position_id)?;
+                d.set_item("total_capital", pos.total_capital)?;
+                d.set_item("fees_paid", pos.fees_paid)?;
+                d.set_item("data", serde_json::to_string(&pos).unwrap_or_default())?;
+            }
+            position::EntryResult::InsufficientCapital { available, required } => {
+                d.set_item("ok", false)?;
+                d.set_item("reason", "insufficient_capital")?;
+                d.set_item("available", available)?;
+                d.set_item("required", required)?;
+            }
+        }
+        Ok(d.into())
+    }
+
+    fn close_on_resolution(&self, position_id: &str, winning_market_id: &str) -> Option<(f64, f64)> {
+        self.positions.lock().close_on_resolution(position_id, winning_market_id)
+            .map(|e| (e.payout, e.profit))
+    }
+
+    fn calculate_liquidation_value(&self, py: Python<'_>,
+                                    position_id: &str,
+                                    current_bids: HashMap<String, f64>) -> PyResult<PyObject> {
+        match self.positions.lock().calculate_liquidation_value(position_id, &current_bids) {
+            Some(liq) => {
+                let d = PyDict::new(py);
+                d.set_item("position_id", &liq.position_id)?;
+                d.set_item("sale_proceeds", liq.sale_proceeds)?;
+                d.set_item("fees", liq.fees)?;
+                d.set_item("net_proceeds", liq.net_proceeds)?;
+                d.set_item("profit", liq.profit)?;
+                d.set_item("resolution_payout", liq.resolution_payout)?;
+                Ok(d.into())
+            }
+            None => Ok(py.None())
+        }
+    }
+
+    fn evaluate_replacement(&self, py: Python<'_>,
+                             position_id: &str,
+                             current_bids: HashMap<String, f64>,
+                             replacement_profit: f64) -> PyResult<PyObject> {
+        match self.positions.lock().evaluate_replacement(position_id, &current_bids, replacement_profit) {
+            Some(eval) => {
+                let d = PyDict::new(py);
+                d.set_item("position_id", &eval.position_id)?;
+                d.set_item("net_gain", eval.net_gain)?;
+                d.set_item("worth_replacing", eval.worth_replacing)?;
+                d.set_item("replacement_profit", eval.replacement_profit)?;
+                d.set_item("liquidation_profit", eval.liquidation.profit)?;
+                d.set_item("liquidation_net_proceeds", eval.liquidation.net_proceeds)?;
+                d.set_item("resolution_payout", eval.liquidation.resolution_payout)?;
+                Ok(d.into())
+            }
+            None => Ok(py.None())
+        }
+    }
+
+    fn check_proactive_exits(&self, py: Python<'_>,
+                              current_bids: HashMap<String, f64>,
+                              exit_multiplier: f64) -> PyResult<PyObject> {
+        let exits = self.positions.lock().check_proactive_exits(&current_bids, exit_multiplier);
+        let list = PyList::empty(py);
+        for exit in &exits {
+            let d = PyDict::new(py);
+            d.set_item("position_id", &exit.position_id)?;
+            d.set_item("ratio", exit.ratio)?;
+            d.set_item("net_proceeds", exit.liquidation.net_proceeds)?;
+            d.set_item("resolution_payout", exit.liquidation.resolution_payout)?;
+            d.set_item("profit", exit.liquidation.profit)?;
+            list.append(d)?;
+        }
+        Ok(list.into())
+    }
+
+    fn liquidate_position(&self, position_id: &str, reason: &str,
+                           current_bids: HashMap<String, f64>) -> Option<(f64, f64)> {
+        self.positions.lock().liquidate_position(position_id, reason, &current_bids)
+    }
+
+    fn check_resolutions(&self, market_prices: HashMap<String, HashMap<String, f64>>) -> Vec<(String, String)> {
+        self.positions.lock().check_resolutions(&market_prices)
+    }
+
+    fn get_held_constraint_ids(&self) -> std::collections::HashSet<String> {
+        self.positions.lock().get_held_constraint_ids()
+    }
+
+    fn get_held_market_ids(&self) -> std::collections::HashSet<String> {
+        self.positions.lock().get_held_market_ids()
+    }
+
+    fn get_open_positions_json(&self) -> Vec<String> {
+        self.positions.lock().get_open_positions_json()
+    }
+
+    fn get_closed_positions_json(&self) -> Vec<String> {
+        self.positions.lock().get_closed_positions_json()
+    }
+
+    fn get_open_position_ids(&self) -> Vec<String> {
+        self.positions.lock().get_open_position_ids()
+    }
+
+    fn get_performance_metrics(&self) -> HashMap<String, f64> {
+        self.positions.lock().get_performance_metrics()
+    }
+
+    fn import_positions(
+        &self, open_json: Vec<String>, closed_json: Vec<String>,
+        capital: f64, initial_capital: f64,
+    ) {
+        self.positions.lock().import_positions_json(&open_json, &closed_json, capital, initial_capital);
+    }
+
+    // =================================================================
+    // Dashboard helpers (Python pushes metrics/opps to Rust for SSE)
+    // =================================================================
+
+    /// Update engine metrics (Python calls this each stats cycle).
+    fn update_dashboard_metrics(&self, iteration: u64,
+                                 lat_p50: u64, lat_p95: u64, lat_max: u64,
+                                 scanner_status: &str, scanner_ts: &str,
+                                 engine_status: &str, engine_ts: &str) {
+        let mut m = self.engine_metrics.lock();
+        m.iteration = iteration;
+        m.lat_p50_us = lat_p50;
+        m.lat_p95_us = lat_p95;
+        m.lat_max_us = lat_max;
+        m.scanner_status = scanner_status.to_string();
+        m.scanner_ts = scanner_ts.to_string();
+        m.engine_status = engine_status.to_string();
+        m.engine_ts = engine_ts.to_string();
+    }
+
+    /// Push latest opportunities for dashboard display.
+    fn set_recent_opps(&self, opps_json: Vec<String>) {
+        let mut opps = self.recent_opps.lock();
+        *opps = opps_json.iter()
+            .filter_map(|s| serde_json::from_str(s).ok())
+            .collect();
+    }
 }
 
 // === RustStateDB: SQLite state persistence (Phase 8 P4b) ===
@@ -374,174 +589,7 @@ impl RustStateDB {
     }
 }
 
-// === RustPositionManager: position lifecycle (Phase 8q-1) ===
-
-#[pyclass]
-struct RustPositionManager {
-    inner: position::PositionManager,
-}
-
-#[pymethods]
-impl RustPositionManager {
-    #[new]
-    fn new(initial_capital: f64, taker_fee: f64) -> Self {
-        Self { inner: position::PositionManager::new(initial_capital, taker_fee) }
-    }
-
-    fn current_capital(&self) -> f64 { self.inner.current_capital() }
-    fn initial_capital(&self) -> f64 { self.inner.initial_capital() }
-    fn open_count(&self) -> usize { self.inner.open_count() }
-    fn closed_count(&self) -> usize { self.inner.closed_count() }
-
-    /// Enter a new position. Returns dict with position data or error.
-    fn enter_position(
-        &self, py: Python<'_>,
-        opportunity_id: &str, constraint_id: &str,
-        strategy: &str, method: &str,
-        market_ids: Vec<String>, market_names: Vec<String>,
-        current_prices: HashMap<String, f64>,
-        optimal_bets: HashMap<String, f64>,
-        expected_profit: f64, expected_profit_pct: f64,
-        is_sell: bool,
-    ) -> PyResult<PyObject> {
-        let result = self.inner.enter_position(
-            opportunity_id, constraint_id, strategy, method,
-            &market_ids, &market_names, &current_prices, &optimal_bets,
-            expected_profit, expected_profit_pct, is_sell,
-        );
-        let d = PyDict::new(py);
-        match result {
-            position::EntryResult::Entered(pos) => {
-                d.set_item("ok", true)?;
-                d.set_item("position_id", &pos.position_id)?;
-                d.set_item("total_capital", pos.total_capital)?;
-                d.set_item("fees_paid", pos.fees_paid)?;
-                d.set_item("data", serde_json::to_string(&pos).unwrap_or_default())?;
-            }
-            position::EntryResult::InsufficientCapital { available, required } => {
-                d.set_item("ok", false)?;
-                d.set_item("reason", "insufficient_capital")?;
-                d.set_item("available", available)?;
-                d.set_item("required", required)?;
-            }
-        }
-        Ok(d.into())
-    }
-
-    /// Close position on market resolution.
-    fn close_on_resolution(&self, position_id: &str, winning_market_id: &str) -> PyResult<Option<(f64, f64)>> {
-        Ok(self.inner.close_on_resolution(position_id, winning_market_id)
-            .map(|e| (e.payout, e.profit)))
-    }
-
-    /// Calculate what a position is worth if sold now.
-    /// current_bids: {market_id: bid_price_for_held_token}
-    /// Returns dict with sale_proceeds, fees, net_proceeds, profit, resolution_payout.
-    fn calculate_liquidation_value(&self, py: Python<'_>,
-                                    position_id: &str,
-                                    current_bids: HashMap<String, f64>) -> PyResult<PyObject> {
-        match self.inner.calculate_liquidation_value(position_id, &current_bids) {
-            Some(liq) => {
-                let d = PyDict::new(py);
-                d.set_item("position_id", &liq.position_id)?;
-                d.set_item("sale_proceeds", liq.sale_proceeds)?;
-                d.set_item("fees", liq.fees)?;
-                d.set_item("net_proceeds", liq.net_proceeds)?;
-                d.set_item("profit", liq.profit)?;
-                d.set_item("resolution_payout", liq.resolution_payout)?;
-                Ok(d.into())
-            }
-            None => Ok(py.None())
-        }
-    }
-
-    /// Evaluate whether replacing position with a new opportunity is worth it.
-    fn evaluate_replacement(&self, py: Python<'_>,
-                             position_id: &str,
-                             current_bids: HashMap<String, f64>,
-                             replacement_profit: f64) -> PyResult<PyObject> {
-        match self.inner.evaluate_replacement(position_id, &current_bids, replacement_profit) {
-            Some(eval) => {
-                let d = PyDict::new(py);
-                d.set_item("position_id", &eval.position_id)?;
-                d.set_item("net_gain", eval.net_gain)?;
-                d.set_item("worth_replacing", eval.worth_replacing)?;
-                d.set_item("replacement_profit", eval.replacement_profit)?;
-                d.set_item("liquidation_profit", eval.liquidation.profit)?;
-                d.set_item("liquidation_net_proceeds", eval.liquidation.net_proceeds)?;
-                d.set_item("resolution_payout", eval.liquidation.resolution_payout)?;
-                Ok(d.into())
-            }
-            None => Ok(py.None())
-        }
-    }
-
-    /// Check all positions for proactive exit (sell now ≥ 1.2× resolution payout).
-    /// current_bids: {market_id: bid_price}
-    fn check_proactive_exits(&self, py: Python<'_>,
-                              current_bids: HashMap<String, f64>,
-                              exit_multiplier: f64) -> PyResult<PyObject> {
-        let exits = self.inner.check_proactive_exits(&current_bids, exit_multiplier);
-        let list = PyList::empty(py);
-        for exit in &exits {
-            let d = PyDict::new(py);
-            d.set_item("position_id", &exit.position_id)?;
-            d.set_item("ratio", exit.ratio)?;
-            d.set_item("net_proceeds", exit.liquidation.net_proceeds)?;
-            d.set_item("resolution_payout", exit.liquidation.resolution_payout)?;
-            d.set_item("profit", exit.liquidation.profit)?;
-            list.append(d)?;
-        }
-        Ok(list.into())
-    }
-
-    /// Liquidate position by selling shares at current bids.
-    /// Returns (net_proceeds, profit) or None.
-    fn liquidate_position(&self, position_id: &str, reason: &str,
-                           current_bids: HashMap<String, f64>) -> Option<(f64, f64)> {
-        self.inner.liquidate_position(position_id, reason, &current_bids)
-    }
-
-    /// Check all open positions for resolution.
-    fn check_resolutions(&self, market_prices: HashMap<String, HashMap<String, f64>>) -> Vec<(String, String)> {
-        self.inner.check_resolutions(&market_prices)
-    }
-
-    /// Get held constraint IDs (for filtering in evaluate_batch).
-    fn get_held_constraint_ids(&self) -> std::collections::HashSet<String> {
-        self.inner.get_held_constraint_ids()
-    }
-
-    /// Get held market IDs.
-    fn get_held_market_ids(&self) -> std::collections::HashSet<String> {
-        self.inner.get_held_market_ids()
-    }
-
-    /// Get open positions as JSON strings.
-    fn get_open_positions_json(&self) -> Vec<String> {
-        self.inner.get_open_positions_json()
-    }
-
-    fn get_closed_positions_json(&self) -> Vec<String> {
-        self.inner.get_closed_positions_json()
-    }
-
-    fn get_open_position_ids(&self) -> Vec<String> {
-        self.inner.get_open_position_ids()
-    }
-
-    fn get_performance_metrics(&self) -> HashMap<String, f64> {
-        self.inner.get_performance_metrics()
-    }
-
-    /// Import existing state (JSON position strings from StateDB).
-    fn import_positions(
-        &self, open_json: Vec<String>, closed_json: Vec<String>,
-        capital: f64, initial_capital: f64,
-    ) {
-        self.inner.import_positions_json(&open_json, &closed_json, capital, initial_capital);
-    }
-}
+// RustPositionManager removed — position management merged into RustWsEngine
 
 // --- Helper functions for extracting config from PyDict ---
 fn get_str(d: &Bound<'_, PyDict>, key: &str) -> Option<String> {
@@ -559,6 +607,5 @@ fn get_float(d: &Bound<'_, PyDict>, key: &str) -> Option<f64> {
 fn rust_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RustWsEngine>()?;
     m.add_class::<RustStateDB>()?;
-    m.add_class::<RustPositionManager>()?;
     Ok(())
 }

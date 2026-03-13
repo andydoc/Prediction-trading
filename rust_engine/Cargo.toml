@@ -22,3 +22,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
 rusqlite = { version = "0.33", features = ["bundled", "backup"] }
+axum = "0.8"
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tokio-stream = "0.1"
+chrono = "0.4"
+async-stream = "0.3"

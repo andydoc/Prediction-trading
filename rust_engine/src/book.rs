@@ -126,6 +126,10 @@ impl BookMirror {
     }
 
     /// Count assets with book data.
+    pub fn len(&self) -> usize {
+        self.books.len()
+    }
+
     pub fn live_count(&self) -> usize {
         self.books.len()
     }
