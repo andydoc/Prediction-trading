@@ -410,6 +410,7 @@ class TradingEngine:
         self._last_state_save = 0.0
         self._last_monitor = 0.0
         self._last_replacement = 0.0
+        self._ai_rejected_cids = set()  # Constraints rejected by AI validator (cached)
         self._iteration = 0
 
         # Priority queues: urgent (effective fill price drift) processed before background (stale)
@@ -1162,6 +1163,11 @@ class TradingEngine:
             max_days = self.max_days_entry
 
         constraint_id = opp_dict.get('constraint_id', '')
+
+        # Previously rejected by AI? Skip without re-calling API
+        if constraint_id in self._ai_rejected_cids:
+            return False
+
         held_cids = get_held_constraint_ids(self.paper_engine)
         held_mids = get_held_market_ids(self.paper_engine)
 
@@ -1185,6 +1191,7 @@ class TradingEngine:
                     if validation.get('has_unrepresented_outcome', False):
                         reason = validation.get('unrepresented_outcome_reason', '')[:100]
                         log.info(f'  SKIP (unrepresented outcome): {constraint_id[:30]} — {reason}')
+                        self._ai_rejected_cids.add(constraint_id)
                         return False
                     try:
                         vd = datetime.strptime(
@@ -1527,63 +1534,71 @@ class TradingEngine:
                         worst_score = rem_score
                         worst_pos = (pid, pos, rem_score, hours_remaining, unrealized)
 
-                # Replace if best new is 20% better than worst held
+                # No replaceable position found? Move to next opportunity
+                if worst_pos is None:
+                    used_opp_cids.add(best_opp.get('constraint_id', ''))
+                    excluded_pids.clear()  # Reset exclusions for next opportunity
+                    continue
+
+                # Not scoring better? This opp can't replace anything
+                if best_score <= worst_score * 1.2:
+                    used_opp_cids.add(best_opp.get('constraint_id', ''))
+                    excluded_pids.clear()
+                    continue
+
+                # Replace: best new is 20% better than worst held
                 # Iterate through held positions worst→best until we find one worth replacing
-                if worst_pos and best_score > worst_score * 1.2:
-                    if self.rust_ws:
-                        # Rust PM path: worst_pos = (pid, name, score, hours, eval_result)
-                        wpid, wname, wscore, whours, eval_r = worst_pos
-                        if not eval_r.get('worth_replacing', False):
-                            # This position can't be profitably liquidated — exclude it and retry
-                            log.debug(f'  Skip replace "{wname}": net_gain=${eval_r.get("net_gain",0):+.2f} (not worth it)')
-                            excluded_pids.add(wpid)
-                            continue  # Retry while loop — will find next worst (skipping excluded)
-                        bname = best_opp.get('market_names', ['?'])[0][:40]
-                        log.info(f'REPLACE: "{wname}" (score={wscore:.6f}, {whours:.0f}h, '
-                                 f'liq_profit=${eval_r["liquidation_profit"]:+.2f})')
-                        log.info(f'  WITH: "{bname}" (score={best_score:.6f}, {best_hours:.0f}h, '
-                                 f'net_gain=${eval_r["net_gain"]:+.2f})')
-                        result = self._pm_liquidate(wpid, 'replaced')
-                        if result.get('success'):
-                            log.info(f'  Liquidated: freed ${result["freed_capital"]:.2f}, '
-                                     f'realized ${result["actual_profit"]:+.2f}')
-                            # Enter the replacement
-                            cap = dynamic_capital(self._pm_capital(), self.capital_pct)
-                            best_opp['total_capital_required'] = cap
-                            old_cap = sum(best_opp.get('optimal_bets', {}).values())
-                            if old_cap > 0:
-                                scale = cap / old_cap
-                                best_opp['optimal_bets'] = {k: v * scale for k, v in best_opp['optimal_bets'].items()}
-                                best_opp['expected_profit'] = best_opp.get('expected_profit', 0) * scale
-                            entry_r = self._pm_enter(best_opp)
-                            if entry_r.get('success'):
-                                replacements_made += 1
-                                used_opp_cids.add(best_opp.get('constraint_id', ''))
-                                self._save_state()  # Persist immediately
-                            else:
-                                log.warning(f'  Replacement entry failed: {entry_r.get("reason")}')
-                        else:
-                            log.warning(f'  Liquidation failed: {result.get("reason")}')
-                            break
-                    else:
-                        # Python fallback path: worst_pos = (pid, pos_obj, score, hours, unrealized)
-                        wpid, wpos, wscore, whours, wpnl = worst_pos
-                        wname = list(wpos.markets.values())[0].get('name', '?')[:40] if wpos.markets else '?'
-                        bname = best_opp.get('market_names', ['?'])[0][:40]
-                        log.info(f'REPLACE: "{wname}" (score={wscore:.6f}, {whours:.0f}h)')
-                        log.info(f'  WITH: "{bname}" (score={best_score:.6f}, {best_hours:.0f}h)')
-                        result = await self.paper_engine.liquidate_position(wpid, self.market_lookup)
-                        if result.get('success'):
-                            log.info(f'  Liquidated: freed ${result["freed_capital"]:.2f}, '
-                                     f'realized ${result["actual_profit"]:+.2f}')
+                if self.rust_ws:
+                    # Rust PM path: worst_pos = (pid, name, score, hours, eval_result)
+                    wpid, wname, wscore, whours, eval_r = worst_pos
+                    if not eval_r.get('worth_replacing', False):
+                        # This position can't be profitably liquidated — exclude it and retry
+                        log.debug(f'  Skip replace "{wname}": net_gain=${eval_r.get("net_gain",0):+.2f} (not worth it)')
+                        excluded_pids.add(wpid)
+                        continue  # Retry while loop — will find next worst (skipping excluded)
+                    bname = best_opp.get('market_names', ['?'])[0][:40]
+                    log.info(f'REPLACE: "{wname}" (score={wscore:.6f}, {whours:.0f}h, '
+                             f'liq_profit=${eval_r["liquidation_profit"]:+.2f})')
+                    log.info(f'  WITH: "{bname}" (score={best_score:.6f}, {best_hours:.0f}h, '
+                             f'net_gain=${eval_r["net_gain"]:+.2f})')
+                    result = self._pm_liquidate(wpid, 'replaced')
+                    if result.get('success'):
+                        log.info(f'  Liquidated: freed ${result["freed_capital"]:.2f}, '
+                                 f'realized ${result["actual_profit"]:+.2f}')
+                        cap = dynamic_capital(self._pm_capital(), self.capital_pct)
+                        best_opp['total_capital_required'] = cap
+                        old_cap = sum(best_opp.get('optimal_bets', {}).values())
+                        if old_cap > 0:
+                            scale = cap / old_cap
+                            best_opp['optimal_bets'] = {k: v * scale for k, v in best_opp['optimal_bets'].items()}
+                            best_opp['expected_profit'] = best_opp.get('expected_profit', 0) * scale
+                        entry_r = self._pm_enter(best_opp)
+                        if entry_r.get('success'):
                             replacements_made += 1
                             used_opp_cids.add(best_opp.get('constraint_id', ''))
-                            self._save_state()  # Persist immediately
+                            self._save_state()
                         else:
-                            log.warning(f'  Liquidation failed: {result.get("reason")}')
-                            break
+                            log.warning(f'  Replacement entry failed: {entry_r.get("reason")}')
+                    else:
+                        log.warning(f'  Liquidation failed: {result.get("reason")}')
+                        break
                 else:
-                    break  # No more profitable swaps
+                    # Python fallback path: worst_pos = (pid, pos_obj, score, hours, unrealized)
+                    wpid, wpos, wscore, whours, wpnl = worst_pos
+                    wname = list(wpos.markets.values())[0].get('name', '?')[:40] if wpos.markets else '?'
+                    bname = best_opp.get('market_names', ['?'])[0][:40]
+                    log.info(f'REPLACE: "{wname}" (score={wscore:.6f}, {whours:.0f}h)')
+                    log.info(f'  WITH: "{bname}" (score={best_score:.6f}, {best_hours:.0f}h)')
+                    result = await self.paper_engine.liquidate_position(wpid, self.market_lookup)
+                    if result.get('success'):
+                        log.info(f'  Liquidated: freed ${result["freed_capital"]:.2f}, '
+                                 f'realized ${result["actual_profit"]:+.2f}')
+                        replacements_made += 1
+                        used_opp_cids.add(best_opp.get('constraint_id', ''))
+                        self._save_state()
+                    else:
+                        log.warning(f'  Liquidation failed: {result.get("reason")}')
+                        break
 
             if replacements_made > 0:
                 self._last_replacement = _time.time()
@@ -1755,18 +1770,19 @@ class TradingEngine:
                 opportunities = await loop.run_in_executor(
                     self._executor, self._process_pending_evals)
                 if opportunities:
-                    # Write opportunities to file (dashboard + debug)
-                    from arbitrage_math.arbitrage_engine import ArbitrageOpportunity
+                    # Filter out AI-rejected constraints before dashboard display
+                    display_opps = [o for o in opportunities
+                                    if o.get('constraint_id', '') not in self._ai_rejected_cids]
+
+                    # Write to file (debug) and push to dashboard (pre-validation view)
                     OPP_PATH.parent.mkdir(parents=True, exist_ok=True)
                     OPP_PATH.write_text(json.dumps({
-                        'opportunities': opportunities,
-                        'count': len(opportunities),
+                        'opportunities': display_opps,
+                        'count': len(display_opps),
                         'timestamp': datetime.now(ZoneInfo('Europe/London')).isoformat()
                     }, indent=2))
-
-                    # Push to Rust dashboard (in-memory, no disk)
                     if self.rust_ws:
-                        opp_jsons = [json.dumps(o, default=str) for o in opportunities]
+                        opp_jsons = [json.dumps(o, default=str) for o in display_opps]
                         self.rust_ws.set_recent_opps(opp_jsons)
 
                     await self._try_enter_or_replace(opportunities)
