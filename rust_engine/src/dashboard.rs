@@ -166,6 +166,7 @@ fn build_state_snapshot(s: &DashboardState) -> Value {
         "open_positions": open.iter().map(|j| serde_json::from_str::<Value>(j).unwrap_or_default()).collect::<Vec<_>>(),
         "closed_positions": closed.iter().map(|j| serde_json::from_str::<Value>(j).unwrap_or_default()).collect::<Vec<_>>(),
         "performance": perf,
+        "recent_opps": s.recent_opps.lock().clone(),
     })
 }
 
