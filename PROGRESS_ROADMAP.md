@@ -716,15 +716,22 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 | 8m | `tokio-tungstenite` WS client with local book mirror (replaces Python `websockets`) | ✅ Built + integrated, ABBA-safe single-lock queue |
 | 8n | Rust eval queue with `tokio::select!` instant wake (no polling, no sleep) | ✅ `parking_lot::Mutex<QueueInner>` dedup queue, wired into engine |
 | 8o | `rusqlite` state persistence (WAL mode, incremental updates) | ✅ `RustStateDB` + adapter wired into paper_trading.py, GIL-free backup |
-| 8p | Single Rust binary: WS + queue + eval + state. Python kept for dashboard + resolution validator only. | ✅ Eval pipeline wired: WS→book→queue→arb math all in Rust. Python only for position lifecycle + dashboard. |
+| 8p | Single Rust binary: WS + queue + eval + state + positions + dashboard. Python kept for orchestrator + AI validators only. | ✅ Hot path fully in Rust. Python remains for: orchestrator loop, resolution validator (Anthropic API), postponement detector, market scanner, constraint detector. |
 | 8q-1 | Rust Position Manager: entry, resolution, liquidation, capital accounting | ✅ `position.rs` — `PositionManager` with accurate payout math, held filtering, state import/export (v0.04.16) |
 | 8q-2 | Wire RustPM into trading_engine.py: replace all paper_trading.py position calls | ✅ entry, liquidation, replacement, proactive exit, state save all via Rust PM (v0.04.18) |
 | 8q-3 | Rust axum dashboard: serves from engine process, zero disk reads | ✅ `dashboard.rs` ~700 lines, SSE, `Arc<Mutex<PositionManager>>` direct read, port 5556 (v0.04.20) |
 | 8q-4 | Shares stored at entry with correct NO book prices; display price = bet/shares | ✅ Fixes $338 phantom payout at extreme prices; `current_no_prices` flows through full chain (v0.04.21) |
 | 8q-5 | AI validator prompt fix + pre-filter: rejected opps never shown on dashboard | ✅ Sports timing rules not flagged; `_ai_rejected_cids` cache; dashboard shows only validated opps (v0.04.22–23) |
 | 8q-6 | State persistence across restarts: EXEC_STATE→.db, Rust PM import after rust_ws created | ✅ Positions survive restart; `_save_state()` on every entry; graceful SIGTERM stop (v0.04.24) |
-| 8q-7 | Remove fully-ported functions from paper_trading.py | 📋 Planned |
-| 8q-8 | Resolution validator port to Rust (currently Python + Anthropic API) | 📋 Planned |
+| 8q-7 | Remove paper_engine middleman: Rust loads SQLite directly, replace all `paper_engine.current_capital` reads with `rust_ws`, remove Python fallback paths | 📋 Planned |
+| 8q-8 | Port resolution validator to Rust: `reqwest` + Anthropic API JSON POST, cache in SQLite table | 📋 Planned |
+| 8q-9 | Port postponement detector to Rust: `reqwest` + Anthropic API with tool_use (web search) | 📋 Planned |
+| 8q-10 | Port market scanner to Rust: Polymarket REST pagination via `reqwest` + `serde` | 📋 Planned |
+| 8q-11 | Port constraint detector to Rust: `HashSet` logic, no I/O | 📋 Planned |
+| 8q-12 | Port main orchestrator loop to Rust: `tokio` event loop replaces Python `asyncio` | 📋 Planned |
+| 8q-13 | Port config loading to Rust: `serde_yaml` for config.yaml + prompts.yaml (hot-reloadable) | 📋 Planned |
+| 8q-14 | Port logging to Rust: `tracing` crate with structured log output | 📋 Planned |
+| 8q-15 | **Single compiled binary**: zero Python, zero venv — deploy by copying one .exe + config.yaml + prompts.yaml. Persistence via execution_state.db + resolution_cache/ | 📋 Planned — endgame |
 
 ### Phase 9 — Admin, Observability & Automation (TODO)
 
@@ -734,8 +741,7 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 | 9b | AI rejection report page (:5557) — full rules + AI decision per rejected constraint | 📋 Planned |
 | 9c | Manual review: mark checked rejections, remove from list | 📋 Planned |
 | 9d | Route rejection review to AI automatically, only inform operator of exceptions | 📋 Planned |
-| 9e | Remove fully-ported functions from paper_trading.py | 📋 Planned |
-| 9f | Oracle Cloud ARM instance provisioning + deployment | 📋 Planned |
+| 9e | Oracle Cloud ARM instance provisioning + deployment | 📋 Planned |
 
 #### Expected Latency by Phase
 
