@@ -604,6 +604,7 @@ class TradingEngine:
                 opp_dict.get('market_ids', []),
                 opp_dict.get('market_names', []),
                 opp_dict.get('current_prices', {}),
+                opp_dict.get('current_no_prices', {}),
                 opp_dict.get('optimal_bets', {}),
                 opp_dict.get('expected_profit', 0),
                 opp_dict.get('expected_profit_pct', 0),
@@ -1289,13 +1290,22 @@ class TradingEngine:
             max_days_to_resolution=self.max_days_entry
         )
         if not ranked:
+            # Debug: why did ranking fail?
+            for opp in opportunities[:2]:
+                mids = opp.get('market_ids', [])
+                hours = get_resolution_hours(opp, self.market_lookup)
+                found = sum(1 for mid in mids if str(mid) in self.market_lookup)
+                log.debug(f'_try_enter: rank failed: mids={mids[:2]} hours={hours} '
+                          f'found_in_lookup={found}/{len(mids)} mid_types={[type(m).__name__ for m in mids[:2]]}')
             return
 
         slots = self.max_positions - self._pm_open_count()
         cap = dynamic_capital(self._pm_capital(), self.capital_pct)
         min_trade = self.config.get('live_trading', self.config.get('paper_trading', {})).get('min_trade_size', 10.0)
         if cap < min_trade:
-            slots = 0  # Can't afford a new position — only replacement is possible
+            slots = 0
+        log.info(f'_try_enter: {len(opportunities)} opps, {len(ranked)} ranked, '
+                 f'slots={slots} cap=${cap:.2f} min_trade=${min_trade:.2f}')
         markets = list(self.market_lookup.values())
 
         # --- ENTER NEW POSITIONS ---
@@ -1330,6 +1340,7 @@ class TradingEngine:
                              f'{hours:.1f}h | score={score:.6f}')
                     entered += 1
                     slots -= 1
+                    self._save_state()  # Persist immediately — survives kill -9
                     # Subscribe new assets to WS
                     if self.ws_manager and self.ws_manager._running:
                         new_assets = get_asset_ids_for_opportunity(opp_dict, self.market_lookup)
@@ -1548,6 +1559,7 @@ class TradingEngine:
                             if entry_r.get('success'):
                                 replacements_made += 1
                                 used_opp_cids.add(best_opp.get('constraint_id', ''))
+                                self._save_state()  # Persist immediately
                             else:
                                 log.warning(f'  Replacement entry failed: {entry_r.get("reason")}')
                         else:
@@ -1566,6 +1578,7 @@ class TradingEngine:
                                      f'realized ${result["actual_profit"]:+.2f}')
                             replacements_made += 1
                             used_opp_cids.add(best_opp.get('constraint_id', ''))
+                            self._save_state()  # Persist immediately
                         else:
                             log.warning(f'  Liquidation failed: {result.get("reason")}')
                             break

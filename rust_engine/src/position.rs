@@ -17,9 +17,11 @@ fn now_ts() -> f64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketLeg {
     pub name: String,
-    pub entry_price: f64,
+    pub entry_price: f64,     // YES ask price at entry
     pub bet_amount: f64,
-    pub outcome: String,  // "yes" or "no"
+    pub outcome: String,      // "yes" or "no"
+    #[serde(default)]
+    pub shares: f64,          // Actual shares purchased (computed at entry with correct prices)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +163,7 @@ impl PositionManager {
         market_ids: &[String],
         market_names: &[String],
         current_prices: &HashMap<String, f64>,
+        current_no_prices: &HashMap<String, f64>,
         optimal_bets: &HashMap<String, f64>,
         expected_profit: f64,
         expected_profit_pct: f64,
@@ -179,16 +182,25 @@ impl PositionManager {
             };
         }
 
-        // Build market legs
+        // Build market legs with accurate shares
         let mut markets = HashMap::new();
         let outcome = if is_sell { "no" } else { "yes" };
         for (i, mid) in market_ids.iter().enumerate() {
             let name = market_names.get(i).cloned().unwrap_or_default();
             let price = current_prices.get(mid).copied().unwrap_or(0.0);
             let bet = optimal_bets.get(mid).copied().unwrap_or(0.0);
+            // Compute shares using the correct price for the side we're buying
+            let shares = if is_sell {
+                let no_price = current_no_prices.get(mid).copied()
+                    .unwrap_or_else(|| (1.0 - price).max(0.001));
+                bet / no_price
+            } else {
+                if price > 0.0 { bet / price } else { 0.0 }
+            };
             markets.insert(mid.clone(), MarketLeg {
                 name, entry_price: price, bet_amount: bet,
                 outcome: outcome.to_string(),
+                shares,
             });
         }
 

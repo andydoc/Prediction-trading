@@ -102,6 +102,7 @@ impl RustWsEngine {
             min_profit_threshold: get_float(config, "min_profit_threshold").unwrap_or(0.03),
             max_profit_threshold: get_float(config, "max_profit_threshold").unwrap_or(0.30),
             max_fw_iter: get_int(config, "max_fw_iter").unwrap_or(200) as usize,
+            max_hours: get_float(config, "max_hours").unwrap_or(1440.0),  // 60 days
         };
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -252,6 +253,7 @@ impl RustWsEngine {
             d.set_item("fees_estimated", opp.fees_estimated)?;
             d.set_item("total_capital_required", opp.total_capital_required)?;
             d.set_item("current_prices", &opp.current_prices)?;
+            d.set_item("current_no_prices", &opp.current_no_prices)?;
             d.set_item("optimal_bets", &opp.optimal_bets)?;
             d.set_item("hours_to_resolve", opp.hours_to_resolve)?;
             d.set_item("score", opp.score)?;
@@ -350,14 +352,15 @@ impl RustWsEngine {
         strategy: &str, method: &str,
         market_ids: Vec<String>, market_names: Vec<String>,
         current_prices: HashMap<String, f64>,
+        current_no_prices: HashMap<String, f64>,
         optimal_bets: HashMap<String, f64>,
         expected_profit: f64, expected_profit_pct: f64,
         is_sell: bool,
     ) -> PyResult<PyObject> {
         let result = self.positions.lock().enter_position(
             opportunity_id, constraint_id, strategy, method,
-            &market_ids, &market_names, &current_prices, &optimal_bets,
-            expected_profit, expected_profit_pct, is_sell,
+            &market_ids, &market_names, &current_prices, &current_no_prices,
+            &optimal_bets, expected_profit, expected_profit_pct, is_sell,
         );
         let d = PyDict::new(py);
         match result {

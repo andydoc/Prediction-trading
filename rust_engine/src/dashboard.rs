@@ -313,26 +313,29 @@ fn build_positions(s: &DashboardState) -> Value {
         let entry_epoch = parse_entry_ts(&p["entry_timestamp"]);
         let entry_ts_fmt = fmt_ts(entry_epoch);
 
-        // Build legs
+        // Build legs — read shares from position data (computed at entry with correct prices)
         let mut legs = Vec::new();
         if let Some(mkts) = markets {
             for (_mid, mdata) in mkts {
                 let name = mdata["name"].as_str().unwrap_or("?");
                 let ep = mdata["entry_price"].as_f64().unwrap_or(0.0);
                 let bet = mdata["bet_amount"].as_f64().unwrap_or(0.0);
-                let (side, shares, payout) = if is_sell {
-                    let no_price = 1.0 - ep;
-                    let sh = if no_price > 0.0 { bet / no_price } else { 0.0 };
-                    ("NO", sh, sh)
-                } else {
-                    let sh = if ep > 0.0 { bet / ep } else { 0.0 };
-                    ("YES", sh, sh)
-                };
+                let shares = mdata["shares"].as_f64().unwrap_or_else(|| {
+                    // Fallback for old positions without shares field
+                    if is_sell {
+                        let no_price = (1.0 - ep).max(0.001);
+                        bet / no_price
+                    } else {
+                        if ep > 0.0 { bet / ep } else { 0.0 }
+                    }
+                });
+                let side = if is_sell { "NO" } else { "YES" };
+                let actual_price = if shares > 0.0 { bet / shares } else { ep };
                 legs.push(json!({
                     "name": name, "bet": (bet * 100.0).round() / 100.0,
-                    "side": side, "price": (ep * 1000.0).round() / 1000.0,
+                    "side": side, "price": (actual_price * 1000.0).round() / 1000.0,
                     "shares": format!("{:.2}", shares),
-                    "payout": (payout * 100.0).round() / 100.0,
+                    "payout": (shares * 100.0).round() / 100.0,
                 }));
             }
         }
@@ -482,23 +485,28 @@ fn build_opportunities(s: &DashboardState) -> Value {
             else if hours < 24.0 { format!("{:.1}h", hours) }
             else { format!("{:.1}d", hours / 24.0) };
 
-        // Legs — prices are in "current_prices" (not "prices")
+        // Legs — use actual NO prices for sell arbs (not 1 - YES_ask)
         let mut legs = Vec::new();
         if let Some(bets) = opp["optimal_bets"].as_object() {
             for (mid, bet_val) in bets {
                 let bet = bet_val.as_f64().unwrap_or(0.0);
                 let name = name_by_id.get(mid.as_str()).copied().unwrap_or("?");
-                let price = opp["current_prices"].get(mid)
+                let yes_price = opp["current_prices"].get(mid)
                     .and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let no_price = opp["current_no_prices"].get(mid)
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or_else(|| (1.0 - yes_price).max(0.001));
                 let side = if is_sell { "NO" } else { "YES" };
-                let sh = if is_sell {
-                    if (1.0 - price) > 0.0 { bet / (1.0 - price) } else { 0.0 }
+                let (sh, actual_price) = if is_sell {
+                    let s = if no_price > 0.0 { bet / no_price } else { 0.0 };
+                    (s, no_price)
                 } else {
-                    if price > 0.0 { bet / price } else { 0.0 }
+                    let s = if yes_price > 0.0 { bet / yes_price } else { 0.0 };
+                    (s, yes_price)
                 };
                 legs.push(json!({
                     "name": name, "bet": (bet * 100.0).round() / 100.0,
-                    "side": side, "price": (price * 1000.0).round() / 1000.0,
+                    "side": side, "price": (actual_price * 1000.0).round() / 1000.0,
                     "shares": format!("{:.2}", sh),
                     "payout": (sh * 100.0).round() / 100.0,
                 }));
@@ -530,7 +538,7 @@ fn build_opportunities(s: &DashboardState) -> Value {
         result.push(json!({
             "idx": idx + 1, "short_name": short_name, "full_names": market_names,
             "profit_pct": (profit_pct * 10.0).round() / 10.0,
-            "resolves": resolves_str, "strategy": strategy,
+            "resolve": resolves_str, "strategy": strategy,
             "score": (score_val * 100.0).round() / 100.0,
             "legs": legs, "scenarios": [],
             "guaranteed_payout": (guaranteed_payout * 100.0).round() / 100.0,
@@ -586,26 +594,29 @@ fn build_closed(s: &DashboardState) -> Value {
         } else { "?".into() };
         let close_dt_str = fmt_ts_sec(close_ts);
 
-        // Build legs
+        // Build legs — read shares from position data (same as open positions)
         let mut legs = Vec::new();
         if let Some(mkts) = markets {
             for (_mid, mdata) in mkts {
                 let name = mdata["name"].as_str().unwrap_or("?");
                 let ep = mdata["entry_price"].as_f64().unwrap_or(0.0);
                 let bet = mdata["bet_amount"].as_f64().unwrap_or(0.0);
-                let (side, shares, payout) = if is_sell {
-                    let np = 1.0 - ep;
-                    let sh = if np > 0.0 { bet / np } else { 0.0 };
-                    ("NO", sh, sh)
-                } else {
-                    let sh = if ep > 0.0 { bet / ep } else { 0.0 };
-                    ("YES", sh, sh)
-                };
+                let shares = mdata["shares"].as_f64().unwrap_or_else(|| {
+                    // Fallback for old positions without shares field
+                    if is_sell {
+                        let np = (1.0 - ep).max(0.001);
+                        bet / np
+                    } else {
+                        if ep > 0.0 { bet / ep } else { 0.0 }
+                    }
+                });
+                let side = if is_sell { "NO" } else { "YES" };
+                let actual_price = if shares > 0.0 { bet / shares } else { ep };
                 legs.push(json!({
                     "name": name, "bet": (bet * 100.0).round() / 100.0,
-                    "side": side, "price": (ep * 1000.0).round() / 1000.0,
+                    "side": side, "price": (actual_price * 1000.0).round() / 1000.0,
                     "shares": format!("{:.2}", shares),
-                    "payout": (payout * 100.0).round() / 100.0,
+                    "payout": (shares * 100.0).round() / 100.0,
                 }));
             }
         }

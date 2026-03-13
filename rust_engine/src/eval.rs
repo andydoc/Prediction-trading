@@ -70,6 +70,7 @@ pub struct EvalConfig {
     pub min_profit_threshold: f64,
     pub max_profit_threshold: f64,
     pub max_fw_iter: usize,
+    pub max_hours: f64,  // Skip constraints resolving further than this (default: 1440 = 60 days)
 }
 
 /// A found opportunity — returned to Python, pre-ranked.
@@ -84,6 +85,7 @@ pub struct Opportunity {
     pub fees_estimated: f64,
     pub total_capital_required: f64,
     pub current_prices: HashMap<String, f64>,
+    pub current_no_prices: HashMap<String, f64>,
     pub optimal_bets: HashMap<String, f64>,
     pub neg_risk: bool,
     pub n_scenarios: Option<usize>,
@@ -136,6 +138,13 @@ pub fn evaluate_batch(
         let n = constraint.markets.len();
         if n < 2 { continue; }
 
+        // Skip constraints with no resolution date — untradeable (can't score, can't return capital)
+        if constraint.end_date_ts <= 0.0 { continue; }
+
+        // Skip constraints resolving too far in the future or already past
+        let hours_to_end = (constraint.end_date_ts - now_ts) / 3600.0;
+        if hours_to_end < 0.0 || hours_to_end > config.max_hours { continue; }
+
         // Skip if any market in this constraint is already held
         let has_held_market = constraint.markets.iter()
             .any(|m| held_mids.contains(&m.market_id));
@@ -186,21 +195,21 @@ pub fn evaluate_batch(
 
         if let Some(arb) = result {
             let mut current_prices = HashMap::new();
+            let mut current_no_prices = HashMap::new();
             let mut optimal_bets = HashMap::new();
             for (mid, bet) in &arb.bets {
                 optimal_bets.insert(mid.clone(), *bet);
             }
             for (i, mid) in market_ids.iter().enumerate() {
                 current_prices.insert(mid.clone(), yes_prices[i]);
+                current_no_prices.insert(mid.clone(), no_prices[i]);
             }
 
-            // Compute hours to resolution
+            // Compute hours to resolution (end_date_ts > 0 guaranteed by filter above)
             let hours = if constraint.end_date_ts > now_ts {
                 (constraint.end_date_ts - now_ts) / 3600.0
-            } else if constraint.end_date_ts > 0.0 {
-                0.01  // already past — resolve imminently
             } else {
-                24.0 * 30.0  // unknown — assume 30 days (will be filtered by Python max_days)
+                0.01  // already past — resolve imminently
             };
 
             // Score: profit_pct / effective_hours (higher = better)
@@ -216,6 +225,7 @@ pub fn evaluate_batch(
                 fees_estimated: arb.fees,
                 total_capital_required: config.capital,
                 current_prices,
+                current_no_prices,
                 optimal_bets,
                 neg_risk: arb.neg_risk,
                 n_scenarios: arb.n_scenarios,

@@ -22,17 +22,26 @@ case "$TARGET" in
     ;;
   *)
     echo "Killing ALL trader processes..."
-    kill -9 $(ps aux | grep -E 'main\.py|trading_engine|dashboard_server|initial_market_scanner' | grep -v grep | awk '{print $2}') 2>/dev/null
-    sleep 2
+    # SIGTERM first (allows graceful shutdown + state save)
+    kill $(ps aux | grep -E 'main\.py|trading_engine|initial_market_scanner' | grep -v grep | awk '{print $2}') 2>/dev/null
+    echo "Waiting for graceful shutdown..."
+    sleep 5
+    # SIGKILL any stragglers
+    kill -9 $(ps aux | grep -E 'main\.py|trading_engine|initial_market_scanner' | grep -v grep | awk '{print $2}') 2>/dev/null
+    sleep 1
     rm -f /home/andydoc/prediction-trader/*.pid
     echo ""
     echo "=== State snapshot ==="
     python3 -c "
-import json
-d = json.load(open('/home/andydoc/prediction-trader/data/system_state/execution_state.json'))
-print(f'Capital: \${d[\"current_capital\"]:.2f}')
-print(f'Open: {len(d.get(\"open_positions\",[]))}')
-print(f'Closed: {len(d.get(\"closed_positions\",[]))}')
+import sys; sys.path.insert(0, '/home/andydoc/prediction-trader')
+from utilities.state_db import read_state_from_disk
+d = read_state_from_disk('/home/andydoc/prediction-trader/data/system_state/execution_state.db')
+if d:
+    print(f'Capital: \${d[\"current_capital\"]:.2f}')
+    print(f'Open: {len(d.get(\"open_positions\",[]))}')
+    print(f'Closed: {len(d.get(\"closed_positions\",[]))}')
+else:
+    print('(could not read state)')
 " 2>/dev/null || echo "(could not read state)"
     echo ""
     echo "=== Remaining python processes ==="
