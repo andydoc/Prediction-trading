@@ -572,29 +572,29 @@ class TradingEngine:
     # --- Rust PM helpers (Phase 8q-2: fall back to paper_engine if Rust unavailable) ---
 
     def _pm_capital(self) -> float:
-        if self.rust_pm:
-            return self.rust_pm.current_capital()
-        return self.paper_engine.current_capital
+        if not self.rust_pm:
+            raise RuntimeError('rust_pm not wired — cannot read capital')
+        return self.rust_pm.current_capital()
 
     def _pm_open_count(self) -> int:
-        if self.rust_pm:
-            return self.rust_pm.pm_open_count()
-        return len(self.paper_engine.open_positions)
+        if not self.rust_pm:
+            raise RuntimeError('rust_pm not wired — cannot read open count')
+        return self.rust_pm.pm_open_count()
 
     def _pm_held_cids(self) -> set:
-        if self.rust_pm:
-            return self.rust_pm.get_held_constraint_ids()
-        return get_held_constraint_ids(self.paper_engine)
+        if not self.rust_pm:
+            raise RuntimeError('rust_pm not wired — cannot read held constraint IDs')
+        return self.rust_pm.get_held_constraint_ids()
 
     def _pm_held_mids(self) -> set:
-        if self.rust_pm:
-            return self.rust_pm.get_held_market_ids()
-        return get_held_market_ids(self.paper_engine)
+        if not self.rust_pm:
+            raise RuntimeError('rust_pm not wired — cannot read held market IDs')
+        return self.rust_pm.get_held_market_ids()
 
     def _pm_enter(self, opp_dict: dict) -> dict:
         """Enter position via Rust PM. Returns {'ok': bool, 'position_id': str, ...}."""
         if not self.rust_pm:
-            return {'success': False, 'reason': 'no_rust_pm'}
+            raise RuntimeError('rust_pm not wired — cannot enter position')
         meta = opp_dict.get('metadata', {})
         method = meta.get('method', opp_dict.get('method', 'unknown'))
         strategy = meta.get('strategy', 'arb_sell' if 'sell' in method else 'arb_buy')
@@ -656,74 +656,70 @@ class TradingEngine:
 
     def _pm_liquidate(self, position_id: str, reason: str) -> dict:
         """Liquidate via Rust PM (sells shares at current bids)."""
-        if self.rust_pm:
-            # Get position data to build bids
-            open_jsons = self.rust_pm.get_open_positions_json()
-            pos_data = None
-            for j in open_jsons:
-                p = json.loads(j)
-                if p.get('position_id') == position_id:
-                    pos_data = p
-                    break
-            if not pos_data:
-                return {'success': False, 'reason': 'position_not_found'}
-            bids = self._pm_get_current_bids(pos_data)
-            result = self.rust_pm.liquidate_position(position_id, reason, bids)
-            if result:
-                net_proceeds, profit = result
-                return {'success': True, 'freed_capital': net_proceeds, 'actual_profit': profit}
-            return {'success': False, 'reason': 'liquidation_failed'}
-        return {'success': False, 'reason': 'no_rust_pm'}
+        if not self.rust_pm:
+            raise RuntimeError('rust_pm not wired — cannot liquidate position')
+        open_jsons = self.rust_pm.get_open_positions_json()
+        pos_data = None
+        for j in open_jsons:
+            p = json.loads(j)
+            if p.get('position_id') == position_id:
+                pos_data = p
+                break
+        if not pos_data:
+            return {'success': False, 'reason': 'position_not_found'}
+        bids = self._pm_get_current_bids(pos_data)
+        result = self.rust_pm.liquidate_position(position_id, reason, bids)
+        if result:
+            net_proceeds, profit = result
+            return {'success': True, 'freed_capital': net_proceeds, 'actual_profit': profit}
+        return {'success': False, 'reason': 'liquidation_failed'}
 
     def _save_state(self):
-        """Save state from rust_pm or paper_engine. SQLite is the sole source of truth."""
+        """Save state from Rust PM to SQLite. SQLite is the sole source of truth."""
+        if not self.rust_pm:
+            raise RuntimeError('rust_pm not wired — cannot save state')
+        if not self.paper_engine._state_store:
+            raise RuntimeError('No SQLite state store — cannot save state')
         import time as _t
         t0 = _t.time()
-        if self.rust_pm and self.paper_engine._state_store:
-            store = self.paper_engine._state_store
-            cap = self.rust_pm.current_capital()
-            init_cap = self.rust_pm.initial_capital()
-            perf = self.rust_pm.get_performance_metrics()
-            # Sync scalars
-            store.save_scalars({
-                'current_capital': cap,
-                'initial_capital': init_cap,
-            })
-            for k in ('total_trades', 'winning_trades', 'losing_trades',
-                      'total_actual_profit', 'total_expected_profit'):
-                if k in perf:
-                    store.save_scalar(k, perf[k])
-            # Sync open positions — full replace
-            open_jsons = self.rust_pm.get_open_positions_json()
-            open_dicts = [json.loads(j) for j in open_jsons]
-            db_open_ids = store.get_open_position_ids() if hasattr(store, 'get_open_position_ids') else set()
-            live_ids = {d.get('position_id', '') for d in open_dicts}
-            for stale_id in (db_open_ids - live_ids):
-                store.delete_position(stale_id)
-            if open_dicts:
-                store.upsert_positions_bulk(open_dicts, 'open')
-            # Sync closed — incremental
-            counts = store.count_by_status()
-            db_closed = counts.get('closed', 0)
-            all_closed_jsons = self.rust_pm.get_closed_positions_json()
-            all_closed_dicts = [json.loads(j) for j in all_closed_jsons]
-            if len(all_closed_dicts) > db_closed:
-                store.upsert_positions_bulk(all_closed_dicts[db_closed:], 'closed')
-            store.backup_to_disk()
+        store = self.paper_engine._state_store
+        cap = self.rust_pm.current_capital()
+        init_cap = self.rust_pm.initial_capital()
+        perf = self.rust_pm.get_performance_metrics()
+        # Sync scalars
+        store.save_scalars({
+            'current_capital': cap,
+            'initial_capital': init_cap,
+        })
+        for k in ('total_trades', 'winning_trades', 'losing_trades',
+                  'total_actual_profit', 'total_expected_profit'):
+            if k in perf:
+                store.save_scalar(k, perf[k])
+        # Sync open positions — full replace
+        open_jsons = self.rust_pm.get_open_positions_json()
+        open_dicts = [json.loads(j) for j in open_jsons]
+        db_open_ids = store.get_open_position_ids() if hasattr(store, 'get_open_position_ids') else set()
+        live_ids = {d.get('position_id', '') for d in open_dicts}
+        for stale_id in (db_open_ids - live_ids):
+            store.delete_position(stale_id)
+        if open_dicts:
+            store.upsert_positions_bulk(open_dicts, 'open')
+        # Sync closed — incremental
+        counts = store.count_by_status()
+        db_closed = counts.get('closed', 0)
+        all_closed_jsons = self.rust_pm.get_closed_positions_json()
+        all_closed_dicts = [json.loads(j) for j in all_closed_jsons]
+        if len(all_closed_dicts) > db_closed:
+            store.upsert_positions_bulk(all_closed_dicts[db_closed:], 'closed')
+        store.backup_to_disk()
 
-            # Keep paper_engine in sync (monitoring + dashboard helpers still read it)
-            self.paper_engine.current_capital = cap
-            self.paper_engine.initial_capital = init_cap
-
-            ms = (_t.time() - t0) * 1000
-            log.info(f'Saved state (Rust PM → SQLite): {len(open_dicts)} open, '
-                     f'{len(all_closed_dicts)} closed [{ms:.0f}ms]')
-        else:
-            self.paper_engine.save_state(EXEC_STATE)
+        ms = (_t.time() - t0) * 1000
+        log.info(f'Saved state (Rust PM → SQLite): {len(open_dicts)} open, '
+                 f'{len(all_closed_dicts)} closed [{ms:.0f}ms]')
 
     def _check_proactive_exits(self):
         """Check all open positions for proactive exit (sell now ≥ 1.2× resolution payout)."""
-        if not self.rust_pm or self.rust_pm.open_count() == 0:
+        if not self.rust_pm or self.rust_pm.pm_open_count() == 0:
             return
         # Build bids dict for all open position markets
         all_bids = {}
@@ -1232,12 +1228,10 @@ class TradingEngine:
         now = datetime.now(timezone.utc)
         checked = 0
 
-        # A1: Iterate Rust PM positions (JSON dicts) instead of paper_engine
-        if self.rust_pm:
-            open_positions = [json.loads(j) for j in self.rust_pm.get_open_positions_json()]
-        else:
-            open_positions = [pos.to_dict() if hasattr(pos, 'to_dict') else pos
-                              for pos in self.paper_engine.open_positions.values()]
+        # A1: Iterate Rust PM positions (JSON dicts)
+        if not self.rust_pm:
+            raise RuntimeError('rust_pm not wired — cannot check postponements')
+        open_positions = [json.loads(j) for j in self.rust_pm.get_open_positions_json()]
         for pos_dict in open_positions:
             # Get expected resolution date from position metadata or market end_date
             expected_date_str = None
@@ -1343,10 +1337,9 @@ class TradingEngine:
                 opp_dict['fees_estimated'] = opp_dict.get('fees_estimated', 0) * scale
 
             try:
-                if self.rust_pm:
-                    result = self._pm_enter(opp_dict)
-                else:
-                    result = await self.paper_engine.execute_opportunity(opp_dict, markets)
+                if not self.rust_pm:
+                    raise RuntimeError('rust_pm not wired — cannot enter position')
+                result = self._pm_enter(opp_dict)
                 if result and result.get('success'):
                     cid = opp_dict.get('constraint_id', '')
                     log.info(f'ENTER: {cid[:30]} | ${cap:.2f} | '
@@ -1404,79 +1397,19 @@ class TradingEngine:
                 worst_pos = None
                 worst_score = float('inf')
                 
-                if self.rust_pm:
-                    # Rust PM path: iterate position JSON data
-                    for pos_json in self.rust_pm.get_open_positions_json():
-                        pos = json.loads(pos_json)
-                        pid = pos.get('position_id', '')
-                        if pid in excluded_pids:
-                            continue
-                        pos_meta = pos.get('metadata', {})
-                        cid = pos_meta.get('constraint_id', '')
-                        
-                        # Get validated resolution date
-                        pos_end = None
-                        if cid and self.resolution_validation_enabled:
-                            cached = load_resolution_cache(cid)
-                            if cached and 'latest_resolution_date' in cached:
-                                try:
-                                    pos_end = datetime.strptime(
-                                        cached['latest_resolution_date'], '%Y-%m-%d'
-                                    ).replace(tzinfo=timezone.utc)
-                                except (ValueError, TypeError):
-                                    pass
-                        if pos_end is None:
-                            for mid_str in pos.get('markets', {}).keys():
-                                md = self.market_lookup.get(str(mid_str))
-                                if md:
-                                    ed = md.end_date
-                                    if ed.tzinfo is None:
-                                        ed = ed.replace(tzinfo=timezone.utc)
-                                    if pos_end is None or ed > pos_end:
-                                        pos_end = ed
-                        if pos_end is None:
-                            continue
-                        # Postponement override
-                        pp_meta = pos_meta.get('postponement', {})
-                        if pp_meta and pp_meta.get('effective_date'):
-                            try:
-                                pp_end = datetime.strptime(
-                                    pp_meta['effective_date'], '%Y-%m-%d'
-                                ).replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
-                                pos_end = pp_end
-                            except (ValueError, TypeError):
-                                pass
-                        elif pos_meta.get('postponed') or pos_end < now_utc:
-                            rescore_floor = now_utc + timedelta(days=self.postponement_rescore_days)
-                            pos_end = max(pos_end, rescore_floor)
-
-                        hours_remaining = (pos_end - now_utc).total_seconds() / 3600
-                        if hours_remaining < 24:
-                            continue
-                        
-                        # Use Rust evaluate_replacement for accurate liquidation value
-                        bids = self._pm_get_current_bids(pos)
-                        repl_profit = best_opp.get('expected_profit', 0)
-                        eval_result = self.rust_pm.evaluate_replacement(pid, bids, repl_profit)
-                        if not eval_result:
-                            continue
-                        
-                        total_cap = pos.get('total_capital', 0)
-                        remaining_upside = pos.get('expected_profit', 0) - eval_result['liquidation_profit']
-                        eff_remaining = hours_remaining
-                        rem_score = (remaining_upside / max(total_cap, 0.01)) / max(eff_remaining, 0.01)
-                        
-                        if rem_score < worst_score:
-                            worst_score = rem_score
-                            pos_name = list(pos.get('markets', {}).values())[0].get('name', '?')[:40] if pos.get('markets') else '?'
-                            worst_pos = (pid, pos_name, rem_score, hours_remaining, eval_result)
-                else:
-                  for pid, pos in self.paper_engine.open_positions.items():
+                if not self.rust_pm:
+                    raise RuntimeError('rust_pm not wired — cannot score positions for replacement')
+                # Rust PM path: iterate position JSON data
+                for pos_json in self.rust_pm.get_open_positions_json():
+                    pos = json.loads(pos_json)
+                    pid = pos.get('position_id', '')
                     if pid in excluded_pids:
                         continue
+                    pos_meta = pos.get('metadata', {})
+                    cid = pos_meta.get('constraint_id', '')
+
                     # Get validated resolution date
                     pos_end = None
-                    cid = pos.metadata.get('constraint_id', '')
                     if cid and self.resolution_validation_enabled:
                         cached = load_resolution_cache(cid)
                         if cached and 'latest_resolution_date' in cached:
@@ -1486,9 +1419,8 @@ class TradingEngine:
                                 ).replace(tzinfo=timezone.utc)
                             except (ValueError, TypeError):
                                 pass
-                    # Fallback to API end_date
                     if pos_end is None:
-                        for mid_str in pos.markets.keys():
+                        for mid_str in pos.get('markets', {}).keys():
                             md = self.market_lookup.get(str(mid_str))
                             if md:
                                 ed = md.end_date
@@ -1498,8 +1430,8 @@ class TradingEngine:
                                     pos_end = ed
                     if pos_end is None:
                         continue
-                    # Postponement detection: use AI-detected date if available
-                    pp_meta = pos.metadata.get('postponement', {})
+                    # Postponement override
+                    pp_meta = pos_meta.get('postponement', {})
                     if pp_meta and pp_meta.get('effective_date'):
                         try:
                             pp_end = datetime.strptime(
@@ -1508,91 +1440,67 @@ class TradingEngine:
                             pos_end = pp_end
                         except (ValueError, TypeError):
                             pass
-                    # Fallback: if still overdue and no postponement data, extend denominator
-                    elif pos.metadata.get('postponed') or pos_end < now_utc:
+                    elif pos_meta.get('postponed') or pos_end < now_utc:
                         rescore_floor = now_utc + timedelta(days=self.postponement_rescore_days)
                         pos_end = max(pos_end, rescore_floor)
 
                     hours_remaining = (pos_end - now_utc).total_seconds() / 3600
-                    # 24h protection
                     if hours_remaining < 24:
                         continue
 
-                    liq_value = calc_position_liq_value(pos, self.market_lookup)
-                    unrealized = liq_value - pos.total_capital
-                    remaining_upside = pos.expected_profit - unrealized
+                    # Use Rust evaluate_replacement for accurate liquidation value
+                    bids = self._pm_get_current_bids(pos)
+                    repl_profit = best_opp.get('expected_profit', 0)
+                    eval_result = self.rust_pm.evaluate_replacement(pid, bids, repl_profit)
+                    if not eval_result:
+                        continue
 
-                    # Apply delay model (same as rank_opportunities)
-                    pos_names = [m.get('name', '') for m in pos.markets.values()]
-                    pos_mids = list(pos.markets.keys())
-                    pos_cat = classify_opportunity_category(pos_names, self.market_lookup, pos_mids)
-                    p95_t, def_p95 = load_delay_table()
-                    pos_p95 = p95_t.get(pos_cat, def_p95)
-                    pos_min_vol = 0.0
-                    for mid_str in pos.markets.keys():
-                        md = self.market_lookup.get(str(mid_str))
-                        if md and hasattr(md, 'volume_24h'):
-                            v = md.volume_24h or 0
-                            pos_min_vol = v if pos_min_vol == 0 else min(pos_min_vol, v)
-                    eff_remaining = hours_remaining + pos_p95 + get_volume_penalty_hours(pos_min_vol)
-                    rem_score = (remaining_upside / max(pos.total_capital, 0.01)) / max(eff_remaining, 0.01)
+                    total_cap = pos.get('total_capital', 0)
+                    remaining_upside = pos.get('expected_profit', 0) - eval_result['liquidation_profit']
+                    eff_remaining = hours_remaining
+                    rem_score = (remaining_upside / max(total_cap, 0.01)) / max(eff_remaining, 0.01)
+
                     if rem_score < worst_score:
                         worst_score = rem_score
-                        worst_pos = (pid, pos, rem_score, hours_remaining, unrealized)
+                        pos_name = list(pos.get('markets', {}).values())[0].get('name', '?')[:40] if pos.get('markets') else '?'
+                        worst_pos = (pid, pos_name, rem_score, hours_remaining, eval_result)
 
                 # Replace if best new is 20% better than worst held
                 # Iterate through held positions worst→best until we find one worth replacing
                 if worst_pos and best_score > worst_score * 1.2:
-                    if self.rust_pm:
-                        # Rust PM path: worst_pos = (pid, name, score, hours, eval_result)
-                        wpid, wname, wscore, whours, eval_r = worst_pos
-                        if not eval_r.get('worth_replacing', False):
-                            # This position can't be profitably liquidated — exclude it and retry
-                            log.debug(f'  Skip replace "{wname}": net_gain=${eval_r.get("net_gain",0):+.2f} (not worth it)')
-                            excluded_pids.add(wpid)
-                            continue  # Retry while loop — will find next worst (skipping excluded)
-                        bname = best_opp.get('market_names', ['?'])[0][:40]
-                        log.info(f'REPLACE: "{wname}" (score={wscore:.6f}, {whours:.0f}h, '
-                                 f'liq_profit=${eval_r["liquidation_profit"]:+.2f})')
-                        log.info(f'  WITH: "{bname}" (score={best_score:.6f}, {best_hours:.0f}h, '
-                                 f'net_gain=${eval_r["net_gain"]:+.2f})')
-                        result = self._pm_liquidate(wpid, 'replaced')
-                        if result.get('success'):
-                            log.info(f'  Liquidated: freed ${result["freed_capital"]:.2f}, '
-                                     f'realized ${result["actual_profit"]:+.2f}')
-                            # Enter the replacement
-                            cap = dynamic_capital(self._pm_capital(), self.capital_pct)
-                            best_opp['total_capital_required'] = cap
-                            old_cap = sum(best_opp.get('optimal_bets', {}).values())
-                            if old_cap > 0:
-                                scale = cap / old_cap
-                                best_opp['optimal_bets'] = {k: v * scale for k, v in best_opp['optimal_bets'].items()}
-                                best_opp['expected_profit'] = best_opp.get('expected_profit', 0) * scale
-                            entry_r = self._pm_enter(best_opp)
-                            if entry_r.get('success'):
-                                replacements_made += 1
-                                used_opp_cids.add(best_opp.get('constraint_id', ''))
-                            else:
-                                log.warning(f'  Replacement entry failed: {entry_r.get("reason")}')
-                        else:
-                            log.warning(f'  Liquidation failed: {result.get("reason")}')
-                            break
-                    else:
-                        # Python fallback path: worst_pos = (pid, pos_obj, score, hours, unrealized)
-                        wpid, wpos, wscore, whours, wpnl = worst_pos
-                        wname = list(wpos.markets.values())[0].get('name', '?')[:40] if wpos.markets else '?'
-                        bname = best_opp.get('market_names', ['?'])[0][:40]
-                        log.info(f'REPLACE: "{wname}" (score={wscore:.6f}, {whours:.0f}h)')
-                        log.info(f'  WITH: "{bname}" (score={best_score:.6f}, {best_hours:.0f}h)')
-                        result = await self.paper_engine.liquidate_position(wpid, self.market_lookup)
-                        if result.get('success'):
-                            log.info(f'  Liquidated: freed ${result["freed_capital"]:.2f}, '
-                                     f'realized ${result["actual_profit"]:+.2f}')
+                    # worst_pos = (pid, name, score, hours, eval_result)
+                    wpid, wname, wscore, whours, eval_r = worst_pos
+                    if not eval_r.get('worth_replacing', False):
+                        # This position can't be profitably liquidated — exclude it and retry
+                        log.debug(f'  Skip replace "{wname}": net_gain=${eval_r.get("net_gain",0):+.2f} (not worth it)')
+                        excluded_pids.add(wpid)
+                        continue  # Retry while loop — will find next worst (skipping excluded)
+                    bname = best_opp.get('market_names', ['?'])[0][:40]
+                    log.info(f'REPLACE: "{wname}" (score={wscore:.6f}, {whours:.0f}h, '
+                             f'liq_profit=${eval_r["liquidation_profit"]:+.2f})')
+                    log.info(f'  WITH: "{bname}" (score={best_score:.6f}, {best_hours:.0f}h, '
+                             f'net_gain=${eval_r["net_gain"]:+.2f})')
+                    result = self._pm_liquidate(wpid, 'replaced')
+                    if result.get('success'):
+                        log.info(f'  Liquidated: freed ${result["freed_capital"]:.2f}, '
+                                 f'realized ${result["actual_profit"]:+.2f}')
+                        # Enter the replacement
+                        cap = dynamic_capital(self._pm_capital(), self.capital_pct)
+                        best_opp['total_capital_required'] = cap
+                        old_cap = sum(best_opp.get('optimal_bets', {}).values())
+                        if old_cap > 0:
+                            scale = cap / old_cap
+                            best_opp['optimal_bets'] = {k: v * scale for k, v in best_opp['optimal_bets'].items()}
+                            best_opp['expected_profit'] = best_opp.get('expected_profit', 0) * scale
+                        entry_r = self._pm_enter(best_opp)
+                        if entry_r.get('success'):
                             replacements_made += 1
                             used_opp_cids.add(best_opp.get('constraint_id', ''))
                         else:
-                            log.warning(f'  Liquidation failed: {result.get("reason")}')
-                            break
+                            log.warning(f'  Replacement entry failed: {entry_r.get("reason")}')
+                    else:
+                        log.warning(f'  Liquidation failed: {result.get("reason")}')
+                        break
                 else:
                     break  # No more profitable swaps
 
@@ -1774,18 +1682,16 @@ class TradingEngine:
                 # --- Monitor open positions (periodic) ---
                 if (now - self._last_monitor) >= self.MONITOR_INTERVAL:
                     if self._pm_open_count() > 0:
-                        if self.rust_pm:
-                            # A1: Use Rust PM check_resolutions directly
-                            market_prices = self._build_market_prices()
-                            resolved = self.rust_pm.check_resolutions(market_prices)
-                            for pid, winning_mid in resolved:
-                                result = self.rust_pm.close_on_resolution(pid, winning_mid)
-                                if result:
-                                    payout, profit = result
-                                    log.info(f'RESOLVED {pid[:40]}: payout=${payout:.2f} profit=${profit:.2f}')
-                        else:
-                            markets_list = list(self.market_lookup.values())
-                            await self.paper_engine.monitor_positions(markets_list)
+                        if not self.rust_pm:
+                            raise RuntimeError('rust_pm not wired — cannot monitor positions')
+                        # A1: Use Rust PM check_resolutions directly
+                        market_prices = self._build_market_prices()
+                        resolved = self.rust_pm.check_resolutions(market_prices)
+                        for pid, winning_mid in resolved:
+                            result = self.rust_pm.close_on_resolution(pid, winning_mid)
+                            if result:
+                                payout, profit = result
+                                log.info(f'RESOLVED {pid[:40]}: payout=${payout:.2f} profit=${profit:.2f}')
                     # Proactive exit: DISABLED — needs validation before production use
                     # self._check_proactive_exits()
                     self._last_monitor = now
@@ -1836,17 +1742,15 @@ class TradingEngine:
                     self._ws_resolved_markets.clear()
                     log.info(f'WS resolution trigger: {len(resolved)} markets')
                     if self._pm_open_count() > 0:
-                        if self.rust_pm:
-                            market_prices = self._build_market_prices()
-                            resolved_positions = self.rust_pm.check_resolutions(market_prices)
-                            for pid, winning_mid in resolved_positions:
-                                result = self.rust_pm.close_on_resolution(pid, winning_mid)
-                                if result:
-                                    payout, profit = result
-                                    log.info(f'RESOLVED {pid[:40]}: payout=${payout:.2f} profit=${profit:.2f}')
-                        else:
-                            markets_list = list(self.market_lookup.values())
-                            await self.paper_engine.monitor_positions(markets_list)
+                        if not self.rust_pm:
+                            raise RuntimeError('rust_pm not wired — cannot check WS resolutions')
+                        market_prices = self._build_market_prices()
+                        resolved_positions = self.rust_pm.check_resolutions(market_prices)
+                        for pid, winning_mid in resolved_positions:
+                            result = self.rust_pm.close_on_resolution(pid, winning_mid)
+                            if result:
+                                payout, profit = result
+                                log.info(f'RESOLVED {pid[:40]}: payout=${payout:.2f} profit=${profit:.2f}')
 
                 # --- Save state (periodic) ---
                 if (now - self._last_state_save) >= self.STATE_SAVE_INTERVAL:
