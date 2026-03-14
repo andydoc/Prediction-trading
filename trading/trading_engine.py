@@ -1623,14 +1623,13 @@ class TradingEngine:
         self._running = True
         write_status('starting')
 
-        # 1. Load execution state (SQLite is the source of truth)
-        if EXEC_STATE.exists():
-            try:
-                self.paper_engine.load_state(EXEC_STATE)
-                log.info(f'State loaded: ${self.paper_engine.current_capital:.2f} capital, '
-                         f'{len(self.paper_engine.open_positions)} positions')
-            except Exception as e:
-                log.warning(f'Could not load state: {e}')
+        # 1. Load execution state (SQLite is the source of truth; JSON only for migration)
+        try:
+            self.paper_engine.load_state(EXEC_STATE)
+            log.info(f'State loaded: ${self.paper_engine.current_capital:.2f} capital, '
+                     f'{len(self.paper_engine.open_positions)} positions')
+        except Exception as e:
+            log.warning(f'Could not load state: {e}')
 
         # 1b. Initialize positions in Rust WS engine (merged — no separate RustPositionManager)
         #     Wire self.rust_pm = self.rust_ws so ALL position ops go through Rust (A1)
