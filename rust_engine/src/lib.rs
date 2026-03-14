@@ -20,6 +20,7 @@ mod eval;
 mod position;
 mod ws;
 mod dashboard;
+mod resolution;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -610,5 +611,6 @@ fn get_float(d: &Bound<'_, PyDict>, key: &str) -> Option<f64> {
 fn rust_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RustWsEngine>()?;
     m.add_class::<RustStateDB>()?;
+    m.add_class::<resolution::RustResolutionValidator>()?;
     Ok(())
 }

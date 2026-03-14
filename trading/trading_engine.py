@@ -43,10 +43,7 @@ from trading.live_trading import LiveTradingEngine
 from market_data.market_data import MarketData
 from constraint_detection.constraint_detector import ConstraintDetector
 from arbitrage_math.arbitrage_engine import ArbitrageMathEngine
-from utilities.resolution_validator import (
-    get_validated_resolution_date, get_full_validation,
-    _load_cache as load_resolution_cache
-)
+# Resolution validator: ported to Rust (A2) — see rust_engine/src/resolution.rs
 from utilities.postponement_detector import check_postponement
 from trading.websocket_manager import (
     WebSocketManager, get_asset_ids_for_constraints,
@@ -391,6 +388,12 @@ class TradingEngine:
             or os.environ.get('ANTHROPIC_API_KEY', '')
         )
 
+        # A2: Rust resolution validator (reads config/prompts.yaml + config/config.yaml)
+        self.rust_rv = rust_engine.RustResolutionValidator(
+            workspace=str(WORKSPACE),
+            api_key=self.anthropic_api_key,
+        )
+
         live_cfg = config.get('live_trading', {})
         self.live_enabled = True  # Always enabled — paper mode retired, shadow is minimum
         self.shadow_only = live_cfg.get('shadow_only', True)  # Default shadow if not specified
@@ -557,7 +560,9 @@ class TradingEngine:
                 })
         self.rust_ws.set_constraints(rust_constraints)
         # Also set eval config with current capital
-        cap = dynamic_capital(self._pm_capital(), self.capital_pct)
+        # Use rust_pm if wired, else paper_engine (init phase: rust_pm not yet assigned)
+        raw_cap = self.rust_pm.current_capital() if self.rust_pm else self.paper_engine.current_capital
+        cap = dynamic_capital(raw_cap, self.capital_pct)
         arb_cfg = self.config.get('arbitrage', {})
         self.rust_ws.set_eval_config(
             cap,
@@ -712,6 +717,7 @@ class TradingEngine:
         if len(all_closed_dicts) > db_closed:
             store.upsert_positions_bulk(all_closed_dicts[db_closed:], 'closed')
         store.backup_to_disk()
+        self.rust_rv.mirror_to_disk()
 
         ms = (_t.time() - t0) * 1000
         log.info(f'Saved state (Rust PM → SQLite): {len(open_dicts)} open, '
@@ -1185,15 +1191,13 @@ class TradingEngine:
         if opportunity_overlaps_held(opp_dict, held_mids):
             return False
 
-        # AI resolution validation
+        # AI resolution validation (Rust — A2)
         if self.resolution_validation_enabled and self.anthropic_api_key:
             try:
                 market_ids = opp_dict.get('market_ids', [])
-                validation = get_full_validation(
-                    market_ids=market_ids,
-                    market_lookup=self.market_lookup,
-                    api_key=self.anthropic_api_key,
-                    group_id=constraint_id
+                validation = self.rust_rv.validate(
+                    group_id=constraint_id,
+                    market_id=int(market_ids[0]) if market_ids else 0,
                 )
                 if validation:
                     if validation.get('has_unrepresented_outcome', False):
@@ -1411,7 +1415,7 @@ class TradingEngine:
                     # Get validated resolution date
                     pos_end = None
                     if cid and self.resolution_validation_enabled:
-                        cached = load_resolution_cache(cid)
+                        cached = self.rust_rv.load_cache(group_id=cid)
                         if cached and 'latest_resolution_date' in cached:
                             try:
                                 pos_end = datetime.strptime(
@@ -1692,8 +1696,7 @@ class TradingEngine:
                             if result:
                                 payout, profit = result
                                 log.info(f'RESOLVED {pid[:40]}: payout=${payout:.2f} profit=${profit:.2f}')
-                    # Proactive exit: DISABLED — needs validation before production use
-                    # self._check_proactive_exits()
+                    self._check_proactive_exits()
                     self._last_monitor = now
 
                 # --- Check for postponed events (periodic, threaded) ---
