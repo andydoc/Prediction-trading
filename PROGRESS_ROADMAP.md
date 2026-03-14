@@ -1,7 +1,7 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.05.01
+> **Version**: v0.05.02
 > **Last updated**: 2026-03-14  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
@@ -735,6 +735,16 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 Most recent first. Each entry summarises what changed and why. Full implementation detail is in the git log.
 
 ---
+
+### v0.05.02 (2026-03-14) — A3: Port postponement detector to Rust
+- **ADDED** `rust_engine/src/postponement.rs` — `RustPostponementDetector` PyO3 class
+  - Anthropic API with `web_search_20250305` tool for event postponement detection
+  - Two-attempt retry strategy with context injection
+  - Rate limiting (60s between API calls) via `Mutex<Instant>`
+  - In-memory SQLite cache with disk backup, date buffer + midnight rounding
+- **CHANGED** `trading_engine.py`: `self.rust_pp.check()` replaces Python `check_postponement()`
+- **CHANGED** Replacement scoring reads `self.rust_pp.load_cache(pid)` instead of broken `pos_meta.get('postponement')`
+- **FIX** Postponement results were never stored since A1 (`pos.metadata` referenced undefined `pos` variable)
 
 ### v0.05.01 (2026-03-14) — A2: Port resolution validator to Rust
 - **ADDED** `rust_engine/src/resolution.rs` — `RustResolutionValidator` PyO3 class
