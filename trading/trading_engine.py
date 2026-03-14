@@ -44,7 +44,7 @@ from market_data.market_data import MarketData
 from constraint_detection.constraint_detector import ConstraintDetector
 from arbitrage_math.arbitrage_engine import ArbitrageMathEngine
 # Resolution validator: ported to Rust (A2) — see rust_engine/src/resolution.rs
-from utilities.postponement_detector import check_postponement
+# Postponement detector: ported to Rust (A3)
 from trading.websocket_manager import (
     WebSocketManager, get_asset_ids_for_constraints,
     get_condition_ids_for_positions
@@ -394,6 +394,12 @@ class TradingEngine:
             api_key=self.anthropic_api_key,
         )
 
+        # A3: Rust postponement detector (web_search + two-attempt retry)
+        self.rust_pp = rust_engine.RustPostponementDetector(
+            workspace=str(WORKSPACE),
+            api_key=self.anthropic_api_key,
+        )
+
         live_cfg = config.get('live_trading', {})
         self.live_enabled = True  # Always enabled — paper mode retired, shadow is minimum
         self.shadow_only = live_cfg.get('shadow_only', True)  # Default shadow if not specified
@@ -718,6 +724,7 @@ class TradingEngine:
             store.upsert_positions_bulk(all_closed_dicts[db_closed:], 'closed')
         store.backup_to_disk()
         self.rust_rv.mirror_to_disk()
+        self.rust_pp.mirror_to_disk()
 
         ms = (_t.time() - t0) * 1000
         log.info(f'Saved state (Rust PM → SQLite): {len(open_dicts)} open, '
@@ -1264,32 +1271,22 @@ class TradingEngine:
             if hours_overdue < overdue_threshold_h:
                 continue
 
-            # Position is overdue — check for postponement
+            # Position is overdue — check for postponement (A3: Rust detector)
             pos_id = pos_dict.get('position_id', '')
             market_names = [m.get('name', '?') for m in pos_dict.get('markets', {}).values()]
 
-            result = check_postponement(
+            result = self.rust_pp.check(
                 position_id=pos_id,
                 market_names=market_names,
                 original_date=expected_date_str,
-                ai_config=self.ai_config,
             )
             checked += 1
 
             if result and result.get('effective_resolution_date'):
-                # Store in position metadata for replacement scoring
-                if hasattr(pos, 'metadata') and isinstance(pos.metadata, dict):
-                    pos.metadata['postponement'] = {
-                        'status': result.get('status'),
-                        'new_date': result.get('new_date'),
-                        'effective_date': result.get('effective_resolution_date'),
-                        'confidence': result.get('date_confidence'),
-                        'reason': result.get('reason', ''),
-                        'checked_at': result.get('checked_at'),
-                    }
-                    log.info(f'Postponement detected: {market_names[0][:40]}... '
-                             f'→ {result.get("effective_resolution_date")} '
-                             f'({result.get("date_confidence")})')
+                # Results stored in rust_pp cache — scoring reads via load_cache()
+                log.info(f'Postponement detected: {market_names[0][:40]}... '
+                         f'→ {result.get("effective_resolution_date")} '
+                         f'({result.get("date_confidence")})')
 
         if checked > 0:
             log.info(f'Postponement check: scanned {checked} overdue positions')
@@ -1434,12 +1431,12 @@ class TradingEngine:
                                     pos_end = ed
                     if pos_end is None:
                         continue
-                    # Postponement override
-                    pp_meta = pos_meta.get('postponement', {})
-                    if pp_meta and pp_meta.get('effective_date'):
+                    # Postponement override (A3: read from Rust cache)
+                    pp_data = self.rust_pp.load_cache(position_id=pid)
+                    if pp_data and pp_data.get('effective_resolution_date'):
                         try:
                             pp_end = datetime.strptime(
-                                pp_meta['effective_date'], '%Y-%m-%d'
+                                pp_data['effective_resolution_date'], '%Y-%m-%d'
                             ).replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
                             pos_end = pp_end
                         except (ValueError, TypeError):
