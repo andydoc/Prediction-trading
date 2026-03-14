@@ -578,7 +578,7 @@ class TradingEngine:
 
     def _pm_open_count(self) -> int:
         if self.rust_pm:
-            return self.rust_pm.open_count()
+            return self.rust_pm.pm_open_count()
         return len(self.paper_engine.open_positions)
 
     def _pm_held_cids(self) -> set:
