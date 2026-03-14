@@ -1631,25 +1631,6 @@ class TradingEngine:
         except Exception as e:
             log.warning(f'Could not load state: {e}')
 
-        # 1b. Initialize positions in Rust WS engine (merged — no separate RustPositionManager)
-        #     Wire self.rust_pm = self.rust_ws so ALL position ops go through Rust (A1)
-        if self.rust_ws:
-            try:
-                fee_rate = self.config.get('arbitrage', {}).get('fees', {}).get('polymarket_taker_fee', 0.0001)
-                self.rust_ws.init_positions(self.paper_engine.initial_capital, fee_rate)
-                # Import existing positions from paper engine
-                open_jsons = [json.dumps(p.to_dict()) for p in self.paper_engine.open_positions.values()]
-                closed_jsons = [json.dumps(p.to_dict()) for p in self.paper_engine.closed_positions]
-                self.rust_ws.import_positions(open_jsons, closed_jsons,
-                                             self.paper_engine.current_capital,
-                                             self.paper_engine.initial_capital)
-                # A1: Wire rust_pm so all _pm_* helpers use Rust directly
-                self.rust_pm = self.rust_ws
-                log.info(f'Rust PM wired (A1): ${self.rust_ws.current_capital():.2f} capital, '
-                         f'{self.rust_ws.pm_open_count()} open, {self.rust_ws.pm_closed_count()} closed')
-            except Exception as e:
-                log.warning(f'Rust PM init failed: {e}')
-
         # 2. Wait for markets (Market Scanner must have run at least once)
         log.info('Waiting for Market Scanner output...')
         while self._running and not MARKETS_PATH.exists():
@@ -1710,6 +1691,18 @@ class TradingEngine:
                 # Start WS connections + dashboard (non-blocking, spawns tokio tasks)
                 self.rust_ws.start(all_assets, dashboard_port=5556)
                 log.info(f'Rust WS engine + dashboard started: {len(all_assets)} assets')
+
+                # A1: Init Rust PM and wire self.rust_pm for all position operations
+                fee_rate = self.config.get('arbitrage', {}).get('fees', {}).get('polymarket_taker_fee', 0.0001)
+                self.rust_ws.init_positions(self.paper_engine.initial_capital, fee_rate)
+                open_jsons = [json.dumps(p.to_dict()) for p in self.paper_engine.open_positions.values()]
+                closed_jsons = [json.dumps(p.to_dict()) for p in self.paper_engine.closed_positions]
+                self.rust_ws.import_positions(open_jsons, closed_jsons,
+                                             self.paper_engine.current_capital,
+                                             self.paper_engine.initial_capital)
+                self.rust_pm = self.rust_ws
+                log.info(f'Rust PM wired (A1): ${self.rust_ws.current_capital():.2f} capital, '
+                         f'{self.rust_ws.pm_open_count()} open, {self.rust_ws.pm_closed_count()} closed')
             except Exception as e:
                 log.warning(f'Rust WS engine failed: {e} — falling back to Python WS')
                 self.rust_ws = None
