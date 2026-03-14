@@ -626,7 +626,7 @@ fn build_closed(s: &DashboardState) -> Value {
         let row = json!({
             "name": short_name, "deployed": (deployed * 100.0).round() / 100.0,
             "pnl": (actual * 100.0).round() / 100.0, "hold": hold_str,
-            "closed_at": close_dt_str, "strategy": strategy,
+            "closed_at": close_dt_str, "strategy": fmt_strategy(strategy, method),
             "legs": legs, "full_names": full_names,
             "_sort_ts": close_ts,
         });
