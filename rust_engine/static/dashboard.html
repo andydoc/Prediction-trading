@@ -412,13 +412,13 @@ function renderClosed(d) {
   var expanded = getExpandedKeys('closed-container');
   var h = '';
   var ridx = 0;
-  var order = ['resolved','replaced_profit','replaced_loss','replaced_even'];
+  var order = ['resolved','proactive_exit','replaced_profit','replaced_loss','replaced_even'];
   order.forEach(function(key) {
     var cat = d.categories[key];
     if (!cat || cat.rows.length === 0) return;
     var cls = cat.collapsed ? 'collapsed' : '';
     var hide = cat.collapsed ? 'hidden' : '';
-    var dateCol = (key === 'resolved') ? 'Resolved' : 'Replaced';
+    var dateCol = (key === 'resolved') ? 'Resolved' : (key === 'proactive_exit') ? 'Exited' : 'Replaced';
     h += '<h3 class="sub-section-title '+cls+'" onclick="toggleSection(this)">'+esc(cat.label)+' ('+cat.rows.length+')</h3>';
     h += '<div class="section-content '+hide+'"><table>';
     h += '<tr><th>Market</th><th>Strategy</th><th>Deployed</th><th>P&amp;L</th><th>Held</th><th>'+dateCol+'</th></tr>';

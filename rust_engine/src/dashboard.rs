@@ -554,6 +554,7 @@ fn build_opportunities(s: &DashboardState) -> Value {
 fn build_closed(s: &DashboardState) -> Value {
     let closed_jsons = s.positions.lock().get_closed_positions_json();
     let mut resolved = Vec::new();
+    let mut proactive_exit = Vec::new();
     let mut replaced_profit = Vec::new();
     let mut replaced_loss = Vec::new();
     let mut replaced_even = Vec::new();
@@ -632,7 +633,8 @@ fn build_closed(s: &DashboardState) -> Value {
 
         match reason {
             "resolved" | "expired" => resolved.push(row),
-            "replaced" | "proactive_exit" => {
+            "proactive_exit" => proactive_exit.push(row),
+            "replaced" => {
                 if actual > 0.01 { replaced_profit.push(row) }
                 else if actual < -0.01 { replaced_loss.push(row) }
                 else { replaced_even.push(row) }
@@ -642,16 +644,17 @@ fn build_closed(s: &DashboardState) -> Value {
     }
 
     // Sort each category by close time descending
-    for cat in [&mut resolved, &mut replaced_profit, &mut replaced_loss, &mut replaced_even] {
+    for cat in [&mut resolved, &mut proactive_exit, &mut replaced_profit, &mut replaced_loss, &mut replaced_even] {
         cat.sort_by(|a, b| b["_sort_ts"].as_f64().unwrap_or(0.0)
             .partial_cmp(&a["_sort_ts"].as_f64().unwrap_or(0.0)).unwrap());
     }
 
-    let total = resolved.len() + replaced_profit.len() + replaced_loss.len() + replaced_even.len();
+    let total = resolved.len() + proactive_exit.len() + replaced_profit.len() + replaced_loss.len() + replaced_even.len();
     json!({
         "total_closed": total,
         "categories": {
             "resolved": { "label": "Resolved", "rows": resolved, "collapsed": resolved.len() > 10 },
+            "proactive_exit": { "label": "Proactive Exit", "rows": proactive_exit, "collapsed": false },
             "replaced_profit": { "label": "Replaced (Profit)", "rows": replaced_profit, "collapsed": false },
             "replaced_loss": { "label": "Replaced (Loss)", "rows": replaced_loss, "collapsed": false },
             "replaced_even": { "label": "Closed Early", "rows": replaced_even, "collapsed": true },
