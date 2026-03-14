@@ -1,7 +1,7 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.05.00
+> **Version**: v0.05.01
 > **Last updated**: 2026-03-14  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
@@ -735,6 +735,18 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 Most recent first. Each entry summarises what changed and why. Full implementation detail is in the git log.
 
 ---
+
+### v0.05.01 (2026-03-14) — A2: Port resolution validator to Rust
+- **ADDED** `rust_engine/src/resolution.rs` — `RustResolutionValidator` PyO3 class
+  - `reqwest::blocking` HTTP client for Polymarket Gamma API + Anthropic Messages API
+  - In-memory SQLite cache with disk backup (`StateDB` pattern, `mirror_to_disk()`)
+  - `serde_yaml` for reading `config/prompts.yaml` + `config/config.yaml` directly in Rust
+  - `py.allow_threads()` GIL release during all blocking HTTP calls
+- **CHANGED** `trading_engine.py`: `self.rust_rv.validate()` replaces Python `get_full_validation()`
+- **CHANGED** `trading_engine.py`: `self.rust_rv.load_cache()` replaces Python `load_resolution_cache()`
+- **CHANGED** `_save_state()`: calls `self.rust_rv.mirror_to_disk()` for cache persistence
+- **FIX** `_load_constraints_into_rust()` called `_pm_capital()` before `rust_pm` wired — used `paper_engine.current_capital` fallback
+- **DEPS** Added `reqwest 0.12` (blocking+json+rustls-tls), `serde_yaml 0.9` to Cargo.toml
 
 ### v0.05.00 (2026-03-14) — A1: Remove paper_engine middleman
 - **CHANGED** `self.rust_pm = self.rust_ws` wired in `run()` after Rust PM init — all position ops now go through Rust directly
