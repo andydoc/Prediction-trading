@@ -557,7 +557,7 @@ class TradingEngine:
                 })
         self.rust_ws.set_constraints(rust_constraints)
         # Also set eval config with current capital
-        cap = dynamic_capital(self.paper_engine.current_capital, self.capital_pct)
+        cap = dynamic_capital(self._pm_capital(), self.capital_pct)
         arb_cfg = self.config.get('arbitrage', {})
         self.rust_ws.set_eval_config(
             cap,
@@ -593,28 +593,28 @@ class TradingEngine:
 
     def _pm_enter(self, opp_dict: dict) -> dict:
         """Enter position via Rust PM. Returns {'ok': bool, 'position_id': str, ...}."""
-        if self.rust_pm:
-            meta = opp_dict.get('metadata', {})
-            method = meta.get('method', opp_dict.get('method', 'unknown'))
-            strategy = meta.get('strategy', 'arb_sell' if 'sell' in method else 'arb_buy')
-            is_sell = 'sell' in method.lower()
-            result = self.rust_pm.enter_position(
-                opp_dict.get('opportunity_id', opp_dict.get('constraint_id', '')),
-                opp_dict.get('constraint_id', ''),
-                strategy, method,
-                opp_dict.get('market_ids', []),
-                opp_dict.get('market_names', []),
-                opp_dict.get('current_prices', {}),
-                opp_dict.get('optimal_bets', {}),
-                opp_dict.get('expected_profit', 0),
-                opp_dict.get('expected_profit_pct', 0),
-                is_sell,
-            )
-            if result.get('ok'):
-                return {'success': True, 'position_id': result['position_id']}
-            return {'success': False, 'reason': result.get('reason', 'unknown')}
-        # Fallback: paper engine (async, but called from sync context — should not happen)
-        return {'success': False, 'reason': 'no_rust_pm'}
+        if not self.rust_pm:
+            return {'success': False, 'reason': 'no_rust_pm'}
+        meta = opp_dict.get('metadata', {})
+        method = meta.get('method', opp_dict.get('method', 'unknown'))
+        strategy = meta.get('strategy', 'arb_sell' if 'sell' in method else 'arb_buy')
+        is_sell = 'sell' in method.lower()
+        result = self.rust_pm.enter_position(
+            opp_dict.get('opportunity_id', opp_dict.get('constraint_id', '')),
+            opp_dict.get('constraint_id', ''),
+            strategy, method,
+            opp_dict.get('market_ids', []),
+            opp_dict.get('market_names', []),
+            opp_dict.get('current_prices', {}),
+            opp_dict.get('current_no_prices', {}),
+            opp_dict.get('optimal_bets', {}),
+            opp_dict.get('expected_profit', 0),
+            opp_dict.get('expected_profit_pct', 0),
+            is_sell,
+        )
+        if result.get('ok'):
+            return {'success': True, 'position_id': result['position_id']}
+        return {'success': False, 'reason': result.get('reason', 'unknown')}
 
     def _pm_get_current_bids(self, position_json: str) -> dict:
         """Get current bid prices for a position's markets from the Rust book mirror."""
@@ -635,6 +635,24 @@ class TradingEngine:
             else:
                 bids[mid] = leg.get('entry_price', 0.5)
         return bids
+
+    def _build_market_prices(self) -> dict:
+        """Build market_id → {outcome → price} dict for Rust check_resolutions.
+        Reads current prices from market_lookup (API snapshot)."""
+        market_prices = {}
+        for mid, md in self.market_lookup.items():
+            prices = {}
+            if hasattr(md, 'outcome_prices') and md.outcome_prices:
+                for outcome, price in md.outcome_prices.items():
+                    prices[outcome] = float(price)
+            elif hasattr(md, 'outcomes') and md.outcomes:
+                for outcome in md.outcomes:
+                    p = getattr(md, f'{outcome.lower()}_price', 0.0)
+                    if p:
+                        prices[outcome] = float(p)
+            if prices:
+                market_prices[str(mid)] = prices
+        return market_prices
 
     def _pm_liquidate(self, position_id: str, reason: str) -> dict:
         """Liquidate via Rust PM (sells shares at current bids)."""
@@ -813,7 +831,7 @@ class TradingEngine:
         book = self.ws_manager.get_book(asset_id)
         if not book or not book.asks:
             return 0.0
-        trade_size = dynamic_capital(self.paper_engine.current_capital, self.capital_pct)
+        trade_size = dynamic_capital(self._pm_capital(), self.capital_pct)
         if HAS_RUST:
             ask_prices = [level.price for level in book.asks]
             ask_sizes = [level.size for level in book.asks]
@@ -898,7 +916,7 @@ class TradingEngine:
         asset_ids_with_books = []
         all_ask_prices = []
         all_ask_sizes = []
-        trade_size = dynamic_capital(self.paper_engine.current_capital, self.capital_pct)
+        trade_size = dynamic_capital(self._pm_capital(), self.capital_pct)
 
         for asset_id in dirty:
             if asset_id not in self.asset_to_constraints:
@@ -1068,7 +1086,7 @@ class TradingEngine:
         # === Rust WS path: full eval pipeline in Rust (Phase 8 P4c) ===
         if self.rust_ws:
             # Update capital for Rust evaluator (changes as positions open/close)
-            cap = dynamic_capital(self.paper_engine.current_capital, self.capital_pct)
+            cap = dynamic_capital(self._pm_capital(), self.capital_pct)
             arb_cfg = self.config.get('arbitrage', {})
             self.rust_ws.set_eval_config(
                 cap,
@@ -1162,8 +1180,8 @@ class TradingEngine:
             max_days = self.max_days_entry
 
         constraint_id = opp_dict.get('constraint_id', '')
-        held_cids = get_held_constraint_ids(self.paper_engine)
-        held_mids = get_held_market_ids(self.paper_engine)
+        held_cids = self._pm_held_cids()
+        held_mids = self._pm_held_mids()
 
         # Already held?
         if constraint_id in held_cids:
@@ -1214,11 +1232,16 @@ class TradingEngine:
         now = datetime.now(timezone.utc)
         checked = 0
 
-        for pos in list(self.paper_engine.open_positions.values()):
+        # A1: Iterate Rust PM positions (JSON dicts) instead of paper_engine
+        if self.rust_pm:
+            open_positions = [json.loads(j) for j in self.rust_pm.get_open_positions_json()]
+        else:
+            open_positions = [pos.to_dict() if hasattr(pos, 'to_dict') else pos
+                              for pos in self.paper_engine.open_positions.values()]
+        for pos_dict in open_positions:
             # Get expected resolution date from position metadata or market end_date
             expected_date_str = None
-            meta = pos.metadata if hasattr(pos, 'metadata') else (pos.get('metadata', {}) if isinstance(pos, dict) else {})
-            pos_dict = pos.to_dict() if hasattr(pos, 'to_dict') else pos
+            meta = pos_dict.get('metadata', {})
 
             # Try AI-validated date first, then raw end_date
             for mid in pos_dict.get('markets', {}):
@@ -1610,6 +1633,7 @@ class TradingEngine:
                 log.warning(f'Could not load state: {e}')
 
         # 1b. Initialize positions in Rust WS engine (merged — no separate RustPositionManager)
+        #     Wire self.rust_pm = self.rust_ws so ALL position ops go through Rust (A1)
         if self.rust_ws:
             try:
                 fee_rate = self.config.get('arbitrage', {}).get('fees', {}).get('polymarket_taker_fee', 0.0001)
@@ -1620,7 +1644,9 @@ class TradingEngine:
                 self.rust_ws.import_positions(open_jsons, closed_jsons,
                                              self.paper_engine.current_capital,
                                              self.paper_engine.initial_capital)
-                log.info(f'Rust PM initialised: ${self.rust_ws.current_capital():.2f} capital, '
+                # A1: Wire rust_pm so all _pm_* helpers use Rust directly
+                self.rust_pm = self.rust_ws
+                log.info(f'Rust PM wired (A1): ${self.rust_ws.current_capital():.2f} capital, '
                          f'{self.rust_ws.pm_open_count()} open, {self.rust_ws.pm_closed_count()} closed')
             except Exception as e:
                 log.warning(f'Rust PM init failed: {e}')
@@ -1725,8 +1751,7 @@ class TradingEngine:
 
         mode_str = 'shadow' if self.shadow_only else 'live'
         log.info(f'Trading Engine ready [{mode_str.upper()}] — entering event loop')
-        write_status('running', self.paper_engine.current_capital,
-                     len(self.paper_engine.open_positions))
+        write_status('running', self._pm_capital(), self._pm_open_count())
 
         # Phase 8a: Event-based eval wake (replaces asyncio.sleep(1.0))
         self._eval_wake = asyncio.Event()
@@ -1756,16 +1781,26 @@ class TradingEngine:
 
                 # --- Monitor open positions (periodic) ---
                 if (now - self._last_monitor) >= self.MONITOR_INTERVAL:
-                    if self.paper_engine.open_positions:
-                        markets_list = list(self.market_lookup.values())
-                        await self.paper_engine.monitor_positions(markets_list)
+                    if self._pm_open_count() > 0:
+                        if self.rust_pm:
+                            # A1: Use Rust PM check_resolutions directly
+                            market_prices = self._build_market_prices()
+                            resolved = self.rust_pm.check_resolutions(market_prices)
+                            for pid, winning_mid in resolved:
+                                result = self.rust_pm.close_on_resolution(pid, winning_mid)
+                                if result:
+                                    payout, profit = result
+                                    log.info(f'RESOLVED {pid[:40]}: payout=${payout:.2f} profit=${profit:.2f}')
+                        else:
+                            markets_list = list(self.market_lookup.values())
+                            await self.paper_engine.monitor_positions(markets_list)
                     # Proactive exit: DISABLED — needs validation before production use
                     # self._check_proactive_exits()
                     self._last_monitor = now
 
                 # --- Check for postponed events (periodic, threaded) ---
                 if (now - self._last_postponement_check) >= self.POSTPONEMENT_CHECK_INTERVAL:
-                    if self.paper_engine.open_positions and self.ai_config.get('postponement', {}).get('enabled', False):
+                    if self._pm_open_count() > 0 and self.ai_config.get('postponement', {}).get('enabled', False):
                         await loop.run_in_executor(
                             self._executor,
                             self._check_postponements
@@ -1808,9 +1843,18 @@ class TradingEngine:
                     resolved = list(self._ws_resolved_markets)
                     self._ws_resolved_markets.clear()
                     log.info(f'WS resolution trigger: {len(resolved)} markets')
-                    if self.paper_engine.open_positions:
-                        markets_list = list(self.market_lookup.values())
-                        await self.paper_engine.monitor_positions(markets_list)
+                    if self._pm_open_count() > 0:
+                        if self.rust_pm:
+                            market_prices = self._build_market_prices()
+                            resolved_positions = self.rust_pm.check_resolutions(market_prices)
+                            for pid, winning_mid in resolved_positions:
+                                result = self.rust_pm.close_on_resolution(pid, winning_mid)
+                                if result:
+                                    payout, profit = result
+                                    log.info(f'RESOLVED {pid[:40]}: payout=${payout:.2f} profit=${profit:.2f}')
+                        else:
+                            markets_list = list(self.market_lookup.values())
+                            await self.paper_engine.monitor_positions(markets_list)
 
                 # --- Save state (periodic) ---
                 if (now - self._last_state_save) >= self.STATE_SAVE_INTERVAL:
@@ -1818,8 +1862,8 @@ class TradingEngine:
                     self._save_state()
                     self._last_state_save = now
 
-                    cap = self.paper_engine.current_capital
-                    npos = len(self.paper_engine.open_positions)
+                    cap = self._pm_capital()
+                    npos = self._pm_open_count()
                     write_status('running', cap, npos)
 
                 # --- Phase 8l: Stale-asset re-subscribe sweep (every 60s) ---
@@ -1909,8 +1953,8 @@ class TradingEngine:
                             'lat_p95_us': round(lat_p95),
                             'lat_max_us': round(lat_max),
                         })
-                    cap = self.paper_engine.current_capital
-                    npos = len(self.paper_engine.open_positions)
+                    cap = self._pm_capital()
+                    npos = self._pm_open_count()
                     log.info(f'[iter {self._iteration}] Capital=${cap:.2f} '
                              f'positions={npos}{ws_info}')
                     write_status('running', cap, npos, engine_metrics=engine_metrics)
@@ -1978,4 +2022,3 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          

@@ -1,8 +1,8 @@
 # Prediction Market Arbitrage System
 # User Guide · Architecture · Roadmap · Progress
 
-> **Version**: v0.04.14  
-> **Last updated**: 2026-03-12 ~09:50 UTC  
+> **Version**: v0.05.00
+> **Last updated**: 2026-03-14  
 > **Mode**: SHADOW  
 > **Laptop**: running (authoritative development machine)  
 > **VPS**: ZAP-Hosting Lifetime (193.23.127.99) — 4 cores, 4 GB RAM, Ubuntu 24.04, systemd auto-restart, $100 fresh capital  
@@ -735,6 +735,18 @@ The Rust arb math port achieved 19,000× speedup (80 ms → 4.2 µs) but total s
 Most recent first. Each entry summarises what changed and why. Full implementation detail is in the git log.
 
 ---
+
+### v0.05.00 (2026-03-14) — A1: Remove paper_engine middleman
+- **CHANGED** `self.rust_pm = self.rust_ws` wired in `run()` after Rust PM init — all position ops now go through Rust directly
+- **CHANGED** `_pm_enter()`: early-return pattern, added missing `current_no_prices` parameter to `enter_position()` call
+- **CHANGED** `_validate_opportunity()`: uses `self._pm_held_cids()` / `self._pm_held_mids()` instead of `get_held_*_ids(paper_engine)`
+- **CHANGED** All `paper_engine.current_capital` / `paper_engine.open_positions` reads in hot path replaced with `self._pm_capital()` / `self._pm_open_count()`
+- **CHANGED** Monitoring loop: uses Rust `check_resolutions()` + `close_on_resolution()` instead of `paper_engine.monitor_positions()`
+- **CHANGED** WS resolution trigger: same Rust PM path
+- **CHANGED** `_check_postponements()`: iterates Rust PM positions via `get_open_positions_json()` instead of `paper_engine.open_positions`
+- **ADDED** `_build_market_prices()`: constructs `market_id → {outcome → price}` dict for Rust `check_resolutions()`
+- **KEPT** `paper_engine` as fallback (all paths have `else` branch) and for bootstrap state loading
+- **FIX** Stripped trailing null bytes from `trading_engine.py` (Windows FS artifact)
 
 ### v0.04.14 (2026-03-12) — Rust Eval Pipeline Wired (Phase 8 P4c integration complete)
 - **ADDED** `_load_constraints_into_rust()`: builds constraint+market data, loads into Rust evaluator with `set_constraints()` + `set_eval_config()`
