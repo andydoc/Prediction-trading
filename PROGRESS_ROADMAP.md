@@ -747,6 +747,10 @@ Most recent first. Each entry summarises what changed and why. Full implementati
 - **ADDED** `_build_market_prices()`: constructs `market_id → {outcome → price}` dict for Rust `check_resolutions()`
 - **KEPT** `paper_engine` as fallback (all paths have `else` branch) and for bootstrap state loading
 - **FIX** Stripped trailing null bytes from `trading_engine.py` (Windows FS artifact)
+- **FIX** State loading no longer gated on `.json` file existence (pre-existing bug since v0.03.00)
+- **FIX** PM init moved after `rust_ws.start()` (was unreachable at step 1b, before rust_ws creation at step 6a)
+- **FIX** `open_count()` → `pm_open_count()` (PyO3 method name mismatch)
+- **INCIDENT** INC-007: 4 positions lost on restart due to state-load bug (see Incident Log)
 
 ### v0.04.14 (2026-03-12) — Rust Eval Pipeline Wired (Phase 8 P4c integration complete)
 - **ADDED** `_load_constraints_into_rust()`: builds constraint+market data, loads into Rust evaluator with `set_constraints()` + `set_eval_config()`
@@ -954,6 +958,20 @@ Most recent first. Each entry summarises what changed and why. Full implementati
 ---
 
 ## 8. Incident Log
+
+### INC-007: State lost on A1 restart — pre-existing state-load bug (2026-03-14)
+**Impact:** 4 open positions ($40.01 invested, $59.99 remaining capital) lost. Capital reset to $100.00.
+
+State loading was gated on `execution_state.json` existing, but the actual state lives in `execution_state.db` (SQLite). When the system restarted for A1, `load_state()` was never called because the `.json` file didn't exist. The first save cycle then overwrote the SQLite DB with empty state.
+
+**Root cause:** Pre-existing bug since SQLite migration (v0.03.00). The JSON gate was never triggered because the system hadn't restarted since migration.
+
+**Fix:** Three commits on main:
+1. Remove `.json` existence gate — always call `load_state()` (SQLite internally handles missing DB)
+2. Move PM init after `rust_ws.start()` (was unreachable at step 1b, before rust_ws creation at step 6a)
+3. Fix `open_count()` → `pm_open_count()` (PyO3 method name mismatch)
+
+**Prevention:** State backup before restart should be added (A6 will parameterise this). Consider adding a pre-restart state snapshot.
 
 ### INC-006: Argentine Fecha 9 Postponement — Capital Locked Until May (identified 2026-03-11)
 **Markets:** 1360750–1360752 (River Plate vs CA Tucumán), 1360744–1360746 (Lanús vs CD Riestra)
