@@ -24,38 +24,33 @@ set "SEEN_RESOLVE=0"
 set "SEEN_LIQUIDATE=0"
 set "ALL_CONFIRMED=0"
 
-:: Find today's log file
-for /f "tokens=*" %%D in ('powershell -NoProfile -Command "Get-Date -Format 'yyyyMMdd'"') do set "TODAY=%%D"
-set "LOGFILE=\\wsl.localhost\Ubuntu\home\andydoc\prediction-trader\logs\trading_engine_%TODAY%.log"
+set "LOGDIR=/home/andydoc/prediction-trader/logs"
 
 echo %BOLD%%CYAN%========================================================%RESET%
 echo %BOLD%%CYAN%  Rust PM First-Time Operation Monitor%RESET%
 echo %BOLD%%CYAN%========================================================%RESET%
 echo.
-echo  Log: %LOGFILE%
+echo  Log dir: %LOGDIR%/trading_engine_YYYYMMDD.log
+echo  Handles midnight rollover automatically.
 echo  Watching for first occurrence of each operation type...
 echo.
-echo  %GREEN%[ ] ENTER%RESET%      — Position entry via rust_pm.enter_position()
-echo  %YELLOW%[ ] REPLACE%RESET%    — Liquidate old + enter new via Rust PM
-echo  %CYAN%[ ] RESOLVE%RESET%    — Resolution via rust_pm.check_resolutions()
-echo  %MAGENTA%[ ] LIQUIDATE%RESET%  — Proactive exit via rust_pm.liquidate_position()
+echo  %GREEN%[ ] ENTER%RESET%      -- Position entry via rust_pm.enter_position()
+echo  %YELLOW%[ ] REPLACE%RESET%    -- Liquidate old + enter new via Rust PM
+echo  %CYAN%[ ] RESOLVE%RESET%    -- Resolution via rust_pm.check_resolutions()
+echo  %MAGENTA%[ ] LIQUIDATE%RESET%  -- Proactive exit via rust_pm.liquidate_position()
 echo.
 echo %BOLD%Tailing log... (Ctrl+C to stop)%RESET%
 echo.
 
-:: Use PowerShell to tail the log and process lines
-powershell -NoProfile -Command ^
-  "$logFile = '%LOGFILE%'; " ^
+:: Use WSL bash loop that follows today's log and re-opens on date rollover
+:: cd to C:\ first to avoid WSL path translation error on P:\
+pushd C:\
+wsl.exe -d Ubuntu -- bash -c "LOGDIR=%LOGDIR%; while true; do D=$(date +%%Y%%m%%d); F=$LOGDIR/trading_engine_${D}.log; [ -f \"$F\" ] || { sleep 2; continue; }; tail -n 0 -f \"$F\" & PID=$!; while [ \"$(date +%%Y%%m%%d)\" = \"$D\" ]; do sleep 10; done; kill $PID 2>/dev/null; wait $PID 2>/dev/null; done" | powershell -NoProfile -Command ^
   "$seenEnter = $false; $seenReplace = $false; $seenResolve = $false; $seenLiquidate = $false; " ^
   "$e = [char]27; " ^
   "$green = \"$e[92m\"; $yellow = \"$e[93m\"; $cyan = \"$e[96m\"; $magenta = \"$e[95m\"; " ^
-  "$bold = \"$e[1m\"; $reset = \"$e[0m\"; $red = \"$e[91m\"; " ^
-  "if (-not (Test-Path $logFile)) { " ^
-  "  Write-Host \"${red}Log file not found: $logFile${reset}\"; " ^
-  "  Write-Host 'Waiting for log file to appear...'; " ^
-  "  while (-not (Test-Path $logFile)) { Start-Sleep -Seconds 2 } " ^
-  "} " ^
-  "Get-Content $logFile -Wait -Tail 0 | ForEach-Object { " ^
+  "$bold = \"$e[1m\"; $reset = \"$e[0m\"; " ^
+  "$input | ForEach-Object { " ^
   "  $line = $_; " ^
   "  if ($line -match 'ENTER:' -and -not $seenEnter) { " ^
   "    $seenEnter = $true; " ^
@@ -94,16 +89,17 @@ powershell -NoProfile -Command ^
   "    Write-Host \"${bold}${green}========================================================${reset}\"; " ^
   "    Write-Host \"${bold}${green}  ALL 4 OPERATION TYPES CONFIRMED THROUGH RUST PM!${reset}\"; " ^
   "    Write-Host \"${bold}${green}========================================================${reset}\"; " ^
-  "    Write-Host \"${green}  [X] ENTER      — rust_pm.enter_position()${reset}\"; " ^
-  "    Write-Host \"${yellow}  [X] REPLACE    — rust_pm (liquidate + enter)${reset}\"; " ^
-  "    Write-Host \"${cyan}  [X] RESOLVE    — rust_pm.check_resolutions()${reset}\"; " ^
-  "    Write-Host \"${magenta}  [X] LIQUIDATE  — rust_pm.liquidate_position()${reset}\"; " ^
+  "    Write-Host \"${green}  [X] ENTER      -- rust_pm.enter_position()${reset}\"; " ^
+  "    Write-Host \"${yellow}  [X] REPLACE    -- rust_pm (liquidate + enter)${reset}\"; " ^
+  "    Write-Host \"${cyan}  [X] RESOLVE    -- rust_pm.check_resolutions()${reset}\"; " ^
+  "    Write-Host \"${magenta}  [X] LIQUIDATE  -- rust_pm.liquidate_position()${reset}\"; " ^
   "    Write-Host ''; " ^
-  "    Write-Host \"${bold}A1 VERIFICATION COMPLETE — paper_engine is fully bypassed.${reset}\"; " ^
+  "    Write-Host \"${bold}A1 VERIFICATION COMPLETE -- paper_engine is fully bypassed.${reset}\"; " ^
   "    break; " ^
   "  } " ^
   "}"
 
+popd
 echo.
 echo Monitor finished.
 pause
