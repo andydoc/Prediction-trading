@@ -253,10 +253,11 @@ fn build_stats(s: &DashboardState) -> Value {
     let days_running = if first_entry_ts < f64::MAX {
         (now_ts - first_entry_ts) / 86400.0
     } else { 0.0 };
-    let annualized_ret = if days_running > 1.0 {
+    let min_days = 1.0 / 24.0; // 1 hour minimum
+    let annualized_ret = if days_running > min_days {
         ((total_value / init_cap).powf(365.0 / days_running) - 1.0) * 100.0
     } else { 0.0 };
-    let annualized_str = if days_running > 1.0 {
+    let annualized_str = if days_running > min_days {
         format!("{:+.0}%", annualized_ret)
     } else { "N/A".into() };
     let now_str = chrono::Utc::now().format("%d/%m/%Y %H:%M:%S").to_string();
