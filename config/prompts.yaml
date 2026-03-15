@@ -27,6 +27,7 @@ resolution_validation: |
      - Postponement clauses ("remains open until played") — not an outcome, just a delay.
      - Standard Yes/No structure where "Otherwise resolves to No" — "No" already covers all non-winning outcomes.
      - Sports extra time, overtime, or penalty shootout rules — these still produce Win/Draw/Lose.
+     - Temperature or measurement unit differences (°C vs °F, km vs miles, etc.) — if the question uses one unit and the rules use another, this is NOT an unrepresented outcome. Unit conversion is trivial and the resolution source covers the same physical quantity. The market outcomes still exhaust all possibilities.
 
   5. Return ONLY a JSON object, no other text:
 

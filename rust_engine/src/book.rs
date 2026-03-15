@@ -5,15 +5,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use crate::types::{OrderBook, BookLevel, OrderedFloat, EngineConfig};
 
+/// Synthetic depth for best_bid_ask events with no order book data.
+const SYNTHETIC_DEPTH: f64 = 100.0;
+
 /// Global book mirror — one entry per asset_id.
 pub struct BookMirror {
     books: DashMap<String, OrderBook>,
-    /// asset_id → last EFP (for drift detection)
-    last_efp: DashMap<String, f64>,
     /// asset_id → constraint_ids that contain this asset
     asset_to_constraints: DashMap<String, Vec<String>>,
-    /// Total WS messages received
-    msg_count: AtomicU64,
     /// Config (trade_size_usd is atomic — updated at runtime as capital changes)
     trade_size_usd: AtomicU64,
     efp_drift_threshold: f64,
@@ -23,9 +22,7 @@ impl BookMirror {
     pub fn new(config: &EngineConfig) -> Self {
         Self {
             books: DashMap::new(),
-            last_efp: DashMap::new(),
             asset_to_constraints: DashMap::new(),
-            msg_count: AtomicU64::new(0),
             trade_size_usd: AtomicU64::new(config.trade_size_usd.to_bits()),
             efp_drift_threshold: config.efp_drift_threshold,
         }
@@ -53,10 +50,9 @@ impl BookMirror {
     pub fn apply_snapshot(
         &self, asset_id: &str, asks: Vec<BookLevel>, bids: Vec<BookLevel>, ts: f64,
     ) -> Vec<(String, bool)> {
-        self.msg_count.fetch_add(1, Ordering::Relaxed);
         let mut book = self.books.entry(asset_id.to_string()).or_default();
         book.apply_snapshot(asks, bids, ts);
-        self.check_efp_drift(asset_id, &book)
+        self.check_efp_drift(asset_id, &mut *book)
     }
 
     /// Apply a delta update.
@@ -64,12 +60,11 @@ impl BookMirror {
     pub fn apply_delta(
         &self, asset_id: &str, is_ask: bool, price: f64, new_size: f64, ts: f64,
     ) -> Vec<(String, bool)> {
-        self.msg_count.fetch_add(1, Ordering::Relaxed);
         let mut book = self.books.entry(asset_id.to_string()).or_default();
         book.apply_delta(is_ask, price, new_size, ts);
         // Only check EFP on ask-side changes (that's what affects trade cost)
         if is_ask {
-            self.check_efp_drift(asset_id, &book)
+            self.check_efp_drift(asset_id, &mut *book)
         } else {
             vec![]
         }
@@ -79,31 +74,30 @@ impl BookMirror {
     pub fn apply_best_prices(
         &self, asset_id: &str, best_bid: f64, best_ask: f64, ts: f64,
     ) -> Vec<(String, bool)> {
-        self.msg_count.fetch_add(1, Ordering::Relaxed);
         // If we don't have a book yet, create one with a single level
         let mut book = self.books.entry(asset_id.to_string()).or_default();
         if book.asks.is_empty() && best_ask > 0.0 {
-            book.asks.insert(OrderedFloat(best_ask), 100.0); // synthetic depth
+            book.asks.insert(OrderedFloat(best_ask), SYNTHETIC_DEPTH);
         }
         if book.bids.is_empty() && best_bid > 0.0 {
-            book.bids.insert(OrderedFloat(best_bid), 100.0);
+            book.bids.insert(OrderedFloat(best_bid), SYNTHETIC_DEPTH);
         }
         book.last_update = ts;
-        self.check_efp_drift(asset_id, &book)
+        self.check_efp_drift(asset_id, &mut *book)
     }
 
     /// Check if EFP has drifted enough to queue evals.
-    fn check_efp_drift(&self, asset_id: &str, book: &OrderBook) -> Vec<(String, bool)> {
+    fn check_efp_drift(&self, asset_id: &str, book: &mut OrderBook) -> Vec<(String, bool)> {
         let new_efp = book.effective_fill_price(self.get_trade_size());
         if new_efp <= 0.0 {
             return vec![];
         }
 
-        let old_efp = self.last_efp.get(asset_id).map(|v| *v).unwrap_or(0.0);
+        let old_efp = book.last_efp;
         let drift = (new_efp - old_efp).abs();
 
         if drift > self.efp_drift_threshold || old_efp == 0.0 {
-            self.last_efp.insert(asset_id.to_string(), new_efp);
+            book.last_efp = new_efp;
             // Look up which constraints this asset belongs to
             if let Some(cids) = self.asset_to_constraints.get(asset_id) {
                 let urgent = drift > self.efp_drift_threshold;
@@ -134,21 +128,11 @@ impl BookMirror {
             .unwrap_or(0.0)
     }
 
-    /// Count assets with book data.
-    pub fn len(&self) -> usize {
-        self.books.len()
-    }
-
     pub fn live_count(&self) -> usize {
         self.books.len()
     }
 
-    /// Total messages processed.
-    pub fn message_count(&self) -> u64 {
-        self.msg_count.load(Ordering::Relaxed)
-    }
-
-    /// Get all ask prices+sizes for an asset (for Python compatibility).
+    /// Get all ask prices+sizes for an asset.
     pub fn get_asks_vec(&self, asset_id: &str) -> (Vec<f64>, Vec<f64>) {
         match self.books.get(asset_id) {
             Some(book) => {

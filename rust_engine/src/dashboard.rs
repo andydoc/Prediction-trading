@@ -9,11 +9,9 @@
 ///                   system(10s), closed(60s)
 ///   GET /state    → JSON snapshot of full execution state
 use std::sync::Arc;
-use std::collections::HashMap;
 use std::time::Duration;
-use axum::{Router, Json, response::{Html, IntoResponse, Sse, sse}};
+use axum::{Router, Json, response::{Html, Sse, sse}};
 use axum::extract::State;
-use tokio_stream::StreamExt;
 use serde_json::{json, Value};
 use parking_lot::Mutex;
 
@@ -31,7 +29,7 @@ pub struct DashboardState {
     pub eval_queue: Arc<EvalQueue>,
     pub ws: Arc<WsManager>,
     pub constraints: Arc<ConstraintStore>,
-    /// Engine metrics updated by Python each stats cycle
+    /// Engine metrics updated each stats cycle
     pub engine_metrics: Arc<Mutex<EngineMetrics>>,
     /// Recent opportunities (last batch from evaluate_batch)
     pub recent_opps: Arc<Mutex<Vec<Value>>>,
@@ -69,7 +67,7 @@ pub async fn start(state: DashboardState, port: u16) {
         .with_state(Arc::new(state));
 
     let listener = match tokio::net::TcpListener::bind(
-        format!("0.0.0.0:{}", port)).await {
+        format!("127.0.0.1:{}", port)).await {
         Ok(l) => l,
         Err(e) => {
             tracing::error!("Dashboard failed to bind port {}: {}", port, e);
@@ -154,19 +152,45 @@ async fn handle_sse(
 }
 
 // =====================================================================
+// Shared helpers
+// =====================================================================
+
+/// Build a JSON leg object from a typed MarketLeg. Used by both open and closed position builders.
+fn build_leg_json(leg: &crate::position::MarketLeg, is_sell: bool) -> Value {
+    let ep = leg.entry_price;
+    let bet = leg.bet_amount;
+    let shares = if leg.shares > 0.0 {
+        leg.shares
+    } else if is_sell {
+        let no_price = (1.0 - ep).max(0.001);
+        bet / no_price
+    } else if ep > 0.0 {
+        bet / ep
+    } else {
+        0.0
+    };
+    let side = if is_sell { "NO" } else { "YES" };
+    let actual_price = if shares > 0.0 { bet / shares } else { ep };
+    json!({
+        "name": leg.name, "bet": (bet * 100.0).round() / 100.0,
+        "side": side, "price": (actual_price * 1000.0).round() / 1000.0,
+        "shares": format!("{:.2}", shares),
+        "payout": (shares * 100.0).round() / 100.0,
+    })
+}
+
+// =====================================================================
 // Data builders — read directly from in-memory Rust structs
 // =====================================================================
 
 fn build_state_snapshot(s: &DashboardState) -> Value {
     let pm = s.positions.lock();
-    let open = pm.get_open_positions_json();
-    let closed = pm.get_closed_positions_json();
     let perf = pm.get_performance_metrics();
     json!({
         "current_capital": pm.current_capital(),
         "initial_capital": pm.initial_capital(),
-        "open_positions": open.iter().map(|j| serde_json::from_str::<Value>(j).unwrap_or_default()).collect::<Vec<_>>(),
-        "closed_positions": closed.iter().map(|j| serde_json::from_str::<Value>(j).unwrap_or_default()).collect::<Vec<_>>(),
+        "open_positions": pm.open_positions().values().collect::<Vec<_>>(),
+        "closed_positions": pm.closed_positions(),
         "performance": perf,
         "recent_opps": s.recent_opps.lock().clone(),
     })
@@ -187,20 +211,23 @@ fn fmt_ts_sec(ts: f64) -> String {
 }
 
 /// Parse entry_timestamp which can be ISO string, Unix float string, or raw f64.
+#[allow(dead_code)]
 fn parse_entry_ts(val: &Value) -> f64 {
     if let Some(s) = val.as_str() {
-        // Try ISO first
-        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-            return dt.timestamp() as f64;
-        }
-        // Try Unix float string like "1773397067.088904"
-        if let Ok(f) = s.parse::<f64>() {
-            return f;
-        }
-        0.0
+        parse_entry_ts_str(s)
     } else {
         val.as_f64().unwrap_or(0.0)
     }
+}
+
+/// Parse entry_timestamp from a string (ISO or Unix float).
+fn parse_entry_ts_str(s: &str) -> f64 {
+    // Try ISO first
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return dt.timestamp() as f64;
+    }
+    // Try Unix float string like "1773397067.088904"
+    s.parse::<f64>().unwrap_or(0.0)
 }
 
 /// Format strategy for display
@@ -222,28 +249,20 @@ fn build_stats(s: &DashboardState) -> Value {
 
     // Calculate deployed capital and fees from open positions
     let mut deployed = 0.0f64;
-    let mut total_fees = 0.0f64;
+    let total_fees = pm.total_fees();
     let mut first_entry_ts = f64::MAX;
-    for pos_json in pm.get_open_positions_json() {
-        if let Ok(p) = serde_json::from_str::<Value>(&pos_json) {
-            deployed += p["total_capital"].as_f64().unwrap_or(0.0);
-            total_fees += p["fees_paid"].as_f64().unwrap_or(0.0);
-            // Track first entry
-            let ts = parse_entry_ts(&p["entry_timestamp"]);
-            if ts > 0.0 && ts < first_entry_ts { first_entry_ts = ts; }
-        }
+    for p in pm.open_positions().values() {
+        deployed += p.total_capital;
+        let ts = parse_entry_ts_str(&p.entry_timestamp);
+        if ts > 0.0 && ts < first_entry_ts { first_entry_ts = ts; }
     }
-    // Also check closed for first trade + fees
-    let closed_jsons = pm.get_closed_positions_json();
+    // Also check closed for first trade
+    for p in pm.closed_positions() {
+        let ts = parse_entry_ts_str(&p.entry_timestamp);
+        if ts > 0.0 && ts < first_entry_ts { first_entry_ts = ts; }
+    }
     let total_realized = perf.get("total_actual_profit").copied().unwrap_or(0.0);
     drop(pm); // Release lock — no more position reads needed
-    for cj in &closed_jsons {
-        if let Ok(p) = serde_json::from_str::<Value>(cj) {
-            total_fees += p["fees_paid"].as_f64().unwrap_or(0.0);
-            let ts = parse_entry_ts(&p["entry_timestamp"]);
-            if ts > 0.0 && ts < first_entry_ts { first_entry_ts = ts; }
-        }
-    }
 
     let total_value = cap + deployed;
     let ret_pct = if init_cap > 0.0 { (total_value - init_cap) / init_cap * 100.0 } else { 0.0 };
@@ -259,19 +278,36 @@ fn build_stats(s: &DashboardState) -> Value {
     let annualized_ret = if days_running > min_days {
         ((total_value / init_cap).powf(365.0 / days_running) - 1.0) * 100.0
     } else { 0.0 };
+    // Format time period label
+    let period_label = if days_running < 1.0 {
+        let hours = (days_running * 24.0).max(1.0) as u32;
+        format!("{}h", hours)
+    } else {
+        format!("{}d", days_running as u32)
+    };
+
     let annualized_str = if days_running > min_days {
-        if annualized_ret.is_nan() || annualized_ret.is_infinite() || annualized_ret.abs() > 1e15 {
+        if days_running < 7.0 {
+            // Under 7 days: show simple daily rate × 365 (linear extrapolation)
+            let daily_ret = ret_pct / days_running;
+            let linear_annual = daily_ret * 365.0;
+            let sign = if linear_annual < 0.0 { "-" } else { "+" };
+            format!("{}{:.0}% <span style=\"font-size:0.7em\">({} data)</span>", sign, linear_annual.abs(), period_label)
+        } else if annualized_ret.is_nan() || annualized_ret.is_infinite() || annualized_ret.abs() > 1e15 {
             let sign = if annualized_ret < 0.0 { "-" } else { "+" };
-            format!("{}<span style=\"font-size:2.2em;vertical-align:middle;line-height:0\">∞</span> <span style=\"font-size:0.7em\">(>{:.0}% in &lt;1d)</span>", sign, ret_pct.abs())
+            format!("{}<span style=\"font-size:2.2em;vertical-align:middle;line-height:0\">∞</span> <span style=\"font-size:0.7em\">({} data)</span>", sign, period_label)
         } else {
             let abs_val = annualized_ret.abs();
             if abs_val == 0.0 {
-                "0.00%".to_string()
+                format!("0.00% <span style=\"font-size:0.7em\">({} data)</span>", period_label)
+            } else if abs_val < 10000.0 {
+                let sign = if annualized_ret < 0.0 { "-" } else { "+" };
+                format!("{}{:.1}% <span style=\"font-size:0.7em\">({} data)</span>", sign, abs_val, period_label)
             } else {
                 let sign = if annualized_ret < 0.0 { "-" } else { "+" };
                 let exp = abs_val.log10().floor() as i32;
                 let mantissa = abs_val / 10f64.powi(exp);
-                format!("{}{:.2}e{}%", sign, mantissa, exp)
+                format!("{}{:.2}e{}% <span style=\"font-size:0.7em\">({} data)</span>", sign, mantissa, exp, period_label)
             }
         }
     } else { "N/A".into() };
@@ -300,43 +336,6 @@ fn build_stats(s: &DashboardState) -> Value {
 // Resolution delay model — P95 delay by event category
 // =====================================================================
 
-/// Classify market names into a resolution-delay category (mirrors Python classify_opportunity_category).
-fn classify_category(names: &[String]) -> &'static str {
-    let combined: String = names.iter().map(|n| n.to_lowercase()).collect::<Vec<_>>().join(" ");
-    let football_q = ["win on 20", "end in a draw", "halftime", "leading at halftime"]
-        .iter().any(|p| combined.contains(p));
-    if football_q { return "football"; }
-    if combined.contains("halftime") || combined.contains("leading at halftime") {
-        return "football";
-    }
-    if ["nba ", "nfl ", "nhl ", "mlb ", "wnba ",
-        "touchdown", "rushing yards", "passing yards",
-        "rebounds", "three-pointer"]
-        .iter().any(|p| combined.contains(p)) { return "us_sports"; }
-    if ["spread:", "team total:", "o/u "]
-        .iter().any(|p| combined.contains(p)) { return "sports_props"; }
-    if ["counter-strike", "cs2", "dota", "league of legends",
-        "valorant", "overwatch", "dreamleague"]
-        .iter().any(|p| combined.contains(p)) { return "esports"; }
-    if ["atp ", "wta ", "tennis"]
-        .iter().any(|p| combined.contains(p)) { return "tennis"; }
-    if ["ufc ", "mma ", "boxing", "pfl ", "bellator"]
-        .iter().any(|p| combined.contains(p)) { return "mma_boxing"; }
-    if ["cricket", "ipl ", "t20 "]
-        .iter().any(|p| combined.contains(p)) { return "cricket"; }
-    if ["rugby", "super rugby", "waratahs"]
-        .iter().any(|p| combined.contains(p)) { return "rugby"; }
-    if ["bitcoin", "ethereum", "solana", "btc ", "eth ", "up or down"]
-        .iter().any(|p| combined.contains(p)) { return "crypto"; }
-    if ["governor", "congress", "senate", "primary",
-        "democrat", "republican", "election", "president"]
-        .iter().any(|p| combined.contains(p)) { return "politics"; }
-    if ["fed ", "federal reserve", "interest rate",
-        "tariff", "government shutdown"]
-        .iter().any(|p| combined.contains(p)) { return "gov_policy"; }
-    "other"
-}
-
 /// Format hours remaining with P95 delay added. Returns (display_string, sort_seconds).
 /// Reads delay table from DashboardState (loaded from SQLite at startup).
 fn resolve_with_delay(
@@ -347,7 +346,7 @@ fn resolve_with_delay(
         return ("?".into(), 9999999.0);
     }
     let (ref p95_table, default_p95) = *delay_table.lock();
-    let category = classify_category(market_names);
+    let category = crate::types::classify_category(market_names);
     let delay_hours = p95_table.get(category).copied().unwrap_or(default_p95);
     let expected_resolve_ts = end_date_ts + delay_hours * 3600.0;
     let hours_remaining = (expected_resolve_ts - now_ts) / 3600.0;
@@ -364,72 +363,47 @@ fn resolve_with_delay(
 
 fn build_positions(s: &DashboardState) -> Value {
     let mut positions = Vec::new();
-    let open_jsons = s.positions.lock().get_open_positions_json();
-    for (idx, pos_json) in open_jsons.iter().enumerate() {
-        let p: Value = match serde_json::from_str(pos_json) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let markets = p["markets"].as_object();
-        let mkt_vals: Vec<&Value> = markets.map(|m| m.values().collect()).unwrap_or_default();
+    let pm = s.positions.lock();
+    let open = pm.open_positions();
+    for (idx, p) in open.values().enumerate() {
+        let mkt_vals: Vec<&crate::position::MarketLeg> = p.markets.values().collect();
         let short_name = mkt_vals.first()
-            .and_then(|m| m["name"].as_str())
-            .unwrap_or("?")
-            .chars().take(40).collect::<String>();
+            .map(|m| m.name.chars().take(40).collect::<String>())
+            .unwrap_or_else(|| "?".into());
         let full_names: Vec<String> = mkt_vals.iter()
-            .map(|m| m["name"].as_str().unwrap_or("?").to_string())
+            .map(|m| m.name.clone())
             .collect();
 
-        let strategy = p["metadata"]["strategy"].as_str().unwrap_or("?");
-        let method = p["metadata"]["method"].as_str().unwrap_or("");
-        let is_sell = method.to_lowercase().contains("sell");
-        let total_cap = p["total_capital"].as_f64().unwrap_or(0.0);
-        let exp_profit = p["expected_profit"].as_f64().unwrap_or(0.0);
+        let total_cap = p.total_capital;
+        let exp_profit = p.expected_profit;
         let exp_pct = if total_cap > 0.0 { exp_profit / total_cap * 100.0 } else { 0.0 };
 
-        let strategy = p["metadata"]["strategy"].as_str().unwrap_or("?");
-        let method = p["metadata"]["method"].as_str().unwrap_or("");
+        let strategy = p.metadata.get("strategy")
+            .and_then(|v| v.as_str()).unwrap_or("?");
+        let method = p.metadata.get("method")
+            .and_then(|v| v.as_str()).unwrap_or("");
         let strategy_fmt = fmt_strategy(strategy, method);
         let is_sell = method.to_lowercase().contains("sell");
 
         // Entry timestamp
-        let entry_epoch = parse_entry_ts(&p["entry_timestamp"]);
+        let entry_epoch = parse_entry_ts_str(&p.entry_timestamp);
         let entry_ts_fmt = fmt_ts(entry_epoch);
 
         // Build legs — read shares from position data (computed at entry with correct prices)
         let mut legs = Vec::new();
-        if let Some(mkts) = markets {
-            for (_mid, mdata) in mkts {
-                let name = mdata["name"].as_str().unwrap_or("?");
-                let ep = mdata["entry_price"].as_f64().unwrap_or(0.0);
-                let bet = mdata["bet_amount"].as_f64().unwrap_or(0.0);
-                let shares = mdata["shares"].as_f64().unwrap_or_else(|| {
-                    // Fallback for old positions without shares field
-                    if is_sell {
-                        let no_price = (1.0 - ep).max(0.001);
-                        bet / no_price
-                    } else {
-                        if ep > 0.0 { bet / ep } else { 0.0 }
-                    }
-                });
-                let side = if is_sell { "NO" } else { "YES" };
-                let actual_price = if shares > 0.0 { bet / shares } else { ep };
-                legs.push(json!({
-                    "name": name, "bet": (bet * 100.0).round() / 100.0,
-                    "side": side, "price": (actual_price * 1000.0).round() / 1000.0,
-                    "shares": format!("{:.2}", shares),
-                    "payout": (shares * 100.0).round() / 100.0,
-                }));
-            }
+        for (_mid, leg) in &p.markets {
+            legs.push(build_leg_json(leg, is_sell));
         }
 
         // Resolution date — constraint store first, then position metadata, then date in name
-        let cid = p["metadata"]["constraint_id"].as_str().unwrap_or("");
+        let cid = p.metadata.get("constraint_id")
+            .and_then(|v| v.as_str()).unwrap_or("");
         let mut end_date_ts = s.constraints.get(cid)
             .map(|c| c.end_date_ts).unwrap_or(0.0);
         // Fallback 1: read end_date_ts stored in position metadata at entry time
         if end_date_ts <= 0.0 {
-            end_date_ts = p["metadata"]["end_date_ts"].as_f64().unwrap_or(0.0);
+            end_date_ts = p.metadata.get("end_date_ts")
+                .and_then(|v| v.as_f64()).unwrap_or(0.0);
         }
         // Fallback 2: extract YYYY-MM-DD from market names
         if end_date_ts <= 0.0 {
@@ -453,10 +427,10 @@ fn build_positions(s: &DashboardState) -> Value {
                 .unwrap_or_else(|| "?".into())
         } else { "?".into() };
 
-        let pp = &p["metadata"]["postponement"];
-        let postponed = pp.is_object() && pp["effective_date"].is_string();
+        let pp = p.metadata.get("postponement");
+        let postponed = pp.map_or(false, |v| v.is_object() && v.get("effective_date").and_then(|d| d.as_str()).is_some());
         let pp_date = if postponed {
-            pp["effective_date"].as_str().unwrap_or("")
+            pp.and_then(|v| v.get("effective_date")).and_then(|v| v.as_str()).unwrap_or("")
         } else { "" };
 
         // Resolution date formatting + hours remaining (with P95 delay)
@@ -472,8 +446,9 @@ fn build_positions(s: &DashboardState) -> Value {
 
         // Postponement object (for JS)
         let postpone = if postponed {
-            let pp_status = pp.get("status").and_then(|v| v.as_str()).unwrap_or("postponed");
-            let pp_reason = pp.get("reason").and_then(|v| v.as_str()).unwrap_or("Postponed");
+            let pp_val = pp.unwrap();
+            let pp_status = pp_val.get("status").and_then(|v| v.as_str()).unwrap_or("postponed");
+            let pp_reason = pp_val.get("reason").and_then(|v| v.as_str()).unwrap_or("Postponed");
             Some(json!({ "status": pp_status, "reason": pp_reason, "date": pp_date }))
         } else { None };
 
@@ -512,6 +487,7 @@ fn build_positions(s: &DashboardState) -> Value {
             "scenarios": [],  // TODO: compute sell-arb scenarios
         }));
     }
+    drop(pm); // Release lock before sorting
     // Sort open positions by score descending, then re-number
     positions.sort_by(|a, b| b["score"].as_f64().unwrap_or(0.0)
         .partial_cmp(&a["score"].as_f64().unwrap_or(0.0)).unwrap());
@@ -651,42 +627,36 @@ fn build_opportunities(s: &DashboardState) -> Value {
 }
 
 fn build_closed(s: &DashboardState) -> Value {
-    let closed_jsons = s.positions.lock().get_closed_positions_json();
+    let pm = s.positions.lock();
+    let closed = pm.closed_positions();
     let mut resolved = Vec::new();
     let mut proactive_exit = Vec::new();
     let mut replaced_profit = Vec::new();
     let mut replaced_loss = Vec::new();
     let mut replaced_even = Vec::new();
 
-    for cj in &closed_jsons {
-        let p: Value = match serde_json::from_str(cj) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let actual = p["actual_profit"].as_f64().unwrap_or(0.0);
-        let deployed = p["total_capital"].as_f64().unwrap_or(0.0);
-        let reason = p["metadata"]["close_reason"].as_str().unwrap_or("resolved");
-        let strategy = p["metadata"]["strategy"].as_str().unwrap_or("?");
-        let method = p["metadata"]["method"].as_str().unwrap_or("");
+    for p in closed {
+        let actual = p.actual_profit;
+        let deployed = p.total_capital;
+        let reason = p.metadata.get("close_reason")
+            .and_then(|v| v.as_str()).unwrap_or("resolved");
+        let strategy = p.metadata.get("strategy")
+            .and_then(|v| v.as_str()).unwrap_or("?");
+        let method = p.metadata.get("method")
+            .and_then(|v| v.as_str()).unwrap_or("");
         let is_sell = method.to_lowercase().contains("sell");
 
-        let markets = p["markets"].as_object();
-        let mkt_vals: Vec<&Value> = markets.map(|m| m.values().collect()).unwrap_or_default();
+        let mkt_vals: Vec<&crate::position::MarketLeg> = p.markets.values().collect();
         let short_name = mkt_vals.first()
-            .and_then(|m| m["name"].as_str())
-            .unwrap_or("?").chars().take(40).collect::<String>();
+            .map(|m| m.name.chars().take(40).collect::<String>())
+            .unwrap_or_else(|| "?".into());
         let full_names: Vec<String> = mkt_vals.iter()
-            .map(|m| m["name"].as_str().unwrap_or("?").to_string()).collect();
+            .map(|m| m.name.clone()).collect();
 
         // Parse entry timestamp
-        let entry_ts = &p["entry_timestamp"];
-        let entry_epoch = if let Some(s) = entry_ts.as_str() {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .map(|dt| dt.timestamp() as f64)
-                .unwrap_or_else(|_| s.parse::<f64>().unwrap_or(0.0))
-        } else { entry_ts.as_f64().unwrap_or(0.0) };
+        let entry_epoch = parse_entry_ts_str(&p.entry_timestamp);
 
-        let close_ts = p["close_timestamp"].as_f64().unwrap_or(0.0);
+        let close_ts = p.close_timestamp.unwrap_or(0.0);
         let hold_secs = if entry_epoch > 0.0 && close_ts > 0.0 { close_ts - entry_epoch } else { -1.0 };
         let hold_str = if hold_secs >= 0.0 {
             if hold_secs < 60.0 { format!("{:.0}s", hold_secs) }
@@ -698,29 +668,8 @@ fn build_closed(s: &DashboardState) -> Value {
 
         // Build legs — read shares from position data (same as open positions)
         let mut legs = Vec::new();
-        if let Some(mkts) = markets {
-            for (_mid, mdata) in mkts {
-                let name = mdata["name"].as_str().unwrap_or("?");
-                let ep = mdata["entry_price"].as_f64().unwrap_or(0.0);
-                let bet = mdata["bet_amount"].as_f64().unwrap_or(0.0);
-                let shares = mdata["shares"].as_f64().unwrap_or_else(|| {
-                    // Fallback for old positions without shares field
-                    if is_sell {
-                        let np = (1.0 - ep).max(0.001);
-                        bet / np
-                    } else {
-                        if ep > 0.0 { bet / ep } else { 0.0 }
-                    }
-                });
-                let side = if is_sell { "NO" } else { "YES" };
-                let actual_price = if shares > 0.0 { bet / shares } else { ep };
-                legs.push(json!({
-                    "name": name, "bet": (bet * 100.0).round() / 100.0,
-                    "side": side, "price": (actual_price * 1000.0).round() / 1000.0,
-                    "shares": format!("{:.2}", shares),
-                    "payout": (shares * 100.0).round() / 100.0,
-                }));
-            }
+        for (_mid, leg) in &p.markets {
+            legs.push(build_leg_json(leg, is_sell));
         }
 
         let deployed_r = (deployed * 100.0).round() / 100.0;
@@ -745,6 +694,7 @@ fn build_closed(s: &DashboardState) -> Value {
             _ => resolved.push(row),
         }
     }
+    drop(pm); // Release lock before sorting
 
     // Sort each category by close time descending
     for cat in [&mut resolved, &mut proactive_exit, &mut replaced_profit, &mut replaced_loss, &mut replaced_even] {
@@ -770,7 +720,7 @@ fn build_system(s: &DashboardState) -> Value {
     let ws = s.ws.stats();
     let (q_urg, q_bg) = s.eval_queue.depths();
     let n_constraints = s.constraints.len();
-    let n_markets = s.book.len();
+    let n_markets = s.book.live_count();
     let pm = s.positions.lock();
 
     json!({

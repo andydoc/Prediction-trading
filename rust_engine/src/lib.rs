@@ -13,6 +13,7 @@
 /// - AI postponement detector (Anthropic API + web search)
 
 pub mod types;
+pub mod cached_db;
 pub mod book;
 pub mod queue;
 pub mod state;
@@ -31,8 +32,8 @@ use std::sync::Arc;
 
 use book::BookMirror;
 use queue::EvalQueue;
-use eval::{ConstraintStore, EvalConfig, Constraint, MarketRef};
-use types::{EngineConfig, LoggingCfg};
+use eval::{ConstraintStore, EvalConfig, Constraint};
+use types::LoggingCfg;
 use ws::WsManager;
 use position::PositionManager;
 use dashboard::{DashboardState, EngineMetrics};
@@ -55,6 +56,7 @@ pub struct TradingEngine {
     pub mode: String,
     pub start_time: chrono::DateTime<chrono::Utc>,
     pub delay_table: Arc<parking_lot::Mutex<(HashMap<String, f64>, f64)>>,
+    pub http_client: reqwest::blocking::Client,
 }
 
 impl TradingEngine {
@@ -144,11 +146,17 @@ impl TradingEngine {
         };
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2))
             .enable_all()
             .thread_name("rust-engine")
             .build()
             .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
+
+        let http_client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
         Ok(Self {
             book, eval_queue, ws, constraints,
@@ -159,6 +167,7 @@ impl TradingEngine {
             mode: "shadow".to_string(),
             start_time: chrono::Utc::now(),
             delay_table: Arc::new(parking_lot::Mutex::new((HashMap::new(), 33.5))),
+            http_client,
         })
     }
 
@@ -430,43 +439,28 @@ impl TradingEngine {
 
     /// Check Polymarket API for missed resolutions (catches WS gaps).
     pub fn check_api_resolutions(&self) -> Vec<ApiResolution> {
-        let positions_json = self.positions.lock().get_open_positions_json();
-        if positions_json.is_empty() {
-            return Vec::new();
-        }
-
-        tracing::info!("Checking API resolution for {} open positions...", positions_json.len());
-
-        let client = match reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .user_agent("Mozilla/5.0 (prediction-trader)")
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("HTTP client error: {}", e);
+        // Collect position IDs and their market IDs under the lock, then release
+        let position_data: Vec<(String, Vec<String>)> = {
+            let pm = self.positions.lock();
+            if pm.open_count() == 0 {
                 return Vec::new();
             }
+            pm.open_positions().values()
+                .map(|p| (p.position_id.clone(), p.markets.keys().cloned().collect()))
+                .collect()
         };
+
+        tracing::info!("Checking API resolution for {} open positions...", position_data.len());
+
+        let client = &self.http_client;
 
         let mut results = Vec::new();
 
-        for pj in &positions_json {
-            let p: serde_json::Value = match serde_json::from_str(pj) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            let pid = p["position_id"].as_str().unwrap_or("");
-            let markets = match p["markets"].as_object() {
-                Some(m) => m,
-                None => continue,
-            };
-
+        for (pid, market_ids) in &position_data {
             let mut resolved_outcomes: HashMap<String, String> = HashMap::new();
             let mut all_resolved = true;
 
-            for mid in markets.keys() {
+            for mid in market_ids {
                 let url = format!("https://gamma-api.polymarket.com/markets/{}", mid);
                 match client.get(&url).send() {
                     Ok(resp) => {
@@ -508,7 +502,7 @@ impl TradingEngine {
                 }
             }
 
-            if !all_resolved || resolved_outcomes.len() != markets.len() {
+            if !all_resolved || resolved_outcomes.len() != market_ids.len() {
                 continue;
             }
 
@@ -574,6 +568,7 @@ impl TradingEngine {
 }
 
 /// Result from evaluate_batch.
+#[must_use]
 pub struct EvalBatchResult {
     pub opportunities: Vec<eval::Opportunity>,
     pub n_urgent: usize,
@@ -583,6 +578,7 @@ pub struct EvalBatchResult {
 }
 
 /// Result from API resolution check.
+#[must_use]
 pub struct ApiResolution {
     pub position_id: String,
     pub winning_market_id: String,

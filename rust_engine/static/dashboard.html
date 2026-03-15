@@ -238,6 +238,7 @@ function restoreExpanded(tbodyId, keys, prefix) {
 
 // === Open positions sort ===
 var _posSortKey = 'score', _posSortDir = 'desc', _lastPosData = null;
+var _lastTotalValue = 0;
 function sortPositions(th) {
   var key = th.dataset.sort;
   if (_posSortKey === key) {
@@ -273,6 +274,7 @@ function applySortToPositions(positions) {
 
 // === Stats bar renderer ===
 function renderStats(d) {
+  _lastTotalValue = d.total_value || 0;
   var bar = document.getElementById('stats-bar');
   if (!bar) return;
   function st(label, id, val, cls) {
@@ -435,7 +437,7 @@ function renderSystem(d) {
   h += '<tr><td>Market Scanner</td><td class="'+scCls+'">'+esc(d.scanner.status)+'</td><td>'+esc(d.scanner.ts||'')+'</td></tr>';
   var eCls = d.engine.status==='running' ? 'color-green' : 'color-amber';
   h += '<tr><td>Trading Engine</td><td class="'+eCls+'">'+esc(d.engine.status)+'</td>';
-  h += '<td>'+esc(d.engine.ts||'')+' | cash=$'+(d.engine.capital||0).toFixed(2)+' | pos='+(d.engine.positions||0)+'</td></tr>';
+  h += '<td>total=$'+_lastTotalValue.toFixed(2)+' | cash=$'+(d.engine.capital||0).toFixed(2)+' | pos='+(d.engine.positions||0)+'</td></tr>';
   var m = d.metrics || {};
   if (m) {
     var rustTag = m.has_rust ? '<span class="color-green">Rust</span>' : '<span class="color-amber">Python</span>';

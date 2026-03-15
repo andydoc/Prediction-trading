@@ -34,47 +34,10 @@ const FALLBACK_P95: &[(&str, f64)] = &[
 ];
 const FALLBACK_DEFAULT: f64 = 33.5;
 
-/// Classify an opportunity into a resolution-delay category.
-fn classify_category(market_names: &[String]) -> &'static str {
-    let names_lower: String = market_names.iter()
-        .map(|n| n.to_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let has = |patterns: &[&str]| patterns.iter().any(|p| names_lower.contains(p));
-
-    if has(&["win on 20", "end in a draw", "halftime", "leading at halftime"]) {
-        return "football";
-    }
-    if has(&["nba ", "nfl ", "nhl ", "mlb ", "wnba ",
-            "touchdown", "rushing yards", "passing yards",
-            "rebounds", "three-pointer"]) {
-        return "us_sports";
-    }
-    if has(&["spread:", "team total:", "o/u "]) {
-        return "sports_props";
-    }
-    if has(&["counter-strike", "cs2", "dota", "league of legends",
-            "valorant", "overwatch", "dreamleague"]) {
-        return "esports";
-    }
-    if has(&["atp ", "wta ", "tennis"]) { return "tennis"; }
-    if has(&["ufc ", "mma ", "boxing", "pfl ", "bellator"]) { return "mma_boxing"; }
-    if has(&["cricket", "ipl ", "t20 "]) { return "cricket"; }
-    if has(&["rugby", "super rugby", "waratahs"]) { return "rugby"; }
-    if has(&["bitcoin", "ethereum", "solana", "btc ", "eth ", "up or down"]) {
-        return "crypto";
-    }
-    if has(&["governor", "congress", "senate", "primary",
-            "democrat", "republican", "election", "president"]) {
-        return "politics";
-    }
-    if has(&["fed ", "federal reserve", "interest rate",
-            "tariff", "government shutdown"]) {
-        return "gov_policy";
-    }
-    "other"
-}
+/// Maximum latency samples to retain for percentile calculation.
+const MAX_LATENCY_SAMPLES: usize = 200;
+/// Proactive exit multiplier — sell if net_proceeds >= this × resolution_payout.
+const PROACTIVE_EXIT_MULTIPLIER: f64 = 1.2;
 
 /// Dynamic capital: % of total portfolio value, floor $10, cap $1000.
 fn dynamic_capital(total_value: f64, pct: f64) -> f64 {
@@ -94,7 +57,7 @@ fn score_opportunity(
     if hours * 3600.0 < min_resolution_secs { return None; }
     if hours > max_hours { return None; }
 
-    let category = classify_category(&opp.market_names);
+    let category = rust_engine::types::classify_category(&opp.market_names);
     let p95_delay = p95_table.get(category).copied().unwrap_or(default_p95);
     let effective_hours = hours + p95_delay;
     let score = opp.expected_profit_pct / effective_hours.max(0.01);
@@ -166,12 +129,12 @@ impl OrchestratorConfig {
 
         let yaml: serde_json::Value = std::fs::read_to_string(&config_path)
             .ok()
-            .and_then(|s| serde_yaml::from_str(&s).ok())
+            .and_then(|s| serde_yaml_ng::from_str(&s).ok())
             .unwrap_or_default();
 
         let secrets: serde_json::Value = std::fs::read_to_string(&secrets_path)
             .ok()
-            .and_then(|s| serde_yaml::from_str(&s).ok())
+            .and_then(|s| serde_yaml_ng::from_str(&s).ok())
             .unwrap_or_default();
 
         let arb = yaml.get("arbitrage").cloned().unwrap_or_default();
@@ -261,6 +224,9 @@ pub struct Orchestrator {
     // Market data cache: market_id → JSON value
     market_lookup: HashMap<String, serde_json::Value>,
 
+    // Parsed config.yaml cached at startup (avoids re-reading from disk)
+    cached_yaml: serde_json::Value,
+
     // Timing state
     last_state_save: f64,
     last_monitor: f64,
@@ -330,10 +296,18 @@ impl Orchestrator {
             (table, FALLBACK_DEFAULT)
         };
 
+        // Cache parsed config.yaml at startup
+        let config_path = cfg.workspace.join("config").join("config.yaml");
+        let cached_yaml: serde_json::Value = std::fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|s| serde_yaml_ng::from_str(&s).ok())
+            .unwrap_or_default();
+
         Ok(Self {
             cfg, engine, scanner, state_db,
             resolution_validator, postponement_detector,
             market_lookup: HashMap::new(),
+            cached_yaml,
             last_state_save: 0.0,
             last_monitor: 0.0,
             last_replacement: 0.0,
@@ -421,7 +395,7 @@ impl Orchestrator {
         let resolved = self.engine.drain_resolved();
         if !resolved.is_empty() {
             let events: Vec<(String, String)> = resolved.iter()
-                .map(|r| (r.asset_id.clone(), r.market_cid.clone()))
+                .map(|r| (r.market_cid.clone(), r.asset_id.clone()))
                 .collect();
             let closed = self.engine.resolve_by_ws_events(&events);
             for (pid, winner) in &closed {
@@ -442,13 +416,13 @@ impl Orchestrator {
 
         if result.n_evaluated > 0 {
             self.recent_latencies.push(batch_us);
-            if self.recent_latencies.len() > 200 {
-                self.recent_latencies = self.recent_latencies[self.recent_latencies.len()-200..].to_vec();
+            if self.recent_latencies.len() > MAX_LATENCY_SAMPLES {
+                self.recent_latencies = self.recent_latencies[self.recent_latencies.len()-MAX_LATENCY_SAMPLES..].to_vec();
             }
         }
 
         if !result.opportunities.is_empty() {
-            self.try_enter_or_replace(&result.opportunities);
+            self.try_enter_or_replace(&result.opportunities, &held_cids, &held_mids);
         }
 
         // --- Monitor (proactive exits) ---
@@ -562,11 +536,7 @@ impl Orchestrator {
             })
             .collect();
 
-        let config_path = self.cfg.workspace.join("config").join("config.yaml");
-        let yaml: serde_json::Value = std::fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|s| serde_yaml::from_str(&s).ok())
-            .unwrap_or_default();
+        let yaml = &self.cached_yaml;
         let cd = yaml.get("constraint_detection").cloned().unwrap_or_default();
 
         let detect_config = DetectionConfig {
@@ -610,16 +580,9 @@ impl Orchestrator {
         let capital = self.state_db.get_scalar("current_capital").unwrap_or(1000.0);
         let initial = self.state_db.get_scalar("initial_capital").unwrap_or(1000.0);
 
-        let fee_rate = {
-            let config_path = self.cfg.workspace.join("config").join("config.yaml");
-            let yaml: serde_json::Value = std::fs::read_to_string(&config_path)
-                .ok()
-                .and_then(|s| serde_yaml::from_str(&s).ok())
-                .unwrap_or_default();
-            yaml.pointer("/arbitrage/fees/polymarket_taker_fee")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0001)
-        };
+        let fee_rate = self.cached_yaml.pointer("/arbitrage/fees/polymarket_taker_fee")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0001);
 
         self.engine.init_positions(initial, fee_rate);
         self.engine.import_positions(&open_jsons, &closed_jsons, capital, initial);
@@ -648,26 +611,35 @@ impl Orchestrator {
             }
         }
 
-        // Sync open positions
-        let open_jsons = self.engine.get_open_positions_json();
-        let db_open_ids: HashSet<String> = self.state_db.get_open_position_ids().into_iter().collect();
-        let live_ids: HashSet<String> = open_jsons.iter()
-            .filter_map(|j| serde_json::from_str::<serde_json::Value>(j).ok())
-            .filter_map(|v| v.get("position_id")?.as_str().map(|s| s.to_string()))
-            .collect();
+        // Sync open positions — extract typed data + JSON under one lock
+        let (live_ids, open_rows, n_closed_total, closed_rows_data) = {
+            let pm = self.engine.positions.lock();
+            let live_ids: HashSet<String> = pm.open_positions().keys().cloned().collect();
+            let open_rows: Vec<(String, String, String, Option<String>, Option<String>)> =
+                pm.open_positions().values()
+                .filter_map(|p| {
+                    let j = serde_json::to_string(p).ok()?;
+                    Some((p.position_id.clone(), "open".to_string(), j, Some(p.entry_timestamp.clone()), None))
+                })
+                .collect();
+            let n_closed_total = pm.closed_count();
+            let closed_data: Vec<(String, String, Option<String>, Option<String>)> =
+                pm.closed_positions().iter()
+                .map(|p| (
+                    p.position_id.clone(),
+                    p.entry_timestamp.clone(),
+                    p.resolved_at.clone(),
+                    serde_json::to_string(p).ok(),
+                ))
+                .collect();
+            (live_ids, open_rows, n_closed_total, closed_data)
+        };
 
+        let db_open_ids: HashSet<String> = self.state_db.get_open_position_ids().into_iter().collect();
         for stale_id in db_open_ids.difference(&live_ids) {
             self.state_db.delete_position(stale_id);
         }
 
-        let open_rows: Vec<(String, String, String, Option<String>, Option<String>)> = open_jsons.iter()
-            .filter_map(|j| {
-                let v: serde_json::Value = serde_json::from_str(j).ok()?;
-                let pid = v.get("position_id")?.as_str()?.to_string();
-                let opened = v.get("entry_timestamp").and_then(|t| t.as_str()).map(|s| s.to_string());
-                Some((pid, "open".to_string(), j.clone(), opened, None))
-            })
-            .collect();
         if !open_rows.is_empty() {
             self.state_db.save_positions_bulk(&open_rows);
         }
@@ -675,16 +647,13 @@ impl Orchestrator {
         // Sync closed (incremental)
         let counts = self.state_db.count_by_status();
         let db_closed = counts.iter().find(|(s, _)| s == "closed").map(|(_, c)| *c).unwrap_or(0) as usize;
-        let closed_jsons = self.engine.get_closed_positions_json();
-        if closed_jsons.len() > db_closed {
+        debug_assert!(n_closed_total >= db_closed, "closed positions shrunk: {} < {}", n_closed_total, db_closed);
+        if closed_rows_data.len() > db_closed {
             let new_rows: Vec<(String, String, String, Option<String>, Option<String>)> =
-                closed_jsons[db_closed..].iter()
-                    .filter_map(|j| {
-                        let v: serde_json::Value = serde_json::from_str(j).ok()?;
-                        let pid = v.get("position_id")?.as_str()?.to_string();
-                        let opened = v.get("entry_timestamp").and_then(|t| t.as_str()).map(|s| s.to_string());
-                        let closed = v.get("resolved_at").and_then(|t| t.as_str()).map(|s| s.to_string());
-                        Some((pid, "closed".to_string(), j.clone(), opened, closed))
+                closed_rows_data[db_closed..].iter()
+                    .filter_map(|(pid, entry_ts, resolved_at, json_opt)| {
+                        let j = json_opt.as_ref()?.clone();
+                        Some((pid.clone(), "closed".to_string(), j, Some(entry_ts.clone()), resolved_at.clone()))
                     })
                     .collect();
             if !new_rows.is_empty() {
@@ -704,12 +673,12 @@ impl Orchestrator {
 
         let ms = t0.elapsed().as_millis();
         tracing::info!("State saved: {} open, {} closed [{ms}ms]",
-            open_jsons.len(), closed_jsons.len());
+            open_rows.len(), n_closed_total);
     }
 
     // --- Entry / replacement ---
 
-    fn try_enter_or_replace(&mut self, opportunities: &[Opportunity]) {
+    fn try_enter_or_replace(&mut self, opportunities: &[Opportunity], held_cids: &HashSet<String>, held_mids: &HashSet<String>) {
         let ranked = rank_opportunities(
             opportunities, &self.p95_table, self.p95_default,
             self.cfg.min_resolution_secs, self.cfg.max_days_entry,
@@ -728,7 +697,7 @@ impl Orchestrator {
             if entered >= slots { break; }
             let opp = &opportunities[idx];
 
-            if !self.validate_opportunity(opp) { continue; }
+            if !self.validate_opportunity(opp, held_cids, held_mids) { continue; }
 
             // Scale to dynamic capital
             let old_cap = opp.optimal_bets.values().sum::<f64>();
@@ -770,39 +739,37 @@ impl Orchestrator {
             );
             if replace_ranked.is_empty() { return; }
 
-            let held_cids = self.engine.get_held_constraint_ids();
-            let held_mids = self.engine.get_held_market_ids();
-
             // Find best untraded opportunity
             let best_new = replace_ranked.iter().find(|&&(_, _, idx)| {
                 let opp = &opportunities[idx];
                 let cid = &opp.constraint_id;
-                !held_cids.contains(cid) && self.validate_opportunity(opp)
+                !held_cids.contains(cid) && self.validate_opportunity(opp, held_cids, held_mids)
             });
 
             if let Some(&(best_score, best_hours, best_idx)) = best_new {
                 let best_opp = &opportunities[best_idx];
 
-                // Find worst held position
-                let open_jsons = self.engine.get_open_positions_json();
+                // Find worst held position using typed access
                 let mut worst: Option<(String, f64)> = None;
+                let mut worst_bids: HashMap<String, f64> = HashMap::new();
 
-                for pj in &open_jsons {
-                    if let Ok(pos) = serde_json::from_str::<serde_json::Value>(pj) {
-                        let pid = pos["position_id"].as_str().unwrap_or("").to_string();
-                        let bids = self.get_position_bids(&pos);
+                {
+                    let pm = self.engine.positions.lock();
+                    for (pid, pos) in pm.open_positions() {
+                        let bids = self.get_position_bids_typed(pos);
                         let repl_profit = best_opp.expected_profit;
 
-                        if let Some(eval) = self.engine.evaluate_replacement(&pid, &bids, repl_profit) {
-                            let total_cap = pos["total_capital"].as_f64().unwrap_or(1.0);
-                            let remaining_upside = pos["expected_profit"].as_f64().unwrap_or(0.0) - eval.liquidation.profit;
+                        if let Some(eval) = pm.evaluate_replacement(pid, &bids, repl_profit) {
+                            let total_cap = pos.total_capital;
+                            let remaining_upside = pos.expected_profit - eval.liquidation.profit;
                             // Use a rough hours estimate
                             let hours_rem = 24.0_f64; // simplified
                             let rem_score = (remaining_upside / total_cap.max(0.01)) / hours_rem.max(0.01);
 
                             if worst.is_none() || rem_score < worst.as_ref().unwrap().1 {
                                 if eval.worth_replacing {
-                                    worst = Some((pid, rem_score));
+                                    worst_bids = bids;
+                                    worst = Some((pid.clone(), rem_score));
                                 }
                             }
                         }
@@ -810,39 +777,34 @@ impl Orchestrator {
                 }
 
                 if let Some((worst_pid, worst_score)) = worst {
-                    if best_score > worst_score * 1.2 {
+                    if best_score > worst_score * PROACTIVE_EXIT_MULTIPLIER {
                         // Execute replacement
-                        if let Some(pos_json) = open_jsons.iter().find(|j| j.contains(&worst_pid)) {
-                            if let Ok(pos) = serde_json::from_str::<serde_json::Value>(pos_json) {
-                                let bids = self.get_position_bids(&pos);
-                                if let Some((net, profit)) = self.engine.liquidate_position(&worst_pid, "replaced", &bids) {
-                                    tracing::info!("REPLACE: liquidated {} → freed ${:.2}, profit=${:+.2}",
-                                        &worst_pid[..worst_pid.len().min(30)], net, profit);
+                        if let Some((net, profit)) = self.engine.liquidate_position(&worst_pid, "replaced", &worst_bids) {
+                            tracing::info!("REPLACE: liquidated {} → freed ${:.2}, profit=${:+.2}",
+                                &worst_pid[..worst_pid.len().min(30)], net, profit);
 
-                                    // Enter replacement
-                                    let cap = dynamic_capital(self.engine.total_value(), self.cfg.capital_pct);
-                                    let old_cap = best_opp.optimal_bets.values().sum::<f64>();
-                                    let scale = if old_cap > 0.0 { cap / old_cap } else { 1.0 };
-                                    let scaled_bets: HashMap<String, f64> = best_opp.optimal_bets.iter()
-                                        .map(|(k, v)| (k.clone(), v * scale))
-                                        .collect();
-                                    let is_sell = best_opp.method.to_lowercase().contains("sell");
+                            // Enter replacement
+                            let cap = dynamic_capital(self.engine.total_value(), self.cfg.capital_pct);
+                            let old_cap = best_opp.optimal_bets.values().sum::<f64>();
+                            let scale = if old_cap > 0.0 { cap / old_cap } else { 1.0 };
+                            let scaled_bets: HashMap<String, f64> = best_opp.optimal_bets.iter()
+                                .map(|(k, v)| (k.clone(), v * scale))
+                                .collect();
+                            let is_sell = best_opp.method.to_lowercase().contains("sell");
 
-                                    let _ = self.engine.enter_position(
-                                        &best_opp.constraint_id, &best_opp.constraint_id,
-                                        if is_sell { "arb_sell" } else { "arb_buy" }, &best_opp.method,
-                                        &best_opp.market_ids, &best_opp.market_names,
-                                        &best_opp.current_prices, &best_opp.current_no_prices,
-                                        &scaled_bets, best_opp.expected_profit * scale,
-                                        best_opp.expected_profit_pct, is_sell,
-                                    );
+                            let _ = self.engine.enter_position(
+                                &best_opp.constraint_id, &best_opp.constraint_id,
+                                if is_sell { "arb_sell" } else { "arb_buy" }, &best_opp.method,
+                                &best_opp.market_ids, &best_opp.market_names,
+                                &best_opp.current_prices, &best_opp.current_no_prices,
+                                &scaled_bets, best_opp.expected_profit * scale,
+                                best_opp.expected_profit_pct, is_sell,
+                            );
 
-                                    self.last_replacement = now;
-                                    tracing::info!("  WITH: {}... | score={:.6} | {:.1}h",
-                                        &best_opp.constraint_id[..best_opp.constraint_id.len().min(30)],
-                                        best_score, best_hours);
-                                }
-                            }
+                            self.last_replacement = now;
+                            tracing::info!("  WITH: {}... | score={:.6} | {:.1}h",
+                                &best_opp.constraint_id[..best_opp.constraint_id.len().min(30)],
+                                best_score, best_hours);
                         }
                     }
                 }
@@ -850,10 +812,7 @@ impl Orchestrator {
         }
     }
 
-    fn validate_opportunity(&self, opp: &Opportunity) -> bool {
-        let held_cids = self.engine.get_held_constraint_ids();
-        let held_mids = self.engine.get_held_market_ids();
-
+    fn validate_opportunity(&self, opp: &Opportunity, held_cids: &HashSet<String>, held_mids: &HashSet<String>) -> bool {
         if held_cids.contains(&opp.constraint_id) { return false; }
         for mid in &opp.market_ids {
             if held_mids.contains(mid) { return false; }
@@ -886,29 +845,18 @@ impl Orchestrator {
         true
     }
 
-    fn get_position_bids(&self, pos: &serde_json::Value) -> HashMap<String, f64> {
-        let markets = pos.get("markets").and_then(|m| m.as_object());
-        let method = pos.pointer("/metadata/method")
-            .and_then(|v| v.as_str()).unwrap_or("");
-        let is_sell = method.to_lowercase().contains("sell");
-
-        let mut bids = HashMap::new();
-        if let Some(markets) = markets {
-            for (mid, leg) in markets {
-                let entry_price = leg.get("entry_price").and_then(|v| v.as_f64()).unwrap_or(0.5);
-                // Use entry price as bid estimate (book mirror prices would be better
-                // but require asset_id lookup which isn't stored in position JSON)
-                bids.insert(mid.clone(), entry_price);
-            }
-        }
-        bids
+    /// Extract bid estimates from a typed Position (entry_price as bid proxy).
+    fn get_position_bids_typed(&self, pos: &rust_engine::position::Position) -> HashMap<String, f64> {
+        pos.markets.iter()
+            .map(|(mid, leg)| (mid.clone(), leg.entry_price))
+            .collect()
     }
 
     // --- Proactive exits ---
 
     fn check_proactive_exits(&self) {
         let all_bids = self.collect_all_position_bids();
-        let exits = self.engine.check_proactive_exits(&all_bids, 1.2);
+        let exits = self.engine.check_proactive_exits(&all_bids, PROACTIVE_EXIT_MULTIPLIER);
         for exit in &exits {
             tracing::info!("PROACTIVE EXIT: {}... ratio={:.3}",
                 &exit.position_id[..exit.position_id.len().min(40)], exit.ratio);
@@ -920,25 +868,20 @@ impl Orchestrator {
     }
 
     fn collect_all_position_bids(&self) -> HashMap<String, f64> {
+        let pm = self.engine.positions.lock();
         let mut all_bids = HashMap::new();
-        for pj in self.engine.get_open_positions_json() {
-            if let Ok(pos) = serde_json::from_str::<serde_json::Value>(&pj) {
-                let bids = self.get_position_bids(&pos);
-                all_bids.extend(bids);
-            }
+        for pos in pm.open_positions().values() {
+            all_bids.extend(self.get_position_bids_typed(pos));
         }
         all_bids
     }
 
     fn get_position_bids_by_id(&self, position_id: &str) -> HashMap<String, f64> {
-        for pj in self.engine.get_open_positions_json() {
-            if let Ok(pos) = serde_json::from_str::<serde_json::Value>(&pj) {
-                if pos["position_id"].as_str() == Some(position_id) {
-                    return self.get_position_bids(&pos);
-                }
-            }
+        let pm = self.engine.positions.lock();
+        match pm.get_position(position_id) {
+            Some(pos) => self.get_position_bids_typed(pos),
+            None => HashMap::new(),
         }
-        HashMap::new()
     }
 
     // --- Postponement ---
@@ -950,24 +893,26 @@ impl Orchestrator {
         };
 
         let now = chrono::Utc::now();
-        let open_positions = self.engine.get_open_positions_json();
+
+        // Collect position data under lock, then release
+        let position_data: Vec<(String, Vec<String>, Vec<String>)> = {
+            let pm = self.engine.positions.lock();
+            pm.open_positions().values().map(|pos| {
+                let pid = pos.position_id.clone();
+                let market_ids: Vec<String> = pos.markets.keys().cloned().collect();
+                let market_names: Vec<String> = pos.markets.values()
+                    .map(|leg| leg.name.clone())
+                    .collect();
+                (pid, market_ids, market_names)
+            }).collect()
+        };
+
         let mut checked = 0;
 
-        for pj in &open_positions {
-            let pos: serde_json::Value = match serde_json::from_str(pj) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            let pid = pos["position_id"].as_str().unwrap_or("");
-            let markets = match pos["markets"].as_object() {
-                Some(m) => m,
-                None => continue,
-            };
-
+        for (pid, market_ids, market_names) in &position_data {
             // Find end_date
             let mut expected_date = None;
-            for (mid, _leg) in markets {
+            for mid in market_ids {
                 if let Some(m) = self.market_lookup.get(mid) {
                     if let Some(ed) = m.pointer("/metadata/end_date").and_then(|v| v.as_str()) {
                         if ed.len() >= 10 {
@@ -991,14 +936,13 @@ impl Orchestrator {
                 continue;
             }
 
-            let market_names: Vec<String> = markets.values()
-                .filter_map(|leg| leg.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                .collect();
-
-            if let Some(result) = pd.check(pid, &market_names, &expected_date) {
+            if let Some(result) = pd.check(pid, market_names, &expected_date) {
                 if result.effective_resolution_date.is_some() {
+                    let display_name = market_names.first()
+                        .map(|n| &n[..n.len().min(40)])
+                        .unwrap_or("?");
                     tracing::info!("Postponement detected: {}... → {}",
-                        market_names.first().map(|n| &n[..n.len().min(40)]).unwrap_or("?"),
+                        display_name,
                         result.effective_resolution_date.as_deref().unwrap_or("?"));
                 }
                 checked += 1;

@@ -11,7 +11,7 @@
 ///   - price_change: bid/ask update
 ///   - best_bid_ask: lightweight best prices
 ///   - last_trade_price: ignored (informational only)
-///   - market_resolved: forwarded to Python via callback queue
+///   - market_resolved: resolved events queue for orchestrator
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -24,7 +24,7 @@ use crate::position::PositionManager;
 use crate::queue::EvalQueue;
 use crate::types::{BookLevel, EngineConfig};
 
-/// Resolved market event, queued for Python to handle.
+/// Resolved market event, queued for orchestrator processing.
 #[derive(Debug, Clone)]
 pub struct ResolvedEvent {
     pub market_cid: String,
@@ -39,7 +39,7 @@ pub struct WsManager {
     running: Arc<AtomicBool>,
     /// Total WS messages received across all shards.
     total_msgs: Arc<AtomicU64>,
-    /// Resolved events accumulator — processed in Rust, no Python round-trip.
+    /// Resolved events accumulator.
     resolved_events: Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
     /// Position manager — for direct resolution when market_resolved arrives.
     positions: Arc<parking_lot::Mutex<PositionManager>>,
@@ -70,7 +70,7 @@ impl WsManager {
     }
 
     /// Start WS shards for the given asset IDs.
-    /// Called from Python after constraint detection provides asset lists.
+    /// Called after constraint detection provides asset lists.
     pub async fn start(&self, all_asset_ids: Vec<String>) {
         self.running.store(true, Ordering::SeqCst);
         let shard_size = self.config.assets_per_shard;
@@ -113,7 +113,7 @@ impl WsManager {
         tracing::info!("WS manager: stop requested");
     }
 
-    /// Drain resolved market events (called by Python).
+    /// Drain resolved market events.
     pub fn drain_resolved(&self) -> Vec<ResolvedEvent> {
         let mut events = self.resolved_events.lock();
         std::mem::take(&mut *events)
@@ -298,7 +298,7 @@ fn handle_message(
     positions: &Arc<parking_lot::Mutex<PositionManager>>,
 ) {
     // Debug: log first 200 chars of every message for diagnosis
-    tracing::debug!("Shard {} raw msg: {}", shard_id, &text[..text.len().min(200)]);
+    tracing::trace!("Shard {} raw msg: {}", shard_id, &text[..text.len().min(200)]);
     // Fast path: skip PONG (plain text response to our PING) and subscription confirmations
     let trimmed = text.trim();
     if trimmed == "PONG"
@@ -339,7 +339,7 @@ fn handle_message(
             "market_resolved" => handle_resolved(msg, resolved, positions, now),
             "last_trade_price" | "pong" | "" => {} // ignore
             _ => {
-                tracing::debug!("Unknown event_type: '{}' in: {}", event_type, &text[..text.len().min(150)]);
+                tracing::trace!("Unknown event_type: '{}' in: {}", event_type, &text[..text.len().min(150)]);
             }
         }
     }
@@ -383,7 +383,7 @@ fn handle_book(
     let bids = parse_levels("bids");
     let evals = book.apply_snapshot(asset_id, asks, bids, ts);
     for (cid, urgent) in evals {
-        queue.push(&cid, asset_id, urgent);
+        queue.push(&cid, asset_id, urgent, ts);
     }
 }
 
@@ -405,7 +405,7 @@ fn handle_price_change(
             let is_ask = side == "SELL" || side == "sell" || side == "ask";
             let evals = book.apply_delta(asset_id, is_ask, price, size, ts);
             for (cid, urgent) in evals {
-                queue.push(&cid, asset_id, urgent);
+                queue.push(&cid, asset_id, urgent, ts);
             }
         }
         return;
@@ -417,7 +417,7 @@ fn handle_price_change(
     if ask > 0.0 || bid > 0.0 {
         let evals = book.apply_best_prices(asset_id, bid, ask, ts);
         for (cid, urgent) in evals {
-            queue.push(&cid, asset_id, urgent);
+            queue.push(&cid, asset_id, urgent, ts);
         }
     }
 }
@@ -435,7 +435,7 @@ fn handle_best_bid_ask(
     if ask > 0.0 || bid > 0.0 {
         let evals = book.apply_best_prices(asset_id, bid, ask, ts);
         for (cid, urgent) in evals {
-            queue.push(&cid, asset_id, urgent);
+            queue.push(&cid, asset_id, urgent, ts);
         }
     }
 }
@@ -477,8 +477,8 @@ fn handle_resolved(
     };
 
     // Try to resolve positions using ALL accumulated events.
-    // PositionManager methods each lock inner briefly — no outer lock needed.
-    let pm = positions.lock();
+    // Single outer lock provides all synchronization (no inner lock in PositionManager).
+    let mut pm = positions.lock();
     if pm.open_count() == 0 {
         return;
     }
@@ -493,10 +493,8 @@ fn handle_resolved(
     }
     drop(pm);
 
-    // Clear processed events if any positions resolved
-    if !resolved_positions.is_empty() {
-        resolved.lock().clear();
-    }
+    // Always clear after processing — events for unrelated markets shouldn't accumulate
+    resolved.lock().clear();
 }
 
 /// Parse a JSON field that might be string or number.

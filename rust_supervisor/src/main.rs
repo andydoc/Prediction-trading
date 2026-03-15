@@ -57,6 +57,10 @@ struct Cli {
     /// Print resolved config and exit (dry run)
     #[arg(long)]
     dry_run: bool,
+
+    /// Skip PID lock check (for running alongside another instance)
+    #[arg(long)]
+    no_pid_lock: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +87,7 @@ impl SupervisorConfig {
         let config_path = workspace.join("config").join("config.yaml");
         let yaml_val: serde_json::Value = fs::read_to_string(&config_path)
             .ok()
-            .and_then(|s| serde_yaml::from_str(&s).ok())
+            .and_then(|s| serde_yaml_ng::from_str(&s).ok())
             .unwrap_or_default();
 
         let log_level = cli.log_level.clone().unwrap_or_else(|| {
@@ -131,7 +135,7 @@ impl SupervisorConfig {
             }
         };
 
-        let mut val: serde_yaml::Value = match serde_yaml::from_str(&contents) {
+        let mut val: serde_yaml_ng::Value = match serde_yaml_ng::from_str(&contents) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("Cannot parse config.yaml for overrides: {}", e);
@@ -144,17 +148,17 @@ impl SupervisorConfig {
         if let Some(ref mode) = self.mode {
             match mode.as_str() {
                 "shadow" => {
-                    set_yaml_value(&mut val, "mode", &serde_yaml::Value::String("dual".into()));
-                    set_yaml_path(&mut val, "live_trading.shadow_only", &serde_yaml::Value::Bool(true));
-                    set_yaml_path(&mut val, "live_trading.enabled", &serde_yaml::Value::Bool(true));
+                    set_yaml_value(&mut val, "mode", &serde_yaml_ng::Value::String("dual".into()));
+                    set_yaml_path(&mut val, "live_trading.shadow_only", &serde_yaml_ng::Value::Bool(true));
+                    set_yaml_path(&mut val, "live_trading.enabled", &serde_yaml_ng::Value::Bool(true));
                 }
                 "live" => {
-                    set_yaml_value(&mut val, "mode", &serde_yaml::Value::String("dual".into()));
-                    set_yaml_path(&mut val, "live_trading.shadow_only", &serde_yaml::Value::Bool(false));
-                    set_yaml_path(&mut val, "live_trading.enabled", &serde_yaml::Value::Bool(true));
+                    set_yaml_value(&mut val, "mode", &serde_yaml_ng::Value::String("dual".into()));
+                    set_yaml_path(&mut val, "live_trading.shadow_only", &serde_yaml_ng::Value::Bool(false));
+                    set_yaml_path(&mut val, "live_trading.enabled", &serde_yaml_ng::Value::Bool(true));
                 }
                 _ => {
-                    set_yaml_value(&mut val, "mode", &serde_yaml::Value::String(mode.clone()));
+                    set_yaml_value(&mut val, "mode", &serde_yaml_ng::Value::String(mode.clone()));
                 }
             }
             changed = true;
@@ -162,11 +166,25 @@ impl SupervisorConfig {
 
         if let Some(port) = self.dashboard_port {
             set_yaml_path(&mut val, "dashboard.port",
-                &serde_yaml::Value::Number(serde_yaml::Number::from(port as u64)));
+                &serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(port as u64)));
             changed = true;
         }
 
+        const ALLOWED_SET_KEYS: &[&str] = &[
+            "dashboard.port", "mode", "state.db_path",
+            "live_trading.shadow_only", "live_trading.enabled",
+            "arbitrage.max_concurrent_positions", "arbitrage.capital_per_trade_pct",
+            "arbitrage.min_trade_size", "arbitrage.max_days_to_resolution",
+            "engine.state_save_interval_seconds", "engine.monitor_interval_seconds",
+            "engine.constraint_rebuild_interval_seconds",
+            "monitoring.logging.level",
+        ];
+
         for (key, value) in &self.config_overrides {
+            if !ALLOWED_SET_KEYS.contains(&key.as_str()) {
+                tracing::warn!("Ignoring unknown --set key: {} (not in allowlist)", key);
+                continue;
+            }
             let yaml_value = parse_yaml_value(value);
             set_yaml_path(&mut val, key, &yaml_value);
             tracing::info!("Config override: {} = {}", key, value);
@@ -174,7 +192,7 @@ impl SupervisorConfig {
         }
 
         if changed {
-            match serde_yaml::to_string(&val) {
+            match serde_yaml_ng::to_string(&val) {
                 Ok(yaml_str) => {
                     if let Err(e) = fs::write(&config_path, &yaml_str) {
                         tracing::error!("Failed to write config overrides: {}", e);
@@ -188,40 +206,40 @@ impl SupervisorConfig {
     }
 }
 
-fn parse_yaml_value(s: &str) -> serde_yaml::Value {
+fn parse_yaml_value(s: &str) -> serde_yaml_ng::Value {
     match s {
-        "true" | "True" | "TRUE" => return serde_yaml::Value::Bool(true),
-        "false" | "False" | "FALSE" => return serde_yaml::Value::Bool(false),
+        "true" | "True" | "TRUE" => return serde_yaml_ng::Value::Bool(true),
+        "false" | "False" | "FALSE" => return serde_yaml_ng::Value::Bool(false),
         _ => {}
     }
     if let Ok(n) = s.parse::<i64>() {
-        return serde_yaml::Value::Number(serde_yaml::Number::from(n));
+        return serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(n));
     }
     if let Ok(f) = s.parse::<f64>() {
-        return serde_yaml::Value::Number(serde_yaml::Number::from(f));
+        return serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(f));
     }
-    serde_yaml::Value::String(s.to_string())
+    serde_yaml_ng::Value::String(s.to_string())
 }
 
-fn set_yaml_value(root: &mut serde_yaml::Value, key: &str, val: &serde_yaml::Value) {
-    if let serde_yaml::Value::Mapping(ref mut map) = root {
-        map.insert(serde_yaml::Value::String(key.to_string()), val.clone());
+fn set_yaml_value(root: &mut serde_yaml_ng::Value, key: &str, val: &serde_yaml_ng::Value) {
+    if let serde_yaml_ng::Value::Mapping(ref mut map) = root {
+        map.insert(serde_yaml_ng::Value::String(key.to_string()), val.clone());
     }
 }
 
-fn set_yaml_path(root: &mut serde_yaml::Value, path: &str, val: &serde_yaml::Value) {
+fn set_yaml_path(root: &mut serde_yaml_ng::Value, path: &str, val: &serde_yaml_ng::Value) {
     let parts: Vec<&str> = path.split('.').collect();
     let mut current = root;
     for (i, part) in parts.iter().enumerate() {
         if i == parts.len() - 1 {
-            if let serde_yaml::Value::Mapping(ref mut map) = current {
-                map.insert(serde_yaml::Value::String(part.to_string()), val.clone());
+            if let serde_yaml_ng::Value::Mapping(ref mut map) = current {
+                map.insert(serde_yaml_ng::Value::String(part.to_string()), val.clone());
             }
         } else {
-            let key = serde_yaml::Value::String(part.to_string());
-            if let serde_yaml::Value::Mapping(ref mut map) = current {
+            let key = serde_yaml_ng::Value::String(part.to_string());
+            if let serde_yaml_ng::Value::Mapping(ref mut map) = current {
                 if !map.contains_key(&key) {
-                    map.insert(key.clone(), serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+                    map.insert(key.clone(), serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new()));
                 }
                 current = map.get_mut(&key).unwrap();
             }
@@ -404,7 +422,9 @@ fn main() {
         return;
     }
 
-    check_pid_lock(&cfg.pid_file);
+    if !cli.no_pid_lock {
+        check_pid_lock(&cfg.pid_file);
+    }
     cfg.apply_overrides_to_config();
 
     let running = Arc::new(AtomicBool::new(true));
@@ -433,6 +453,8 @@ fn main() {
         }
     }
 
-    remove_pid_file(&cfg.pid_file);
+    if !cli.no_pid_lock {
+        remove_pid_file(&cfg.pid_file);
+    }
     tracing::info!("System stopped.");
 }

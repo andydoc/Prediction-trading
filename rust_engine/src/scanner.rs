@@ -5,50 +5,40 @@
 ///
 /// Schema:
 ///   markets(market_id TEXT PK, data TEXT JSON, updated_at REAL)
-use rusqlite::{Connection, params};
-use rusqlite::backup::Backup;
-use parking_lot::Mutex;
+use rusqlite::params;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::cached_db::CachedSqliteDB;
 
 // ---------------------------------------------------------------------------
 // SQLite cache (in-memory + disk backup, same pattern as ResolutionCache)
 // ---------------------------------------------------------------------------
 
+const SCANNER_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS markets (
+        market_id TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        updated_at REAL NOT NULL
+    );
+";
+
 struct ScannerDB {
-    mem: Mutex<Connection>,
-    disk_path: PathBuf,
+    db: CachedSqliteDB,
 }
 
 impl ScannerDB {
     fn new(disk_path: &str) -> Result<Self, String> {
-        let mem_conn = Connection::open_in_memory()
-            .map_err(|e| format!("Failed to open in-memory SQLite: {}", e))?;
-
-        mem_conn.execute_batch("
-            PRAGMA journal_mode=WAL;
-            PRAGMA synchronous=OFF;
-            CREATE TABLE IF NOT EXISTS markets (
-                market_id TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                updated_at REAL NOT NULL
-            );
-        ").map_err(|e| format!("Failed to create markets table: {}", e))?;
-
-        let db = Self {
-            mem: Mutex::new(mem_conn),
-            disk_path: PathBuf::from(disk_path),
-        };
+        let db = CachedSqliteDB::new(disk_path, SCANNER_SCHEMA)?;
 
         // Restore from disk if available
-        if db.disk_path.exists() {
+        if db.disk_exists() {
             match db.load_from_disk() {
                 Ok(ms) => tracing::info!("[scanner] Loaded market cache from disk in {:.1}ms", ms),
                 Err(e) => tracing::warn!("[scanner] Could not load market cache from disk: {}", e),
             }
         }
 
-        Ok(db)
+        Ok(Self { db })
     }
 
     fn save_markets(&self, markets: &[(String, String)]) {
@@ -57,10 +47,10 @@ impl ScannerDB {
             .unwrap_or_default()
             .as_secs_f64();
 
-        let db = self.mem.lock();
+        let conn = self.db.conn();
         // Clear and reload — full replacement each scan
-        let _ = db.execute("DELETE FROM markets", []);
-        let mut stmt = match db.prepare(
+        let _ = conn.execute("DELETE FROM markets", []);
+        let mut stmt = match conn.prepare(
             "INSERT OR REPLACE INTO markets (market_id, data, updated_at) VALUES (?1, ?2, ?3)"
         ) {
             Ok(s) => s,
@@ -75,9 +65,9 @@ impl ScannerDB {
     }
 
     fn load_all(&self) -> Vec<String> {
-        let db = self.mem.lock();
+        let conn = self.db.conn();
         let mut result = Vec::new();
-        if let Ok(mut stmt) = db.prepare("SELECT data FROM markets") {
+        if let Ok(mut stmt) = conn.prepare("SELECT data FROM markets") {
             if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
                 for row in rows.flatten() {
                     result.push(row);
@@ -88,56 +78,17 @@ impl ScannerDB {
     }
 
     fn count(&self) -> usize {
-        let db = self.mem.lock();
-        db.query_row("SELECT count(*) FROM markets", [], |row| row.get::<_, usize>(0))
-            .unwrap_or(0)
+        let conn = self.db.conn();
+        conn.query_row("SELECT count(*) FROM markets", [], |row| row.get::<_, i64>(0))
+            .unwrap_or(0) as usize
     }
 
     fn mirror_to_disk(&self) -> f64 {
-        let t0 = Instant::now();
-        let db = self.mem.lock();
-
-        if let Some(parent) = self.disk_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        match Connection::open(&self.disk_path) {
-            Ok(mut disk_db) => {
-                match Backup::new(&*db, &mut disk_db) {
-                    Ok(backup) => {
-                        if let Err(e) = backup.run_to_completion(
-                            100, Duration::ZERO,
-                            None::<fn(rusqlite::backup::Progress)>,
-                        ) {
-                            tracing::warn!("[scanner] Cache backup failed: {}", e);
-                        }
-                    }
-                    Err(e) => tracing::warn!("[scanner] Cache backup init failed: {}", e),
-                }
-            }
-            Err(e) => tracing::warn!("[scanner] Failed to open disk DB: {}", e),
-        }
-
-        t0.elapsed().as_secs_f64() * 1000.0
+        self.db.mirror_to_disk()
     }
 
     fn load_from_disk(&self) -> Result<f64, String> {
-        if !self.disk_path.exists() {
-            return Err("Disk DB file not found".into());
-        }
-        let t0 = Instant::now();
-        let disk_db = Connection::open(&self.disk_path)
-            .map_err(|e| format!("Failed to open disk DB: {}", e))?;
-
-        let mut db = self.mem.lock();
-        let backup = Backup::new(&disk_db, &mut *db)
-            .map_err(|e| format!("Backup init failed: {}", e))?;
-        backup.run_to_completion(
-            100, Duration::ZERO,
-            None::<fn(rusqlite::backup::Progress)>,
-        ).map_err(|e| format!("Backup restore failed: {}", e))?;
-
-        Ok(t0.elapsed().as_secs_f64() * 1000.0)
+        self.db.load_from_disk()
     }
 }
 
@@ -354,6 +305,7 @@ fn write_json_file(path: &std::path::Path, markets: &[(String, serde_json::Value
 // ScanResult
 // ---------------------------------------------------------------------------
 
+#[must_use]
 pub struct ScanResult {
     pub markets: Vec<serde_json::Value>,
     pub count: usize,
@@ -425,7 +377,7 @@ impl MarketScanner {
     /// Load cached markets from SQLite (no API call). Returns same format as scan().
     pub fn load_cached(&self) -> ScanResult {
         // Try loading from disk if in-memory is empty
-        if self.db.count() == 0 && self.db.disk_path.exists() {
+        if self.db.count() == 0 && self.db.db.disk_exists() {
             let _ = self.db.load_from_disk();
         }
 

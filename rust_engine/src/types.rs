@@ -15,6 +15,7 @@ pub struct OrderBook {
     pub asks: BTreeMap<OrderedFloat, f64>,  // price → size
     pub bids: BTreeMap<OrderedFloat, f64>,  // price → size (reverse iter for best)
     pub last_update: f64,                    // unix timestamp
+    pub last_efp: f64,                       // last effective fill price (for drift detection)
 }
 
 /// Wrapper for f64 that implements Ord (for BTreeMap keys).
@@ -31,7 +32,7 @@ impl PartialOrd for OrderedFloat {
 
 impl Ord for OrderedFloat {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
+        self.0.total_cmp(&other.0)
     }
 }
 
@@ -221,7 +222,7 @@ pub fn load_engine_config(workspace: &str) -> (EngineConfig, EvalCfg, PositionCf
     let path = std::path::PathBuf::from(workspace).join("config").join("config.yaml");
 
     let val: serde_json::Value = match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_yaml::from_str(&contents).unwrap_or_default(),
+        Ok(contents) => serde_yaml_ng::from_str(&contents).unwrap_or_default(),
         Err(_) => {
             tracing::warn!("config.yaml not found at {:?}, using defaults", path);
             return (EngineConfig::default(), EvalCfg::default(), PositionCfg::default(), LoggingCfg::default());
@@ -330,6 +331,33 @@ pub fn load_engine_config(workspace: &str) -> (EngineConfig, EvalCfg, PositionCf
     );
 
     (engine_cfg, eval_cfg, pos_cfg, log_cfg)
+}
+
+/// Classify market names into a resolution-delay category.
+pub fn classify_category(market_names: &[String]) -> &'static str {
+    let combined: String = market_names.iter()
+        .map(|n| n.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let has = |patterns: &[&str]| patterns.iter().any(|p| combined.contains(p));
+
+    if has(&["win on 20", "end in a draw", "halftime", "leading at halftime"]) { return "football"; }
+    if has(&["nba ", "nfl ", "nhl ", "mlb ", "wnba ",
+            "touchdown", "rushing yards", "passing yards",
+            "rebounds", "three-pointer"]) { return "us_sports"; }
+    if has(&["spread:", "team total:", "o/u "]) { return "sports_props"; }
+    if has(&["counter-strike", "cs2", "dota", "league of legends",
+            "valorant", "overwatch", "dreamleague"]) { return "esports"; }
+    if has(&["atp ", "wta ", "tennis"]) { return "tennis"; }
+    if has(&["ufc ", "mma ", "boxing", "pfl ", "bellator"]) { return "mma_boxing"; }
+    if has(&["cricket", "ipl ", "t20 "]) { return "cricket"; }
+    if has(&["rugby", "super rugby", "waratahs"]) { return "rugby"; }
+    if has(&["bitcoin", "ethereum", "solana", "btc ", "eth ", "up or down"]) { return "crypto"; }
+    if has(&["governor", "congress", "senate", "primary",
+            "democrat", "republican", "election", "president"]) { return "politics"; }
+    if has(&["fed ", "federal reserve", "interest rate",
+            "tariff", "government shutdown"]) { return "gov_policy"; }
+    "other"
 }
 
 /// Reason an eval was queued.

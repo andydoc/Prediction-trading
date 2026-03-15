@@ -1,5 +1,5 @@
-/// Eval queue: Rust WS tasks push constraint IDs here,
-/// Python drains them for arb evaluation.
+/// Eval queue: WS tasks push constraint IDs here,
+/// orchestrator drains them for arb evaluation.
 ///
 /// Two priority levels:
 ///   - Urgent: EFP drift > threshold (process first)
@@ -48,12 +48,7 @@ impl EvalQueue {
     }
 
     /// Push a constraint eval (called from WS handler threads).
-    pub fn push(&self, constraint_id: &str, asset_id: &str, urgent: bool) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-
+    pub fn push(&self, constraint_id: &str, asset_id: &str, urgent: bool, now: f64) {
         let entry = QueueEntry {
             constraint_id: constraint_id.to_string(),
             trigger_asset: asset_id.to_string(),
@@ -124,4 +119,8 @@ impl EvalQueue {
         q.urgent_set.clear();
         q.bg_set.clear();
     }
+}
+
+impl Default for EvalQueue {
+    fn default() -> Self { Self::new() }
 }

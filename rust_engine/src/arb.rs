@@ -1,6 +1,11 @@
 /// Pure Rust arb math — extracted from rust_arb, no PyO3 dependencies.
 /// Used by evaluate_batch() to run the entire hot path in Rust.
 
+/// Minimum price sum to consider mutex arb (filters garbage data).
+const MIN_PRICE_SUM_THRESHOLD: f64 = 0.899;
+/// Maximum markets for polytope optimization.
+const MAX_POLYTOPE_MARKETS: usize = 12;
+
 /// Result of a mutex arb check.
 #[derive(Debug, Clone)]
 pub struct ArbResult {
@@ -41,7 +46,7 @@ pub fn check_mutex_arb(
     if yes_prices.iter().any(|&p| p < 0.02) { return None; }
 
     let price_sum: f64 = yes_prices.iter().sum();
-    if price_sum < 0.899 { return None; }
+    if price_sum < MIN_PRICE_SUM_THRESHOLD { return None; }
 
     // --- Buy-side: sum(YES asks) < 1.0 ---
     if price_sum < 1.0 {
@@ -138,7 +143,7 @@ pub fn polytope_arb(
     let n = market_ids.len();
     if n < 2 || yes_prices.len() != n { return None; }
     if yes_prices.iter().any(|&p| p < 0.02) { return None; }
-    if n > 12 { return None; }
+    if n > MAX_POLYTOPE_MARKETS { return None; }
 
     let price_sum: f64 = yes_prices.iter().sum();
     let ct = constraint_type;

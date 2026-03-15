@@ -8,11 +8,11 @@
 ///
 /// Schema:
 ///   postponement_cache(position_id TEXT PK, data TEXT JSON, cached_at REAL)
-use rusqlite::{Connection, params};
-use rusqlite::backup::Backup;
+use rusqlite::params;
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use crate::cached_db::CachedSqliteDB;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -66,45 +66,35 @@ pub struct PostponementConfig {
 // In-memory SQLite cache (mirrors StateDB / ResolutionCache pattern)
 // ---------------------------------------------------------------------------
 
+const POSTPONEMENT_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS postponement_cache (
+        position_id TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        cached_at REAL NOT NULL
+    );
+";
+
 struct PostponementCache {
-    mem: Mutex<Connection>,
-    disk_path: PathBuf,
+    db: CachedSqliteDB,
     ttl_secs: f64,
 }
 
 impl PostponementCache {
     fn new(disk_path: &str, ttl_secs: f64) -> Result<Self, String> {
-        let mem_conn = Connection::open_in_memory()
-            .map_err(|e| format!("Failed to open in-memory SQLite: {}", e))?;
+        let db = CachedSqliteDB::new(disk_path, POSTPONEMENT_SCHEMA)?;
 
-        mem_conn.execute_batch("
-            PRAGMA journal_mode=WAL;
-            PRAGMA synchronous=OFF;
-            CREATE TABLE IF NOT EXISTS postponement_cache (
-                position_id TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                cached_at REAL NOT NULL
-            );
-        ").map_err(|e| format!("Failed to create cache table: {}", e))?;
-
-        let cache = Self {
-            mem: Mutex::new(mem_conn),
-            disk_path: PathBuf::from(disk_path),
-            ttl_secs,
-        };
-
-        if cache.disk_path.exists() {
-            match cache.load_from_disk() {
+        if db.disk_exists() {
+            match db.load_from_disk() {
                 Ok(ms) => tracing::info!("Postponement cache loaded from disk in {:.1}ms", ms),
                 Err(e) => tracing::warn!("Could not load postponement cache from disk: {}", e),
             }
         }
 
-        Ok(cache)
+        Ok(Self { db, ttl_secs })
     }
 
     fn load(&self, position_id: &str) -> Option<PostponementResult> {
-        let db = self.mem.lock();
+        let db = self.db.conn();
         let row: Option<(String, f64)> = db.query_row(
             "SELECT data, cached_at FROM postponement_cache WHERE position_id = ?1",
             params![position_id],
@@ -138,7 +128,7 @@ impl PostponementCache {
             }
         };
 
-        let db = self.mem.lock();
+        let db = self.db.conn();
         let _ = db.execute(
             "INSERT OR REPLACE INTO postponement_cache (position_id, data, cached_at) VALUES (?1, ?2, ?3)",
             params![position_id, data_json, now],
@@ -146,50 +136,7 @@ impl PostponementCache {
     }
 
     fn mirror_to_disk(&self) -> f64 {
-        let t0 = Instant::now();
-        let db = self.mem.lock();
-
-        if let Some(parent) = self.disk_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        match Connection::open(&self.disk_path) {
-            Ok(mut disk_db) => {
-                match Backup::new(&*db, &mut disk_db) {
-                    Ok(backup) => {
-                        if let Err(e) = backup.run_to_completion(
-                            100, Duration::ZERO,
-                            None::<fn(rusqlite::backup::Progress)>,
-                        ) {
-                            tracing::warn!("Postponement cache backup failed: {}", e);
-                        }
-                    }
-                    Err(e) => tracing::warn!("Postponement cache backup init failed: {}", e),
-                }
-            }
-            Err(e) => tracing::warn!("Failed to open postponement cache disk DB: {}", e),
-        }
-
-        t0.elapsed().as_secs_f64() * 1000.0
-    }
-
-    fn load_from_disk(&self) -> Result<f64, String> {
-        if !self.disk_path.exists() {
-            return Err("Disk DB file not found".into());
-        }
-        let t0 = Instant::now();
-        let disk_db = Connection::open(&self.disk_path)
-            .map_err(|e| format!("Failed to open disk DB: {}", e))?;
-
-        let mut db = self.mem.lock();
-        let backup = Backup::new(&disk_db, &mut *db)
-            .map_err(|e| format!("Backup init failed: {}", e))?;
-        backup.run_to_completion(
-            100, Duration::ZERO,
-            None::<fn(rusqlite::backup::Progress)>,
-        ).map_err(|e| format!("Backup restore failed: {}", e))?;
-
-        Ok(t0.elapsed().as_secs_f64() * 1000.0)
+        self.db.mirror_to_disk()
     }
 }
 
@@ -405,7 +352,7 @@ fn load_prompts(workspace: &str) -> (String, String) {
     let path = PathBuf::from(workspace).join("config").join("prompts.yaml");
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
-            match serde_yaml::from_str::<serde_json::Value>(&contents) {
+            match serde_yaml_ng::from_str::<serde_json::Value>(&contents) {
                 Ok(val) => {
                     let detection = val.get("postponement_detection")
                         .and_then(|v| v.as_str())
@@ -449,7 +396,7 @@ fn load_config(workspace: &str) -> PostponementConfig {
     };
 
     if let Ok(contents) = std::fs::read_to_string(&path) {
-        if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(&contents) {
+        if let Ok(val) = serde_yaml_ng::from_str::<serde_json::Value>(&contents) {
             // ai.api_url
             if let Some(url) = val.pointer("/ai/api_url").and_then(|v| v.as_str()) {
                 cfg.api_url = url.to_string();
@@ -566,7 +513,7 @@ impl PostponementDetector {
     ) -> Option<PostponementResult> {
         // 1. Check cache
         if let Some(cached) = self.cache.load(position_id) {
-            tracing::debug!("Postponement cache hit for {}", &position_id[..position_id.len().min(30)]);
+
             return Some(cached);
         }
 

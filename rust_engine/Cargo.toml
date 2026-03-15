@@ -20,7 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
-rusqlite = { version = "0.33", features = ["bundled", "backup"] }
+rusqlite = { version = "0.38", features = ["bundled", "backup"] }
 axum = "0.8"
 axum-extra = { version = "0.10", features = ["typed-header"] }
 tower-http = { version = "0.6", features = ["cors"] }
@@ -28,4 +28,4 @@ tokio-stream = "0.1"
 chrono = "0.4"
 async-stream = "0.3"
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
-serde_yaml = "0.9"
+serde_yaml_ng = "0.9"

@@ -1,4 +1,4 @@
-/// Rust Position Manager — replaces paper_trading.py (Phase 8q-1)
+/// Position Manager — full position lifecycle management.
 ///
 /// Manages the full position lifecycle: entry, monitoring, resolution, liquidation.
 /// All capital accounting happens here. State persisted via RustStateDB.
@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
-use parking_lot::Mutex;
 
 fn now_ts() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
@@ -53,6 +52,7 @@ pub struct Position {
 }
 
 /// Result of attempting to enter a position
+#[must_use]
 #[derive(Debug)]
 pub enum EntryResult {
     Entered(Position),
@@ -98,12 +98,11 @@ pub struct ProactiveExit {
     pub ratio: f64,  // net_proceeds / resolution_payout (>1.2 = exit)
 }
 
-/// Core position manager — thread-safe, owns all capital accounting
+/// Core position manager — owns all capital accounting.
+///
+/// Thread safety is provided by the outer `Arc<parking_lot::Mutex<PositionManager>>`
+/// in TradingEngine / WsManager. No internal locking needed.
 pub struct PositionManager {
-    inner: Mutex<PositionManagerInner>,
-}
-
-struct PositionManagerInner {
     current_capital: f64,
     initial_capital: f64,
     taker_fee: f64,
@@ -121,53 +120,54 @@ struct PositionManagerInner {
 impl PositionManager {
     pub fn new(initial_capital: f64, taker_fee: f64) -> Self {
         Self {
-            inner: Mutex::new(PositionManagerInner {
-                current_capital: initial_capital,
-                initial_capital,
-                taker_fee,
-                open_positions: HashMap::new(),
-                closed_positions: Vec::new(),
-                asset_index: HashMap::new(),
-                total_trades: 0,
-                winning_trades: 0,
-                losing_trades: 0,
-                total_actual_profit: 0.0,
-                total_expected_profit: 0.0,
-            }),
+            current_capital: initial_capital,
+            initial_capital,
+            taker_fee,
+            open_positions: HashMap::new(),
+            closed_positions: Vec::new(),
+            asset_index: HashMap::new(),
+            total_trades: 0,
+            winning_trades: 0,
+            losing_trades: 0,
+            total_actual_profit: 0.0,
+            total_expected_profit: 0.0,
         }
     }
 
     // --- Capital queries ---
 
     pub fn current_capital(&self) -> f64 {
-        self.inner.lock().current_capital
+        self.current_capital
     }
 
     /// Total portfolio value: free cash + deployed capital in open positions.
     pub fn total_value(&self) -> f64 {
-        let mgr = self.inner.lock();
-        let deployed: f64 = mgr.open_positions.values()
+        let deployed: f64 = self.open_positions.values()
             .map(|p| p.total_capital)
             .sum();
-        mgr.current_capital + deployed
+        self.current_capital + deployed
     }
 
     pub fn initial_capital(&self) -> f64 {
-        self.inner.lock().initial_capital
+        self.initial_capital
     }
 
     pub fn open_count(&self) -> usize {
-        self.inner.lock().open_positions.len()
+        self.open_positions.len()
+    }
+
+    pub fn deployed_capital(&self) -> f64 {
+        self.open_positions.values().map(|p| p.total_capital).sum()
     }
 
     pub fn closed_count(&self) -> usize {
-        self.inner.lock().closed_positions.len()
+        self.closed_positions.len()
     }
 
     // --- Position entry ---
 
     pub fn enter_position(
-        &self,
+        &mut self,
         opportunity_id: &str,
         constraint_id: &str,
         strategy: &str,
@@ -182,15 +182,13 @@ impl PositionManager {
         is_sell: bool,
         end_date_ts: f64,
     ) -> EntryResult {
-        let mut mgr = self.inner.lock();
-
         let total_cost: f64 = optimal_bets.values().sum();
-        let fees = total_cost * mgr.taker_fee;
+        let fees = total_cost * self.taker_fee;
         let required = total_cost + fees;
 
-        if mgr.current_capital < required {
+        if self.current_capital < required {
             return EntryResult::InsufficientCapital {
-                available: mgr.current_capital,
+                available: self.current_capital,
                 required,
             };
         }
@@ -254,12 +252,12 @@ impl PositionManager {
         };
 
         // Deduct capital
-        mgr.current_capital -= required;
-        mgr.total_trades += 1;
-        mgr.total_expected_profit += expected_profit;
+        self.current_capital -= required;
+        self.total_trades += 1;
+        self.total_expected_profit += expected_profit;
 
         let result = position.clone();
-        mgr.open_positions.insert(pid, position);
+        self.open_positions.insert(pid, position);
 
         EntryResult::Entered(result)
     }
@@ -267,13 +265,11 @@ impl PositionManager {
     // --- Resolution: close position when market resolves ---
 
     pub fn close_on_resolution(
-        &self,
+        &mut self,
         position_id: &str,
         winning_market_id: &str,
     ) -> Option<ResolutionEvent> {
-        let mut mgr = self.inner.lock();
-
-        let mut position = match mgr.open_positions.remove(position_id) {
+        let mut position = match self.open_positions.remove(position_id) {
             Some(p) => p,
             None => return None,
         };
@@ -324,10 +320,10 @@ impl PositionManager {
             serde_json::Value::String("resolved".to_string()));
 
         // Update capital + stats
-        mgr.current_capital += payout;
-        mgr.total_actual_profit += profit;
-        if profit > 0.001 { mgr.winning_trades += 1; }
-        else if profit < -0.001 { mgr.losing_trades += 1; }
+        self.current_capital += payout;
+        self.total_actual_profit += profit;
+        if profit > 0.001 { self.winning_trades += 1; }
+        else if profit < -0.001 { self.losing_trades += 1; }
 
         let event = ResolutionEvent {
             position_id: position.position_id.clone(),
@@ -337,7 +333,7 @@ impl PositionManager {
             profit,
         };
 
-        mgr.closed_positions.push(position);
+        self.closed_positions.push(position);
         Some(event)
     }
 
@@ -350,8 +346,7 @@ impl PositionManager {
         position_id: &str,
         current_bids: &HashMap<String, f64>,
     ) -> Option<LiquidationValue> {
-        let mgr = self.inner.lock();
-        let position = mgr.open_positions.get(position_id)?;
+        let position = self.open_positions.get(position_id)?;
 
         let method = position.metadata.get("method")
             .and_then(|v| v.as_str()).unwrap_or("");
@@ -373,7 +368,7 @@ impl PositionManager {
             sale_proceeds += shares * bid;
         }
 
-        let fees = sale_proceeds * mgr.taker_fee;
+        let fees = sale_proceeds * self.taker_fee;
         let net_proceeds = sale_proceeds - fees;
         let total_invested = position.total_capital + position.fees_paid;
         let profit = net_proceeds - total_invested;
@@ -426,10 +421,7 @@ impl PositionManager {
         current_bids: &HashMap<String, f64>,
         exit_multiplier: f64,  // typically 1.2
     ) -> Vec<ProactiveExit> {
-        let position_ids: Vec<String> = {
-            let mgr = self.inner.lock();
-            mgr.open_positions.keys().cloned().collect()
-        };
+        let position_ids: Vec<String> = self.open_positions.keys().cloned().collect();
 
         let mut exits = Vec::new();
         for pid in &position_ids {
@@ -455,14 +447,13 @@ impl PositionManager {
     /// current_bids: market_id → bid price for held token.
     /// Returns (net_proceeds, profit) or None if position not found.
     pub fn liquidate_position(
-        &self, position_id: &str, reason: &str,
+        &mut self, position_id: &str, reason: &str,
         current_bids: &HashMap<String, f64>,
     ) -> Option<(f64, f64)> {
-        // First calculate the value (needs read lock)
+        // Calculate value then remove — both under the single outer lock (no TOCTOU race)
         let liq = self.calculate_liquidation_value(position_id, current_bids)?;
 
-        let mut mgr = self.inner.lock();
-        let mut position = match mgr.open_positions.remove(position_id) {
+        let mut position = match self.open_positions.remove(position_id) {
             Some(p) => p,
             None => return None,
         };
@@ -481,12 +472,12 @@ impl PositionManager {
         position.metadata.insert("liquidation_fees".into(),
             serde_json::Value::Number(serde_json::Number::from_f64(liq.fees).unwrap_or(serde_json::Number::from(0))));
 
-        mgr.current_capital += liq.net_proceeds;
-        mgr.total_actual_profit += liq.profit;
-        if liq.profit > 0.001 { mgr.winning_trades += 1; }
-        else if liq.profit < -0.001 { mgr.losing_trades += 1; }
+        self.current_capital += liq.net_proceeds;
+        self.total_actual_profit += liq.profit;
+        if liq.profit > 0.001 { self.winning_trades += 1; }
+        else if liq.profit < -0.001 { self.losing_trades += 1; }
 
-        mgr.closed_positions.push(position);
+        self.closed_positions.push(position);
 
         Some((liq.net_proceeds, liq.profit))
     }
@@ -494,17 +485,15 @@ impl PositionManager {
     // --- Asset index (for WS resolution mapping) ---
 
     /// Set the asset_id → (market_id, is_yes) index.
-    /// Called from Python after constraint detection populates asset_to_market.
+    /// Called after constraint detection populates asset_to_market.
     ///
     /// IMPORTANT: Merges rather than replaces — preserves old entries for
     /// asset_ids that belong to open positions. This ensures WS resolution
     /// still works for positions whose markets have closed (dropped from
     /// the scanner/constraint detection) but not yet resolved.
-    pub fn set_asset_index(&self, new_index: HashMap<String, (String, bool)>) {
-        let mut mgr = self.inner.lock();
-
+    pub fn set_asset_index(&mut self, new_index: HashMap<String, (String, bool)>) {
         // Collect all market_ids referenced by open positions
-        let open_market_ids: std::collections::HashSet<&String> = mgr.open_positions.values()
+        let open_market_ids: std::collections::HashSet<&String> = self.open_positions.values()
             .flat_map(|p| p.markets.keys())
             .collect();
 
@@ -512,14 +501,14 @@ impl PositionManager {
         let new_count = new_index.len();
         let mut merged = new_index;
         let mut preserved = 0usize;
-        for (asset_id, (market_id, is_yes)) in &mgr.asset_index {
+        for (asset_id, (market_id, is_yes)) in &self.asset_index {
             if open_market_ids.contains(market_id) && !merged.contains_key(asset_id) {
                 merged.insert(asset_id.clone(), (market_id.clone(), *is_yes));
                 preserved += 1;
             }
         }
 
-        mgr.asset_index = merged;
+        self.asset_index = merged;
 
         if preserved > 0 {
             tracing::info!(
@@ -539,12 +528,10 @@ impl PositionManager {
         &self,
         events: &[(String, String)],  // (condition_id, asset_id)
     ) -> Vec<(String, String)> {
-        let mgr = self.inner.lock();
-
         // Map WS events to {market_id → "yes"/"no"} using asset index
         let mut winners: HashMap<String, String> = HashMap::new();
         for (_cid, asset_id) in events {
-            if let Some((market_id, is_yes)) = mgr.asset_index.get(asset_id) {
+            if let Some((market_id, is_yes)) = self.asset_index.get(asset_id) {
                 let outcome = if *is_yes { "yes" } else { "no" };
                 winners.insert(market_id.clone(), outcome.to_string());
             }
@@ -552,7 +539,7 @@ impl PositionManager {
 
         // Find positions where ALL legs have resolved
         let mut resolved = Vec::new();
-        for (pid, position) in &mgr.open_positions {
+        for (pid, position) in &self.open_positions {
             let total_markets = position.markets.len();
             let mut resolved_count = 0;
             let mut winning_market_id = String::new();
@@ -573,37 +560,62 @@ impl PositionManager {
         resolved
     }
 
-    // --- Data export (for dashboard SSE + state persistence) ---
+    // --- Direct typed accessors (no JSON round-trip) ---
+
+    /// Direct access to open positions (no JSON serialization).
+    pub fn open_positions(&self) -> &HashMap<String, Position> {
+        &self.open_positions
+    }
+
+    /// Direct access to closed positions (no JSON serialization).
+    pub fn closed_positions(&self) -> &[Position] {
+        &self.closed_positions
+    }
+
+    /// Get a single open position by ID.
+    pub fn get_position(&self, position_id: &str) -> Option<&Position> {
+        self.open_positions.get(position_id)
+    }
+
+    /// Get current bid prices for a specific position's markets.
+    /// Returns market_id → entry_price mapping.
+    pub fn get_position_entry_prices(&self, position_id: &str) -> Option<&HashMap<String, f64>> {
+        self.open_positions.get(position_id).map(|p| &p.entry_prices)
+    }
+
+    /// Total fees across all positions (open + closed).
+    pub fn total_fees(&self) -> f64 {
+        let open_fees: f64 = self.open_positions.values().map(|p| p.fees_paid).sum();
+        let closed_fees: f64 = self.closed_positions.iter().map(|p| p.fees_paid).sum();
+        open_fees + closed_fees
+    }
+
+    // --- Data export (for state persistence — JSON strings for SQLite) ---
 
     pub fn get_open_positions_json(&self) -> Vec<String> {
-        let mgr = self.inner.lock();
-        mgr.open_positions.values()
+        self.open_positions.values()
             .map(|p| serde_json::to_string(p).unwrap_or_default())
             .collect()
     }
 
     pub fn get_closed_positions_json(&self) -> Vec<String> {
-        let mgr = self.inner.lock();
-        mgr.closed_positions.iter()
+        self.closed_positions.iter()
             .map(|p| serde_json::to_string(p).unwrap_or_default())
             .collect()
     }
 
     pub fn get_open_position_ids(&self) -> Vec<String> {
-        let mgr = self.inner.lock();
-        mgr.open_positions.keys().cloned().collect()
+        self.open_positions.keys().cloned().collect()
     }
 
     pub fn get_held_constraint_ids(&self) -> std::collections::HashSet<String> {
-        let mgr = self.inner.lock();
-        mgr.open_positions.values()
+        self.open_positions.values()
             .filter_map(|p| p.metadata.get("constraint_id")?.as_str().map(|s| s.to_string()))
             .collect()
     }
 
     pub fn get_held_market_ids(&self) -> std::collections::HashSet<String> {
-        let mgr = self.inner.lock();
-        mgr.open_positions.values()
+        self.open_positions.values()
             .flat_map(|p| p.markets.keys().cloned())
             .collect()
     }
@@ -611,64 +623,61 @@ impl PositionManager {
     /// Get all asset_ids from the asset_index that map to markets in open positions.
     /// Used to ensure WS stays subscribed to these assets even after constraint rebuild.
     pub fn get_open_position_asset_ids(&self) -> Vec<String> {
-        let mgr = self.inner.lock();
-        let open_market_ids: std::collections::HashSet<&String> = mgr.open_positions.values()
+        let open_market_ids: std::collections::HashSet<&String> = self.open_positions.values()
             .flat_map(|p| p.markets.keys())
             .collect();
-        mgr.asset_index.iter()
+        self.asset_index.iter()
             .filter(|(_, (mid, _))| open_market_ids.contains(mid))
             .map(|(aid, _)| aid.clone())
             .collect()
     }
 
     pub fn get_performance_metrics(&self) -> HashMap<String, f64> {
-        let mgr = self.inner.lock();
         let mut m = HashMap::new();
-        m.insert("current_capital".into(), mgr.current_capital);
-        m.insert("initial_capital".into(), mgr.initial_capital);
-        m.insert("total_trades".into(), mgr.total_trades as f64);
-        m.insert("winning_trades".into(), mgr.winning_trades as f64);
-        m.insert("losing_trades".into(), mgr.losing_trades as f64);
-        m.insert("total_actual_profit".into(), mgr.total_actual_profit);
-        m.insert("total_expected_profit".into(), mgr.total_expected_profit);
-        m.insert("open_count".into(), mgr.open_positions.len() as f64);
-        m.insert("closed_count".into(), mgr.closed_positions.len() as f64);
+        m.insert("current_capital".into(), self.current_capital);
+        m.insert("initial_capital".into(), self.initial_capital);
+        m.insert("total_trades".into(), self.total_trades as f64);
+        m.insert("winning_trades".into(), self.winning_trades as f64);
+        m.insert("losing_trades".into(), self.losing_trades as f64);
+        m.insert("total_actual_profit".into(), self.total_actual_profit);
+        m.insert("total_expected_profit".into(), self.total_expected_profit);
+        m.insert("open_count".into(), self.open_positions.len() as f64);
+        m.insert("closed_count".into(), self.closed_positions.len() as f64);
         m
     }
 
     // --- State import (from existing JSON execution_state) ---
 
     pub fn import_positions_json(
-        &self, open_json: &[String], closed_json: &[String],
+        &mut self, open_json: &[String], closed_json: &[String],
         capital: f64, initial_capital: f64,
     ) {
-        let mut mgr = self.inner.lock();
-        mgr.current_capital = capital;
-        mgr.initial_capital = initial_capital;
-        mgr.open_positions.clear();
-        mgr.closed_positions.clear();
+        self.current_capital = capital;
+        self.initial_capital = initial_capital;
+        self.open_positions.clear();
+        self.closed_positions.clear();
 
         for j in open_json {
             if let Ok(p) = serde_json::from_str::<Position>(j) {
-                mgr.open_positions.insert(p.position_id.clone(), p);
+                self.open_positions.insert(p.position_id.clone(), p);
             }
         }
         for j in closed_json {
             if let Ok(p) = serde_json::from_str::<Position>(j) {
-                mgr.closed_positions.push(p);
+                self.closed_positions.push(p);
             }
         }
 
         // Restore stats from closed positions
-        mgr.total_trades = (mgr.open_positions.len() + mgr.closed_positions.len()) as u64;
-        mgr.total_actual_profit = mgr.closed_positions.iter()
+        self.total_trades = (self.open_positions.len() + self.closed_positions.len()) as u64;
+        self.total_actual_profit = self.closed_positions.iter()
             .map(|p| p.actual_profit).sum();
-        mgr.winning_trades = mgr.closed_positions.iter()
+        self.winning_trades = self.closed_positions.iter()
             .filter(|p| p.actual_profit > 0.001).count() as u64;
-        mgr.losing_trades = mgr.closed_positions.iter()
+        self.losing_trades = self.closed_positions.iter()
             .filter(|p| p.actual_profit < -0.001).count() as u64;
-        mgr.total_expected_profit = mgr.open_positions.values()
-            .chain(mgr.closed_positions.iter())
+        self.total_expected_profit = self.open_positions.values()
+            .chain(self.closed_positions.iter())
             .map(|p| p.expected_profit).sum();
     }
 }

@@ -7,6 +7,60 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.10.1] — 2026-03-15 — Code Review: Bugs, Performance, Security & Cleanup
+
+### Fixed
+- **B1**: OrderedFloat NaN safety — `partial_cmp().unwrap_or()` → `total_cmp()`
+- **B2+B4**: Double-Mutex on PositionManager — removed redundant inner `Mutex<PositionManagerInner>` wrapper
+- **B3**: Unbounded WS event accumulation — resolved events vector now always drained after processing
+- **B5**: WS resolution field swap — `resolve_by_ws_events` was receiving `(asset_id, condition_id)` instead of `(condition_id, asset_id)`
+- **B6**: Held-set filtering in `try_enter_or_replace` — pre-built `HashSet` of held condition/market IDs passed to validation
+- **B7**: Replacement assertion — `debug_assert!` verifying replacement target exists before entering new position
+- **B8**: WAL pragma removed from in-memory SQLite — WAL mode is invalid for `:memory:` databases (state, resolution, postponement, scanner)
+
+### Security
+- **S3**: CLI `--set` allowlist — only permitted config keys can be overridden via command line
+- **S4**: Dashboard binds to `127.0.0.1` instead of `0.0.0.0`
+- **S5**: Generic user-agent header on HTTP client
+
+### Performance
+- **P1**: Typed position accessors — dashboard, orchestrator, and API resolution checks use `&Position` directly instead of JSON serialize/parse round-trips
+- **P2**: `last_efp` timestamp moved into `OrderBook` to avoid repeated `Instant::now()` calls
+- **P4**: `EvalQueue::push` accepts `now` parameter to batch timestamp lookups
+- **P6**: Shared `reqwest::blocking::Client` on TradingEngine instead of creating per-request clients
+
+### Refactored
+- **I1**: `classify_category` extracted to `types.rs` — deduplicated from dashboard.rs and orchestrator.rs
+- **I2**: `CachedSqliteDB` generic struct — ~200 lines of duplicated in-memory + disk backup boilerplate eliminated across 4 modules
+- **I4**: Config values cached on `Orchestrator` struct instead of re-reading HashMap on every tick
+- **I5**: `build_leg_json` helper in dashboard.rs replaces duplicated leg-building code
+- **I6**: Removed unused `msg_count` field from `BookMirror`
+- **I7**: Removed dead `deployed_dollars` variable from dashboard.rs
+- **I8**: Held-set reuse in `try_enter_or_replace` — single computation shared across validation and replacement
+
+### Style & Maintainability
+- **ST1**: Python-era comments updated throughout (ws.rs, position.rs, eval.rs, queue.rs, state.rs)
+- **ST3**: `#[must_use]` on key return types (Opportunity, ScanResult, PositionManager, ConstraintStore)
+- **ST5**: `len()` → `live_count()` on BookMirror for semantic clarity
+- **ST6**: Named constants for magic numbers (MIN_PRICE_SUM_THRESHOLD, MAX_POLYTOPE_MARKETS, SYNTHETIC_DEPTH)
+- **ST7**: `Default` derive on ConstraintStore, EvalQueue
+- **D1**: WS raw message logging downgraded from `debug!` → `trace!`
+- **D2**: WS pong logging downgraded to `trace!`
+- **D3**: Postponement cache-hit log removed (noisy)
+- **D4**: Dashboard SSE comment-only keepalive to avoid empty-line disconnects
+
+### Dependencies
+- **DEP1**: `serde_yaml` → `serde_yaml_ng` (serde_yaml deprecated)
+- **DEP3**: `rusqlite` 0.33 → 0.38
+
+### Hardware
+- **H1**: Tokio worker threads set to `available_parallelism()` instead of hardcoded 2
+
+### Validator
+- Temperature unit mismatch instruction added to resolution validation prompt — unit differences (°C/°F, km/miles) no longer trigger false rejections
+
+---
+
 ## [0.10.0] — 2026-03-15 — A10: Single Compiled Binary
 
 ### Added

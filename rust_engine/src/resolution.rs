@@ -5,11 +5,11 @@
 ///
 /// Schema:
 ///   resolution_cache(group_id TEXT PK, data TEXT JSON, cached_at REAL)
-use rusqlite::{Connection, params};
-use rusqlite::backup::Backup;
+use rusqlite::params;
 use parking_lot::Mutex;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::cached_db::CachedSqliteDB;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -39,46 +39,36 @@ pub struct ValidatorConfig {
 // In-memory SQLite cache (mirrors StateDB pattern)
 // ---------------------------------------------------------------------------
 
+const RESOLUTION_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS resolution_cache (
+        group_id TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        cached_at REAL NOT NULL
+    );
+";
+
 struct ResolutionCache {
-    mem: Mutex<Connection>,
-    disk_path: PathBuf,
+    db: CachedSqliteDB,
     ttl_secs: f64,
 }
 
 impl ResolutionCache {
     fn new(disk_path: &str, ttl_secs: f64) -> Result<Self, String> {
-        let mem_conn = Connection::open_in_memory()
-            .map_err(|e| format!("Failed to open in-memory SQLite: {}", e))?;
-
-        mem_conn.execute_batch("
-            PRAGMA journal_mode=WAL;
-            PRAGMA synchronous=OFF;
-            CREATE TABLE IF NOT EXISTS resolution_cache (
-                group_id TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                cached_at REAL NOT NULL
-            );
-        ").map_err(|e| format!("Failed to create cache table: {}", e))?;
-
-        let cache = Self {
-            mem: Mutex::new(mem_conn),
-            disk_path: PathBuf::from(disk_path),
-            ttl_secs,
-        };
+        let db = CachedSqliteDB::new(disk_path, RESOLUTION_SCHEMA)?;
 
         // Restore from disk if available
-        if cache.disk_path.exists() {
-            match cache.load_from_disk() {
+        if db.disk_exists() {
+            match db.load_from_disk() {
                 Ok(ms) => tracing::info!("Resolution cache loaded from disk in {:.1}ms", ms),
                 Err(e) => tracing::warn!("Could not load resolution cache from disk: {}", e),
             }
         }
 
-        Ok(cache)
+        Ok(Self { db, ttl_secs })
     }
 
     fn load(&self, group_id: &str) -> Option<ValidationResult> {
-        let db = self.mem.lock();
+        let db = self.db.conn();
         let row: Option<(String, f64)> = db.query_row(
             "SELECT data, cached_at FROM resolution_cache WHERE group_id = ?1",
             params![group_id],
@@ -112,7 +102,7 @@ impl ResolutionCache {
             }
         };
 
-        let db = self.mem.lock();
+        let db = self.db.conn();
         let _ = db.execute(
             "INSERT OR REPLACE INTO resolution_cache (group_id, data, cached_at) VALUES (?1, ?2, ?3)",
             params![group_id, data_json, now],
@@ -120,50 +110,7 @@ impl ResolutionCache {
     }
 
     fn mirror_to_disk(&self) -> f64 {
-        let t0 = Instant::now();
-        let db = self.mem.lock();
-
-        if let Some(parent) = self.disk_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        match Connection::open(&self.disk_path) {
-            Ok(mut disk_db) => {
-                match Backup::new(&*db, &mut disk_db) {
-                    Ok(backup) => {
-                        if let Err(e) = backup.run_to_completion(
-                            100, Duration::ZERO,
-                            None::<fn(rusqlite::backup::Progress)>,
-                        ) {
-                            tracing::warn!("Resolution cache backup failed: {}", e);
-                        }
-                    }
-                    Err(e) => tracing::warn!("Resolution cache backup init failed: {}", e),
-                }
-            }
-            Err(e) => tracing::warn!("Failed to open resolution cache disk DB: {}", e),
-        }
-
-        t0.elapsed().as_secs_f64() * 1000.0
-    }
-
-    fn load_from_disk(&self) -> Result<f64, String> {
-        if !self.disk_path.exists() {
-            return Err("Disk DB file not found".into());
-        }
-        let t0 = Instant::now();
-        let disk_db = Connection::open(&self.disk_path)
-            .map_err(|e| format!("Failed to open disk DB: {}", e))?;
-
-        let mut db = self.mem.lock();
-        let backup = Backup::new(&disk_db, &mut *db)
-            .map_err(|e| format!("Backup init failed: {}", e))?;
-        backup.run_to_completion(
-            100, Duration::ZERO,
-            None::<fn(rusqlite::backup::Progress)>,
-        ).map_err(|e| format!("Backup restore failed: {}", e))?;
-
-        Ok(t0.elapsed().as_secs_f64() * 1000.0)
+        self.db.mirror_to_disk()
     }
 }
 
@@ -308,7 +255,7 @@ fn load_prompt_template(workspace: &str) -> String {
     let path = PathBuf::from(workspace).join("config").join("prompts.yaml");
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
-            match serde_yaml::from_str::<serde_json::Value>(&contents) {
+            match serde_yaml_ng::from_str::<serde_json::Value>(&contents) {
                 Ok(val) => {
                     if let Some(tpl) = val.get("resolution_validation").and_then(|v| v.as_str()) {
                         tracing::info!("Loaded resolution prompt from {}", path.display());
@@ -338,7 +285,7 @@ fn load_config(workspace: &str) -> ValidatorConfig {
     };
 
     if let Ok(contents) = std::fs::read_to_string(&path) {
-        if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(&contents) {
+        if let Ok(val) = serde_yaml_ng::from_str::<serde_json::Value>(&contents) {
             // ai.api_url
             if let Some(url) = val.pointer("/ai/api_url").and_then(|v| v.as_str()) {
                 cfg.api_url = url.to_string();

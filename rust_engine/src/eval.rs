@@ -13,9 +13,9 @@ use dashmap::DashMap;
 use crate::arb::{self, ArbResult};
 use crate::book::BookMirror;
 use crate::queue::EvalQueue;
-use std::sync::Arc;
 
-/// Stored constraint definition (loaded from Python once after constraint detection).
+
+/// Stored constraint definition (loaded after constraint detection).
 #[derive(Debug, Clone)]
 pub struct Constraint {
     pub constraint_id: String,
@@ -36,7 +36,7 @@ pub struct MarketRef {
     pub name: String,
 }
 
-/// Holds all constraint definitions. Populated from Python after constraint detection.
+/// Holds all constraint definitions. Populated after constraint detection.
 pub struct ConstraintStore {
     constraints: DashMap<String, Constraint>,
 }
@@ -62,6 +62,10 @@ impl ConstraintStore {
     }
 }
 
+impl Default for ConstraintStore {
+    fn default() -> Self { Self::new() }
+}
+
 /// Config for arb evaluation.
 #[derive(Debug, Clone)]
 pub struct EvalConfig {
@@ -73,7 +77,8 @@ pub struct EvalConfig {
     pub max_hours: f64,  // Skip constraints resolving further than this (default: 1440 = 60 days)
 }
 
-/// A found opportunity — returned to Python, pre-ranked.
+/// A found opportunity, pre-ranked by score.
+#[must_use]
 #[derive(Debug, Clone)]
 pub struct Opportunity {
     pub constraint_id: String,
