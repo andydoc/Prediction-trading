@@ -114,10 +114,25 @@ _delay_table_cache = {'p95_hours': None, 'default': None, 'loaded_at': None}
 
 
 def load_delay_table():
-    """Load P95 delay table from JSON. Falls back to hardcoded values."""
+    """Load P95 delay table from SQLite. Falls back to JSON then hardcoded values."""
     if (_delay_table_cache['p95_hours'] is not None and _delay_table_cache['loaded_at']
             and (_time.time() - _delay_table_cache['loaded_at']) < 3600):
         return _delay_table_cache['p95_hours'], _delay_table_cache['default']
+    # Try SQLite first
+    db_path = STATE_DIR / 'execution_state.db'
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute("SELECT category, p95_hours FROM delay_p95").fetchall()
+        conn.close()
+        if rows:
+            p95 = {cat: val for cat, val in rows}
+            default = p95.get('other', _FALLBACK_DEFAULT)
+            _delay_table_cache.update(p95_hours=p95, default=default, loaded_at=_time.time())
+            return p95, default
+    except Exception:
+        pass
+    # Fallback: JSON file
     try:
         if P95_JSON_PATH.exists():
             data = json.loads(P95_JSON_PATH.read_text())
@@ -193,9 +208,9 @@ def get_min_volume(opp_dict: dict, market_lookup: dict) -> float:
     return min(volumes) if volumes else 0.0
 
 
-def dynamic_capital(current_balance: float, pct: float = 0.10) -> float:
-    """% of current capital, floor $10, cap $1000."""
-    return max(10.0, min(current_balance * pct, 1000.0))
+def dynamic_capital(total_value: float, pct: float = 0.10) -> float:
+    """% of total portfolio value (cash + deployed), floor $10, cap $1000."""
+    return max(10.0, min(total_value * pct, 1000.0))
 
 
 def get_resolution_hours(opp_dict: dict, market_lookup: dict) -> Optional[float]:
@@ -400,6 +415,12 @@ class TradingEngine:
             api_key=self.anthropic_api_key,
         )
 
+        # A4: Rust market scanner (Gamma API fetch + SQLite cache)
+        self.scanner = rust_engine.RustMarketScanner(
+            db_path=str(WORKSPACE / 'data' / 'markets.db'),
+            json_path=str(MARKETS_PATH),
+        )
+
         live_cfg = config.get('live_trading', {})
         self.live_enabled = True  # Always enabled — paper mode retired, shadow is minimum
         self.shadow_only = live_cfg.get('shadow_only', True)  # Default shadow if not specified
@@ -416,7 +437,7 @@ class TradingEngine:
 
         # --- State ---
         self._running = False
-        self._ws_resolved_markets: Set[str] = set()        # condition_ids resolved via WS
+        # Resolution is handled entirely in Rust (WS market_resolved → PositionManager)
         self._last_state_save = 0.0
         self._last_monitor = 0.0
         self._last_replacement = 0.0
@@ -429,7 +450,6 @@ class TradingEngine:
         self._constraint_last_eval: Dict[str, float] = {}   # constraint_id → unix time of last eval
         self._constraint_queue_time: Dict[str, float] = {}  # constraint_id → unix time when queued
         self._recent_latencies: list = []                    # last 200 latency_μs values (batch eval time)
-        self.EFP_DRIFT_THRESHOLD = 0.005                     # $0.005 effective fill price drift → urgent
 
         # Phase 8j: buffer dirty assets from WS callbacks, batch-process in eval loop
         # Reduces per-event Python overhead from ~10 ops to 1 (set.add)
@@ -444,24 +464,33 @@ class TradingEngine:
         # Keeps asyncio event loop free for WS heartbeats
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='arb')
 
-        # --- Timing config ---
-        self.STATE_SAVE_INTERVAL = 30       # seconds
-        self.MONITOR_INTERVAL = 30          # seconds
-        self.REPLACEMENT_COOLDOWN = 60      # seconds
-        self.CONSTRAINT_REBUILD_INTERVAL = 600  # seconds (on new_market batch)
+        # --- Timing config (all from config.yaml → engine / arbitrage sections) ---
+        eng_cfg = config.get('engine', {})
+        self.STATE_SAVE_INTERVAL = eng_cfg.get('state_save_interval_seconds', 30)
+        self.MONITOR_INTERVAL = eng_cfg.get('monitor_interval_seconds', 30)
+        self.CONSTRAINT_REBUILD_INTERVAL = eng_cfg.get('constraint_rebuild_interval_seconds', 600)
+        self.MAX_EVALS_PER_BATCH = eng_cfg.get('max_evals_per_batch', 500)
+        self.EFP_DRIFT_THRESHOLD = eng_cfg.get('efp_drift_threshold', 0.005)
+        self.EFP_STALE_SECS = eng_cfg.get('efp_staleness_seconds', 5.0)
+        self.STATS_LOG_INTERVAL = eng_cfg.get('stats_log_interval_seconds', 30)
+        self.STALE_SWEEP_INTERVAL = eng_cfg.get('stale_sweep_interval_seconds', 60)
+        self.STALE_ASSET_THRESHOLD = eng_cfg.get('stale_asset_threshold_seconds', 30)
+        self.REPLACEMENT_COOLDOWN = arb_cfg.get('replacement_cooldown_seconds', 60)
+        self.MIN_RESOLUTION_SECS = arb_cfg.get('min_resolution_time_secs', 300)
+        self.MIN_TRADE_SIZE = arb_cfg.get('min_trade_size', 10.0)
         self._last_constraint_rebuild = 0.0
         self._new_market_buffer: list = []  # buffer new_market events for batch rebuild
-        self.MAX_EVALS_PER_BATCH = 500      # Rust arb math = 4µs each; 500 evals = 2ms CPU
 
         # --- AI config (for resolution validator + postponement detector) ---
         self.ai_config = config.get('ai', {})
         self._last_postponement_check = 0.0
-        self.POSTPONEMENT_CHECK_INTERVAL = 3600  # seconds (1 hour — actual per-position throttle is in detector cache)
+        pp_cfg = self.ai_config.get('postponement', {})
+        self.POSTPONEMENT_CHECK_INTERVAL = pp_cfg.get('check_interval_hours', 24) * 3600
 
     # --- Index Building ---
 
     def load_markets(self):
-        """Load markets from Market Scanner output."""
+        """Load markets from Market Scanner output (legacy fallback)."""
         if not MARKETS_PATH.exists():
             log.warning('No markets file yet')
             return
@@ -469,6 +498,19 @@ class TradingEngine:
         markets = [MarketData.from_dict(m) for m in data.get('markets', [])]
         self.market_lookup = {str(m.market_id): m for m in markets}
         log.info(f'Loaded {len(self.market_lookup)} markets')
+
+    def _refresh_markets_bg(self):
+        """Background market refresh — updates market_lookup when done."""
+        try:
+            result = self.scanner.scan()
+            fresh = {}
+            for m in result['markets']:
+                md = MarketData.from_dict(m)
+                fresh[str(md.market_id)] = md
+            self.market_lookup = fresh  # atomic replace
+            log.info(f'Background market refresh: {result["count"]} markets')
+        except Exception as e:
+            log.warning(f'Background market refresh failed: {e}')
 
     def load_and_detect_constraints(self):
         """Run constraint detection inline (replaces old L2 process)."""
@@ -521,6 +563,13 @@ class TradingEngine:
                  f'{len(self.market_to_constraint)} market_ids mapped, '
                  f'{len(self.asset_to_market)} asset→market reverse lookups')
 
+        # Push asset index to Rust PM for WS resolution mapping
+        if self.rust_pm:
+            rust_index = {aid: (mid, idx == 0)
+                          for aid, (mid, idx) in self.asset_to_market.items()}
+            self.rust_pm.set_resolution_index(rust_index)
+            log.debug(f'Pushed {len(rust_index)} asset mappings to Rust PM')
+
     def _load_constraints_into_rust(self):
         """Build constraint list with full market refs and load into Rust evaluator."""
         if not self.rust_ws:
@@ -567,8 +616,8 @@ class TradingEngine:
         self.rust_ws.set_constraints(rust_constraints)
         # Also set eval config with current capital
         # Use rust_pm if wired, else paper_engine (init phase: rust_pm not yet assigned)
-        raw_cap = self.rust_pm.current_capital() if self.rust_pm else self.paper_engine.current_capital
-        cap = dynamic_capital(raw_cap, self.capital_pct)
+        raw_val = self.rust_pm.total_value() if self.rust_pm else self.paper_engine.current_capital
+        cap = dynamic_capital(raw_val, self.capital_pct)
         arb_cfg = self.config.get('arbitrage', {})
         self.rust_ws.set_eval_config(
             cap,
@@ -578,6 +627,124 @@ class TradingEngine:
         )
         log.info(f'Loaded {len(rust_constraints)} constraints into Rust evaluator (capital=${cap:.2f})')
 
+    def detect_and_load_constraints_rust(self):
+        """A5: Run constraint detection in Rust — replaces Python detect + build_index + load_into_rust."""
+        if not self.rust_ws or not self.market_lookup:
+            log.warning('Cannot detect constraints: no Rust engine or no markets loaded')
+            return []
+
+        # Build minimal market dicts for Rust
+        markets_for_rust = []
+        for mid, md in self.market_lookup.items():
+            meta = md.metadata if isinstance(md.metadata, dict) else {}
+            yes_price = (md.outcome_prices.get('Yes') or
+                         md.outcome_prices.get('yes') or
+                         md.outcome_prices.get('true') or
+                         next(iter(md.outcome_prices.values()), 0.5))
+            end_ts = 0.0
+            if md.end_date:
+                try:
+                    edt = md.end_date
+                    if hasattr(edt, 'tzinfo') and edt.tzinfo is None:
+                        edt = edt.replace(tzinfo=timezone.utc)
+                    end_ts = edt.timestamp()
+                except (ValueError, TypeError, AttributeError):
+                    pass
+            markets_for_rust.append({
+                'market_id': str(mid),
+                'question': (md.question[:80] if hasattr(md, 'question') and md.question else str(mid)),
+                'yes_asset_id': md.yes_asset_id or '',
+                'no_asset_id': md.no_asset_id or '',
+                'neg_risk': bool(meta.get('negRisk', False)),
+                'neg_risk_market_id': meta.get('negRiskMarketID', '') or '',
+                'yes_price': float(yes_price),
+                'end_date_ts': end_ts,
+            })
+
+        # Config from config.yaml
+        cd_cfg = self.config.get('constraint_detection', {})
+        detect_config = {
+            'min_price_sum': cd_cfg.get('min_price_sum', 0.85),
+            'max_price_sum': cd_cfg.get('max_price_sum', 1.15),
+            'min_markets': cd_cfg.get('min_markets', 2),
+        }
+
+        result = self.rust_ws.detect_and_load_constraints(markets_for_rust, detect_config)
+
+        # Populate Python-side indices (for fallback WS paths + monitor)
+        self.asset_to_constraints = {k: set(v) for k, v in result['asset_to_constraints'].items()}
+        self.asset_to_market = {}
+        for k, v in result['asset_to_market'].items():
+            mid, is_yes = v
+            self.asset_to_market[k] = (mid, 0 if is_yes else 1)
+        self.market_to_constraint = {}
+        self.constraint_to_assets = {}
+
+        # Set eval config with current capital
+        raw_val = self.rust_pm.total_value() if self.rust_pm else self.paper_engine.current_capital
+        cap = dynamic_capital(raw_val, self.capital_pct)
+        arb_cfg = self.config.get('arbitrage', {})
+        self.rust_ws.set_eval_config(
+            cap,
+            arb_cfg.get('fees', {}).get('polymarket_taker_fee', 0.0001),
+            arb_cfg.get('min_profit_threshold', 0.03),
+            arb_cfg.get('max_profit_threshold', 0.30),
+        )
+
+        # all_asset_ids already includes open position assets (added in Rust step 6b)
+        all_assets = result['all_asset_ids']
+
+        log.info(f'Rust constraint detection: {result["n_constraints"]} constraints, '
+                 f'{len(all_assets)} assets (capital=${cap:.2f})')
+        return all_assets
+
+    def _seed_delay_table(self):
+        """Seed delay_p95 table in SQLite from JSON if table is empty."""
+        store = getattr(self.paper_engine, '_state_store', None)
+        if not store or not hasattr(store, 'get_delay_table'):
+            return
+        try:
+            existing = store.get_delay_table()
+            if existing:
+                return  # Already populated
+            # Table empty — seed from JSON
+            if P95_JSON_PATH.exists():
+                data = json.loads(P95_JSON_PATH.read_text())
+                cats = data.get('categories', {})
+                now_iso = data.get('generated_at', '')
+                rows = [(cat, info['p95'], info['count'], info['median'],
+                         info['p75'], info['pct_over_24h'])
+                        for cat, info in cats.items()]
+                store.set_delay_table(rows, now_iso)
+                log.info(f'Seeded delay_p95 table from JSON: {len(cats)} categories')
+            else:
+                # Seed from hardcoded fallback
+                now_iso = datetime.now(timezone.utc).isoformat()
+                rows = [(cat, p95, 0, 0.0, 0.0, 0.0) for cat, p95 in _FALLBACK_P95.items()]
+                store.set_delay_table(rows, now_iso)
+                log.info(f'Seeded delay_p95 table from fallback: {len(_FALLBACK_P95)} categories')
+        except Exception as e:
+            log.warning(f'Failed to seed delay table: {e}')
+
+    def _check_api_resolutions(self):
+        """Check Polymarket API for positions whose markets already resolved.
+
+        Catches missed WS resolution events (e.g. system was down during resolution).
+        Called once at startup before entering the main event loop.
+        Runs entirely in Rust (GIL-free HTTP requests + resolution logic).
+        Skipped in live mode — live relies on account balance movements.
+        """
+        if not self.rust_pm:
+            return
+        if not self.shadow_only:
+            log.debug('Skipping API resolution check in live mode (uses account movements)')
+            return
+        results = self.rust_pm.check_api_resolutions()
+        if results:
+            for r in results:
+                log.info(f'API resolution: {r["position_id"]} → '
+                         f'winner={r["winning_market_id"]}, profit=${r["profit"]:.4f}')
+
     # --- WS Callback Registration ---
 
     # --- Rust PM helpers (Phase 8q-2: fall back to paper_engine if Rust unavailable) ---
@@ -586,6 +753,11 @@ class TradingEngine:
         if not self.rust_pm:
             raise RuntimeError('rust_pm not wired — cannot read capital')
         return self.rust_pm.current_capital()
+
+    def _pm_total_value(self) -> float:
+        if not self.rust_pm:
+            raise RuntimeError('rust_pm not wired — cannot read total value')
+        return self.rust_pm.total_value()
 
     def _pm_open_count(self) -> int:
         if not self.rust_pm:
@@ -725,6 +897,7 @@ class TradingEngine:
         store.backup_to_disk()
         self.rust_rv.mirror_to_disk()
         self.rust_pp.mirror_to_disk()
+        self.scanner.mirror_to_disk()
 
         ms = (_t.time() - t0) * 1000
         log.info(f'Saved state (Rust PM → SQLite): {len(open_dicts)} open, '
@@ -770,9 +943,8 @@ class TradingEngine:
             self._dirty_assets.add(asset_id)  # Phase 8j: 1 Python op instead of ~10
 
         def on_market_resolved(market_cid: str, asset_id: str):
-            """A market resolved — trigger immediate payout check."""
-            self._ws_resolved_markets.add(market_cid)
-            log.info(f'WS: market_resolved {market_cid[:20]}... — queued')
+            """Market resolved — resolution handled in Rust via PositionManager."""
+            log.info(f'WS: market_resolved cid={market_cid[:20]}... asset={asset_id[:20]}...')
 
         def on_new_market(data: dict):
             """A new market was created — buffer for batch constraint rebuild."""
@@ -840,7 +1012,7 @@ class TradingEngine:
         book = self.ws_manager.get_book(asset_id)
         if not book or not book.asks:
             return 0.0
-        trade_size = dynamic_capital(self._pm_capital(), self.capital_pct)
+        trade_size = dynamic_capital(self._pm_total_value(), self.capital_pct)
         if HAS_RUST:
             ask_prices = [level.price for level in book.asks]
             ask_sizes = [level.size for level in book.asks]
@@ -898,7 +1070,7 @@ class TradingEngine:
                     self._eval_wake.set()
             else:
                 last_eval_time = self._constraint_last_eval.get(cid, 0.0)
-                if (now - last_eval_time) >= 5.0:
+                if (now - last_eval_time) >= self.EFP_STALE_SECS:
                     if cid not in self._urgent_evals:
                         if cid not in self._constraint_queue_time:
                             self._constraint_queue_time[cid] = now
@@ -925,7 +1097,7 @@ class TradingEngine:
         asset_ids_with_books = []
         all_ask_prices = []
         all_ask_sizes = []
-        trade_size = dynamic_capital(self._pm_capital(), self.capital_pct)
+        trade_size = dynamic_capital(self._pm_total_value(), self.capital_pct)
 
         for asset_id in dirty:
             if asset_id not in self.asset_to_constraints:
@@ -1095,7 +1267,7 @@ class TradingEngine:
         # === Rust WS path: full eval pipeline in Rust (Phase 8 P4c) ===
         if self.rust_ws:
             # Update capital for Rust evaluator (changes as positions open/close)
-            cap = dynamic_capital(self._pm_capital(), self.capital_pct)
+            cap = dynamic_capital(self._pm_total_value(), self.capital_pct)
             arb_cfg = self.config.get('arbitrage', {})
             self.rust_ws.set_eval_config(
                 cap,
@@ -1202,11 +1374,18 @@ class TradingEngine:
         if self.resolution_validation_enabled and self.anthropic_api_key:
             try:
                 market_ids = opp_dict.get('market_ids', [])
+                mid = int(market_ids[0]) if market_ids else 0
                 validation = self.rust_rv.validate(
                     group_id=constraint_id,
-                    market_id=int(market_ids[0]) if market_ids else 0,
+                    market_id=mid,
                 )
+                if validation is None:
+                    log.debug(f'AI validation returned None: {constraint_id[:30]} mid={mid}')
                 if validation:
+                    log.info(f'AI validation: {constraint_id[:30]} '
+                             f'date={validation.get("latest_resolution_date")} '
+                             f'confidence={validation.get("confidence")} '
+                             f'reason={validation.get("reasoning","")[:120]}')
                     if validation.get('has_unrepresented_outcome', False):
                         reason = validation.get('unrepresented_outcome_reason', '')[:100]
                         log.info(f'  SKIP (unrepresented outcome): {constraint_id[:30]} — {reason}')
@@ -1304,16 +1483,15 @@ class TradingEngine:
         # Rank by score
         ranked = rank_opportunities(
             opportunities, self.market_lookup,
-            min_resolution_secs=300,
+            min_resolution_secs=self.MIN_RESOLUTION_SECS,
             max_days_to_resolution=self.max_days_entry
         )
         if not ranked:
             return
 
         slots = self.max_positions - self._pm_open_count()
-        cap = dynamic_capital(self._pm_capital(), self.capital_pct)
-        min_trade = self.config.get('live_trading', self.config.get('paper_trading', {})).get('min_trade_size', 10.0)
-        if cap < min_trade:
+        cap = dynamic_capital(self._pm_total_value(), self.capital_pct)
+        if cap < self.MIN_TRADE_SIZE:
             slots = 0  # Can't afford a new position — only replacement is possible
         markets = list(self.market_lookup.values())
 
@@ -1361,7 +1539,7 @@ class TradingEngine:
             # Filter ranked to replacement-eligible (stricter max_days)
             replace_ranked = rank_opportunities(
                 opportunities, self.market_lookup,
-                min_resolution_secs=300,
+                min_resolution_secs=self.MIN_RESOLUTION_SECS,
                 max_days_to_resolution=self.max_days_replace
             )
             if not replace_ranked:
@@ -1486,7 +1664,7 @@ class TradingEngine:
                         log.info(f'  Liquidated: freed ${result["freed_capital"]:.2f}, '
                                  f'realized ${result["actual_profit"]:+.2f}')
                         # Enter the replacement
-                        cap = dynamic_capital(self._pm_capital(), self.capital_pct)
+                        cap = dynamic_capital(self._pm_total_value(), self.capital_pct)
                         best_opp['total_capital_required'] = cap
                         old_cap = sum(best_opp.get('optimal_bets', {}).values())
                         if old_cap > 0:
@@ -1540,21 +1718,43 @@ class TradingEngine:
         except Exception as e:
             log.warning(f'Could not load state: {e}')
 
-        # 2. Wait for markets (Market Scanner must have run at least once)
-        log.info('Waiting for Market Scanner output...')
-        while self._running and not MARKETS_PATH.exists():
-            await asyncio.sleep(5)
-        if not self._running:
-            return
-        self.load_markets()
+        # 1b. Seed delay table into SQLite if empty (one-time migration from JSON)
+        self._seed_delay_table()
 
-        # 3. Constraint detection (inline, replaces old L2) — runs in thread pool
-        log.info('Running constraint detection (threaded)...')
+        # 2. Load markets: cache-first (instant restart), then refresh in background
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(self._executor, self.load_and_detect_constraints)
+        cached = self.scanner.load_cached()
+        if cached and cached['count'] > 0:
+            markets = [MarketData.from_dict(m) for m in cached['markets']]
+            self.market_lookup = {str(m.market_id): m for m in markets}
+            log.info(f'Loaded {len(self.market_lookup)} markets from cache')
+            # Refresh from API in background (non-blocking)
+            loop.run_in_executor(self._executor, self._refresh_markets_bg)
+        else:
+            log.info('No cached markets — scanning from API...')
+            result = await loop.run_in_executor(self._executor, self.scanner.scan)
+            markets = [MarketData.from_dict(m) for m in result['markets']]
+            self.market_lookup = {str(m.market_id): m for m in markets}
+            log.info(f'Loaded {len(self.market_lookup)} markets ({result.get("skipped", 0)} skipped)')
 
-        # 4. Build index (threaded)
-        await loop.run_in_executor(self._executor, self.build_index)
+        # 3. Init Rust WS engine (reads config.yaml directly)
+        if HAS_RUST_WS:
+            try:
+                self.rust_ws = rust_engine.RustWsEngine(str(WORKSPACE))
+                log.info('Rust WS engine created (config loaded from config.yaml)')
+            except Exception as e:
+                log.error(f'Rust WS engine init failed: {e}')
+                self.rust_ws = None
+
+        # 4. Constraint detection + index building (A5: single Rust call)
+        log.info('Running constraint detection in Rust...')
+        all_assets = await loop.run_in_executor(
+            self._executor, self.detect_and_load_constraints_rust)
+
+        # 4b. Load delay table into Rust engine (for dashboard display)
+        if self.rust_ws:
+            p95, _ = load_delay_table()
+            self.rust_ws.set_delay_table(list(p95.items()))
 
         # 5. Init live engine
         if self.live_enabled:
@@ -1570,33 +1770,9 @@ class TradingEngine:
                 log.error(f'Live engine init failed: {e}')
                 self.live_engine = None
 
-        # 6. Start WS manager + subscribe
-        all_assets = list(self.asset_to_constraints.keys())
-
-        # 6a. Try Rust WS engine first (Phase 8 P4a — no GIL, full async)
-        if HAS_RUST_WS and all_assets:
+        # 6. Start WS connections + dashboard
+        if self.rust_ws and all_assets:
             try:
-                ws_cfg = self.config.get('websocket', {})
-                rust_cfg = {
-                    'ws_url': ws_cfg.get('market_url',
-                        'wss://ws-subscriptions-clob.polymarket.com/ws/market'),
-                    'assets_per_shard': ws_cfg.get('assets_per_shard', 2000),
-                    'heartbeat_interval_secs': ws_cfg.get('heartbeat_interval', 10),
-                    'efp_drift_threshold': self.EFP_DRIFT_THRESHOLD,
-                    'efp_stale_secs': 5.0,
-                    'trade_size_usd': dynamic_capital(
-                        self.paper_engine.current_capital, self.capital_pct),
-                }
-                self.rust_ws = rust_engine.RustWsEngine(rust_cfg)
-
-                # Build asset→constraint index for Rust (converts sets to lists)
-                rust_index = {aid: list(cids) for aid, cids
-                              in self.asset_to_constraints.items()}
-                self.rust_ws.set_asset_index(rust_index)
-
-                # Load constraint definitions into Rust evaluator (Phase 8 P4c)
-                self._load_constraints_into_rust()
-
                 # Start WS connections + dashboard (non-blocking, spawns tokio tasks)
                 self.rust_ws.start(all_assets, dashboard_port=5556)
                 log.info(f'Rust WS engine + dashboard started: {len(all_assets)} assets')
@@ -1647,6 +1823,12 @@ class TradingEngine:
                 log.warning(f'WS manager failed: {e} — running without live prices')
                 self.ws_manager = None
 
+        # 7. Check API for missed resolutions (catches WS gaps from downtime)
+        try:
+            self._check_api_resolutions()
+        except Exception as e:
+            log.warning(f'API resolution check failed: {e}')
+
         # Weekly delay table update
         trigger_weekly_delay_update()
 
@@ -1681,19 +1863,10 @@ class TradingEngine:
                     await self._try_enter_or_replace(opportunities)
 
                 # --- Monitor open positions (periodic) ---
+                # Resolution is handled exclusively by WS market_resolved events (below)
                 if (now - self._last_monitor) >= self.MONITOR_INTERVAL:
                     if self._pm_open_count() > 0:
-                        if not self.rust_pm:
-                            raise RuntimeError('rust_pm not wired — cannot monitor positions')
-                        # A1: Use Rust PM check_resolutions directly
-                        market_prices = self._build_market_prices()
-                        resolved = self.rust_pm.check_resolutions(market_prices)
-                        for pid, winning_mid in resolved:
-                            result = self.rust_pm.close_on_resolution(pid, winning_mid)
-                            if result:
-                                payout, profit = result
-                                log.info(f'RESOLVED {pid[:40]}: payout=${payout:.2f} profit=${profit:.2f}')
-                    self._check_proactive_exits()
+                        self._check_proactive_exits()
                     self._last_monitor = now
 
                 # --- Check for postponed events (periodic, threaded) ---
@@ -1711,46 +1884,26 @@ class TradingEngine:
                     count = len(self._new_market_buffer)
                     self._new_market_buffer.clear()
                     log.info(f'Rebuilding constraints ({count} new markets buffered, threaded)')
-                    # Reload markets + detect constraints in thread pool
-                    def _rebuild():
-                        self.load_markets()
-                        self.load_and_detect_constraints()
-                        self.build_index()
-                    await loop.run_in_executor(self._executor, _rebuild)
-                    # Re-subscribe / re-index all assets
-                    all_assets = list(self.asset_to_constraints.keys())
-                    if self.rust_ws and all_assets:
-                        rust_index = {aid: list(cids) for aid, cids
-                                      in self.asset_to_constraints.items()}
-                        self.rust_ws.set_asset_index(rust_index)
-                        self._load_constraints_into_rust()
-                        self.rust_ws.start(all_assets, dashboard_port=0)  # Re-subscribe only, no dashboard restart
-                        log.info(f'Rust WS re-indexed: {len(all_assets)} assets')
-                    elif self.ws_manager and self.ws_manager._running:
+                    if self.rust_ws:
+                        def _rebuild():
+                            self.load_markets()
+                            return self.detect_and_load_constraints_rust()
+                        all_assets = await loop.run_in_executor(self._executor, _rebuild)
                         if all_assets:
+                            self.rust_ws.start(all_assets, dashboard_port=0)
+                            log.info(f'Rust WS re-indexed: {len(all_assets)} assets')
+                    else:
+                        def _rebuild_py():
+                            self.load_markets()
+                            self.load_and_detect_constraints()
+                            self.build_index()
+                        await loop.run_in_executor(self._executor, _rebuild_py)
+                        all_assets = list(self.asset_to_constraints.keys())
+                        if self.ws_manager and self.ws_manager._running and all_assets:
                             await self.ws_manager.subscribe_assets(all_assets)
                     self._last_constraint_rebuild = now
 
-                # --- WS resolved markets → force monitor pass ---
-                # Drain Rust WS resolved events into the same set
-                if self.rust_ws:
-                    for cid, _aid in self.rust_ws.drain_resolved():
-                        if cid:
-                            self._ws_resolved_markets.add(cid)
-                if self._ws_resolved_markets:
-                    resolved = list(self._ws_resolved_markets)
-                    self._ws_resolved_markets.clear()
-                    log.info(f'WS resolution trigger: {len(resolved)} markets')
-                    if self._pm_open_count() > 0:
-                        if not self.rust_pm:
-                            raise RuntimeError('rust_pm not wired — cannot check WS resolutions')
-                        market_prices = self._build_market_prices()
-                        resolved_positions = self.rust_pm.check_resolutions(market_prices)
-                        for pid, winning_mid in resolved_positions:
-                            result = self.rust_pm.close_on_resolution(pid, winning_mid)
-                            if result:
-                                payout, profit = result
-                                log.info(f'RESOLVED {pid[:40]}: payout=${payout:.2f} profit=${profit:.2f}')
+                # Resolution handled entirely in Rust (WS market_resolved → PositionManager)
 
                 # --- Save state (periodic) ---
                 if (now - self._last_state_save) >= self.STATE_SAVE_INTERVAL:
@@ -1762,32 +1915,31 @@ class TradingEngine:
                     npos = self._pm_open_count()
                     write_status('running', cap, npos)
 
-                # --- Phase 8l: Stale-asset re-subscribe sweep (every 60s) ---
-                if (now - self._last_stale_sweep) >= 60.0:
+                # --- Phase 8l: Stale-asset re-subscribe sweep ---
+                if (now - self._last_stale_sweep) >= self.STALE_SWEEP_INTERVAL:
                     if self.rust_ws:
                         # Rust tracks staleness internally
-                        stale_assets = self.rust_ws.get_stale_assets(30.0)
+                        stale_assets = self.rust_ws.get_stale_assets(self.STALE_ASSET_THRESHOLD)
                         if stale_assets:
-                            log.info(f'Rust stale assets: {len(stale_assets)} >30s old (re-subscribe not yet implemented)')
+                            log.info(f'Rust stale assets: {len(stale_assets)} >{self.STALE_ASSET_THRESHOLD}s old (re-subscribe not yet implemented)')
                             # TODO P4a: Add per-shard mpsc channels for dynamic re-subscribe
                             # For now, stale books are expected for low-volume markets
                         self._last_stale_sweep = now
                     elif self.ws_manager:
-                        stale_threshold = 30.0  # seconds
                         stale_assets = []
                         for asset_id in self.asset_to_constraints:
                             book = self.ws_manager.get_book(asset_id)
                             if book and book.last_update > 0:
                                 age = now - book.last_update
-                                if age > stale_threshold:
+                                if age > self.STALE_ASSET_THRESHOLD:
                                     stale_assets.append(asset_id)
                         if stale_assets:
-                            log.info(f'Stale re-subscribe: {len(stale_assets)} assets >30s old')
+                            log.info(f'Stale re-subscribe: {len(stale_assets)} assets >{self.STALE_ASSET_THRESHOLD}s old')
                             await self.ws_manager.subscribe_assets(stale_assets)
                         self._last_stale_sweep = now
 
-                # --- Stats logging (every ~30s) ---
-                if (now - getattr(self, '_last_stats_log', 0)) >= 30.0:
+                # --- Stats logging ---
+                if (now - getattr(self, '_last_stats_log', 0)) >= self.STATS_LOG_INTERVAL:
                     ws_info = ''
                     engine_metrics = {
                         'iteration': self._iteration,

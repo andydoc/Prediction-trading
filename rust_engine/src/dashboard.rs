@@ -39,6 +39,8 @@ pub struct DashboardState {
     pub mode: String,
     /// Start time (for uptime display)
     pub start_time: chrono::DateTime<chrono::Utc>,
+    /// P95 delay table: category → p95_hours (loaded from SQLite at startup)
+    pub delay_table: Arc<Mutex<(std::collections::HashMap<String, f64>, f64)>>,
 }
 
 /// Metrics updated by the Python engine loop each stats cycle.
@@ -258,7 +260,20 @@ fn build_stats(s: &DashboardState) -> Value {
         ((total_value / init_cap).powf(365.0 / days_running) - 1.0) * 100.0
     } else { 0.0 };
     let annualized_str = if days_running > min_days {
-        format!("{:+.0}%", annualized_ret)
+        if annualized_ret.is_nan() || annualized_ret.is_infinite() || annualized_ret.abs() > 1e15 {
+            let sign = if annualized_ret < 0.0 { "-" } else { "+" };
+            format!("{}<span style=\"font-size:2.2em;vertical-align:middle;line-height:0\">∞</span> <span style=\"font-size:0.7em\">(>{:.0}% in &lt;1d)</span>", sign, ret_pct.abs())
+        } else {
+            let abs_val = annualized_ret.abs();
+            if abs_val == 0.0 {
+                "0.00%".to_string()
+            } else {
+                let sign = if annualized_ret < 0.0 { "-" } else { "+" };
+                let exp = abs_val.log10().floor() as i32;
+                let mantissa = abs_val / 10f64.powi(exp);
+                format!("{}{:.2}e{}%", sign, mantissa, exp)
+            }
+        }
     } else { "N/A".into() };
     let now_str = chrono::Utc::now().format("%d/%m/%Y %H:%M:%S").to_string();
     let start_str = s.start_time.format("%d/%m/%Y %H:%M").to_string();
@@ -279,6 +294,72 @@ fn build_stats(s: &DashboardState) -> Value {
         "lat_p50": 0, "lat_p95": 0, "lat_max": 0,
         "has_rust": true, "constraints": 0, "iteration": 0,
     })
+}
+
+// =====================================================================
+// Resolution delay model — P95 delay by event category
+// =====================================================================
+
+/// Classify market names into a resolution-delay category (mirrors Python classify_opportunity_category).
+fn classify_category(names: &[String]) -> &'static str {
+    let combined: String = names.iter().map(|n| n.to_lowercase()).collect::<Vec<_>>().join(" ");
+    let football_q = ["win on 20", "end in a draw", "halftime", "leading at halftime"]
+        .iter().any(|p| combined.contains(p));
+    if football_q { return "football"; }
+    if combined.contains("halftime") || combined.contains("leading at halftime") {
+        return "football";
+    }
+    if ["nba ", "nfl ", "nhl ", "mlb ", "wnba ",
+        "touchdown", "rushing yards", "passing yards",
+        "rebounds", "three-pointer"]
+        .iter().any(|p| combined.contains(p)) { return "us_sports"; }
+    if ["spread:", "team total:", "o/u "]
+        .iter().any(|p| combined.contains(p)) { return "sports_props"; }
+    if ["counter-strike", "cs2", "dota", "league of legends",
+        "valorant", "overwatch", "dreamleague"]
+        .iter().any(|p| combined.contains(p)) { return "esports"; }
+    if ["atp ", "wta ", "tennis"]
+        .iter().any(|p| combined.contains(p)) { return "tennis"; }
+    if ["ufc ", "mma ", "boxing", "pfl ", "bellator"]
+        .iter().any(|p| combined.contains(p)) { return "mma_boxing"; }
+    if ["cricket", "ipl ", "t20 "]
+        .iter().any(|p| combined.contains(p)) { return "cricket"; }
+    if ["rugby", "super rugby", "waratahs"]
+        .iter().any(|p| combined.contains(p)) { return "rugby"; }
+    if ["bitcoin", "ethereum", "solana", "btc ", "eth ", "up or down"]
+        .iter().any(|p| combined.contains(p)) { return "crypto"; }
+    if ["governor", "congress", "senate", "primary",
+        "democrat", "republican", "election", "president"]
+        .iter().any(|p| combined.contains(p)) { return "politics"; }
+    if ["fed ", "federal reserve", "interest rate",
+        "tariff", "government shutdown"]
+        .iter().any(|p| combined.contains(p)) { return "gov_policy"; }
+    "other"
+}
+
+/// Format hours remaining with P95 delay added. Returns (display_string, sort_seconds).
+/// Reads delay table from DashboardState (loaded from SQLite at startup).
+fn resolve_with_delay(
+    end_date_ts: f64, now_ts: f64, market_names: &[String],
+    delay_table: &parking_lot::Mutex<(std::collections::HashMap<String, f64>, f64)>,
+) -> (String, f64) {
+    if end_date_ts <= 0.0 {
+        return ("?".into(), 9999999.0);
+    }
+    let (ref p95_table, default_p95) = *delay_table.lock();
+    let category = classify_category(market_names);
+    let delay_hours = p95_table.get(category).copied().unwrap_or(default_p95);
+    let expected_resolve_ts = end_date_ts + delay_hours * 3600.0;
+    let hours_remaining = (expected_resolve_ts - now_ts) / 3600.0;
+    let display = if hours_remaining <= 0.0 {
+        "overdue".into()
+    } else if hours_remaining < 24.0 {
+        format!("{:.1}h", hours_remaining)
+    } else {
+        format!("{:.1}d", hours_remaining / 24.0)
+    };
+    let sort_secs = hours_remaining * 3600.0;
+    (display, sort_secs)
 }
 
 fn build_positions(s: &DashboardState) -> Value {
@@ -342,10 +423,30 @@ fn build_positions(s: &DashboardState) -> Value {
             }
         }
 
-        // Resolution date — look up from constraint store (positions don't store end_date)
+        // Resolution date — constraint store first, then position metadata, then date in name
         let cid = p["metadata"]["constraint_id"].as_str().unwrap_or("");
-        let end_date_ts = s.constraints.get(cid)
+        let mut end_date_ts = s.constraints.get(cid)
             .map(|c| c.end_date_ts).unwrap_or(0.0);
+        // Fallback 1: read end_date_ts stored in position metadata at entry time
+        if end_date_ts <= 0.0 {
+            end_date_ts = p["metadata"]["end_date_ts"].as_f64().unwrap_or(0.0);
+        }
+        // Fallback 2: extract YYYY-MM-DD from market names
+        if end_date_ts <= 0.0 {
+            for name in &full_names {
+                if let Some(pos) = name.find("202") {
+                    if name.len() >= pos + 10 {
+                        let date_str = &name[pos..pos+10];
+                        if let Ok(dt) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                            end_date_ts = dt.and_hms_opt(23, 59, 59)
+                                .map(|ndt| ndt.and_utc().timestamp() as f64)
+                                .unwrap_or(0.0);
+                            if end_date_ts > 0.0 { break; }
+                        }
+                    }
+                }
+            }
+        }
         let end_date = if end_date_ts > 0.0 {
             chrono::DateTime::from_timestamp(end_date_ts as i64, 0)
                 .map(|dt| dt.format("%Y-%m-%d").to_string())
@@ -358,17 +459,11 @@ fn build_positions(s: &DashboardState) -> Value {
             pp["effective_date"].as_str().unwrap_or("")
         } else { "" };
 
-        // Resolution date formatting + hours remaining
+        // Resolution date formatting + hours remaining (with P95 delay)
         let status = if postponed { "postponed" } else { "monitoring" };
         let now_ts = chrono::Utc::now().timestamp() as f64;
-        let hours_remaining = if end_date_ts > 0.0 { (end_date_ts - now_ts) / 3600.0 } else { 0.0 };
-        let resolve_str = if end_date_ts > 0.0 {
-            if hours_remaining < 24.0 {
-                format!("{:.1}h", hours_remaining.max(0.0))
-            } else {
-                format!("{:.1}d", hours_remaining / 24.0)
-            }
-        } else { "?".into() };
+        let (resolve_str, resolve_sort_secs) = resolve_with_delay(end_date_ts, now_ts, &full_names, &s.delay_table);
+        let hours_remaining = resolve_sort_secs / 3600.0;
 
         // Score = profit_pct / hours_remaining
         let score_val = if hours_remaining > 0.01 {
@@ -408,12 +503,20 @@ fn build_positions(s: &DashboardState) -> Value {
             "total_cap": (total_cap * 100.0).round() / 100.0,
             "exp_profit": (exp_profit * 100.0).round() / 100.0,
             "exp_pct": (exp_pct * 10.0).round() / 10.0,
-            "resolve": resolve_str, "end_date": end_date,
+            "resolve": resolve_str,
+            "_resolve_secs": resolve_sort_secs,
+            "end_date": end_date,
             "status": status, "postpone": postpone,
             "entry_ts": entry_ts_fmt, "legs": legs,
             "guaranteed": (guaranteed * 100.0).round() / 100.0,
             "scenarios": [],  // TODO: compute sell-arb scenarios
         }));
+    }
+    // Sort open positions by score descending, then re-number
+    positions.sort_by(|a, b| b["score"].as_f64().unwrap_or(0.0)
+        .partial_cmp(&a["score"].as_f64().unwrap_or(0.0)).unwrap());
+    for (i, pos) in positions.iter_mut().enumerate() {
+        pos["idx"] = serde_json::Value::from(i + 1);
     }
     // Build aggregates: group all legs across positions by market name
     let mut agg_map: std::collections::HashMap<String, (String, f64, f64, f64, usize)> = std::collections::HashMap::new();
@@ -435,7 +538,8 @@ fn build_positions(s: &DashboardState) -> Value {
     let mut aggregates: Vec<Value> = agg_map.iter().map(|(name, (side, bet, price, payout, pidx))| {
         json!({"name": name, "side": side, "total_bet": bet, "avg_price": price, "payout": payout, "pos_idx": pidx})
     }).collect();
-    aggregates.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    aggregates.sort_by(|a, b| a["pos_idx"].as_u64().unwrap_or(0)
+        .cmp(&b["pos_idx"].as_u64().unwrap_or(0)));
     let agg_total: f64 = aggregates.iter().map(|a| a["total_bet"].as_f64().unwrap_or(0.0)).sum();
 
     json!({ "positions": positions, "pos_count": positions.len(),
@@ -474,18 +578,12 @@ fn build_opportunities(s: &DashboardState) -> Value {
             }
         }
 
-        // Resolution hours — prefer constraint end_date_ts over opp field
+        // Resolution hours — prefer constraint end_date_ts over opp field (with P95 delay)
         let end_date_ts = s.constraints.get(constraint_id)
             .map(|c| c.end_date_ts).unwrap_or(0.0);
         let now_ts = chrono::Utc::now().timestamp() as f64;
-        let hours = if end_date_ts > 0.0 {
-            (end_date_ts - now_ts) / 3600.0
-        } else {
-            opp["hours_to_resolve"].as_f64().unwrap_or(0.0)
-        };
-        let resolves_str = if hours <= 0.0 { "past".into() }
-            else if hours < 24.0 { format!("{:.1}h", hours) }
-            else { format!("{:.1}d", hours / 24.0) };
+        let (resolves_str, _resolve_sort_secs) = resolve_with_delay(end_date_ts, now_ts, &market_names, &s.delay_table);
+        let hours = _resolve_sort_secs / 3600.0;
 
         // Legs — use actual NO prices for sell arbs (not 1 - YES_ask)
         let mut legs = Vec::new();
@@ -589,11 +687,12 @@ fn build_closed(s: &DashboardState) -> Value {
         } else { entry_ts.as_f64().unwrap_or(0.0) };
 
         let close_ts = p["close_timestamp"].as_f64().unwrap_or(0.0);
-        let hold_str = if entry_epoch > 0.0 && close_ts > 0.0 {
-            let secs = close_ts - entry_epoch;
-            if secs < 3600.0 { format!("{:.0}m", secs / 60.0) }
-            else if secs < 86400.0 { format!("{:.1}h", secs / 3600.0) }
-            else { format!("{:.1}d", secs / 86400.0) }
+        let hold_secs = if entry_epoch > 0.0 && close_ts > 0.0 { close_ts - entry_epoch } else { -1.0 };
+        let hold_str = if hold_secs >= 0.0 {
+            if hold_secs < 60.0 { format!("{:.0}s", hold_secs) }
+            else if hold_secs < 3600.0 { format!("{:.0}m", hold_secs / 60.0) }
+            else if hold_secs < 86400.0 { format!("{:.1}h", hold_secs / 3600.0) }
+            else { format!("{:.1}d", hold_secs / 86400.0) }
         } else { "?".into() };
         let close_dt_str = fmt_ts_sec(close_ts);
 
@@ -624,12 +723,15 @@ fn build_closed(s: &DashboardState) -> Value {
             }
         }
 
+        let deployed_r = (deployed * 100.0).round() / 100.0;
+        let pnl_r = (actual * 100.0).round() / 100.0;
+        let pnl_pct = if deployed_r.abs() > 0.001 { (pnl_r / deployed_r * 1000.0).round() / 10.0 } else { 0.0 };
         let row = json!({
-            "name": short_name, "deployed": (deployed * 100.0).round() / 100.0,
-            "pnl": (actual * 100.0).round() / 100.0, "hold": hold_str,
+            "name": short_name, "deployed": deployed_r,
+            "pnl": pnl_r, "pnl_pct": pnl_pct, "hold": hold_str,
             "closed_at": close_dt_str, "strategy": fmt_strategy(strategy, method),
             "legs": legs, "full_names": full_names,
-            "_sort_ts": close_ts,
+            "_sort_ts": close_ts, "_hold_secs": hold_secs,
         });
 
         match reason {

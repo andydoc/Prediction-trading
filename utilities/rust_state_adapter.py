@@ -92,6 +92,16 @@ class RustStateAdapter:
     def get_open_position_ids(self) -> set:
         return set(self._db.get_open_position_ids())
 
+    # --- Delay P95 table ---
+
+    def get_delay_table(self):
+        """Get delay P95 values as list of (category, p95_hours)."""
+        return self._db.get_delay_table()
+
+    def set_delay_table(self, rows, updated_at: str):
+        """Replace delay P95 table. rows: [(cat, p95, count, median, p75, pct)]"""
+        self._db.set_delay_table(rows, updated_at)
+
     # --- Disk persistence ---
 
     def backup_to_disk(self):

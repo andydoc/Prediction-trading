@@ -20,6 +20,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use serde_json::Value;
 use crate::book::BookMirror;
+use crate::position::PositionManager;
 use crate::queue::EvalQueue;
 use crate::types::{BookLevel, EngineConfig};
 
@@ -38,8 +39,10 @@ pub struct WsManager {
     running: Arc<AtomicBool>,
     /// Total WS messages received across all shards.
     total_msgs: Arc<AtomicU64>,
-    /// Resolved events queue (drained by Python).
+    /// Resolved events accumulator — processed in Rust, no Python round-trip.
     resolved_events: Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
+    /// Position manager — for direct resolution when market_resolved arrives.
+    positions: Arc<parking_lot::Mutex<PositionManager>>,
     /// Assets currently subscribed (for stats).
     subscribed_count: Arc<AtomicU64>,
     /// Notify for shutdown.
@@ -51,6 +54,7 @@ impl WsManager {
         config: EngineConfig,
         book: Arc<BookMirror>,
         eval_queue: Arc<EvalQueue>,
+        positions: Arc<parking_lot::Mutex<PositionManager>>,
     ) -> Self {
         Self {
             config,
@@ -59,6 +63,7 @@ impl WsManager {
             running: Arc::new(AtomicBool::new(false)),
             total_msgs: Arc::new(AtomicU64::new(0)),
             resolved_events: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            positions,
             subscribed_count: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(Notify::new()),
         }
@@ -87,6 +92,7 @@ impl WsManager {
             let running = Arc::clone(&self.running);
             let total_msgs = Arc::clone(&self.total_msgs);
             let resolved = Arc::clone(&self.resolved_events);
+            let positions = Arc::clone(&self.positions);
             let shutdown = Arc::clone(&self.shutdown);
             let ws_url = self.config.ws_url.clone();
             let hb_interval = self.config.heartbeat_interval_secs;
@@ -94,7 +100,7 @@ impl WsManager {
             tokio::spawn(async move {
                 shard_loop(
                     shard_id, assets, ws_url, hb_interval,
-                    book, queue, running, total_msgs, resolved, shutdown,
+                    book, queue, running, total_msgs, resolved, positions, shutdown,
                 ).await;
             });
         }
@@ -143,6 +149,7 @@ async fn shard_loop(
     running: Arc<AtomicBool>,
     total_msgs: Arc<AtomicU64>,
     resolved: Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
+    positions: Arc<parking_lot::Mutex<PositionManager>>,
     shutdown: Arc<Notify>,
 ) {
     let mut backoff_ms: u64 = 1000;
@@ -153,7 +160,7 @@ async fn shard_loop(
 
         match connect_and_run(
             shard_id, &assets, &ws_url, hb_interval_secs,
-            &book, &queue, &running, &total_msgs, &resolved, &shutdown,
+            &book, &queue, &running, &total_msgs, &resolved, &positions, &shutdown,
         ).await {
             Ok(()) => {
                 tracing::info!("Shard {}: clean disconnect", shard_id);
@@ -189,6 +196,7 @@ async fn connect_and_run(
     running: &Arc<AtomicBool>,
     total_msgs: &Arc<AtomicU64>,
     resolved: &Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
+    positions: &Arc<parking_lot::Mutex<PositionManager>>,
     shutdown: &Arc<Notify>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (ws_stream, _response) = tokio_tungstenite::connect_async(ws_url).await?;
@@ -245,7 +253,7 @@ async fn connect_and_run(
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         total_msgs.fetch_add(1, Ordering::Relaxed);
-                        handle_message(shard_id, &text, book, queue, resolved);
+                        handle_message(shard_id, &text, book, queue, resolved, positions);
                     }
                     Some(Ok(WsMessage::Ping(data))) => {
                         let _ = sink.send(WsMessage::Pong(data)).await;
@@ -287,6 +295,7 @@ fn handle_message(
     book: &Arc<BookMirror>,
     queue: &Arc<EvalQueue>,
     resolved: &Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
+    positions: &Arc<parking_lot::Mutex<PositionManager>>,
 ) {
     // Debug: log first 200 chars of every message for diagnosis
     tracing::debug!("Shard {} raw msg: {}", shard_id, &text[..text.len().min(200)]);
@@ -327,7 +336,7 @@ fn handle_message(
             "book" => handle_book(msg, book, queue, now),
             "price_change" => handle_price_change(msg, book, queue, now),
             "best_bid_ask" => handle_best_bid_ask(msg, book, queue, now),
-            "market_resolved" => handle_resolved(msg, resolved, now),
+            "market_resolved" => handle_resolved(msg, resolved, positions, now),
             "last_trade_price" | "pong" | "" => {} // ignore
             _ => {
                 tracing::debug!("Unknown event_type: '{}' in: {}", event_type, &text[..text.len().min(150)]);
@@ -432,9 +441,11 @@ fn handle_best_bid_ask(
 }
 
 /// Handle market_resolved event.
+/// Accumulates the event, then attempts to resolve any affected positions directly.
 fn handle_resolved(
     msg: &Value,
     resolved: &Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
+    positions: &Arc<parking_lot::Mutex<PositionManager>>,
     ts: f64,
 ) {
     let asset_id = msg.get("asset_id")
@@ -445,13 +456,46 @@ fn handle_resolved(
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    if !asset_id.is_empty() || !market_cid.is_empty() {
-        resolved.lock().push(ResolvedEvent {
+    if asset_id.is_empty() && market_cid.is_empty() {
+        return;
+    }
+
+    tracing::info!("Market resolved: cid={}, asset={}", market_cid, asset_id);
+
+    // Accumulate event
+    let events = {
+        let mut queue = resolved.lock();
+        queue.push(ResolvedEvent {
             market_cid: market_cid.to_string(),
             asset_id: asset_id.to_string(),
             timestamp: ts,
         });
-        tracing::info!("Market resolved: cid={}, asset={}", market_cid, asset_id);
+        // Snapshot all accumulated events for resolution attempt
+        queue.iter()
+            .map(|e| (e.market_cid.clone(), e.asset_id.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    // Try to resolve positions using ALL accumulated events.
+    // PositionManager methods each lock inner briefly — no outer lock needed.
+    let pm = positions.lock();
+    if pm.open_count() == 0 {
+        return;
+    }
+    let resolved_positions = pm.resolve_by_ws_events(&events);
+    for (pid, winning_mid) in &resolved_positions {
+        if let Some(res) = pm.close_on_resolution(pid, winning_mid) {
+            tracing::info!(
+                "RESOLVED {}: payout=${:.2} profit=${:.2}",
+                &pid[..pid.len().min(40)], res.payout, res.profit
+            );
+        }
+    }
+    drop(pm);
+
+    // Clear processed events if any positions resolved
+    if !resolved_positions.is_empty() {
+        resolved.lock().clear();
     }
 }
 

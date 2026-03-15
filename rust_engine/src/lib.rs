@@ -22,6 +22,8 @@ mod ws;
 mod dashboard;
 mod resolution;
 mod postponement;
+mod scanner;
+mod detect;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -54,21 +56,18 @@ struct RustWsEngine {
     recent_opps: Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
     mode: String,
     start_time: chrono::DateTime<chrono::Utc>,
+    /// P95 delay table: category → p95_hours
+    delay_table: Arc<parking_lot::Mutex<(std::collections::HashMap<String, f64>, f64)>>,
 }
 
 #[pymethods]
 impl RustWsEngine {
-    /// Create a new engine with config from Python dict.
+    /// Create a new engine. Reads all config from config.yaml at the given workspace path.
     ///
-    /// Config keys (all optional, sensible defaults):
-    ///   ws_url: str (default: Polymarket market WS)
-    ///   assets_per_shard: int (default: 2000)
-    ///   heartbeat_interval_secs: int (default: 10)
-    ///   efp_drift_threshold: float (default: 0.005)
-    ///   efp_stale_secs: float (default: 5.0)
-    ///   trade_size_usd: float (default: 10.0)
+    /// Args:
+    ///   workspace: str — path to the project root (containing config/config.yaml)
     #[new]
-    fn new(config: &Bound<'_, PyDict>) -> PyResult<Self> {
+    fn new(workspace: &str) -> PyResult<Self> {
         // Install rustls crypto provider (required by rustls 0.23+)
         let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -78,33 +77,27 @@ impl RustWsEngine {
             .with_env_filter("rust_engine=debug")
             .try_init();
 
-        let cfg = EngineConfig {
-            ws_url: get_str(config, "ws_url")
-                .unwrap_or_else(|| EngineConfig::default().ws_url),
-            assets_per_shard: get_int(config, "assets_per_shard")
-                .unwrap_or(2000) as usize,
-            heartbeat_interval_secs: get_int(config, "heartbeat_interval_secs")
-                .unwrap_or(10) as u64,
-            efp_drift_threshold: get_float(config, "efp_drift_threshold")
-                .unwrap_or(0.005),
-            efp_stale_secs: get_float(config, "efp_stale_secs")
-                .unwrap_or(5.0),
-            trade_size_usd: get_float(config, "trade_size_usd")
-                .unwrap_or(10.0),
-        };
+        // Load all config from config.yaml
+        let (cfg, eval_cfg, pos_cfg) = types::load_engine_config(workspace);
 
         let book = Arc::new(BookMirror::new(&cfg));
         let eval_queue = Arc::new(EvalQueue::new());
-        let ws = Arc::new(WsManager::new(cfg.clone(), Arc::clone(&book), Arc::clone(&eval_queue)));
+        let positions = Arc::new(parking_lot::Mutex::new(
+            PositionManager::new(pos_cfg.initial_capital, pos_cfg.taker_fee)
+        ));
+        let ws = Arc::new(WsManager::new(
+            cfg.clone(), Arc::clone(&book), Arc::clone(&eval_queue),
+            Arc::clone(&positions),
+        ));
         let constraints = Arc::new(ConstraintStore::new());
 
         let eval_config = EvalConfig {
             capital: cfg.trade_size_usd,
-            fee_rate: get_float(config, "fee_rate").unwrap_or(0.0001),
-            min_profit_threshold: get_float(config, "min_profit_threshold").unwrap_or(0.03),
-            max_profit_threshold: get_float(config, "max_profit_threshold").unwrap_or(0.30),
-            max_fw_iter: get_int(config, "max_fw_iter").unwrap_or(200) as usize,
-            max_hours: get_float(config, "max_hours").unwrap_or(1440.0),  // 60 days
+            fee_rate: eval_cfg.fee_rate,
+            min_profit_threshold: eval_cfg.min_profit_threshold,
+            max_profit_threshold: eval_cfg.max_profit_threshold,
+            max_fw_iter: eval_cfg.max_fw_iter,
+            max_hours: eval_cfg.max_hours,
         };
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -118,11 +111,12 @@ impl RustWsEngine {
 
         Ok(Self {
             book, eval_queue, ws, constraints, eval_config, runtime,
-            positions: Arc::new(parking_lot::Mutex::new(PositionManager::new(100.0, 0.0001))),
+            positions,
             engine_metrics: Arc::new(parking_lot::Mutex::new(EngineMetrics::default())),
             recent_opps: Arc::new(parking_lot::Mutex::new(Vec::new())),
             mode: "shadow".to_string(),
             start_time: chrono::Utc::now(),
+            delay_table: Arc::new(parking_lot::Mutex::new((std::collections::HashMap::new(), 33.5))),
         })
     }
 
@@ -161,6 +155,7 @@ impl RustWsEngine {
                 recent_opps: Arc::clone(&self.recent_opps),
                 mode: self.mode.clone(),
                 start_time: self.start_time,
+                delay_table: Arc::clone(&self.delay_table),
             };
             self.runtime.spawn(async move {
                 dashboard::start(dash_state, dashboard_port).await;
@@ -214,12 +209,135 @@ impl RustWsEngine {
         Ok(())
     }
 
+    /// A5: Detect constraints from market data, build indices, load into ConstraintStore.
+    /// Replaces Python detect_constraints() + build_index() + _load_constraints_into_rust().
+    ///
+    /// markets: list of dicts with keys:
+    ///   market_id, question, yes_asset_id, no_asset_id,
+    ///   neg_risk (bool), neg_risk_market_id (str), yes_price (float), end_date_ts (float)
+    /// config: dict with min_price_sum, max_price_sum, min_markets
+    ///
+    /// Returns dict: {n_constraints, all_asset_ids, asset_to_constraints, asset_to_market, stats}
+    fn detect_and_load_constraints(
+        &self,
+        py: Python<'_>,
+        markets: &Bound<'_, PyList>,
+        config: &Bound<'_, PyDict>,
+    ) -> PyResult<PyObject> {
+        // 1. Parse market dicts
+        let mut rust_markets = Vec::with_capacity(markets.len());
+        for item in markets.iter() {
+            let d: &Bound<'_, PyDict> = item.downcast()?;
+            rust_markets.push(detect::DetectableMarket {
+                market_id: d.get_item("market_id")?.unwrap().extract()?,
+                question: d.get_item("question")?.unwrap().extract()?,
+                yes_asset_id: d.get_item("yes_asset_id")?.unwrap().extract()?,
+                no_asset_id: d.get_item("no_asset_id")?.unwrap().extract()?,
+                neg_risk: d.get_item("neg_risk")?.unwrap().extract()?,
+                neg_risk_market_id: d.get_item("neg_risk_market_id")?.unwrap().extract()?,
+                yes_price: d.get_item("yes_price")?.unwrap().extract()?,
+                end_date_ts: d.get_item("end_date_ts")?.unwrap().extract()?,
+            });
+        }
+
+        // 2. Parse config
+        let det_config = detect::DetectionConfig {
+            min_price_sum: get_float(config, "min_price_sum").unwrap_or(0.85),
+            max_price_sum: get_float(config, "max_price_sum").unwrap_or(1.15),
+            min_markets: get_int(config, "min_markets").unwrap_or(2) as usize,
+        };
+
+        // 3. Run detection
+        let result = detect::detect_constraints(&rust_markets, &det_config);
+
+        let n_constraints = result.constraints.len();
+        let n_assets = result.all_asset_ids.len();
+
+        // 4. Load into ConstraintStore
+        self.constraints.set_constraints(result.constraints);
+
+        // 5. Set BookMirror asset→constraint index
+        self.book.set_asset_index(result.asset_to_constraints.clone());
+
+        // 6. Set PositionManager asset→market index (for WS resolution)
+        //    Merge preserves entries for open position markets automatically.
+        self.positions.lock().set_asset_index(result.asset_to_market.clone());
+
+        // 6b. Ensure open position assets are in the WS subscription list.
+        //     When markets close (dropped from scanner), their assets would be
+        //     missing from all_asset_ids. Add them back so WS stays subscribed.
+        let open_pos_assets = self.positions.lock().get_open_position_asset_ids();
+        let mut all_asset_ids = result.all_asset_ids;
+        if !open_pos_assets.is_empty() {
+            let asset_set: std::collections::HashSet<String> =
+                all_asset_ids.iter().cloned().collect();
+            let mut extra = 0usize;
+            for aid in &open_pos_assets {
+                if !asset_set.contains(aid) {
+                    all_asset_ids.push(aid.clone());
+                    extra += 1;
+                }
+            }
+            if extra > 0 {
+                tracing::info!("Added {} assets from open positions to WS subscription", extra);
+            }
+        }
+
+        tracing::info!(
+            "Detected {} constraints from {} markets ({} assets, {} groups, {} incomplete, {} overpriced)",
+            n_constraints, result.n_markets_input, all_asset_ids.len(),
+            result.n_groups, result.n_skipped_incomplete, result.n_skipped_overpriced,
+        );
+
+        // 7. Build return dict for Python
+        let ret = PyDict::new(py);
+        ret.set_item("n_constraints", n_constraints)?;
+        ret.set_item("all_asset_ids", &all_asset_ids)?;
+
+        // asset_to_constraints: {str: [str]}
+        let atc = PyDict::new(py);
+        for (k, v) in &result.asset_to_constraints {
+            atc.set_item(k, v)?;
+        }
+        ret.set_item("asset_to_constraints", atc)?;
+
+        // asset_to_market: {str: (str, bool)}
+        let atm = PyDict::new(py);
+        for (k, (mid, is_yes)) in &result.asset_to_market {
+            atm.set_item(k, (mid, *is_yes))?;
+        }
+        ret.set_item("asset_to_market", atm)?;
+
+        // stats
+        let stats = PyDict::new(py);
+        stats.set_item("n_markets_input", result.n_markets_input)?;
+        stats.set_item("n_groups", result.n_groups)?;
+        stats.set_item("n_skipped_incomplete", result.n_skipped_incomplete)?;
+        stats.set_item("n_skipped_overpriced", result.n_skipped_overpriced)?;
+        ret.set_item("stats", stats)?;
+
+        Ok(ret.into())
+    }
+
+    /// Load P95 delay table into engine (for dashboard display).
+    /// delays: list of (category, p95_hours)
+    fn set_delay_table(&self, delays: Vec<(String, f64)>) {
+        let mut table = std::collections::HashMap::new();
+        for (cat, p95) in &delays {
+            table.insert(cat.clone(), *p95);
+        }
+        let default = table.get("other").copied().unwrap_or(33.5);
+        *self.delay_table.lock() = (table, default);
+    }
+
     /// Update eval config (called when capital changes).
     fn set_eval_config(&mut self, capital: f64, fee_rate: f64, min_profit: f64, max_profit: f64) {
         self.eval_config.capital = capital;
         self.eval_config.fee_rate = fee_rate;
         self.eval_config.min_profit_threshold = min_profit;
         self.eval_config.max_profit_threshold = max_profit;
+        // Keep BookMirror's trade size in sync for EFP calculations
+        self.book.set_trade_size(capital);
     }
 
     /// THE KEY FUNCTION: drain queue + read books + arb math → pre-ranked opportunities.
@@ -343,7 +461,16 @@ impl RustWsEngine {
         *pm = PositionManager::new(initial_capital, taker_fee);
     }
 
+    /// Update the trade size used in EFP and arb math calculations.
+    /// Called by Python when capital changes (dynamic sizing).
+    fn set_trade_size(&mut self, trade_size_usd: f64) {
+        self.eval_config.capital = trade_size_usd;
+        // BookMirror also needs this for EFP calculation
+        self.book.set_trade_size(trade_size_usd);
+    }
+
     fn current_capital(&self) -> f64 { self.positions.lock().current_capital() }
+    fn total_value(&self) -> f64 { self.positions.lock().total_value() }
     fn initial_capital(&self) -> f64 { self.positions.lock().initial_capital() }
     fn pm_open_count(&self) -> usize { self.positions.lock().open_count() }
     fn pm_closed_count(&self) -> usize { self.positions.lock().closed_count() }
@@ -359,10 +486,15 @@ impl RustWsEngine {
         expected_profit: f64, expected_profit_pct: f64,
         is_sell: bool,
     ) -> PyResult<PyObject> {
+        // Look up end_date_ts from constraint store before entering
+        let end_date_ts = self.constraints.get(constraint_id)
+            .map(|c| c.end_date_ts).unwrap_or(0.0);
+
         let result = self.positions.lock().enter_position(
             opportunity_id, constraint_id, strategy, method,
             &market_ids, &market_names, &current_prices, &current_no_prices,
             &optimal_bets, expected_profit, expected_profit_pct, is_sell,
+            end_date_ts,
         );
         let d = PyDict::new(py);
         match result {
@@ -386,6 +518,128 @@ impl RustWsEngine {
     fn close_on_resolution(&self, position_id: &str, winning_market_id: &str) -> Option<(f64, f64)> {
         self.positions.lock().close_on_resolution(position_id, winning_market_id)
             .map(|e| (e.payout, e.profit))
+    }
+
+    /// Check Polymarket API for positions whose markets already resolved.
+    /// Catches missed WS events (system downtime, WS reconnect gaps).
+    /// Only for shadow/paper mode — live mode relies on account movements.
+    /// Requires BOTH closed=true AND prices at 1/0 to confirm resolution.
+    /// Returns list of (position_id, winning_market_id, payout, profit).
+    fn check_api_resolutions(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let positions_json = self.positions.lock().get_open_positions_json();
+        if positions_json.is_empty() {
+            return Ok(PyList::empty(py).into());
+        }
+
+        tracing::info!("Checking API resolution for {} open positions...", positions_json.len());
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("Mozilla/5.0 (prediction-trader)")
+            .build()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("HTTP client error: {}", e)))?;
+
+        let results = PyList::empty(py);
+
+        for pj in &positions_json {
+            let p: serde_json::Value = match serde_json::from_str(pj) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let pid = p["position_id"].as_str().unwrap_or("");
+            let markets = match p["markets"].as_object() {
+                Some(m) => m,
+                None => continue,
+            };
+
+            // Query each market's resolution status
+            let mut resolved_outcomes: HashMap<String, String> = HashMap::new();
+            let mut all_resolved = true;
+
+            for mid in markets.keys() {
+                let url = format!("https://gamma-api.polymarket.com/markets/{}", mid);
+                match client.get(&url).send() {
+                    Ok(resp) => {
+                        if let Ok(mdata) = resp.json::<serde_json::Value>() {
+                            // Must be closed=true (market actually closed, not just extreme prices)
+                            let is_closed = mdata["closed"].as_bool().unwrap_or(false);
+                            if !is_closed {
+                                all_resolved = false;
+                                continue;
+                            }
+
+                            let prices_raw = &mdata["outcomePrices"];
+                            let prices: Vec<f64> = if let Some(s) = prices_raw.as_str() {
+                                serde_json::from_str(s).unwrap_or_default()
+                            } else if let Some(arr) = prices_raw.as_array() {
+                                arr.iter().filter_map(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).collect()
+                            } else {
+                                Vec::new()
+                            };
+
+                            // Require definitive resolution: exactly one outcome at $1
+                            if prices.len() >= 2 {
+                                if prices[0] >= 0.99 && prices[1] <= 0.01 {
+                                    resolved_outcomes.insert(mid.clone(), "yes".into());
+                                } else if prices[1] >= 0.99 && prices[0] <= 0.01 {
+                                    resolved_outcomes.insert(mid.clone(), "no".into());
+                                } else {
+                                    all_resolved = false;
+                                }
+                            } else {
+                                all_resolved = false;
+                            }
+                        } else {
+                            all_resolved = false;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("API check failed for market {}: {}", mid, e);
+                        all_resolved = false;
+                    }
+                }
+            }
+
+            if !all_resolved || resolved_outcomes.len() != markets.len() {
+                continue;
+            }
+
+            // Find winning market (YES outcome)
+            let winning_mid = match resolved_outcomes.iter().find(|(_, v)| v.as_str() == "yes") {
+                Some((mid, _)) => mid.clone(),
+                None => {
+                    tracing::warn!("Position {}: all markets resolved but no YES winner", pid);
+                    continue;
+                }
+            };
+
+            // Resolve the position
+            if let Some((payout, profit)) = self.positions.lock()
+                .close_on_resolution(pid, &winning_mid)
+                .map(|e| (e.payout, e.profit))
+            {
+                tracing::info!(
+                    "API resolution: {} → winner={}, payout={:.2}, profit={:.4}",
+                    pid, winning_mid, payout, profit
+                );
+                let d = PyDict::new(py);
+                let _ = d.set_item("position_id", pid);
+                let _ = d.set_item("winning_market_id", &winning_mid);
+                let _ = d.set_item("payout", payout);
+                let _ = d.set_item("profit", profit);
+                let _ = results.append(d);
+            }
+        }
+
+        let count = results.len();
+        if count > 0 {
+            tracing::info!("API resolution check: resolved {} positions", count);
+        } else {
+            tracing::info!("API resolution check: all positions still open");
+        }
+
+        Ok(results.into())
     }
 
     fn calculate_liquidation_value(&self, py: Python<'_>,
@@ -448,8 +702,15 @@ impl RustWsEngine {
         self.positions.lock().liquidate_position(position_id, reason, &current_bids)
     }
 
-    fn check_resolutions(&self, market_prices: HashMap<String, HashMap<String, f64>>) -> Vec<(String, String)> {
-        self.positions.lock().check_resolutions(&market_prices)
+    /// Set asset_id → (market_id, is_yes) index for WS resolution mapping.
+    /// Called after build_index() in Python.
+    fn set_resolution_index(&self, index: HashMap<String, (String, bool)>) {
+        self.positions.lock().set_asset_index(index);
+    }
+
+    /// Resolve positions using raw WS events: [(condition_id, asset_id), ...]
+    fn resolve_by_ws_events(&self, events: Vec<(String, String)>) -> Vec<(String, String)> {
+        self.positions.lock().resolve_by_ws_events(&events)
     }
 
     fn get_held_constraint_ids(&self) -> std::collections::HashSet<String> {
@@ -458,6 +719,12 @@ impl RustWsEngine {
 
     fn get_held_market_ids(&self) -> std::collections::HashSet<String> {
         self.positions.lock().get_held_market_ids()
+    }
+
+    /// Asset IDs from the index that map to markets in open positions.
+    /// Used to ensure WS stays subscribed even after constraint rebuild.
+    fn get_open_position_asset_ids(&self) -> Vec<String> {
+        self.positions.lock().get_open_position_asset_ids()
     }
 
     fn get_open_positions_json(&self) -> Vec<String> {
@@ -592,6 +859,22 @@ impl RustStateDB {
     fn dirty_count(&self) -> usize {
         self.inner.dirty_count()
     }
+
+    /// Replace the delay P95 table.
+    /// rows: list of (category, p95_hours, count, median, p75, pct_over_24h)
+    fn set_delay_table(&self, rows: Vec<(String, f64, i64, f64, f64, f64)>, updated_at: &str) {
+        self.inner.set_delay_table(&rows, updated_at);
+    }
+
+    /// Get delay P95 values as list of (category, p95_hours).
+    fn get_delay_table(&self) -> Vec<(String, f64)> {
+        self.inner.get_delay_table()
+    }
+
+    /// Get full delay table with all stats.
+    fn get_delay_table_full(&self) -> Vec<(String, f64, i64, f64, f64, f64, String)> {
+        self.inner.get_delay_table_full()
+    }
 }
 
 // RustPositionManager removed — position management merged into RustWsEngine
@@ -614,5 +897,6 @@ fn rust_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RustStateDB>()?;
     m.add_class::<resolution::RustResolutionValidator>()?;
     m.add_class::<postponement::RustPostponementDetector>()?;
+    m.add_class::<scanner::RustMarketScanner>()?;
     Ok(())
 }

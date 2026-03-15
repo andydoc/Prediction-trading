@@ -41,6 +41,15 @@ impl StateDB {
                 closed_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_pos_status ON positions(status);
+            CREATE TABLE IF NOT EXISTS delay_p95 (
+                category TEXT PRIMARY KEY,
+                p95_hours REAL NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                median_hours REAL NOT NULL DEFAULT 0,
+                p75_hours REAL NOT NULL DEFAULT 0,
+                pct_over_24h REAL NOT NULL DEFAULT 0,
+                updated_at TEXT
+            );
         ").map_err(|e| format!("Failed to create tables: {}", e))?;
 
         Ok(Self {
@@ -167,6 +176,62 @@ impl StateDB {
             .collect()
     }
 
+    // --- Delay P95 table ---
+
+    /// Replace the entire delay_p95 table with new data.
+    /// rows: [(category, p95_hours, count, median, p75, pct_over_24h)]
+    pub fn set_delay_table(&self, rows: &[(String, f64, i64, f64, f64, f64)], updated_at: &str) {
+        let db = self.mem.lock();
+        let _ = db.execute("DELETE FROM delay_p95", []);
+        for (cat, p95, count, median, p75, pct) in rows {
+            let _ = db.execute(
+                "INSERT INTO delay_p95 (category, p95_hours, count, median_hours, p75_hours, pct_over_24h, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![cat, p95, count, median, p75, pct, updated_at],
+            );
+        }
+        *self.dirty_count.lock() += 1;
+    }
+
+    /// Get all delay P95 values as (category, p95_hours).
+    pub fn get_delay_table(&self) -> Vec<(String, f64)> {
+        let db = self.mem.lock();
+        let mut stmt = match db.prepare("SELECT category, p95_hours FROM delay_p95") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        }).unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    }
+
+    /// Get full delay table as JSON-ready rows.
+    pub fn get_delay_table_full(&self) -> Vec<(String, f64, i64, f64, f64, f64, String)> {
+        let db = self.mem.lock();
+        let mut stmt = match db.prepare(
+            "SELECT category, p95_hours, count, median_hours, p75_hours, pct_over_24h, \
+             COALESCE(updated_at, '') FROM delay_p95"
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, f64>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        }).unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    }
+
     // --- Disk persistence (runs WITHOUT the GIL — main latency win) ---
 
     /// Atomic backup of in-memory DB to disk. Returns elapsed ms.
@@ -212,12 +277,27 @@ impl StateDB {
             .map_err(|e| format!("Failed to open disk DB: {}", e))?;
 
         let mut db = self.mem.lock();
-        let backup = Backup::new(&disk_db, &mut *db)
-            .map_err(|e| format!("Backup init failed: {}", e))?;
-        backup.run_to_completion(
-            100, Duration::ZERO,
-            None::<fn(rusqlite::backup::Progress)>,
-        ).map_err(|e| format!("Backup restore failed: {}", e))?;
+        {
+            let backup = Backup::new(&disk_db, &mut *db)
+                .map_err(|e| format!("Backup init failed: {}", e))?;
+            backup.run_to_completion(
+                100, Duration::ZERO,
+                None::<fn(rusqlite::backup::Progress)>,
+            ).map_err(|e| format!("Backup restore failed: {}", e))?;
+        }
+
+        // Ensure new tables exist after restoring from older disk DB
+        let _ = db.execute_batch("
+            CREATE TABLE IF NOT EXISTS delay_p95 (
+                category TEXT PRIMARY KEY,
+                p95_hours REAL NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                median_hours REAL NOT NULL DEFAULT 0,
+                p75_hours REAL NOT NULL DEFAULT 0,
+                pct_over_24h REAL NOT NULL DEFAULT 0,
+                updated_at TEXT
+            );
+        ");
 
         Ok(t0.elapsed().as_secs_f64() * 1000.0)
     }

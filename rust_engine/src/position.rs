@@ -114,6 +114,8 @@ struct PositionManagerInner {
     losing_trades: u64,
     total_actual_profit: f64,
     total_expected_profit: f64,
+    /// asset_id → (market_id, is_yes) — populated by set_asset_index()
+    asset_index: HashMap<String, (String, bool)>,
 }
 
 impl PositionManager {
@@ -125,6 +127,7 @@ impl PositionManager {
                 taker_fee,
                 open_positions: HashMap::new(),
                 closed_positions: Vec::new(),
+                asset_index: HashMap::new(),
                 total_trades: 0,
                 winning_trades: 0,
                 losing_trades: 0,
@@ -138,6 +141,15 @@ impl PositionManager {
 
     pub fn current_capital(&self) -> f64 {
         self.inner.lock().current_capital
+    }
+
+    /// Total portfolio value: free cash + deployed capital in open positions.
+    pub fn total_value(&self) -> f64 {
+        let mgr = self.inner.lock();
+        let deployed: f64 = mgr.open_positions.values()
+            .map(|p| p.total_capital)
+            .sum();
+        mgr.current_capital + deployed
     }
 
     pub fn initial_capital(&self) -> f64 {
@@ -168,6 +180,7 @@ impl PositionManager {
         expected_profit: f64,
         expected_profit_pct: f64,
         is_sell: bool,
+        end_date_ts: f64,
     ) -> EntryResult {
         let mut mgr = self.inner.lock();
 
@@ -212,6 +225,9 @@ impl PositionManager {
         meta.insert("constraint_id".into(), serde_json::Value::String(constraint_id.to_string()));
         meta.insert("strategy".into(), serde_json::Value::String(strategy.to_string()));
         meta.insert("method".into(), serde_json::Value::String(method.to_string()));
+        if end_date_ts > 0.0 {
+            meta.insert("end_date_ts".into(), serde_json::json!(end_date_ts));
+        }
 
         let position = Position {
             position_id: pid.clone(),
@@ -475,43 +491,77 @@ impl PositionManager {
         Some((liq.net_proceeds, liq.profit))
     }
 
-    // --- Resolution checking: scan open positions for resolved markets ---
+    // --- Asset index (for WS resolution mapping) ---
 
-    /// Check all open positions against current market prices.
-    /// Returns positions that have fully resolved (all markets at YES>=0.95 or missing).
-    pub fn check_resolutions(
+    /// Set the asset_id → (market_id, is_yes) index.
+    /// Called from Python after constraint detection populates asset_to_market.
+    ///
+    /// IMPORTANT: Merges rather than replaces — preserves old entries for
+    /// asset_ids that belong to open positions. This ensures WS resolution
+    /// still works for positions whose markets have closed (dropped from
+    /// the scanner/constraint detection) but not yet resolved.
+    pub fn set_asset_index(&self, new_index: HashMap<String, (String, bool)>) {
+        let mut mgr = self.inner.lock();
+
+        // Collect all market_ids referenced by open positions
+        let open_market_ids: std::collections::HashSet<&String> = mgr.open_positions.values()
+            .flat_map(|p| p.markets.keys())
+            .collect();
+
+        // Preserve old asset_index entries whose market_id is in an open position
+        let new_count = new_index.len();
+        let mut merged = new_index;
+        let mut preserved = 0usize;
+        for (asset_id, (market_id, is_yes)) in &mgr.asset_index {
+            if open_market_ids.contains(market_id) && !merged.contains_key(asset_id) {
+                merged.insert(asset_id.clone(), (market_id.clone(), *is_yes));
+                preserved += 1;
+            }
+        }
+
+        mgr.asset_index = merged;
+
+        if preserved > 0 {
+            tracing::info!(
+                "Asset index updated: {} new + {} preserved for open positions = {} total",
+                new_count, preserved, new_count + preserved
+            );
+        }
+    }
+
+    // --- Resolution checking via WS events ---
+
+    /// Resolve positions using raw WS market_resolved events.
+    /// `events` is a list of (condition_id, asset_id) pairs from WS.
+    /// Uses internal asset_index to map asset_id → (market_id, is_yes).
+    /// Returns (position_id, winning_market_id) for positions where ALL legs resolved.
+    pub fn resolve_by_ws_events(
         &self,
-        market_prices: &HashMap<String, HashMap<String, f64>>,  // market_id → {outcome → price}
-    ) -> Vec<(String, String)> {  // (position_id, winning_market_id)
+        events: &[(String, String)],  // (condition_id, asset_id)
+    ) -> Vec<(String, String)> {
         let mgr = self.inner.lock();
-        let mut resolved = Vec::new();
 
+        // Map WS events to {market_id → "yes"/"no"} using asset index
+        let mut winners: HashMap<String, String> = HashMap::new();
+        for (_cid, asset_id) in events {
+            if let Some((market_id, is_yes)) = mgr.asset_index.get(asset_id) {
+                let outcome = if *is_yes { "yes" } else { "no" };
+                winners.insert(market_id.clone(), outcome.to_string());
+            }
+        }
+
+        // Find positions where ALL legs have resolved
+        let mut resolved = Vec::new();
         for (pid, position) in &mgr.open_positions {
             let total_markets = position.markets.len();
             let mut resolved_count = 0;
             let mut winning_market_id = String::new();
 
             for market_id in position.markets.keys() {
-                match market_prices.get(market_id) {
-                    None => {
-                        // Market missing from data — treat as resolved
-                        resolved_count += 1;
-                    }
-                    Some(outcomes) => {
-                        let mut max_price = 0.0f64;
-                        let mut max_outcome = String::new();
-                        for (outcome, price) in outcomes {
-                            if *price > max_price {
-                                max_price = *price;
-                                max_outcome = outcome.clone();
-                            }
-                        }
-                        if max_price >= 0.95 {
-                            resolved_count += 1;
-                            if max_outcome.to_lowercase() == "yes" {
-                                winning_market_id = market_id.clone();
-                            }
-                        }
+                if let Some(outcome) = winners.get(market_id) {
+                    resolved_count += 1;
+                    if outcome == "yes" {
+                        winning_market_id = market_id.clone();
                     }
                 }
             }
@@ -555,6 +605,19 @@ impl PositionManager {
         let mgr = self.inner.lock();
         mgr.open_positions.values()
             .flat_map(|p| p.markets.keys().cloned())
+            .collect()
+    }
+
+    /// Get all asset_ids from the asset_index that map to markets in open positions.
+    /// Used to ensure WS stays subscribed to these assets even after constraint rebuild.
+    pub fn get_open_position_asset_ids(&self) -> Vec<String> {
+        let mgr = self.inner.lock();
+        let open_market_ids: std::collections::HashSet<&String> = mgr.open_positions.values()
+            .flat_map(|p| p.markets.keys())
+            .collect();
+        mgr.asset_index.iter()
+            .filter(|(_, (mid, _))| open_market_ids.contains(mid))
+            .map(|(aid, _)| aid.clone())
             .collect()
     }
 

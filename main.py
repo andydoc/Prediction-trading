@@ -92,21 +92,8 @@ def main():
     log.info(f'PID: {os.getpid()}')
     log.info('=' * 60)
 
-    # --- Run initial scanner: postponement check + market fetch (synchronous, blocking) ---
-    scanner_script = WORKSPACE / 'utilities' / 'initial_market_scanner.py'
-    log.info('Running initial scanner (postponement check + market fetch)...')
-    try:
-        scanner_proc = subprocess.run(
-            [VENV_PYTHON, str(scanner_script)],
-            cwd=str(WORKSPACE),
-            timeout=300,  # 5 min: allows for postponement AI calls (60s rate limit each)
-        )
-        if scanner_proc.returncode != 0:
-            log.error(f'Scanner failed (exit code {scanner_proc.returncode}). Starting engine anyway (may use stale data).')
-        else:
-            log.info('Scanner complete — latest_markets.json ready')
-    except subprocess.TimeoutExpired:
-        log.warning('Scanner timed out after 300s — starting engine with whatever data is available')
+    # Market scanning handled by trading engine at startup (A4: Rust RustMarketScanner)
+    # Postponement detection handled by RustPostponementDetector (A3)
 
     # --- Start supervised processes ---
     for layer in LAYERS:

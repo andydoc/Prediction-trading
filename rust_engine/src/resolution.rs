@@ -233,7 +233,7 @@ fn call_anthropic(
     {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("Anthropic API request failed: {}", e);
+            eprintln!("[rust_rv] Anthropic API request failed: {}", e);
             return None;
         }
     };
@@ -241,14 +241,14 @@ fn call_anthropic(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
-        tracing::warn!("Anthropic API returned {}: {}", status, &text[..text.len().min(200)]);
+        eprintln!("[rust_rv] Anthropic API returned {}: {}", status, &text[..text.len().min(500)]);
         return None;
     }
 
     let data: serde_json::Value = match resp.json() {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!("Failed to parse Anthropic response: {}", e);
+            eprintln!("[rust_rv] Failed to parse Anthropic response: {}", e);
             return None;
         }
     };
@@ -281,19 +281,10 @@ fn call_anthropic(
     }
 
     match serde_json::from_str::<ValidationResult>(&text) {
-        Ok(result) => {
-            tracing::info!(
-                "AI validation: date={} confidence={} unrepresented_outcome={} reason={}",
-                result.latest_resolution_date,
-                result.confidence,
-                result.has_unrepresented_outcome,
-                &result.reasoning[..result.reasoning.len().min(80)]
-            );
-            Some(result)
-        }
+        Ok(result) => Some(result),
         Err(e) => {
-            tracing::warn!(
-                "Failed to parse Anthropic response as JSON: {}, text={}",
+            eprintln!(
+                "[rust_rv] JSON parse failed: {}, text={}",
                 e, &text[..text.len().min(200)]
             );
             None
@@ -306,6 +297,9 @@ fn format_prompt(template: &str, question: &str, description: &str, api_end_date
         .replace("{question}", question)
         .replace("{description}", description)
         .replace("{api_end_date}", api_end_date)
+        // Prompt templates use {{ and }} for literal braces (Python f-string convention)
+        .replace("{{", "{")
+        .replace("}}", "}")
 }
 
 // ---------------------------------------------------------------------------
@@ -457,26 +451,32 @@ impl RustResolutionValidator {
         let config = self.config.clone();
         let client = self.client.clone();
 
-        let result: Option<ValidationResult> = py.allow_threads(move || {
+        let result: Result<ValidationResult, String> = py.allow_threads(move || {
             // Fetch market description from Polymarket
             let (question, description, end_date) = match fetch_market_description(&client, market_id) {
                 Some(details) => details,
-                None => return None,
+                None => return Err(format!("fetch_market_description failed for mid={}", market_id)),
             };
 
             // Format prompt
             let prompt = format_prompt(&prompt_template, &question, &description, &end_date);
 
             // Call Anthropic API
-            call_anthropic(&client, &config, &api_key, &prompt)
+            match call_anthropic(&client, &config, &api_key, &prompt) {
+                Some(vr) => Ok(vr),
+                None => Err("call_anthropic returned None".into()),
+            }
         });
 
         match result {
-            Some(vr) => {
+            Ok(vr) => {
                 self.cache.save(&group_id, &vr);
                 validation_to_pydict(py, &vr)
             }
-            None => Ok(py.None()),
+            Err(e) => {
+                eprintln!("[rust_rv] validation failed for {}: {}", group_id, e);
+                Ok(py.None())
+            }
         }
     }
 

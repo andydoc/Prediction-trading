@@ -21,7 +21,11 @@
 </style>
 <style>
   table { border-collapse: collapse; width: 100%; margin: 5px 0; }
-  th { background: #1a1a1a; color: #0af; text-align: left; padding: 6px 10px; font-size: 12px; }
+  th { background: #1a1a1a; color: #0af; text-align: left; padding: 6px 10px; font-size: 12px; white-space: nowrap; }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: #0f0; }
+  th .sort-arrow { font-size: 10px; margin-left: 3px; color: #555; }
+  th.sort-asc .sort-arrow, th.sort-desc .sort-arrow { color: #0f0; }
   td { border-bottom: 1px solid #222; padding: 5px 10px; font-size: 12px; }
   td[title] { cursor: help; }
   tr:hover { background: #1a1a2a; }
@@ -125,7 +129,17 @@
   </h2>
   <div class="section-content">
     <table><thead>
-      <tr><th>#</th><th>Market</th><th>Strategy</th><th>Score</th><th>Deployed</th><th>Expected P&amp;L</th><th>Resolves</th><th>Status</th><th>Entered</th></tr>
+      <tr>
+        <th class="sortable sort-desc" data-sort="idx" data-type="num" onclick="sortPositions(this)">#<span class="sort-arrow"></span></th>
+        <th>Market</th>
+        <th class="sortable" data-sort="strategy" data-type="str" onclick="sortPositions(this)">Strategy<span class="sort-arrow"></span></th>
+        <th class="sortable sort-desc" data-sort="score" data-type="num" onclick="sortPositions(this)">Score<span class="sort-arrow"></span></th>
+        <th class="sortable" data-sort="total_cap" data-type="num" onclick="sortPositions(this)">Deployed<span class="sort-arrow"></span></th>
+        <th class="sortable" data-sort="exp_pct" data-type="num" onclick="sortPositions(this)">Expected P&amp;L<span class="sort-arrow"></span></th>
+        <th class="sortable" data-sort="_resolve_secs" data-type="num" onclick="sortPositions(this)">Resolves<span class="sort-arrow"></span></th>
+        <th>Status</th>
+        <th class="sortable" data-sort="entry_ts" data-type="str" onclick="sortPositions(this)">Entered<span class="sort-arrow"></span></th>
+      </tr>
     </thead><tbody id="positions-body"></tbody></table>
   </div>
 
@@ -222,6 +236,41 @@ function restoreExpanded(tbodyId, keys, prefix) {
   updateCollapseBtn(prefix);
 }
 
+// === Open positions sort ===
+var _posSortKey = 'score', _posSortDir = 'desc', _lastPosData = null;
+function sortPositions(th) {
+  var key = th.dataset.sort;
+  if (_posSortKey === key) {
+    _posSortDir = _posSortDir === 'desc' ? 'asc' : _posSortDir === 'asc' ? 'none' : 'desc';
+  } else {
+    _posSortKey = key;
+    _posSortDir = 'desc';
+  }
+  // Update header arrows
+  th.closest('tr').querySelectorAll('th.sortable').forEach(function(h) {
+    h.classList.remove('sort-asc','sort-desc');
+  });
+  if (_posSortDir !== 'none') th.classList.add('sort-' + _posSortDir);
+  // Re-render with current data
+  if (_lastPosData) renderPositions(_lastPosData);
+}
+function applySortToPositions(positions) {
+  if (_posSortDir === 'none') return positions;
+  var sorted = positions.slice();
+  var type = 'num';
+  document.querySelectorAll('th.sortable').forEach(function(h) {
+    if (h.dataset.sort === _posSortKey) type = h.dataset.type || 'num';
+  });
+  sorted.sort(function(a, b) {
+    var va = a[_posSortKey], vb = b[_posSortKey];
+    if (type === 'num') { va = parseFloat(va)||0; vb = parseFloat(vb)||0; }
+    else { va = String(va||''); vb = String(vb||''); }
+    var cmp = type === 'num' ? va - vb : va.localeCompare(vb);
+    return _posSortDir === 'desc' ? -cmp : cmp;
+  });
+  return sorted;
+}
+
 // === Stats bar renderer ===
 function renderStats(d) {
   var bar = document.getElementById('stats-bar');
@@ -252,18 +301,22 @@ function renderStats(d) {
   el=document.getElementById('mode-badge'); if(el) { el.textContent=d.mode_label; el.className='mode-badge '+d.mode_class; }
   // Tab annualized
   el=document.getElementById('tab-ann-paper');
-  if(el && d.annualized && d.annualized!=='N/A') { el.textContent=d.annualized+' ann.'; el.className='tab-annualized '+(d.annualized_ret>=0?'color-green':'color-red'); }
+  if(el && d.annualized && d.annualized!=='N/A') { el.innerHTML=d.annualized+' ann.'; el.className='tab-annualized '+(d.annualized_ret>=0?'color-green':'color-red'); }
 }
 
 // === Positions renderer ===
 function renderPositions(d) {
+  _lastPosData = d;
   document.getElementById('pos-count').textContent = d.pos_count;
   var tb = document.getElementById('positions-body');
   if (!tb) return;
   // Save expanded state before rebuild
   var expanded = getExpandedKeys('positions-body');
+  var sorted = applySortToPositions(d.positions);
+  // Re-number after sort
+  for (var si = 0; si < sorted.length; si++) sorted[si].idx = si + 1;
   var h = '';
-  d.positions.forEach(function(p) {
+  sorted.forEach(function(p) {
     var key = p.short_name;  // stable key for expand persistence
     var resolveHtml = esc(p.resolve);
     if (p.postpone) {
@@ -404,8 +457,44 @@ function renderSystem(d) {
   h += '<tr><td>Dashboard</td><td class="color-positive">running</td><td>'+esc(d.dashboard_ts)+'</td></tr>';
   sb.innerHTML = h;
 }
+// === Closed positions sort ===
+var _clSortKeys = {}, _clSortDirs = {}, _lastClosedData = null;
+function applySortToClosed(rows, cat) {
+  var dir = _clSortDirs[cat];
+  if (!dir || dir === 'none') return rows;
+  var key = _clSortKeys[cat];
+  var sorted = rows.slice();
+  sorted.sort(function(a, b) {
+    var va, vb;
+    if (key === '_hold_secs' || key === 'deployed' || key === 'pnl_pct' || key === '_sort_ts') {
+      va = parseFloat(a[key])||0; vb = parseFloat(b[key])||0;
+    } else {
+      va = String(a[key]||''); vb = String(b[key]||'');
+    }
+    var cmp = (typeof va === 'number') ? va - vb : va.localeCompare(vb);
+    return dir === 'desc' ? -cmp : cmp;
+  });
+  return sorted;
+}
+// Event delegation for closed position sortable headers
+document.addEventListener('click', function(e) {
+  var th = e.target.closest('th.sortable');
+  if (!th) return;
+  var tbl = th.closest('table');
+  if (!tbl || !tbl.dataset.cat) return;
+  e.stopPropagation();
+  var cat = tbl.dataset.cat;
+  var key = th.dataset.sort;
+  if (!_clSortKeys[cat]) { _clSortKeys[cat] = null; _clSortDirs[cat] = 'none'; }
+  if (_clSortKeys[cat] === key) {
+    _clSortDirs[cat] = _clSortDirs[cat] === 'desc' ? 'asc' : _clSortDirs[cat] === 'asc' ? 'none' : 'desc';
+  } else { _clSortKeys[cat] = key; _clSortDirs[cat] = 'desc'; }
+  if (_lastClosedData) renderClosed(_lastClosedData);
+});
+
 // === Closed positions renderer ===
 function renderClosed(d) {
+  _lastClosedData = d;
   document.getElementById('closed-count').textContent = d.total_closed;
   var cc = document.getElementById('closed-container');
   if (!cc) return;
@@ -420,17 +509,27 @@ function renderClosed(d) {
     var hide = cat.collapsed ? 'hidden' : '';
     var dateCol = (key === 'resolved') ? 'Resolved' : (key === 'proactive_exit') ? 'Exited' : 'Replaced';
     h += '<h3 class="sub-section-title '+cls+'" onclick="toggleSection(this)">'+esc(cat.label)+' ('+cat.rows.length+')</h3>';
-    h += '<div class="section-content '+hide+'"><table>';
-    h += '<tr><th>Market</th><th>Strategy</th><th>Deployed</th><th>P&amp;L</th><th>Held</th><th>'+dateCol+'</th></tr>';
-    cat.rows.forEach(function(r) {
+    h += '<div class="section-content '+hide+'"><table data-cat="'+key+'">';
+    var sk = _clSortKeys[key] || '', sd = _clSortDirs[key] || 'none';
+    function sa(k) { return (sk===k && sd!=='none') ? ' sort-'+sd : ''; }
+    h += '<thead><tr><th>Market</th>';
+    h += '<th class="sortable'+sa('strategy')+'" data-sort="strategy">Strategy<span class="sort-arrow"></span></th>';
+    h += '<th class="sortable'+sa('deployed')+'" data-sort="deployed">Deployed<span class="sort-arrow"></span></th>';
+    h += '<th class="sortable'+sa('pnl_pct')+'" data-sort="pnl_pct">P&amp;L<span class="sort-arrow"></span></th>';
+    h += '<th class="sortable'+sa('_hold_secs')+'" data-sort="_hold_secs">Held<span class="sort-arrow"></span></th>';
+    h += '<th class="sortable'+sa('_sort_ts')+'" data-sort="_sort_ts">'+dateCol+'<span class="sort-arrow"></span></th>';
+    h += '</tr></thead><tbody>';
+    var sorted = applySortToClosed(cat.rows, key);
+    sorted.forEach(function(r) {
       ridx++;
       var rkey = r.name;
-      var cls2 = r.pnl > 0.01 ? 'good' : (r.pnl < -0.01 ? 'bad' : '');
+      var pct = r.pnl_pct || 0;
+      var cls2 = pct > 0.1 ? 'good' : (pct < -0.1 ? 'bad' : '');
       h += '<tr id="cl-row-'+ridx+'" class="pos-row '+cls2+'" data-key="'+esc(rkey)+'" onclick="toggleRow(\'cl\','+ridx+')">';
       h += '<td title="'+esc((r.full_names||[]).join(' | '))+'">'+esc(r.name)+'</td>';
       h += '<td>'+esc(r.strategy||'?')+'</td>';
       h += '<td>$'+r.deployed.toFixed(2)+'</td>';
-      h += '<td>$'+(r.pnl>=0?'+':'')+r.pnl.toFixed(2)+'</td>';
+      h += '<td>'+(pct>=0?'+':'')+pct.toFixed(1)+'%</td>';
       h += '<td>'+esc(r.hold)+'</td>';
       h += '<td>'+esc(r.closed_at||'?')+'</td></tr>';
       // Detail row with legs
@@ -444,7 +543,7 @@ function renderClosed(d) {
       }
       h += '</td></tr>';
     });
-    h += '</table></div>';
+    h += '</tbody></table></div>';
   });
   cc.innerHTML = h;
   restoreExpanded('closed-container', expanded, 'cl');

@@ -14,8 +14,8 @@ pub struct BookMirror {
     asset_to_constraints: DashMap<String, Vec<String>>,
     /// Total WS messages received
     msg_count: AtomicU64,
-    /// Config
-    trade_size_usd: f64,
+    /// Config (trade_size_usd is atomic — updated at runtime as capital changes)
+    trade_size_usd: AtomicU64,
     efp_drift_threshold: f64,
 }
 
@@ -26,9 +26,18 @@ impl BookMirror {
             last_efp: DashMap::new(),
             asset_to_constraints: DashMap::new(),
             msg_count: AtomicU64::new(0),
-            trade_size_usd: config.trade_size_usd,
+            trade_size_usd: AtomicU64::new(config.trade_size_usd.to_bits()),
             efp_drift_threshold: config.efp_drift_threshold,
         }
+    }
+
+    /// Update trade size at runtime (called when capital changes).
+    pub fn set_trade_size(&self, trade_size_usd: f64) {
+        self.trade_size_usd.store(trade_size_usd.to_bits(), Ordering::Relaxed);
+    }
+
+    fn get_trade_size(&self) -> f64 {
+        f64::from_bits(self.trade_size_usd.load(Ordering::Relaxed))
     }
 
     /// Register asset→constraint index (called during setup).
@@ -85,7 +94,7 @@ impl BookMirror {
 
     /// Check if EFP has drifted enough to queue evals.
     fn check_efp_drift(&self, asset_id: &str, book: &OrderBook) -> Vec<(String, bool)> {
-        let new_efp = book.effective_fill_price(self.trade_size_usd);
+        let new_efp = book.effective_fill_price(self.get_trade_size());
         if new_efp <= 0.0 {
             return vec![];
         }
@@ -107,7 +116,7 @@ impl BookMirror {
     /// Get EFP for an asset.
     pub fn get_efp(&self, asset_id: &str) -> f64 {
         self.books.get(asset_id)
-            .map(|b| b.effective_fill_price(self.trade_size_usd))
+            .map(|b| b.effective_fill_price(self.get_trade_size()))
             .unwrap_or(0.0)
     }
 

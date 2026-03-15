@@ -126,14 +126,17 @@ impl OrderBook {
     }
 }
 
-/// Configuration passed from Python.
+/// Engine configuration — loaded from config.yaml at startup.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
+    // websocket section
     pub ws_url: String,
     pub assets_per_shard: usize,
     pub heartbeat_interval_secs: u64,
+    // engine section
     pub efp_drift_threshold: f64,
     pub efp_stale_secs: f64,
+    // runtime (set dynamically, not from config)
     pub trade_size_usd: f64,
 }
 
@@ -148,6 +151,137 @@ impl Default for EngineConfig {
             trade_size_usd: 10.0,
         }
     }
+}
+
+/// Eval-related configuration — loaded from config.yaml at startup.
+#[derive(Debug, Clone)]
+pub struct EvalCfg {
+    pub fee_rate: f64,
+    pub min_profit_threshold: f64,
+    pub max_profit_threshold: f64,
+    pub max_fw_iter: usize,
+    pub max_hours: f64,
+}
+
+impl Default for EvalCfg {
+    fn default() -> Self {
+        Self {
+            fee_rate: 0.0001,
+            min_profit_threshold: 0.03,
+            max_profit_threshold: 0.30,
+            max_fw_iter: 200,
+            max_hours: 1440.0,
+        }
+    }
+}
+
+/// Position manager configuration — loaded from config.yaml at startup.
+#[derive(Debug, Clone)]
+pub struct PositionCfg {
+    pub initial_capital: f64,
+    pub taker_fee: f64,
+}
+
+impl Default for PositionCfg {
+    fn default() -> Self {
+        Self {
+            initial_capital: 100.0,
+            taker_fee: 0.0001,
+        }
+    }
+}
+
+/// Load all engine config from config.yaml.
+/// Falls back to defaults if file is missing or values are absent.
+pub fn load_engine_config(workspace: &str) -> (EngineConfig, EvalCfg, PositionCfg) {
+    let path = std::path::PathBuf::from(workspace).join("config").join("config.yaml");
+
+    let val: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(contents) => serde_yaml::from_str(&contents).unwrap_or_default(),
+        Err(_) => {
+            tracing::warn!("config.yaml not found at {:?}, using defaults", path);
+            return (EngineConfig::default(), EvalCfg::default(), PositionCfg::default());
+        }
+    };
+
+    // --- websocket ---
+    let ws_url = val.pointer("/websocket/market_channel_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("wss://ws-subscriptions-clob.polymarket.com/ws/market")
+        .to_string();
+    let assets_per_shard = val.pointer("/websocket/assets_per_shard")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2000) as usize;
+    let heartbeat_interval_secs = val.pointer("/websocket/heartbeat_interval")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10);
+
+    // --- engine ---
+    let efp_drift_threshold = val.pointer("/engine/efp_drift_threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.005);
+    let efp_stale_secs = val.pointer("/engine/efp_staleness_seconds")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(5.0);
+
+    // --- arbitrage fees ---
+    let fee_rate = val.pointer("/arbitrage/fees/trading_fee")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0001);
+    let taker_fee = val.pointer("/arbitrage/fees/polymarket_taker_fee")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0001);
+
+    // --- arbitrage thresholds ---
+    let min_profit_threshold = val.pointer("/arbitrage/min_profit_threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.03);
+    let max_profit_threshold = val.pointer("/arbitrage/max_profit_threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.30);
+    let max_fw_iter = val.pointer("/arbitrage/optimization/max_iterations")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(200) as usize;
+    let max_days = val.pointer("/arbitrage/max_days_to_resolution")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(60.0);
+    let max_hours = max_days * 24.0;
+
+    // --- live_trading / position ---
+    let initial_capital = val.pointer("/live_trading/initial_capital")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(100.0);
+
+    let engine_cfg = EngineConfig {
+        ws_url,
+        assets_per_shard,
+        heartbeat_interval_secs,
+        efp_drift_threshold,
+        efp_stale_secs,
+        trade_size_usd: 10.0, // set dynamically at runtime via set_trade_size()
+    };
+
+    let eval_cfg = EvalCfg {
+        fee_rate,
+        min_profit_threshold,
+        max_profit_threshold,
+        max_fw_iter,
+        max_hours,
+    };
+
+    let pos_cfg = PositionCfg {
+        initial_capital,
+        taker_fee,
+    };
+
+    tracing::info!(
+        "Config loaded: ws_shard={}, efp_drift={}, fee={}, profit=[{:.2}%..{:.2}%], max_days={}, capital={}",
+        assets_per_shard, efp_drift_threshold, fee_rate,
+        min_profit_threshold * 100.0, max_profit_threshold * 100.0,
+        max_days, initial_capital,
+    );
+
+    (engine_cfg, eval_cfg, pos_cfg)
 }
 
 /// Reason an eval was queued.
