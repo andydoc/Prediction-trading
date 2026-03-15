@@ -198,6 +198,7 @@ Each document is produced at the point in the milestone sequence when its conten
 | ⬚ **A10: Single compiled binary** (8q-15) | `cargo build --release` produces one binary. Deploy to VPS with config files only. No Python, no venv, no pip. |
 | ⬚ **A11: Create CHANGELOG.md** | All version entries (v0.01.00 through current) transferred from PROGRESS_ROADMAP.md §7. Compare with git records and update. Most recent first. keepachangelog.com format (Added/Changed/Fixed/Removed). |
 | ⬚ **A12: Create INCIDENT_LOG.md** | All incidents (INC-001 through INC-006+) transferred. Each has: date, markets, impact, root cause, fix, status. Includes template for future incidents. |
+| ⬚ **A13: Independent code review** | Comprehensive review of the Rust codebase covering bugs, security, performance, style, and dependencies. Full findings and remediation plan in `Code_Review.md`. Implemented as v0.10.1 (all items except S1 explicit TLS and S2 zeroize API keys). |
 
 #### Parameterisation Table
 
