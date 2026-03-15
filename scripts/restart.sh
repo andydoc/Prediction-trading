@@ -1,82 +1,55 @@
 #!/bin/bash
-# restart.sh - Start or restart the prediction trading system
-# Usage: bash restart.sh [--clean]
-#   --clean  Also purge stale L2/L3 data before starting
+# restart.sh — Stop, pull, rebuild, and restart the trading system
+#
+# Usage:
+#   bash restart.sh                       # default restart
+#   bash restart.sh --mode shadow         # restart in shadow mode
+#   bash restart.sh --clean               # also purge stale cache data
+#   bash restart.sh --set key=value       # pass overrides to supervisor
 
 set -e
-source /home/andydoc/prediction-trader-env/bin/activate
-cd /home/andydoc/prediction-trader
+WORKSPACE="${TRADER_WORKSPACE:-/home/andydoc/prediction-trader}"
+cd "$WORKSPACE"
 
-echo "Restarting Prediction Trader..."
+# Separate --clean from supervisor args
+CLEAN=false
+SUPERVISOR_ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "--clean" ]; then
+        CLEAN=true
+    else
+        SUPERVISOR_ARGS+=("$arg")
+    fi
+done
 
-echo "Pulling latest code..."
-git pull --ff-only origin main 2>&1 || echo "  WARNING: git pull failed — continuing with local code"
-
-echo "Killing all trader processes..."
-PIDS=$(ps aux | grep -E 'main\.py|trading_engine|dashboard_server|initial_market_scanner' | grep -v grep | tr -s ' ' | cut -d' ' -f2)
-if [ -n "$PIDS" ]; then
-    echo "  Killing PIDs: $PIDS"
-    echo "$PIDS" | xargs kill 2>/dev/null || true
-else
-    echo "  No trader processes found"
-fi
+echo "[restart] Stopping all trader processes..."
+bash "$WORKSPACE/scripts/kill.sh" --quiet 2>/dev/null || true
 sleep 3
 
-if [ "$1" = "--clean" ]; then
-    echo "Cleaning stale data..."
+if [ "$CLEAN" = true ]; then
+    echo "[restart] Cleaning stale cache data..."
     rm -f constraint_detection/data/latest_constraints.json
     rm -f arbitrage_math/data/latest_opportunities.json
-    rm -f constraint_detection/__pycache__/*.pyc
-    echo "  Cleaned L2/L3 cache"
+    echo "  Cleaned"
 fi
 
-echo "Starting system..."
-rm -f *.pid
-mkdir -p logs
-nohup python main.py >> logs/main.log 2>&1 &
-MAIN_PID=$!
-disown $MAIN_PID
-echo "  Supervisor PID: $MAIN_PID"
+# Pull + rebuild
+echo "[restart] Pulling latest code..."
+git pull --ff-only origin main 2>&1 || echo "  WARNING: git pull failed — continuing with local code"
 
-echo "Waiting for layers to start..."
-sleep 15
+# Rebuild Rust supervisor if source changed
+echo "[restart] Rebuilding supervisor..."
+cd "$WORKSPACE/rust_supervisor"
+cargo build --release 2>&1 | tail -3
+cd "$WORKSPACE"
 
+# Rebuild Rust engine
+echo "[restart] Rebuilding Rust engine..."
+source "$WORKSPACE/.venv/bin/activate" 2>/dev/null || source "$WORKSPACE/../prediction-trader-env/bin/activate"
+cd "$WORKSPACE/rust_engine"
+maturin develop --release 2>&1 | tail -3
+cd "$WORKSPACE"
+
+# Start via start.sh (passes through supervisor args)
 echo ""
-echo "=== Process check ==="
-ps aux | grep -E 'main\.py|trading_engine|dashboard_server' | grep -v grep | tr -s ' ' | cut -d' ' -f2,11
-
-echo ""
-echo "=== Trading Engine log (last 10 lines) ==="
-LOGFILE="logs/trading_engine_$(date +%Y%m%d).log"
-if [ -f "$LOGFILE" ]; then
-    tail -10 "$LOGFILE"
-else
-    echo "  Engine log not yet created — try: tail -f $LOGFILE"
-fi
-
-echo ""
-echo "=== Dashboard ==="
-HTTP=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5556/ 2>/dev/null)
-if [ "$HTTP" = "200" ]; then
-    echo "  Dashboard OK (HTTP 200) — http://localhost:5556"
-else
-    echo "  Dashboard NOT responding (HTTP $HTTP)"
-fi
-
-echo ""
-echo "=== Capital ==="
-python3 -c "
-import json
-try:
-    d = json.load(open('data/system_state/execution_state.json'))
-    cap = d['current_capital']
-    pos = d['open_positions']
-    closed = d['closed_positions']
-    deployed = sum(p.get('total_capital', 0) for p in pos)
-    print(f'  Cash=\${cap:.2f}  Deployed=\${deployed:.2f}  Total=\${cap+deployed:.2f}  Open={len(pos)}  Closed={len(closed)}')
-except Exception as e:
-    print(f'  Could not read state: {e}')
-" 2>/dev/null
-
-echo ""
-echo "Done."
+bash "$WORKSPACE/scripts/start.sh" "${SUPERVISOR_ARGS[@]}"

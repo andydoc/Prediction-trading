@@ -74,6 +74,13 @@ apt-get install -y -qq \
     > /dev/null 2>&1
 echo "  Done. Python: $(${PYTHON_VERSION} --version)"
 
+# Install Rust toolchain (needed for Rust engine + supervisor)
+if ! command -v cargo &>/dev/null; then
+    echo "  Installing Rust toolchain..."
+    sudo -u ${TRADER_USER} bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
+    echo "  Rust installed"
+fi
+
 # --- 2. Create trader user ---
 echo "[2/8] Setting up trader user..."
 if id "${TRADER_USER}" &>/dev/null; then
@@ -129,6 +136,11 @@ sudo -u ${TRADER_USER} mkdir -p \
     "${REPO_DIR}/data/system_state" \
     "${REPO_DIR}/data/resolution_cache"
 
+# Build Rust supervisor binary
+echo "  Building Rust supervisor binary..."
+sudo -u ${TRADER_USER} bash -c "source ~/.cargo/env && cd ${REPO_DIR}/rust_supervisor && cargo build --release"
+echo "  Supervisor binary: ${REPO_DIR}/rust_supervisor/target/release/prediction-trader"
+
 # --- 5. Python venv + dependencies ---
 echo "[5/8] Setting up Python environment..."
 if [ ! -d "${VENV_DIR}" ]; then
@@ -152,7 +164,12 @@ sudo -u ${TRADER_USER} "${VENV_DIR}/bin/pip" install -q \
     py-clob-client \
     python-dateutil \
     pytz \
-    tqdm
+    tqdm \
+    maturin
+
+# Build Rust engine as PyO3 module
+echo "  Building Rust engine (maturin develop)..."
+sudo -u ${TRADER_USER} bash -c "source ~/.cargo/env && source ${VENV_DIR}/bin/activate && cd ${REPO_DIR}/rust_engine && maturin develop --release"
 
 # Verify critical imports
 echo "  Verifying imports..."
@@ -201,11 +218,9 @@ Type=simple
 User=${TRADER_USER}
 Group=${TRADER_USER}
 WorkingDirectory=${REPO_DIR}
-ExecStart=${VENV_DIR}/bin/python main.py
+ExecStart=${REPO_DIR}/rust_supervisor/target/release/prediction-trader --workspace ${REPO_DIR} --python ${VENV_DIR}/bin/python
 Restart=always
 RestartSec=30
-StandardOutput=append:${REPO_DIR}/logs/main.log
-StandardError=append:${REPO_DIR}/logs/main.log
 
 # Resource limits
 MemoryMax=5G
@@ -213,6 +228,7 @@ CPUQuota=95%
 
 # Environment
 Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/${TRADER_USER}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=multi-user.target
@@ -293,8 +309,8 @@ echo ""
 echo "7. Test run:"
 echo "   sudo su - ${TRADER_USER}"
 echo "   cd ${REPO_DIR}"
-echo "   source ${VENV_DIR}/bin/activate"
-echo "   python main.py  # Watch for errors, Ctrl+C to stop"
+echo "   ./rust_supervisor/target/release/prediction-trader --dry-run  # Verify config"
+echo "   ./rust_supervisor/target/release/prediction-trader  # Watch for errors, Ctrl+C to stop"
 echo ""
 echo "8. Start as service:"
 echo "   sudo systemctl start prediction-trader"

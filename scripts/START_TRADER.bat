@@ -1,11 +1,14 @@
 @echo off
-echo Pulling latest code...
-wsl bash -c "cd /home/andydoc/prediction-trader && git pull --ff-only origin main 2>&1 || echo 'WARNING: git pull failed'"
 echo Starting Prediction Trader...
-wsl bash -c "source /home/andydoc/prediction-trader-env/bin/activate && cd /home/andydoc/prediction-trader && rm -f *.pid && nohup python main.py > logs/main.log 2>&1 &"
-timeout /t 12 /nobreak >nul
-echo Checking status...
-wsl bash -c "ps aux | grep -E 'main\.py|dashboard_server' | grep -v grep | wc -l"
+
+REM Mount P: drive if not present
+if not exist P:\ (
+    echo Mounting P: drive...
+    subst P: \\wsl.localhost\Ubuntu\home\andydoc\prediction-trader
+    timeout /t 2 /nobreak >nul
+)
+
+wsl bash -c "cd /home/andydoc/prediction-trader && bash scripts/start.sh"
 echo.
 echo Dashboard: http://localhost:5556
 echo.
