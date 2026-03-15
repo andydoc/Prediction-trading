@@ -1,15 +1,13 @@
 [package]
 name = "rust_engine"
-version = "0.1.0"
+version = "0.10.0"
 edition = "2021"
-description = "High-performance WS engine + book mirror for prediction market trading"
+description = "Core trading engine: WS, book mirror, arb math, positions, dashboard"
 
 [lib]
 name = "rust_engine"
-crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.24", features = ["extension-module"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", features = ["ring"] }

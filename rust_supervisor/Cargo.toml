@@ -1,19 +1,28 @@
 [package]
 name = "prediction-trader"
-version = "0.5.3"
+version = "0.10.0"
 edition = "2021"
-description = "Supervisor binary for prediction market trading system"
+description = "Single-binary prediction market trading system"
 
 [[bin]]
 name = "prediction-trader"
 path = "src/main.rs"
 
 [dependencies]
+rust_engine = { path = "../rust_engine" }
 clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 chrono = "0.4"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
+
+[target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", features = ["signal", "process"] }
+
+[target.'cfg(not(unix))'.dependencies]
+ctrlc = "3"

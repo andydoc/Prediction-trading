@@ -5,8 +5,6 @@
 ///
 /// Schema:
 ///   markets(market_id TEXT PK, data TEXT JSON, updated_at REAL)
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
 use rusqlite::{Connection, params};
 use rusqlite::backup::Backup;
 use parking_lot::Mutex;
@@ -353,68 +351,33 @@ fn write_json_file(path: &std::path::Path, markets: &[(String, serde_json::Value
 }
 
 // ---------------------------------------------------------------------------
-// Helper: serde_json::Value → PyObject
+// ScanResult
 // ---------------------------------------------------------------------------
 
-fn json_value_to_py(py: Python<'_>, val: &serde_json::Value) -> PyObject {
-    match val {
-        serde_json::Value::Null => py.None(),
-        serde_json::Value::Bool(b) => {
-            if *b { true.into_pyobject(py).unwrap().to_owned().into_any().unbind() }
-            else { false.into_pyobject(py).unwrap().to_owned().into_any().unbind() }
-        }
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                i.into_pyobject(py).unwrap().into_any().unbind()
-            } else if let Some(f) = n.as_f64() {
-                f.into_pyobject(py).unwrap().into_any().unbind()
-            } else {
-                py.None()
-            }
-        }
-        serde_json::Value::String(s) => s.into_pyobject(py).unwrap().into_any().unbind(),
-        serde_json::Value::Array(arr) => {
-            let list = PyList::empty(py);
-            for item in arr {
-                let _ = list.append(json_value_to_py(py, item));
-            }
-            list.into_any().unbind()
-        }
-        serde_json::Value::Object(map) => {
-            let dict = PyDict::new(py);
-            for (k, v) in map {
-                let _ = dict.set_item(k, json_value_to_py(py, v));
-            }
-            dict.into_any().unbind()
-        }
-    }
+pub struct ScanResult {
+    pub markets: Vec<serde_json::Value>,
+    pub count: usize,
+    pub skipped: usize,
 }
 
 // ---------------------------------------------------------------------------
-// PyO3 class
+// MarketScanner
 // ---------------------------------------------------------------------------
 
-#[pyclass]
-pub struct RustMarketScanner {
+pub struct MarketScanner {
     db: ScannerDB,
     client: reqwest::blocking::Client,
     json_output_path: Option<PathBuf>,
 }
 
-#[pymethods]
-impl RustMarketScanner {
-    #[new]
-    #[pyo3(signature = (db_path, json_path=None))]
-    fn new(db_path: String, json_path: Option<String>) -> PyResult<Self> {
+impl MarketScanner {
+    pub fn new(db_path: &str, json_path: Option<&str>) -> Result<Self, String> {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                format!("Failed to create HTTP client: {}", e)
-            ))?;
+            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-        let db = ScannerDB::new(&db_path)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let db = ScannerDB::new(db_path)?;
 
         Ok(Self {
             db,
@@ -423,29 +386,19 @@ impl RustMarketScanner {
         })
     }
 
-    /// Fetch all markets from Gamma API, convert, store in SQLite, return as list of dicts.
-    fn scan(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let client = self.client.clone();
-        let json_path = self.json_output_path.clone();
+    /// Fetch all markets from Gamma API, convert, store in SQLite, return as ScanResult.
+    pub fn scan(&self) -> Result<ScanResult, String> {
+        let (markets, skipped) = fetch_all_markets(&self.client);
 
-        // Release GIL during HTTP + conversion
-        let (markets, skipped) = py.allow_threads(move || {
-            let (markets, skipped) = fetch_all_markets(&client);
-
-            if !markets.is_empty() {
-                // Write to JSON file (backward compat)
-                if let Some(ref path) = json_path {
-                    write_json_file(path, &markets);
-                }
+        if !markets.is_empty() {
+            // Write to JSON file (backward compat)
+            if let Some(ref path) = self.json_output_path {
+                write_json_file(path, &markets);
             }
-
-            (markets, skipped)
-        });
+        }
 
         if markets.is_empty() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "No markets fetched from Gamma API"
-            ));
+            return Err("No markets fetched from Gamma API".into());
         }
 
         // Store in SQLite (needs lock, quick operation)
@@ -457,58 +410,50 @@ impl RustMarketScanner {
         tracing::info!("[scanner] {} markets stored, {} skipped, disk backup {:.1}ms",
                   markets.len(), skipped, mirror_ms);
 
-        // Convert to Python dicts
-        let market_list = PyList::empty(py);
-        for (_, val) in &markets {
-            let py_dict = json_value_to_py(py, val);
-            let _ = market_list.append(py_dict);
-        }
+        let market_values: Vec<serde_json::Value> = markets.into_iter()
+            .map(|(_, val)| val)
+            .collect();
+        let count = market_values.len();
 
-        let result = PyDict::new(py);
-        result.set_item("markets", market_list)?;
-        result.set_item("count", markets.len())?;
-        result.set_item("skipped", skipped)?;
-
-        Ok(result.into_any().unbind())
+        Ok(ScanResult {
+            markets: market_values,
+            count,
+            skipped,
+        })
     }
 
     /// Load cached markets from SQLite (no API call). Returns same format as scan().
-    fn load_cached(&self, py: Python<'_>) -> PyResult<PyObject> {
+    pub fn load_cached(&self) -> ScanResult {
         // Try loading from disk if in-memory is empty
         if self.db.count() == 0 && self.db.disk_path.exists() {
             let _ = self.db.load_from_disk();
         }
 
         let json_strings = self.db.load_all();
-        let market_list = PyList::empty(py);
-        for json_str in &json_strings {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
-                let py_dict = json_value_to_py(py, &val);
-                let _ = market_list.append(py_dict);
-            }
+        let markets: Vec<serde_json::Value> = json_strings.iter()
+            .filter_map(|json_str| serde_json::from_str::<serde_json::Value>(json_str).ok())
+            .collect();
+        let count = markets.len();
+
+        ScanResult {
+            markets,
+            count,
+            skipped: 0,
         }
-
-        let result = PyDict::new(py);
-        result.set_item("markets", market_list)?;
-        result.set_item("count", json_strings.len())?;
-        result.set_item("skipped", 0)?;
-
-        Ok(result.into_any().unbind())
     }
 
     /// Market count in DB.
-    fn count(&self) -> usize {
+    pub fn count(&self) -> usize {
         self.db.count()
     }
 
     /// Mirror in-memory SQLite to disk. Returns elapsed ms.
-    fn mirror_to_disk(&self) -> f64 {
+    pub fn mirror_to_disk(&self) -> f64 {
         self.db.mirror_to_disk()
     }
 
     /// Load disk DB into memory (startup recovery). Returns elapsed ms.
-    fn load_from_disk(&self) -> PyResult<f64> {
+    pub fn load_from_disk(&self) -> Result<f64, String> {
         self.db.load_from_disk()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
     }
 }

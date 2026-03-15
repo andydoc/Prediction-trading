@@ -13,8 +13,8 @@
 #
 # What this does:
 #   - Creates 'trader' user with SSH access
-#   - Installs Python 3.12+, git, system dependencies
-#   - Clones the repo, creates venv, installs pip packages
+#   - Installs git, Rust toolchain, system dependencies
+#   - Clones the repo, builds single Rust binary
 #   - Creates systemd service for auto-start on reboot
 #   - Sets up log rotation
 #   - Opens firewall ports for dashboard (5556) and exec control (5557)
@@ -32,8 +32,6 @@ set -euo pipefail
 TRADER_USER="trader"
 REPO_URL="https://github.com/andydoc/Prediction-trading.git"
 REPO_DIR="/home/${TRADER_USER}/prediction-trader"
-VENV_DIR="/home/${TRADER_USER}/prediction-trader-env"
-PYTHON_VERSION="python3"  # Will use system python3 (3.10+ on Ubuntu 22.04)
 
 echo "========================================"
 echo "PREDICTION-TRADER VPS SETUP"
@@ -58,10 +56,6 @@ fi
 echo "[1/8] Installing system packages..."
 apt-get update -qq
 apt-get install -y -qq \
-    ${PYTHON_VERSION} \
-    ${PYTHON_VERSION}-venv \
-    ${PYTHON_VERSION}-dev \
-    python3-pip \
     git \
     curl \
     wget \
@@ -72,9 +66,9 @@ apt-get install -y -qq \
     libssl-dev \
     pkg-config \
     > /dev/null 2>&1
-echo "  Done. Python: $(${PYTHON_VERSION} --version)"
+echo "  Done."
 
-# Install Rust toolchain (needed for Rust engine + supervisor)
+# Install Rust toolchain
 if ! command -v cargo &>/dev/null; then
     echo "  Installing Rust toolchain..."
     sudo -u ${TRADER_USER} bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
@@ -136,53 +130,12 @@ sudo -u ${TRADER_USER} mkdir -p \
     "${REPO_DIR}/data/system_state" \
     "${REPO_DIR}/data/resolution_cache"
 
-# Build Rust supervisor binary
-echo "  Building Rust supervisor binary..."
-sudo -u ${TRADER_USER} bash -c "source ~/.cargo/env && cd ${REPO_DIR}/rust_supervisor && cargo build --release"
-echo "  Supervisor binary: ${REPO_DIR}/rust_supervisor/target/release/prediction-trader"
-
-# --- 5. Python venv + dependencies ---
-echo "[5/8] Setting up Python environment..."
-if [ ! -d "${VENV_DIR}" ]; then
-    sudo -u ${TRADER_USER} ${PYTHON_VERSION} -m venv "${VENV_DIR}"
-    echo "  Created venv at ${VENV_DIR}"
-fi
-
-# Upgrade pip first
-sudo -u ${TRADER_USER} "${VENV_DIR}/bin/pip" install --upgrade pip setuptools wheel -q
-
-# Install core dependencies
-echo "  Installing pip packages (this takes 2-5 minutes on ARM)..."
-sudo -u ${TRADER_USER} "${VENV_DIR}/bin/pip" install -q \
-    pyyaml \
-    aiohttp \
-    requests \
-    numpy \
-    scipy \
-    cvxpy \
-    flask \
-    py-clob-client \
-    python-dateutil \
-    pytz \
-    tqdm \
-    maturin
-
-# Build Rust engine as PyO3 module
-echo "  Building Rust engine (maturin develop)..."
-sudo -u ${TRADER_USER} bash -c "source ~/.cargo/env && source ${VENV_DIR}/bin/activate && cd ${REPO_DIR}/rust_engine && maturin develop --release"
-
-# Verify critical imports
-echo "  Verifying imports..."
-sudo -u ${TRADER_USER} "${VENV_DIR}/bin/python" -c "
-import yaml, aiohttp, requests, numpy, scipy, cvxpy, flask
-from py_clob_client.client import ClobClient
-print('All critical imports OK')
-print(f'  numpy={numpy.__version__}, scipy={scipy.__version__}, cvxpy={cvxpy.__version__}')
-" || {
-    echo "CRITICAL: Import verification failed!"
-    echo "Check logs above for missing packages"
-    exit 1
-}
+# --- 5. Build single binary ---
+echo "[5/8] Building prediction-trader binary..."
+sudo -u ${TRADER_USER} bash -c "source ~/.cargo/env && cd ${REPO_DIR} && cargo build --release"
+BINARY="${REPO_DIR}/rust_supervisor/target/release/prediction-trader"
+echo "  Binary: ${BINARY}"
+echo "  Size: $(du -h ${BINARY} | cut -f1)"
 
 # --- 6. Firewall ---
 echo "[6/8] Configuring firewall..."
@@ -218,7 +171,7 @@ Type=simple
 User=${TRADER_USER}
 Group=${TRADER_USER}
 WorkingDirectory=${REPO_DIR}
-ExecStart=${REPO_DIR}/rust_supervisor/target/release/prediction-trader --workspace ${REPO_DIR} --python ${VENV_DIR}/bin/python
+ExecStart=${REPO_DIR}/rust_supervisor/target/release/prediction-trader --workspace ${REPO_DIR}
 Restart=always
 RestartSec=30
 
@@ -227,7 +180,6 @@ MemoryMax=5G
 CPUQuota=95%
 
 # Environment
-Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/home/${TRADER_USER}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
@@ -263,9 +215,8 @@ echo ""
 echo "System:"
 echo "  User:    ${TRADER_USER}"
 echo "  Repo:    ${REPO_DIR}"
-echo "  Venv:    ${VENV_DIR}"
+echo "  Binary:  ${REPO_DIR}/rust_supervisor/target/release/prediction-trader"
 echo "  Service: prediction-trader.service"
-echo "  Python:  $(${VENV_DIR}/bin/python --version)"
 echo "  Arch:    $(uname -m)"
 echo "  RAM:     $(free -h | awk '/Mem:/{print $2}')"
 echo "  Swap:    $(free -h | awk '/Swap:/{print $2}')"

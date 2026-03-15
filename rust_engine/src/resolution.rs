@@ -5,8 +5,6 @@
 ///
 /// Schema:
 ///   resolution_cache(group_id TEXT PK, data TEXT JSON, cached_at REAL)
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use rusqlite::{Connection, params};
 use rusqlite::backup::Backup;
 use parking_lot::Mutex;
@@ -29,12 +27,12 @@ pub struct ValidationResult {
 }
 
 #[derive(Debug, Clone)]
-struct ValidatorConfig {
-    api_url: String,
-    api_version: String,
-    model: String,
-    max_tokens: u32,
-    cache_ttl_secs: f64,
+pub struct ValidatorConfig {
+    pub api_url: String,
+    pub api_version: String,
+    pub model: String,
+    pub max_tokens: u32,
+    pub cache_ttl_secs: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -373,11 +371,10 @@ fn load_config(workspace: &str) -> ValidatorConfig {
 }
 
 // ---------------------------------------------------------------------------
-// PyO3 class
+// ResolutionValidator
 // ---------------------------------------------------------------------------
 
-#[pyclass]
-pub struct RustResolutionValidator {
+pub struct ResolutionValidator {
     cache: ResolutionCache,
     client: reqwest::blocking::Client,
     config: ValidatorConfig,
@@ -385,25 +382,21 @@ pub struct RustResolutionValidator {
     prompt_template: String,
 }
 
-#[pymethods]
-impl RustResolutionValidator {
+impl ResolutionValidator {
     /// Create a new resolution validator.
     ///
     /// Reads config/prompts.yaml and config/config.yaml from workspace.
     /// Opens (or creates) SQLite cache at {workspace}/data/resolution_cache.db.
     /// Loads existing cache from disk on startup.
-    #[new]
-    fn new(workspace: String, api_key: String) -> PyResult<Self> {
-        let prompt_template = load_prompt_template(&workspace);
+    pub fn new(workspace: &str, api_key: &str) -> Result<Self, String> {
+        let prompt_template = load_prompt_template(workspace);
         if prompt_template.is_empty() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Failed to load resolution_validation prompt template"
-            ));
+            return Err("Failed to load resolution_validation prompt template".into());
         }
 
-        let config = load_config(&workspace);
+        let config = load_config(workspace);
 
-        let cache_path = PathBuf::from(&workspace)
+        let cache_path = PathBuf::from(workspace)
             .join("data")
             .join("resolution_cache.db");
         // Ensure parent dir exists
@@ -412,18 +405,15 @@ impl RustResolutionValidator {
         }
         let cache_path_str = cache_path.to_string_lossy().to_string();
 
-        let cache = ResolutionCache::new(&cache_path_str, config.cache_ttl_secs)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let cache = ResolutionCache::new(&cache_path_str, config.cache_ttl_secs)?;
 
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                format!("Failed to build HTTP client: {}", e)
-            ))?;
+            .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
         tracing::info!(
-            "RustResolutionValidator initialized: model={}, cache={}",
+            "ResolutionValidator initialized: model={}, cache={}",
             config.model, cache_path_str
         );
 
@@ -431,84 +421,57 @@ impl RustResolutionValidator {
             cache,
             client,
             config,
-            api_key: Mutex::new(api_key),
+            api_key: Mutex::new(api_key.to_string()),
             prompt_template,
         })
     }
 
-    /// Full validation: cache check → Polymarket fetch → Anthropic API → cache save.
-    /// Returns Python dict with validation result, or None.
-    /// Releases GIL during HTTP calls.
-    fn validate(&self, py: Python<'_>, group_id: String, market_id: i64) -> PyResult<PyObject> {
-        // 1. Check cache (fast, no GIL release needed)
-        if let Some(cached) = self.cache.load(&group_id) {
-            return validation_to_pydict(py, &cached);
+    /// Full validation: cache check -> Polymarket fetch -> Anthropic API -> cache save.
+    /// Returns Some(ValidationResult) on success, or None on failure.
+    pub fn validate(&self, group_id: &str, market_id: i64) -> Option<ValidationResult> {
+        // 1. Check cache
+        if let Some(cached) = self.cache.load(group_id) {
+            return Some(cached);
         }
 
-        // 2. HTTP calls — release GIL
+        // 2. Fetch market description from Polymarket
+        let (question, description, end_date) = match fetch_market_description(&self.client, market_id) {
+            Some(details) => details,
+            None => {
+                tracing::error!("[rust_rv] fetch_market_description failed for mid={}", market_id);
+                return None;
+            }
+        };
+
+        // 3. Format prompt
         let api_key = self.api_key.lock().clone();
-        let prompt_template = self.prompt_template.clone();
-        let config = self.config.clone();
-        let client = self.client.clone();
+        let prompt = format_prompt(&self.prompt_template, &question, &description, &end_date);
 
-        let result: Result<ValidationResult, String> = py.allow_threads(move || {
-            // Fetch market description from Polymarket
-            let (question, description, end_date) = match fetch_market_description(&client, market_id) {
-                Some(details) => details,
-                None => return Err(format!("fetch_market_description failed for mid={}", market_id)),
-            };
-
-            // Format prompt
-            let prompt = format_prompt(&prompt_template, &question, &description, &end_date);
-
-            // Call Anthropic API
-            match call_anthropic(&client, &config, &api_key, &prompt) {
-                Some(vr) => Ok(vr),
-                None => Err("call_anthropic returned None".into()),
+        // 4. Call Anthropic API
+        match call_anthropic(&self.client, &self.config, &api_key, &prompt) {
+            Some(vr) => {
+                self.cache.save(group_id, &vr);
+                Some(vr)
             }
-        });
-
-        match result {
-            Ok(vr) => {
-                self.cache.save(&group_id, &vr);
-                validation_to_pydict(py, &vr)
-            }
-            Err(e) => {
-                tracing::error!("[rust_rv] validation failed for {}: {}", group_id, e);
-                Ok(py.None())
+            None => {
+                tracing::error!("[rust_rv] validation failed for {}: call_anthropic returned None", group_id);
+                None
             }
         }
     }
 
-    /// Cache-only read for position scoring. Returns dict or None.
-    fn load_cache(&self, py: Python<'_>, group_id: String) -> PyResult<PyObject> {
-        match self.cache.load(&group_id) {
-            Some(vr) => validation_to_pydict(py, &vr),
-            None => Ok(py.None()),
-        }
+    /// Cache-only read for position scoring. Returns Some(result) or None.
+    pub fn load_cache(&self, group_id: &str) -> Option<ValidationResult> {
+        self.cache.load(group_id)
     }
 
     /// Backup in-memory cache to disk. Returns elapsed ms.
-    fn mirror_to_disk(&self) -> f64 {
+    pub fn mirror_to_disk(&self) -> f64 {
         self.cache.mirror_to_disk()
     }
 
     /// Update API key at runtime.
-    fn set_api_key(&self, api_key: String) {
-        *self.api_key.lock() = api_key;
+    pub fn set_api_key(&self, api_key: &str) {
+        *self.api_key.lock() = api_key.to_string();
     }
-}
-
-// ---------------------------------------------------------------------------
-// Helper: convert ValidationResult to Python dict
-// ---------------------------------------------------------------------------
-
-fn validation_to_pydict(py: Python<'_>, vr: &ValidationResult) -> PyResult<PyObject> {
-    let dict = PyDict::new(py);
-    dict.set_item("latest_resolution_date", &vr.latest_resolution_date)?;
-    dict.set_item("confidence", &vr.confidence)?;
-    dict.set_item("has_unrepresented_outcome", vr.has_unrepresented_outcome)?;
-    dict.set_item("unrepresented_outcome_reason", &vr.unrepresented_outcome_reason)?;
-    dict.set_item("reasoning", &vr.reasoning)?;
-    Ok(dict.into())
 }

@@ -8,8 +8,6 @@
 ///
 /// Schema:
 ///   postponement_cache(position_id TEXT PK, data TEXT JSON, cached_at REAL)
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use rusqlite::{Connection, params};
 use rusqlite::backup::Backup;
 use parking_lot::Mutex;
@@ -21,47 +19,47 @@ use std::time::{Duration, Instant};
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PostponementResult {
+pub struct PostponementResult {
     #[serde(default)]
-    status: String,
+    pub status: String,
     #[serde(default)]
-    new_date: Option<String>,
+    pub new_date: Option<String>,
     #[serde(default)]
-    date_confidence: String,
+    pub date_confidence: String,
     #[serde(default)]
-    window_end: Option<String>,
+    pub window_end: Option<String>,
     #[serde(default)]
-    season_end: Option<String>,
+    pub season_end: Option<String>,
     #[serde(default)]
-    reason: String,
+    pub reason: String,
     #[serde(default)]
-    sources: Vec<String>,
+    pub sources: Vec<String>,
     #[serde(default)]
-    search_queries_used: Vec<String>,
+    pub search_queries_used: Vec<String>,
     // Computed fields (not from API response)
     #[serde(default)]
-    effective_resolution_date: Option<String>,
+    pub effective_resolution_date: Option<String>,
     #[serde(default)]
-    checked_at: String,
+    pub checked_at: String,
     #[serde(default)]
-    original_date: String,
+    pub original_date: String,
     #[serde(default)]
-    days_overdue: i64,
+    pub days_overdue: i64,
     #[serde(default)]
-    _search_count: u32,
+    pub _search_count: u32,
 }
 
 #[derive(Debug, Clone)]
-struct PostponementConfig {
-    api_url: String,
-    api_version: String,
-    model: String,
-    max_tokens: u32,
-    cache_ttl_secs: f64,
-    rate_limit_secs: f64,
-    max_attempts: u32,
-    fallback_to_season_end: bool,
-    date_buffer_hours: i64,
+pub struct PostponementConfig {
+    pub api_url: String,
+    pub api_version: String,
+    pub model: String,
+    pub max_tokens: u32,
+    pub cache_ttl_secs: f64,
+    pub rate_limit_secs: f64,
+    pub max_attempts: u32,
+    pub fallback_to_season_end: bool,
+    pub date_buffer_hours: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -499,11 +497,10 @@ fn load_config(workspace: &str) -> PostponementConfig {
 }
 
 // ---------------------------------------------------------------------------
-// PyO3 class
+// PostponementDetector
 // ---------------------------------------------------------------------------
 
-#[pyclass]
-pub struct RustPostponementDetector {
+pub struct PostponementDetector {
     cache: PostponementCache,
     client: reqwest::blocking::Client,
     config: PostponementConfig,
@@ -513,24 +510,22 @@ pub struct RustPostponementDetector {
     last_api_call: Mutex<Instant>,
 }
 
-#[pymethods]
-impl RustPostponementDetector {
+impl PostponementDetector {
     /// Create a new postponement detector.
     ///
     /// Reads config/prompts.yaml and config/config.yaml from workspace.
     /// Opens (or creates) SQLite cache at {workspace}/data/postponement_cache.db.
-    #[new]
-    fn new(workspace: String, api_key: String) -> PyResult<Self> {
-        let (prompt_template, retry_prompt_template) = load_prompts(&workspace);
+    pub fn new(workspace: &str, api_key: &str) -> Result<Self, String> {
+        let (prompt_template, retry_prompt_template) = load_prompts(workspace);
         if prompt_template.is_empty() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Failed to load postponement_detection prompt template"
-            ));
+            return Err(
+                "Failed to load postponement_detection prompt template".to_string()
+            );
         }
 
-        let config = load_config(&workspace);
+        let config = load_config(workspace);
 
-        let cache_path = PathBuf::from(&workspace)
+        let cache_path = PathBuf::from(workspace)
             .join("data")
             .join("postponement_cache.db");
         if let Some(parent) = cache_path.parent() {
@@ -538,18 +533,15 @@ impl RustPostponementDetector {
         }
         let cache_path_str = cache_path.to_string_lossy().to_string();
 
-        let cache = PostponementCache::new(&cache_path_str, config.cache_ttl_secs)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let cache = PostponementCache::new(&cache_path_str, config.cache_ttl_secs)?;
 
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(90))
             .build()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                format!("Failed to build HTTP client: {}", e)
-            ))?;
+            .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
         tracing::info!(
-            "RustPostponementDetector initialized: model={}, cache={}",
+            "PostponementDetector initialized: model={}, cache={}",
             config.model, cache_path_str
         );
 
@@ -557,33 +549,31 @@ impl RustPostponementDetector {
             cache,
             client,
             config,
-            api_key: Mutex::new(api_key),
+            api_key: Mutex::new(api_key.to_string()),
             prompt_template,
             retry_prompt_template,
             last_api_call: Mutex::new(Instant::now() - Duration::from_secs(120)),
         })
     }
 
-    /// Full postponement check: cache → attempt 1 → optional retry → date buffer → cache save.
-    /// Returns Python dict with result, or None.
-    /// Releases GIL during HTTP calls.
-    fn check(
+    /// Full postponement check: cache -> attempt 1 -> optional retry -> date buffer -> cache save.
+    /// Returns PostponementResult on success, or None.
+    pub fn check(
         &self,
-        py: Python<'_>,
-        position_id: String,
-        market_names: Vec<String>,
-        original_date: String,
-    ) -> PyResult<PyObject> {
+        position_id: &str,
+        market_names: &[String],
+        original_date: &str,
+    ) -> Option<PostponementResult> {
         // 1. Check cache
-        if let Some(cached) = self.cache.load(&position_id) {
+        if let Some(cached) = self.cache.load(position_id) {
             tracing::debug!("Postponement cache hit for {}", &position_id[..position_id.len().min(30)]);
-            return result_to_pydict(py, &cached);
+            return Some(cached);
         }
 
         // 2. Compute today and days_overdue
         let now = chrono::Utc::now();
         let today = now.format("%Y-%m-%d").to_string();
-        let days_overdue = if let Ok(orig) = chrono::NaiveDate::parse_from_str(&original_date, "%Y-%m-%d") {
+        let days_overdue = if let Ok(orig) = chrono::NaiveDate::parse_from_str(original_date, "%Y-%m-%d") {
             let today_date = now.date_naive();
             (today_date - orig).num_days().max(0)
         } else {
@@ -594,142 +584,100 @@ impl RustPostponementDetector {
             market_names.first().map(|n| &n[..n.len().min(50)]).unwrap_or("?"),
             days_overdue);
 
-        // 3. Release GIL for HTTP calls
+        // 3. Attempt 1
         let api_key = self.api_key.lock().clone();
-        let prompt_template = self.prompt_template.clone();
-        let retry_template = self.retry_prompt_template.clone();
-        let config = self.config.clone();
-        let client = self.client.clone();
-        let last_api_call = &self.last_api_call;
+        let prompt = format_prompt(
+            &self.prompt_template, market_names, original_date, &today, days_overdue,
+        );
+        let mut result = call_anthropic_with_search(
+            &self.client, &self.config, &api_key, &prompt, &self.last_api_call,
+        )?;
 
-        let result: Option<PostponementResult> = py.allow_threads(|| {
-            // Attempt 1
-            let prompt = format_prompt(
-                &prompt_template, &market_names, &original_date, &today, days_overdue,
+        // Attempt 2: if postponed but no date found
+        if result.status == "postponed"
+            && result.new_date.is_none()
+            && self.config.max_attempts >= 2
+            && !self.retry_prompt_template.is_empty()
+        {
+            tracing::info!("  Attempt 1 found postponement but no date — retrying with context injection");
+            let retry_prompt = format_retry_prompt(
+                &self.retry_prompt_template, &result, market_names, original_date, &today,
             );
-            let mut result = call_anthropic_with_search(
-                &client, &config, &api_key, &prompt, last_api_call,
-            )?;
-
-            // Attempt 2: if postponed but no date found
-            if result.status == "postponed"
-                && result.new_date.is_none()
-                && config.max_attempts >= 2
-                && !retry_template.is_empty()
-            {
-                tracing::info!("  Attempt 1 found postponement but no date — retrying with context injection");
-                let retry_prompt = format_retry_prompt(
-                    &retry_template, &result, &market_names, &original_date, &today,
-                );
-                if let Some(result2) = call_anthropic_with_search(
-                    &client, &config, &api_key, &retry_prompt, last_api_call,
-                ) {
-                    if result2.new_date.is_some() {
-                        tracing::info!("  Attempt 2 found date: {}",
-                            result2.new_date.as_deref().unwrap_or("?"));
-                        result = result2;
-                    } else {
-                        // Merge: inherit season_end, merge sources
-                        if result.season_end.is_none() {
-                            result.season_end = result2.season_end;
-                        }
-                        let mut all_sources = result.sources.clone();
-                        for s in &result2.sources {
-                            if !all_sources.contains(s) {
-                                all_sources.push(s.clone());
-                            }
-                        }
-                        result.sources = all_sources;
+            if let Some(result2) = call_anthropic_with_search(
+                &self.client, &self.config, &api_key, &retry_prompt, &self.last_api_call,
+            ) {
+                if result2.new_date.is_some() {
+                    tracing::info!("  Attempt 2 found date: {}",
+                        result2.new_date.as_deref().unwrap_or("?"));
+                    result = result2;
+                } else {
+                    // Merge: inherit season_end, merge sources
+                    if result.season_end.is_none() {
+                        result.season_end = result2.season_end;
                     }
+                    let mut all_sources = result.sources.clone();
+                    for s in &result2.sources {
+                        if !all_sources.contains(s) {
+                            all_sources.push(s.clone());
+                        }
+                    }
+                    result.sources = all_sources;
                 }
             }
+        }
 
-            // Compute effective_resolution_date
-            let raw_date = result.new_date.as_deref();
-            let season_end = result.season_end.as_deref();
+        // Compute effective_resolution_date
+        let raw_date = result.new_date.as_deref();
+        let season_end = result.season_end.as_deref();
 
-            let effective = if let Some(d) = raw_date {
-                apply_date_buffer(d, config.date_buffer_hours)
-            } else if config.fallback_to_season_end {
-                if let Some(se) = season_end {
-                    let eff = apply_date_buffer(se, config.date_buffer_hours);
-                    if eff.is_some() {
-                        result.date_confidence = "season_end".to_string();
-                        result.new_date = Some(se.to_string());
-                        tracing::info!("  No date found — falling back to season end: {} (+{}h = {})",
-                            se, config.date_buffer_hours, eff.as_deref().unwrap_or("?"));
-                    }
-                    eff
-                } else {
-                    None
+        let effective = if let Some(d) = raw_date {
+            apply_date_buffer(d, self.config.date_buffer_hours)
+        } else if self.config.fallback_to_season_end {
+            if let Some(se) = season_end {
+                let eff = apply_date_buffer(se, self.config.date_buffer_hours);
+                if eff.is_some() {
+                    result.date_confidence = "season_end".to_string();
+                    result.new_date = Some(se.to_string());
+                    tracing::info!("  No date found — falling back to season end: {} (+{}h = {})",
+                        se, self.config.date_buffer_hours, eff.as_deref().unwrap_or("?"));
                 }
+                eff
             } else {
                 None
-            };
-
-            result.effective_resolution_date = effective;
-            result.checked_at = now.to_rfc3339();
-            result.original_date = original_date;
-            result.days_overdue = days_overdue;
-
-            tracing::info!("  Result: status={} date={} confidence={} effective={}",
-                result.status,
-                result.new_date.as_deref().unwrap_or("null"),
-                result.date_confidence,
-                result.effective_resolution_date.as_deref().unwrap_or("null"));
-
-            Some(result)
-        });
-
-        match result {
-            Some(pr) => {
-                self.cache.save(&position_id, &pr);
-                result_to_pydict(py, &pr)
             }
-            None => {
-                tracing::warn!("Postponement check failed for {}",
-                    &position_id[..position_id.len().min(30)]);
-                Ok(py.None())
-            }
-        }
+        } else {
+            None
+        };
+
+        result.effective_resolution_date = effective;
+        result.checked_at = now.to_rfc3339();
+        result.original_date = original_date.to_string();
+        result.days_overdue = days_overdue;
+
+        tracing::info!("  Result: status={} date={} confidence={} effective={}",
+            result.status,
+            result.new_date.as_deref().unwrap_or("null"),
+            result.date_confidence,
+            result.effective_resolution_date.as_deref().unwrap_or("null"));
+
+        // Save to cache on success
+        self.cache.save(position_id, &result);
+
+        Some(result)
     }
 
-    /// Cache-only read for replacement scoring. Returns dict or None.
-    fn load_cache(&self, py: Python<'_>, position_id: String) -> PyResult<PyObject> {
-        match self.cache.load(&position_id) {
-            Some(pr) => result_to_pydict(py, &pr),
-            None => Ok(py.None()),
-        }
+    /// Cache-only read for replacement scoring. Returns result or None.
+    pub fn load_cache(&self, position_id: &str) -> Option<PostponementResult> {
+        self.cache.load(position_id)
     }
 
     /// Backup in-memory cache to disk. Returns elapsed ms.
-    fn mirror_to_disk(&self) -> f64 {
+    pub fn mirror_to_disk(&self) -> f64 {
         self.cache.mirror_to_disk()
     }
 
     /// Update API key at runtime.
-    fn set_api_key(&self, api_key: String) {
-        *self.api_key.lock() = api_key;
+    pub fn set_api_key(&self, api_key: &str) {
+        *self.api_key.lock() = api_key.to_string();
     }
-}
-
-// ---------------------------------------------------------------------------
-// Helper: convert PostponementResult to Python dict
-// ---------------------------------------------------------------------------
-
-fn result_to_pydict(py: Python<'_>, pr: &PostponementResult) -> PyResult<PyObject> {
-    let dict = PyDict::new(py);
-    dict.set_item("status", &pr.status)?;
-    dict.set_item("new_date", &pr.new_date)?;
-    dict.set_item("date_confidence", &pr.date_confidence)?;
-    dict.set_item("window_end", &pr.window_end)?;
-    dict.set_item("season_end", &pr.season_end)?;
-    dict.set_item("reason", &pr.reason)?;
-    dict.set_item("sources", &pr.sources)?;
-    dict.set_item("search_queries_used", &pr.search_queries_used)?;
-    dict.set_item("effective_resolution_date", &pr.effective_resolution_date)?;
-    dict.set_item("checked_at", &pr.checked_at)?;
-    dict.set_item("original_date", &pr.original_date)?;
-    dict.set_item("days_overdue", pr.days_overdue)?;
-    Ok(dict.into())
 }

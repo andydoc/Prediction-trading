@@ -37,18 +37,9 @@ fi
 echo "[restart] Pulling latest code..."
 git pull --ff-only origin main 2>&1 || echo "  WARNING: git pull failed — continuing with local code"
 
-# Rebuild Rust supervisor if source changed
-echo "[restart] Rebuilding supervisor..."
-cd "$WORKSPACE/rust_supervisor"
-cargo build --release 2>&1 | tail -3
-cd "$WORKSPACE"
-
-# Rebuild Rust engine
-echo "[restart] Rebuilding Rust engine..."
-source "$WORKSPACE/.venv/bin/activate" 2>/dev/null || source "$WORKSPACE/../prediction-trader-env/bin/activate"
-cd "$WORKSPACE/rust_engine"
-maturin develop --release 2>&1 | tail -3
-cd "$WORKSPACE"
+# Rebuild (workspace build — single binary)
+echo "[restart] Rebuilding..."
+cargo build --release --manifest-path "$WORKSPACE/Cargo.toml" 2>&1 | tail -5
 
 # Start via start.sh (passes through supervisor args)
 echo ""

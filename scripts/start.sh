@@ -1,5 +1,5 @@
 #!/bin/bash
-# start.sh — Start the prediction trading system
+# start.sh — Start the prediction trading system (single binary)
 #
 # Usage:
 #   bash start.sh                         # default (shadow mode)
@@ -7,8 +7,7 @@
 #   bash start.sh --set arbitrage.min_profit_threshold=0.05
 #   bash start.sh --dry-run               # print config and exit
 #
-# On first run: builds the Rust supervisor binary if not present.
-# If P: drive is not mounted (WSL via Windows), mounts it.
+# On first run: builds the Rust binary if not present.
 
 set -e
 WORKSPACE="${TRADER_WORKSPACE:-/home/andydoc/prediction-trader}"
@@ -16,32 +15,10 @@ BINARY="$WORKSPACE/rust_supervisor/target/release/prediction-trader"
 
 cd "$WORKSPACE"
 
-# --- Ensure P: drive is mounted (Windows/WSL only) ---
-if [ -n "$WSL_DISTRO_NAME" ] && ! mountpoint -q /mnt/p 2>/dev/null; then
-    # Check if subst P: exists on Windows side
-    if ! ls /mnt/p/ >/dev/null 2>&1; then
-        echo "[start] P: drive not mounted — mounting via subst..."
-        cmd.exe /c "subst P: \\\\wsl.localhost\\Ubuntu\\home\\andydoc\\prediction-trader" 2>/dev/null || true
-        sleep 1
-    fi
-fi
-
 # --- Build if needed ---
 if [ ! -f "$BINARY" ]; then
-    echo "[start] Building supervisor binary..."
-    cd "$WORKSPACE/rust_supervisor"
-    cargo build --release
-    cd "$WORKSPACE"
-fi
-
-# --- Build Rust engine if needed ---
-RUST_ENGINE="$WORKSPACE/.venv/lib/python3.12/site-packages/rust_engine"
-if [ ! -d "$RUST_ENGINE" ] && [ -f "$WORKSPACE/rust_engine/Cargo.toml" ]; then
-    echo "[start] Building Rust engine (maturin)..."
-    source "$WORKSPACE/.venv/bin/activate" 2>/dev/null || source "$WORKSPACE/../prediction-trader-env/bin/activate"
-    cd "$WORKSPACE/rust_engine"
-    maturin develop --release
-    cd "$WORKSPACE"
+    echo "[start] Building prediction-trader binary..."
+    cargo build --release --manifest-path "$WORKSPACE/Cargo.toml"
 fi
 
 # --- Pull latest code (non-destructive) ---
@@ -54,12 +31,12 @@ rm -f "$WORKSPACE"/*.pid
 # --- Create log directory ---
 mkdir -p "$WORKSPACE/logs"
 
-# --- Start supervisor ---
-echo "[start] Starting prediction-trader supervisor..."
-nohup "$BINARY" "$@" >> "$WORKSPACE/logs/supervisor_start.log" 2>&1 &
-SUPERVISOR_PID=$!
-disown $SUPERVISOR_PID
-echo "[start] Supervisor PID: $SUPERVISOR_PID"
+# --- Start ---
+echo "[start] Starting prediction-trader..."
+nohup "$BINARY" --workspace "$WORKSPACE" "$@" >> "$WORKSPACE/logs/supervisor_start.log" 2>&1 &
+PID=$!
+disown $PID
+echo "[start] PID: $PID"
 
 # --- Wait for startup ---
 echo "[start] Waiting for engine startup..."
@@ -68,7 +45,7 @@ sleep 15
 # --- Verify ---
 echo ""
 echo "=== Process check ==="
-ps aux | grep -E 'prediction-trader|trading_engine' | grep -v grep | awk '{print $2, $NF}' || echo "  No processes found"
+ps aux | grep prediction-trader | grep -v grep | awk '{print $2, $NF}' || echo "  No processes found"
 
 echo ""
 echo "=== Dashboard ==="
