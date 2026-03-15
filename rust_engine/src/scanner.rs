@@ -45,8 +45,8 @@ impl ScannerDB {
         // Restore from disk if available
         if db.disk_path.exists() {
             match db.load_from_disk() {
-                Ok(ms) => eprintln!("[scanner] Loaded market cache from disk in {:.1}ms", ms),
-                Err(e) => eprintln!("[scanner] Could not load market cache from disk: {}", e),
+                Ok(ms) => tracing::info!("[scanner] Loaded market cache from disk in {:.1}ms", ms),
+                Err(e) => tracing::warn!("[scanner] Could not load market cache from disk: {}", e),
             }
         }
 
@@ -67,7 +67,7 @@ impl ScannerDB {
         ) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[scanner] Failed to prepare insert: {}", e);
+                tracing::error!("[scanner] Failed to prepare insert: {}", e);
                 return;
             }
         };
@@ -111,13 +111,13 @@ impl ScannerDB {
                             100, Duration::ZERO,
                             None::<fn(rusqlite::backup::Progress)>,
                         ) {
-                            eprintln!("[scanner] Cache backup failed: {}", e);
+                            tracing::warn!("[scanner] Cache backup failed: {}", e);
                         }
                     }
-                    Err(e) => eprintln!("[scanner] Cache backup init failed: {}", e),
+                    Err(e) => tracing::warn!("[scanner] Cache backup init failed: {}", e),
                 }
             }
-            Err(e) => eprintln!("[scanner] Failed to open disk DB: {}", e),
+            Err(e) => tracing::warn!("[scanner] Failed to open disk DB: {}", e),
         }
 
         t0.elapsed().as_secs_f64() * 1000.0
@@ -294,20 +294,20 @@ fn fetch_all_markets(
         {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[scanner] Gamma API request failed at offset {}: {}", offset, e);
+                tracing::error!("[scanner] Gamma API request failed at offset {}: {}", offset, e);
                 break;
             }
         };
 
         if !resp.status().is_success() {
-            eprintln!("[scanner] Gamma API returned {} at offset {}", resp.status(), offset);
+            tracing::error!("[scanner] Gamma API returned {} at offset {}", resp.status(), offset);
             break;
         }
 
         let batch: Vec<serde_json::Value> = match resp.json() {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[scanner] Failed to parse Gamma API response at offset {}: {}", offset, e);
+                tracing::error!("[scanner] Failed to parse Gamma API response at offset {}: {}", offset, e);
                 break;
             }
         };
@@ -348,7 +348,7 @@ fn write_json_file(path: &std::path::Path, markets: &[(String, serde_json::Value
 
     match std::fs::write(path, serde_json::to_string(&output).unwrap_or_default()) {
         Ok(_) => {}
-        Err(e) => eprintln!("[scanner] Failed to write JSON file: {}", e),
+        Err(e) => tracing::warn!("[scanner] Failed to write JSON file: {}", e),
     }
 }
 
@@ -454,7 +454,7 @@ impl RustMarketScanner {
             .collect();
         self.db.save_markets(&db_pairs);
         let mirror_ms = self.db.mirror_to_disk();
-        eprintln!("[scanner] {} markets stored, {} skipped, disk backup {:.1}ms",
+        tracing::info!("[scanner] {} markets stored, {} skipped, disk backup {:.1}ms",
                   markets.len(), skipped, mirror_ms);
 
         // Convert to Python dicts

@@ -33,7 +33,7 @@ use std::sync::Arc;
 use book::BookMirror;
 use queue::EvalQueue;
 use eval::{ConstraintStore, EvalConfig, Constraint, MarketRef};
-use types::EngineConfig;
+use types::{EngineConfig, LoggingCfg};
 use ws::WsManager;
 use position::PositionManager;
 use dashboard::{DashboardState, EngineMetrics};
@@ -60,6 +60,71 @@ struct RustWsEngine {
     delay_table: Arc<parking_lot::Mutex<(std::collections::HashMap<String, f64>, f64)>>,
 }
 
+impl RustWsEngine {
+    /// Initialize tracing with daily rotating file + stderr output.
+    /// Called once at engine creation. Safe to call multiple times (try_init is idempotent).
+    fn init_tracing(workspace: &str, log_cfg: &LoggingCfg) {
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::EnvFilter;
+
+        let log_dir = std::path::PathBuf::from(workspace).join(&log_cfg.log_dir);
+        let _ = std::fs::create_dir_all(&log_dir);
+
+        // Daily rotating file appender: produces {prefix}.YYYY-MM-DD in log_dir
+        let file_appender = tracing_appender::rolling::daily(&log_dir, &log_cfg.file_prefix);
+
+        // Build env filter from config level
+        let filter_str = format!("rust_engine={}", log_cfg.level);
+        let env_filter = EnvFilter::try_new(&filter_str)
+            .unwrap_or_else(|_| EnvFilter::new("rust_engine=debug"));
+
+        // Two layers: file (with timestamps) + stderr (for Python capture)
+        let file_layer = fmt::layer()
+            .with_writer(file_appender)
+            .with_target(false)
+            .with_ansi(false);
+
+        let stderr_layer = fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_target(false);
+
+        let _ = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(file_layer)
+            .with(stderr_layer)
+            .try_init();
+
+        // Clean up old log files if retention is set
+        if log_cfg.retention_days > 0 {
+            Self::cleanup_old_logs(&log_dir, &log_cfg.file_prefix, log_cfg.retention_days);
+        }
+    }
+
+    /// Remove log files older than retention_days.
+    fn cleanup_old_logs(log_dir: &std::path::Path, prefix: &str, retention_days: u32) {
+        let cutoff = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(retention_days as u64 * 86400);
+
+        if let Ok(entries) = std::fs::read_dir(log_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if !name_str.starts_with(prefix) {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        if modified < cutoff {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[pymethods]
 impl RustWsEngine {
     /// Create a new engine. Reads all config from config.yaml at the given workspace path.
@@ -71,14 +136,11 @@ impl RustWsEngine {
         // Install rustls crypto provider (required by rustls 0.23+)
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        // Initialize tracing (logs to stderr, picked up by Python logging)
-        let _ = tracing_subscriber::fmt()
-            .with_target(false)
-            .with_env_filter("rust_engine=debug")
-            .try_init();
+        // Load all config from config.yaml (logging config needed before tracing init)
+        let (cfg, eval_cfg, pos_cfg, log_cfg) = types::load_engine_config(workspace);
 
-        // Load all config from config.yaml
-        let (cfg, eval_cfg, pos_cfg) = types::load_engine_config(workspace);
+        // Initialize tracing: daily rotating file + stderr, configurable level
+        Self::init_tracing(workspace, &log_cfg);
 
         let book = Arc::new(BookMirror::new(&cfg));
         let eval_queue = Arc::new(EvalQueue::new());

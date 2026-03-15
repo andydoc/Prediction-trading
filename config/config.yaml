@@ -447,6 +447,12 @@ monitoring:
     # How often to rotate log files. "daily" creates a new file each day.
     rotation: daily
 
+    # Directory for Rust engine log files (relative to workspace root).
+    log_dir: logs
+
+    # Filename prefix for Rust engine logs. Produces files like rust_engine.2026-03-15.
+    rust_file_prefix: rust_engine
+
 performance:
   cache:
     # Whether to enable in-memory caching of frequently accessed data (market lookups, prices).

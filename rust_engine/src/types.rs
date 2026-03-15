@@ -191,16 +191,40 @@ impl Default for PositionCfg {
     }
 }
 
+/// Logging configuration — loaded from config.yaml at startup.
+#[derive(Debug, Clone)]
+pub struct LoggingCfg {
+    /// Minimum tracing level: "trace", "debug", "info", "warn", "error"
+    pub level: String,
+    /// Directory for log files (relative to workspace)
+    pub log_dir: String,
+    /// Log file prefix (produces {prefix}.YYYY-MM-DD)
+    pub file_prefix: String,
+    /// Days to retain old log files (0 = keep forever)
+    pub retention_days: u32,
+}
+
+impl Default for LoggingCfg {
+    fn default() -> Self {
+        Self {
+            level: "debug".into(),
+            log_dir: "logs".into(),
+            file_prefix: "rust_engine".into(),
+            retention_days: 30,
+        }
+    }
+}
+
 /// Load all engine config from config.yaml.
 /// Falls back to defaults if file is missing or values are absent.
-pub fn load_engine_config(workspace: &str) -> (EngineConfig, EvalCfg, PositionCfg) {
+pub fn load_engine_config(workspace: &str) -> (EngineConfig, EvalCfg, PositionCfg, LoggingCfg) {
     let path = std::path::PathBuf::from(workspace).join("config").join("config.yaml");
 
     let val: serde_json::Value = match std::fs::read_to_string(&path) {
         Ok(contents) => serde_yaml::from_str(&contents).unwrap_or_default(),
         Err(_) => {
             tracing::warn!("config.yaml not found at {:?}, using defaults", path);
-            return (EngineConfig::default(), EvalCfg::default(), PositionCfg::default());
+            return (EngineConfig::default(), EvalCfg::default(), PositionCfg::default(), LoggingCfg::default());
         }
     };
 
@@ -274,6 +298,30 @@ pub fn load_engine_config(workspace: &str) -> (EngineConfig, EvalCfg, PositionCf
         taker_fee,
     };
 
+    // --- logging ---
+    let log_level = val.pointer("/monitoring/logging/level")
+        .and_then(|v| v.as_str())
+        .unwrap_or("DEBUG")
+        .to_lowercase();
+    let log_dir = val.pointer("/monitoring/logging/log_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or("logs")
+        .to_string();
+    let file_prefix = val.pointer("/monitoring/logging/rust_file_prefix")
+        .and_then(|v| v.as_str())
+        .unwrap_or("rust_engine")
+        .to_string();
+    let retention_days = val.pointer("/monitoring/logging/retention")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30) as u32;
+
+    let log_cfg = LoggingCfg {
+        level: log_level,
+        log_dir,
+        file_prefix,
+        retention_days,
+    };
+
     tracing::info!(
         "Config loaded: ws_shard={}, efp_drift={}, fee={}, profit=[{:.2}%..{:.2}%], max_days={}, capital={}",
         assets_per_shard, efp_drift_threshold, fee_rate,
@@ -281,7 +329,7 @@ pub fn load_engine_config(workspace: &str) -> (EngineConfig, EvalCfg, PositionCf
         max_days, initial_capital,
     );
 
-    (engine_cfg, eval_cfg, pos_cfg)
+    (engine_cfg, eval_cfg, pos_cfg, log_cfg)
 }
 
 /// Reason an eval was queued.

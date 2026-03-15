@@ -233,7 +233,7 @@ fn call_anthropic(
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[rust_rv] Anthropic API request failed: {}", e);
+            tracing::error!("[rust_rv] Anthropic API request failed: {}", e);
             return None;
         }
     };
@@ -241,14 +241,14 @@ fn call_anthropic(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
-        eprintln!("[rust_rv] Anthropic API returned {}: {}", status, &text[..text.len().min(500)]);
+        tracing::error!("[rust_rv] Anthropic API returned {}: {}", status, &text[..text.len().min(500)]);
         return None;
     }
 
     let data: serde_json::Value = match resp.json() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[rust_rv] Failed to parse Anthropic response: {}", e);
+            tracing::error!("[rust_rv] Failed to parse Anthropic response: {}", e);
             return None;
         }
     };
@@ -283,7 +283,7 @@ fn call_anthropic(
     match serde_json::from_str::<ValidationResult>(&text) {
         Ok(result) => Some(result),
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "[rust_rv] JSON parse failed: {}, text={}",
                 e, &text[..text.len().min(200)]
             );
@@ -474,7 +474,7 @@ impl RustResolutionValidator {
                 validation_to_pydict(py, &vr)
             }
             Err(e) => {
-                eprintln!("[rust_rv] validation failed for {}: {}", group_id, e);
+                tracing::error!("[rust_rv] validation failed for {}: {}", group_id, e);
                 Ok(py.None())
             }
         }

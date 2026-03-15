@@ -192,12 +192,12 @@ Each document is produced at the point in the milestone sequence when its conten
 | ✅ **A4: Port market scanner** (8q-10) | Rust module fetches all markets from Gamma API with pagination. Writes to SQLite (not JSON). Runs once at startup + periodic refresh. Handles API errors gracefully. |
 | ✅ **A5: Port constraint detector** (8q-11) | Rust module identifies mutex groups from market data. Completeness guards read from config (not hardcoded). Results stored in Rust ConstraintStore. |
 | ✅ **A6: Port config loading + parameterise all thresholds** (8q-13) | Rust reads `config.yaml` and `secrets.yaml` at startup. **All previously hardcoded thresholds moved to config** (see Parameterisation Table below). Hot-reload not required (restart is acceptable). |
-| ⬚ **A7: Port logging** (8q-14) | Rust `tracing` or `log` crate. Daily rotating log files matching current naming convention. Log levels configurable. |
+| ✅ **A7: Port logging** (8q-14) | Rust `tracing` crate with `tracing-appender`. Daily rotating files (`rust_engine.YYYY-MM-DD`). Level configurable via `config.yaml`. Auto-cleanup by retention days. All `eprintln!` replaced with tracing macros. |
 | ⬚ **A8: Port main orchestrator** (8q-12) | Rust `main()` replaces Python `main.py`. Starts scanner, engine, dashboard. Signal handling (SIGTERM, SIGINT). Systemd compatible. |
 | ⬚ **A9: Rationalise scripts** | Consolidate the current script sprawl into 3 essential scripts: `start.sh` (build if needed + start binary + verify), `restart.sh` (stop + pull + build + start), `kill.sh` (stop binary + optional cancel open CLOB orders). Remove or archive: `START_TRADER.bat`, `START_TRADER_SILENT.bat`, `START_TRADER_HIDDEN.vbs`, `STOP_TRADER.bat`, `RESTART_TRADER.bat`, `mode.sh`, `status.sh`, `sync.sh`. Mode switching moves into config + restart. Status moves to dashboard. Sync is just `git push`. |
 | ⬚ **A10: Single compiled binary** (8q-15) | `cargo build --release` produces one binary. Deploy to VPS with config files only. No Python, no venv, no pip. |
-| ⬚ **A11: Create CHANGELOG.md** | All version entries (v0.01.00 through current) transferred from PROGRESS_ROADMAP.md §7. Most recent first. keepachangelog.com format (Added/Changed/Fixed/Removed). |
-| ⬚ **A12: Create INCIDENT_LOG.md** | All 6 incidents (INC-001 through INC-006) transferred. Each has: date, markets, impact, root cause, fix, status. Includes template for future incidents. |
+| ⬚ **A11: Create CHANGELOG.md** | All version entries (v0.01.00 through current) transferred from PROGRESS_ROADMAP.md §7. Compare with git records and update. Most recent first. keepachangelog.com format (Added/Changed/Fixed/Removed). |
+| ⬚ **A12: Create INCIDENT_LOG.md** | All incidents (INC-001 through INC-006+) transferred. Each has: date, markets, impact, root cause, fix, status. Includes template for future incidents. |
 
 #### Parameterisation Table
 
