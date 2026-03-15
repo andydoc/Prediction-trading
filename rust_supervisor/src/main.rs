@@ -110,7 +110,7 @@ impl SupervisorConfig {
 
         Self {
             log_dir: workspace.join("logs"),
-            pid_file: workspace.join("supervisor.pid"),
+            pid_file: workspace.join("prediction-trader.pid"),
             log_level,
             log_retention_days,
             mode: cli.mode.clone(),
