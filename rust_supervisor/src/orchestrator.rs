@@ -577,8 +577,11 @@ impl Orchestrator {
         let open_jsons = self.state_db.load_open();
         let closed_jsons = self.state_db.load_closed();
 
-        let capital = self.state_db.get_scalar("current_capital").unwrap_or(1000.0);
-        let initial = self.state_db.get_scalar("initial_capital").unwrap_or(1000.0);
+        let cfg_initial = self.cached_yaml.pointer("/live_trading/initial_capital")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(100.0);
+        let capital = self.state_db.get_scalar("current_capital").unwrap_or(cfg_initial);
+        let initial = self.state_db.get_scalar("initial_capital").unwrap_or(cfg_initial);
 
         let fee_rate = self.cached_yaml.pointer("/arbitrage/fees/polymarket_taker_fee")
             .and_then(|v| v.as_f64())
