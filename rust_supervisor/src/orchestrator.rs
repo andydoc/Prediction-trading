@@ -155,6 +155,7 @@ pub struct OrchestratorConfig {
     pub postponement_enabled: bool,
     pub postponement_check_interval: f64,
     pub postponement_rescore_days: u32,
+    pub state_db_path: PathBuf,
 }
 
 impl OrchestratorConfig {
@@ -237,6 +238,10 @@ impl OrchestratorConfig {
                 .and_then(|v| v.as_f64()).unwrap_or(24.0) * 3600.0,
             postponement_rescore_days: pp_cfg.get("postponement_rescore_days")
                 .and_then(|v| v.as_u64()).unwrap_or(14) as u32,
+            state_db_path: yaml.pointer("/state/db_path")
+                .and_then(|v| v.as_str())
+                .map(|s| workspace.join(s))
+                .unwrap_or_else(|| workspace.join("data").join("system_state").join("execution_state.db")),
         }
     }
 }
@@ -285,8 +290,7 @@ impl Orchestrator {
         )?;
 
         let state_db = StateDB::new(
-            &cfg.workspace.join("data").join("system_state").join("execution_state.db")
-                .to_string_lossy(),
+            &cfg.state_db_path.to_string_lossy(),
         )?;
 
         let resolution_validator = if cfg.resolution_validation_enabled && !cfg.anthropic_api_key.is_empty() {
@@ -593,6 +597,12 @@ impl Orchestrator {
     // --- State management ---
 
     fn load_state(&mut self) {
+        // Restore in-memory DB from disk file
+        match self.state_db.load_from_disk() {
+            Ok(ms) => tracing::info!("SQLite restored from disk in {:.1}ms", ms),
+            Err(e) => tracing::warn!("No disk state to restore: {}", e),
+        }
+
         // Load positions from SQLite
         let open_jsons = self.state_db.load_open();
         let closed_jsons = self.state_db.load_closed();
@@ -1030,8 +1040,8 @@ impl Orchestrator {
         self.engine.update_dashboard_metrics(
             self.iteration,
             lat_p50 as u64, lat_p95 as u64, lat_max as u64,
-            "running", &chrono::Utc::now().to_rfc3339(),
-            "running", &chrono::Utc::now().to_rfc3339(),
+            "running", &chrono::Utc::now().format("%d/%m/%Y %H:%M:%S").to_string(),
+            "running", &chrono::Utc::now().format("%d/%m/%Y %H:%M:%S").to_string(),
         );
     }
 }
