@@ -363,9 +363,12 @@ fn resolve_with_delay(
 
 fn build_positions(s: &DashboardState) -> Value {
     let mut positions = Vec::new();
-    let pm = s.positions.lock();
-    let open = pm.open_positions();
-    for (idx, p) in open.values().enumerate() {
+    // Clone positions under lock, then release — avoids blocking WS resolution events
+    let open_snapshot: Vec<crate::position::Position> = {
+        let pm = s.positions.lock();
+        pm.open_positions().values().cloned().collect()
+    };
+    for (idx, p) in open_snapshot.iter().enumerate() {
         let mkt_vals: Vec<&crate::position::MarketLeg> = p.markets.values().collect();
         let short_name = mkt_vals.first()
             .map(|m| m.name.chars().take(40).collect::<String>())
@@ -487,7 +490,6 @@ fn build_positions(s: &DashboardState) -> Value {
             "scenarios": [],  // TODO: compute sell-arb scenarios
         }));
     }
-    drop(pm); // Release lock before sorting
     // Sort open positions by score descending, then re-number
     positions.sort_by(|a, b| b["score"].as_f64().unwrap_or(0.0)
         .partial_cmp(&a["score"].as_f64().unwrap_or(0.0)).unwrap());
@@ -627,15 +629,18 @@ fn build_opportunities(s: &DashboardState) -> Value {
 }
 
 fn build_closed(s: &DashboardState) -> Value {
-    let pm = s.positions.lock();
-    let closed = pm.closed_positions();
+    // Clone closed positions under lock, then release
+    let closed_snapshot: Vec<crate::position::Position> = {
+        let pm = s.positions.lock();
+        pm.closed_positions().to_vec()
+    };
     let mut resolved = Vec::new();
     let mut proactive_exit = Vec::new();
     let mut replaced_profit = Vec::new();
     let mut replaced_loss = Vec::new();
     let mut replaced_even = Vec::new();
 
-    for p in closed {
+    for p in &closed_snapshot {
         let actual = p.actual_profit;
         let deployed = p.total_capital;
         let reason = p.metadata.get("close_reason")
@@ -694,7 +699,6 @@ fn build_closed(s: &DashboardState) -> Value {
             _ => resolved.push(row),
         }
     }
-    drop(pm); // Release lock before sorting
 
     // Sort each category by close time descending
     for cat in [&mut resolved, &mut proactive_exit, &mut replaced_profit, &mut replaced_loss, &mut replaced_even] {

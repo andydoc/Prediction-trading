@@ -620,6 +620,21 @@ impl PositionManager {
             .collect()
     }
 
+    /// Combined held IDs — single iteration over open positions instead of two.
+    pub fn get_held_ids(&self) -> (std::collections::HashSet<String>, std::collections::HashSet<String>) {
+        let mut cids = std::collections::HashSet::new();
+        let mut mids = std::collections::HashSet::new();
+        for p in self.open_positions.values() {
+            if let Some(cid) = p.metadata.get("constraint_id").and_then(|v| v.as_str()) {
+                cids.insert(cid.to_string());
+            }
+            for mk in p.markets.keys() {
+                mids.insert(mk.clone());
+            }
+        }
+        (cids, mids)
+    }
+
     /// Get all asset_ids from the asset_index that map to markets in open positions.
     /// Used to ensure WS stays subscribed to these assets even after constraint rebuild.
     pub fn get_open_position_asset_ids(&self) -> Vec<String> {

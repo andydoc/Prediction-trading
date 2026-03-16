@@ -6,8 +6,10 @@
 ///   - Background: stale data refresh, periodic re-eval
 ///
 /// Uses a single Mutex over all state to prevent lock ordering deadlocks.
+/// Condvar-based wake: orchestrator sleeps until urgent work arrives or timeout.
 use std::collections::HashSet;
-use parking_lot::Mutex;
+use std::time::Duration;
+use parking_lot::{Condvar, Mutex};
 
 /// All queue state under a single lock — prevents ABBA deadlocks.
 struct QueueInner {
@@ -19,6 +21,9 @@ struct QueueInner {
 
 pub struct EvalQueue {
     inner: Mutex<QueueInner>,
+    /// Signalled when urgent work is pushed — wakes the orchestrator early.
+    wake_flag: Mutex<bool>,
+    wake_cond: Condvar,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +49,8 @@ impl EvalQueue {
                 urgent_set: HashSet::new(),
                 bg_set: HashSet::new(),
             }),
+            wake_flag: Mutex::new(false),
+            wake_cond: Condvar::new(),
         }
     }
 
@@ -61,6 +68,11 @@ impl EvalQueue {
                 q.urgent.push(entry);
             }
             q.bg_set.remove(constraint_id);
+            // Wake the orchestrator immediately for urgent work
+            drop(q);
+            let mut flag = self.wake_flag.lock();
+            *flag = true;
+            self.wake_cond.notify_one();
         } else {
             if !q.urgent_set.contains(constraint_id) {
                 if q.bg_set.insert(constraint_id.to_string()) {
@@ -68,6 +80,21 @@ impl EvalQueue {
                 }
             }
         }
+    }
+
+    /// Wait for urgent work or timeout. Returns true if woken by urgent push.
+    /// Replaces thread::sleep in the orchestrator — matches Python's
+    /// asyncio.wait_for(_eval_wake.wait(), timeout=0.05) pattern.
+    pub fn wait_for_work(&self, timeout: Duration) -> bool {
+        let mut flag = self.wake_flag.lock();
+        if *flag {
+            *flag = false;
+            return true;
+        }
+        self.wake_cond.wait_for(&mut flag, timeout);
+        let had = *flag;
+        *flag = false;
+        had
     }
 
     /// Drain up to `max` entries, urgent first then background.

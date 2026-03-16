@@ -378,8 +378,9 @@ impl Orchestrator {
                 tracing::error!("[iter {}] Error: {}", self.iteration, e);
             }
 
-            // Sleep 50ms between iterations (same as Python's asyncio.wait_for timeout)
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // Wait up to 50ms for urgent work — wakes instantly on EFP drift
+            // (matches Python's asyncio.wait_for(_eval_wake.wait(), timeout=0.05))
+            self.engine.eval_queue.wait_for_work(std::time::Duration::from_millis(50));
         }
 
         // Shutdown
@@ -404,8 +405,7 @@ impl Orchestrator {
         }
 
         // --- Evaluate batch ---
-        let held_cids = self.engine.get_held_constraint_ids();
-        let held_mids = self.engine.get_held_market_ids();
+        let (held_cids, held_mids) = self.engine.get_held_ids();
 
         let t0 = Instant::now();
         let result = self.engine.evaluate_batch(

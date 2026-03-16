@@ -410,6 +410,11 @@ impl TradingEngine {
         self.positions.lock().get_held_market_ids()
     }
 
+    /// Combined held IDs — single PM lock acquisition instead of two.
+    pub fn get_held_ids(&self) -> (std::collections::HashSet<String>, std::collections::HashSet<String>) {
+        self.positions.lock().get_held_ids()
+    }
+
     pub fn get_open_position_asset_ids(&self) -> Vec<String> {
         self.positions.lock().get_open_position_asset_ids()
     }
