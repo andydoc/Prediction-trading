@@ -103,7 +103,10 @@ impl WsManager {
             let ws_url = self.config.ws_url.clone();
             let hb_interval = self.config.heartbeat_interval_secs;
 
+            // Stagger shard connections 150ms apart to avoid thundering herd
+            let stagger = Duration::from_millis(150 * shard_id as u64);
             tokio::spawn(async move {
+                tokio::time::sleep(stagger).await;
                 shard_loop(
                     shard_id, assets, ws_url, hb_interval,
                     book, queue, running, total_msgs, resolved, positions, shutdown,
@@ -166,6 +169,7 @@ async fn shard_loop(
     while running.load(Ordering::Relaxed) {
         tracing::info!("Shard {}: connecting ({} assets)...", shard_id, assets.len());
 
+        let connect_time = std::time::Instant::now();
         match connect_and_run(
             shard_id, &assets, &ws_url, hb_interval_secs,
             &book, &queue, &running, &total_msgs, &resolved, &positions, &shutdown,
@@ -176,7 +180,13 @@ async fn shard_loop(
                 backoff_ms = 1000;
             }
             Err(e) => {
-                tracing::warn!("Shard {}: error: {}, reconnecting in {}ms", shard_id, e, backoff_ms);
+                let lived_secs = connect_time.elapsed().as_secs();
+                // Reset backoff if connection was healthy for >30s — not a rapid-fail loop
+                if lived_secs > 30 {
+                    backoff_ms = 1000;
+                }
+                tracing::warn!("Shard {}: error after {}s: {}, reconnecting in {}ms",
+                    shard_id, lived_secs, e, backoff_ms);
             }
         }
 
@@ -214,44 +224,40 @@ async fn connect_and_run(
 
     tracing::info!("Shard {}: connected, subscribing {} assets", shard_id, assets.len());
 
-    // Subscribe in batches of 500 (Polymarket limit)
-    for (batch_idx, chunk) in assets.chunks(500).enumerate() {
-        let asset_list: Vec<Value> = chunk.iter()
-            .map(|a| Value::String(a.clone()))
-            .collect();
-        let sub_msg = if batch_idx == 0 {
-            // First batch: use "type": "market"
-            serde_json::json!({
-                "assets_ids": asset_list,
-                "type": "market",
-                "custom_feature_enabled": true,
-                "initial_dump": true,
-            })
-        } else {
-            // Subsequent batches: use "operation": "subscribe"
-            serde_json::json!({
-                "assets_ids": asset_list,
-                "operation": "subscribe",
-                "custom_feature_enabled": true,
-                "initial_dump": true,
-            })
-        };
-        sink.send(WsMessage::Text(sub_msg.to_string())).await?;
-        // Small delay between batches to avoid server throttle
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    // Subscribe — single message (shard size ≤ 400, well under Polymarket's 500 limit)
+    let asset_list: Vec<Value> = assets.iter()
+        .map(|a| Value::String(a.clone()))
+        .collect();
+    let sub_msg = serde_json::json!({
+        "assets_ids": asset_list,
+        "type": "market",
+        "custom_feature_enabled": true,
+        "initial_dump": true,
+    });
+    sink.send(WsMessage::Text(sub_msg.to_string())).await?;
 
     tracing::info!("Shard {}: subscribed {} assets", shard_id, assets.len());
 
-    // Main loop: heartbeat + message read
+    // Main loop: heartbeat + message read + pong timeout
     let mut heartbeat_interval = tokio::time::interval(
         Duration::from_secs(hb_interval_secs)
     );
+    let mut last_pong = std::time::Instant::now();
+    let pong_timeout = Duration::from_secs(hb_interval_secs * 3); // 3 missed pongs = dead
 
     loop {
         tokio::select! {
+            // biased: heartbeat MUST fire on time even under heavy message load
+            biased;
+
             // Heartbeat tick — Polymarket expects plain text "PING"
             _ = heartbeat_interval.tick() => {
+                // Check if we've received a PONG recently
+                if last_pong.elapsed() > pong_timeout {
+                    tracing::warn!("Shard {}: no PONG for {}s, treating as dead",
+                        shard_id, last_pong.elapsed().as_secs());
+                    return Err("pong timeout".into());
+                }
                 if let Err(e) = sink.send(WsMessage::Text("PING".to_string())).await {
                     tracing::warn!("Shard {}: heartbeat send failed: {}", shard_id, e);
                     return Err(Box::new(e));
@@ -263,10 +269,23 @@ async fn connect_and_run(
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         total_msgs.fetch_add(1, Ordering::Relaxed);
+                        // Track PONG responses to our text PING
+                        let trimmed = text.trim();
+                        if trimmed == "PONG"
+                            || trimmed.starts_with("{\"type\":\"pong\"")
+                            || trimmed.starts_with("[{\"type\":\"pong\"")
+                        {
+                            last_pong = std::time::Instant::now();
+                            continue;
+                        }
                         handle_message(shard_id, &text, book, queue, resolved, positions, latency);
                     }
                     Some(Ok(WsMessage::Ping(data))) => {
                         let _ = sink.send(WsMessage::Pong(data)).await;
+                        last_pong = std::time::Instant::now(); // server ping = alive
+                    }
+                    Some(Ok(WsMessage::Pong(_))) => {
+                        last_pong = std::time::Instant::now(); // WS-level pong
                     }
                     Some(Ok(WsMessage::Close(_))) => {
                         tracing::info!("Shard {}: server sent Close", shard_id);
@@ -279,7 +298,7 @@ async fn connect_and_run(
                         tracing::info!("Shard {}: stream ended", shard_id);
                         return Ok(());
                     }
-                    _ => {} // Binary, Pong — ignore
+                    _ => {} // Binary — ignore
                 }
             }
 
@@ -310,14 +329,6 @@ fn handle_message(
 ) {
     // Debug: log first 200 chars of every message for diagnosis
     tracing::trace!("Shard {} raw msg: {}", shard_id, &text[..text.len().min(200)]);
-    // Fast path: skip PONG (plain text response to our PING) and subscription confirmations
-    let trimmed = text.trim();
-    if trimmed == "PONG"
-        || trimmed.starts_with("{\"type\":\"pong\"")
-        || trimmed.starts_with("[{\"type\":\"pong\"")
-    {
-        return;
-    }
 
     // Polymarket sends arrays of events
     let messages: Vec<Value> = if text.starts_with('[') {

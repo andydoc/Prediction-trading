@@ -109,6 +109,7 @@ websocket:
   heartbeat_interval: 10
   reconnect_base_delay: 1.0
   reconnect_max_delay: 60.0
+  assets_per_shard: 400
   max_book_staleness_secs: 30
 execution_control:
   enabled: true
@@ -178,6 +179,7 @@ ollama:
   model: lfm2.5-thinking:1.2b
 dashboard:
   port: 5558
+  bind_addr: '127.0.0.1'
 notifications:
   enabled: false
   webhook_url: ''

@@ -60,24 +60,24 @@ pub struct EngineMetrics {
 /// Static HTML — loaded at compile time from the extracted template.
 const DASHBOARD_HTML: &str = include_str!("../static/dashboard.html");
 
-/// Start the dashboard server on the given port (default 5556).
+/// Start the dashboard server on the given bind address and port.
 /// Must be called from within a tokio runtime (spawned as async task).
-pub async fn start(state: DashboardState, port: u16) {
+pub async fn start(state: DashboardState, port: u16, bind_addr: &str) {
     let app = Router::new()
         .route("/", axum::routing::get(handle_html))
         .route("/stream", axum::routing::get(handle_sse))
         .route("/state", axum::routing::get(handle_state))
         .with_state(Arc::new(state));
 
-    let listener = match tokio::net::TcpListener::bind(
-        format!("127.0.0.1:{}", port)).await {
+    let addr = format!("{}:{}", bind_addr, port);
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("Dashboard failed to bind port {}: {}", port, e);
+            tracing::error!("Dashboard failed to bind {}: {}", addr, e);
             return;
         }
     };
-    tracing::info!("Dashboard server started on port {}", port);
+    tracing::info!("Dashboard server started on {}", addr);
     if let Err(e) = axum::serve(listener, app).await {
         tracing::error!("Dashboard server error: {}", e);
     }

@@ -184,7 +184,7 @@ impl TradingEngine {
     }
 
     /// Start WS connections and dashboard server.
-    pub fn start(&self, asset_ids: Vec<String>, dashboard_port: u16) {
+    pub fn start(&self, asset_ids: Vec<String>, dashboard_port: u16, dashboard_bind: &str) {
         let ws = Arc::clone(&self.ws);
         self.runtime.spawn(async move {
             ws.start(asset_ids).await;
@@ -204,8 +204,9 @@ impl TradingEngine {
                 delay_table: Arc::clone(&self.delay_table),
                 latency: Arc::clone(&self.latency),
             };
+            let bind_addr = dashboard_bind.to_string();
             self.runtime.spawn(async move {
-                dashboard::start(dash_state, dashboard_port).await;
+                dashboard::start(dash_state, dashboard_port, &bind_addr).await;
             });
         }
     }

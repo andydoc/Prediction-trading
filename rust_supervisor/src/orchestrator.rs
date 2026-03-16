@@ -94,6 +94,7 @@ pub struct OrchestratorConfig {
     pub mode: String,
     pub shadow_only: bool,
     pub dashboard_port: u16,
+    pub dashboard_bind: String,
 
     // Arbitrage
     pub max_positions: usize,
@@ -175,6 +176,8 @@ impl OrchestratorConfig {
             shadow_only,
             dashboard_port: yaml.pointer("/dashboard/port")
                 .and_then(|v| v.as_u64()).unwrap_or(5556) as u16,
+            dashboard_bind: yaml.pointer("/dashboard/bind_addr")
+                .and_then(|v| v.as_str()).unwrap_or("127.0.0.1").to_string(),
 
             max_positions: arb.get("max_concurrent_positions")
                 .and_then(|v| v.as_u64()).unwrap_or(20) as usize,
@@ -418,7 +421,7 @@ impl Orchestrator {
 
         // 4. Start WS + dashboard
         if !all_assets.is_empty() {
-            self.engine.start(all_assets, self.cfg.dashboard_port);
+            self.engine.start(all_assets, self.cfg.dashboard_port, &self.cfg.dashboard_bind);
             tracing::info!("WS engine + dashboard started (port {})", self.cfg.dashboard_port);
         }
 
@@ -556,7 +559,7 @@ impl Orchestrator {
                     self.ingest_scan_result(&result);
                     let all_assets = self.detect_constraints();
                     if !all_assets.is_empty() {
-                        self.engine.start(all_assets, 0); // port=0 skips dashboard restart
+                        self.engine.start(all_assets, 0, &self.cfg.dashboard_bind); // port=0 skips dashboard restart
                     }
                 }
                 Err(e) => tracing::warn!("Constraint rebuild scan failed: {}", e),
