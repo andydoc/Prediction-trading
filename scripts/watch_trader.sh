@@ -1,32 +1,55 @@
 #!/bin/bash
 # watch_trader.sh — Real-time trading activity monitor
-# Run in WSL: ./scripts/watch_trader.sh
+# Works on both WSL and VPS:
+#   WSL: ./scripts/watch_trader.sh
+#   VPS: ./scripts/watch_trader.sh                    (auto-detects journald)
+#   VPS: ./scripts/watch_trader.sh shadow-a            (specific instance)
 #
 # Shows: opportunities, entries, exits, resolutions, errors, book depth issues
 # Color-coded for quick visual scanning
 
-WORKSPACE="${WORKSPACE:-/home/andydoc/prediction-trader}"
-LOG_DIR="$WORKSPACE/logs"
+INSTANCE="${1:-}"
 
-# Find today's supervisor log
-TODAY=$(date -u +%Y-%m-%d)
-LOG_FILE="$LOG_DIR/supervisor.$TODAY"
+# Auto-detect: journald (VPS/systemd) vs log files (WSL)
+if systemctl is-active --quiet "prediction-trader@${INSTANCE:-shadow-a}" 2>/dev/null; then
+    MODE="journal"
+    UNIT="prediction-trader@${INSTANCE:-shadow-a}"
+    echo "=== Prediction Trader Monitor (journald: $UNIT) ==="
+    echo "Press Ctrl+C to stop"
+    echo "===================================================="
+    echo ""
+    SOURCE_CMD="journalctl -u $UNIT -f -n 50 --no-pager -o cat"
+else
+    MODE="file"
+    # Detect workspace: VPS default vs WSL default
+    if [ -d "$HOME/prediction-trader" ]; then
+        WORKSPACE="${WORKSPACE:-$HOME/prediction-trader}"
+    else
+        WORKSPACE="${WORKSPACE:-/home/andydoc/prediction-trader}"
+    fi
+    LOG_DIR="$WORKSPACE/logs"
 
-if [ ! -f "$LOG_FILE" ]; then
-    echo "No log file for today: $LOG_FILE"
-    echo "Available logs:"
-    ls -lt "$LOG_DIR"/supervisor.* 2>/dev/null | head -5
-    exit 1
+    # Find today's supervisor log
+    TODAY=$(date -u +%Y-%m-%d)
+    LOG_FILE="$LOG_DIR/supervisor.$TODAY"
+
+    if [ ! -f "$LOG_FILE" ]; then
+        echo "No log file for today: $LOG_FILE"
+        echo "Available logs:"
+        ls -lt "$LOG_DIR"/supervisor.* 2>/dev/null | head -5
+        exit 1
+    fi
+
+    echo "=== Prediction Trader Monitor ==="
+    echo "Watching: $LOG_FILE"
+    echo "Press Ctrl+C to stop"
+    echo "================================="
+    echo ""
+    SOURCE_CMD="tail -n 50 -f $LOG_FILE"
 fi
 
-echo "=== Prediction Trader Monitor ==="
-echo "Watching: $LOG_FILE"
-echo "Press Ctrl+C to stop"
-echo "================================="
-echo ""
-
 # Tail the log, filtering to important events with color coding
-tail -n 50 -f "$LOG_FILE" | while IFS= read -r line; do
+$SOURCE_CMD | while IFS= read -r line; do
     # Entry events (green)
     if echo "$line" | grep -qE 'ENTER:|PositionEntry'; then
         echo -e "\033[32m$line\033[0m"
