@@ -86,5 +86,8 @@ $SOURCE_CMD | while IFS= read -r line; do
     # Circuit breaker (red bold)
     elif echo "$line" | grep -qE 'CIRCUIT BREAKER|circuit_breaker'; then
         echo -e "\033[1;31;7m$line\033[0m"
+    # Everything else (dim) — so nothing is silently swallowed
+    else
+        echo -e "\033[2m$line\033[0m"
     fi
 done
