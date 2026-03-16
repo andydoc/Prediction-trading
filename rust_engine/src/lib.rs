@@ -477,8 +477,15 @@ impl TradingEngine {
                             }
 
                             let prices_raw = &mdata["outcomePrices"];
+                            // outcomePrices can be: a JSON string wrapping an array of strings,
+                            // e.g. "[\"0\", \"1\"]", or a direct array.
                             let prices: Vec<f64> = if let Some(s) = prices_raw.as_str() {
-                                serde_json::from_str(s).unwrap_or_default()
+                                // Parse the string as a JSON array, then convert each element
+                                serde_json::from_str::<Vec<serde_json::Value>>(s)
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .filter_map(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                                    .collect()
                             } else if let Some(arr) = prices_raw.as_array() {
                                 arr.iter().filter_map(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).collect()
                             } else {

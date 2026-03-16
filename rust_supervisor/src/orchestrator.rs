@@ -111,6 +111,7 @@ pub struct OrchestratorConfig {
     pub stats_log_interval: f64,
     pub stale_sweep_interval: f64,
     pub stale_asset_threshold: f64,
+    pub api_resolution_interval: f64,
 
     // AI
     pub resolution_validation_enabled: bool,
@@ -191,6 +192,8 @@ impl OrchestratorConfig {
                 .and_then(|v| v.as_f64()).unwrap_or(60.0),
             stale_asset_threshold: eng.get("stale_asset_threshold_seconds")
                 .and_then(|v| v.as_f64()).unwrap_or(30.0),
+            api_resolution_interval: eng.get("api_resolution_interval_seconds")
+                .and_then(|v| v.as_f64()).unwrap_or(300.0),
 
             resolution_validation_enabled: rv_cfg.get("enabled")
                 .and_then(|v| v.as_bool()).unwrap_or(true),
@@ -235,6 +238,7 @@ pub struct Orchestrator {
     last_stats_log: f64,
     last_stale_sweep: f64,
     last_postponement_check: f64,
+    last_api_resolution_check: f64,
     iteration: u64,
     recent_latencies: Vec<f64>,
 
@@ -321,6 +325,7 @@ impl Orchestrator {
             last_stats_log: 0.0,
             last_stale_sweep: 0.0,
             last_postponement_check: 0.0,
+            last_api_resolution_check: 0.0,
             iteration: 0,
             recent_latencies: Vec::new(),
             p95_table, p95_default,
@@ -484,6 +489,20 @@ impl Orchestrator {
                 tracing::debug!("Stale assets: {} > {:.0}s old", stale.len(), self.cfg.stale_asset_threshold);
             }
             self.last_stale_sweep = now;
+        }
+
+        // --- API resolution poll (safety net for missed WS events) ---
+        if (now - self.last_api_resolution_check) >= self.cfg.api_resolution_interval {
+            if self.engine.pm_open_count() > 0 {
+                let results = self.engine.check_api_resolutions();
+                if !results.is_empty() {
+                    for r in &results {
+                        tracing::info!("API RESOLUTION: {} → winner={}, profit=${:.4}",
+                            r.position_id, r.winning_market_id, r.profit);
+                    }
+                }
+            }
+            self.last_api_resolution_check = now;
         }
 
         // --- Stats ---
