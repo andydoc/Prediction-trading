@@ -216,10 +216,10 @@ impl OrchestratorConfig {
 pub struct Orchestrator {
     cfg: OrchestratorConfig,
     engine: TradingEngine,
-    scanner: MarketScanner,
-    state_db: StateDB,
-    resolution_validator: Option<ResolutionValidator>,
-    postponement_detector: Option<PostponementDetector>,
+    scanner: Arc<MarketScanner>,
+    state_db: Arc<StateDB>,
+    resolution_validator: Option<Arc<ResolutionValidator>>,
+    postponement_detector: Option<Arc<PostponementDetector>>,
 
     // Market data cache: market_id → JSON value
     market_lookup: HashMap<String, serde_json::Value>,
@@ -241,6 +241,9 @@ pub struct Orchestrator {
     // Delay table
     p95_table: HashMap<String, f64>,
     p95_default: f64,
+
+    // Background disk save thread handle
+    disk_save_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Orchestrator {
@@ -304,8 +307,11 @@ impl Orchestrator {
             .unwrap_or_default();
 
         Ok(Self {
-            cfg, engine, scanner, state_db,
-            resolution_validator, postponement_detector,
+            cfg, engine,
+            scanner: Arc::new(scanner),
+            state_db: Arc::new(state_db),
+            resolution_validator: resolution_validator.map(Arc::new),
+            postponement_detector: postponement_detector.map(Arc::new),
             market_lookup: HashMap::new(),
             cached_yaml,
             last_state_save: 0.0,
@@ -318,6 +324,7 @@ impl Orchestrator {
             iteration: 0,
             recent_latencies: Vec::new(),
             p95_table, p95_default,
+            disk_save_handle: None,
         })
     }
 
@@ -383,10 +390,17 @@ impl Orchestrator {
             self.engine.eval_queue.wait_for_work(std::time::Duration::from_millis(50));
         }
 
-        // Shutdown
+        // Shutdown — wait for any in-flight disk save, then do a final sync save
         tracing::info!("Orchestrator shutting down...");
         self.engine.stop();
+        if let Some(h) = self.disk_save_handle.take() {
+            let _ = h.join();
+        }
         self.save_state();
+        // Wait for the final save to complete before exiting
+        if let Some(h) = self.disk_save_handle.take() {
+            let _ = h.join();
+        }
         tracing::info!("Orchestrator stopped.");
     }
 
@@ -596,7 +610,7 @@ impl Orchestrator {
             self.engine.pm_closed_count());
     }
 
-    fn save_state(&self) {
+    fn save_state(&mut self) {
         let t0 = Instant::now();
 
         let cap = self.engine.current_capital();
@@ -664,19 +678,26 @@ impl Orchestrator {
             }
         }
 
-        self.state_db.mirror_to_disk();
-
-        if let Some(ref rv) = self.resolution_validator {
-            rv.mirror_to_disk();
+        // Disk mirrors run in a background thread to avoid blocking the tick loop.
+        // Only spawn if previous save has completed.
+        if self.disk_save_handle.as_ref().map_or(true, |h| h.is_finished()) {
+            let db = Arc::clone(&self.state_db);
+            let rv = self.resolution_validator.as_ref().map(Arc::clone);
+            let pd = self.postponement_detector.as_ref().map(Arc::clone);
+            let sc = Arc::clone(&self.scanner);
+            let n_open = open_rows.len();
+            self.disk_save_handle = Some(std::thread::spawn(move || {
+                db.mirror_to_disk();
+                if let Some(ref rv) = rv { rv.mirror_to_disk(); }
+                if let Some(ref pd) = pd { pd.mirror_to_disk(); }
+                sc.mirror_to_disk();
+                let ms = t0.elapsed().as_millis();
+                tracing::info!("State saved: {} open, {} closed [{ms}ms]",
+                    n_open, n_closed_total);
+            }));
+        } else {
+            tracing::debug!("Skipping disk mirror — previous save still running");
         }
-        if let Some(ref pd) = self.postponement_detector {
-            pd.mirror_to_disk();
-        }
-        self.scanner.mirror_to_disk();
-
-        let ms = t0.elapsed().as_millis();
-        tracing::info!("State saved: {} open, {} closed [{ms}ms]",
-            open_rows.len(), n_closed_total);
     }
 
     // --- Entry / replacement ---
