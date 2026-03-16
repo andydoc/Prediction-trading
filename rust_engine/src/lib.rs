@@ -470,17 +470,16 @@ impl TradingEngine {
                 match client.get(&url).send() {
                     Ok(resp) => {
                         if let Ok(mdata) = resp.json::<serde_json::Value>() {
-                            let is_closed = mdata["closed"].as_bool().unwrap_or(false);
-                            if !is_closed {
+                            // Only trust umaResolutionStatus == "resolved" — not prices
+                            let uma_status = mdata["umaResolutionStatus"].as_str().unwrap_or("");
+                            if uma_status != "resolved" {
                                 all_resolved = false;
                                 continue;
                             }
 
+                            // Market is definitively resolved — read outcome from prices
                             let prices_raw = &mdata["outcomePrices"];
-                            // outcomePrices can be: a JSON string wrapping an array of strings,
-                            // e.g. "[\"0\", \"1\"]", or a direct array.
                             let prices: Vec<f64> = if let Some(s) = prices_raw.as_str() {
-                                // Parse the string as a JSON array, then convert each element
                                 serde_json::from_str::<Vec<serde_json::Value>>(s)
                                     .unwrap_or_default()
                                     .iter()
@@ -498,6 +497,8 @@ impl TradingEngine {
                                 } else if prices[1] >= 0.99 && prices[0] <= 0.01 {
                                     resolved_outcomes.insert(mid.clone(), "no".into());
                                 } else {
+                                    // Resolved but prices ambiguous — skip
+                                    tracing::warn!("Market {} resolved but prices ambiguous: {:?}", mid, prices);
                                     all_resolved = false;
                                 }
                             } else {
