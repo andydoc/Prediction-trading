@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use dashmap::DashMap;
 use crate::arb::{self, ArbResult};
 use crate::book::BookMirror;
+use crate::latency::LatencyTracker;
 use crate::queue::EvalQueue;
 
 
@@ -104,6 +105,8 @@ pub struct Opportunity {
     pub capital_efficiency: Option<f64>,
     /// Collateral per unit for negRisk sell arbs (B3)
     pub collateral_per_unit: Option<f64>,
+    /// Earliest Polymarket server timestamp that triggered this opportunity (for e2e latency).
+    pub origin_ts: f64,
 }
 
 /// Evaluate a batch of constraints from the queue.
@@ -119,6 +122,7 @@ pub fn evaluate_batch(
     held_mids: &HashSet<String>,
     top_n: usize,
     depth_haircut: f64,
+    latency: &LatencyTracker,
 ) -> (Vec<Opportunity>, usize, usize, usize, usize) {
     let entries = queue.drain(max_evals);
     if entries.is_empty() {
@@ -134,6 +138,18 @@ pub fn evaluate_batch(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
+
+    // Segment 3: queue wait — time from push to drain
+    if latency.is_enabled() {
+        for entry in &entries {
+            if entry.queued_at > 0.0 {
+                let wait_us = (now_ts - entry.queued_at) * 1_000_000.0;
+                if wait_us > 0.0 && wait_us < 60_000_000.0 { // sanity: < 60s
+                    latency.record_queue_wait(wait_us);
+                }
+            }
+        }
+    }
 
     for entry in &entries {
         // Skip constraints already held
@@ -255,6 +271,7 @@ pub fn evaluate_batch(
                 min_leg_depth_usd: if min_leg_depth_usd.is_infinite() { 0.0 } else { min_leg_depth_usd },
                 capital_efficiency: arb.capital_efficiency,
                 collateral_per_unit: arb.collateral_per_unit,
+                origin_ts: entry.origin_ts,
             });
         }
     }

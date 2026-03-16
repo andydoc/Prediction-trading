@@ -17,6 +17,7 @@ use parking_lot::Mutex;
 
 use crate::position::PositionManager;
 use crate::book::BookMirror;
+use crate::latency::LatencyTracker;
 use crate::queue::EvalQueue;
 use crate::eval::ConstraintStore;
 use crate::ws::WsManager;
@@ -39,6 +40,8 @@ pub struct DashboardState {
     pub start_time: chrono::DateTime<chrono::Utc>,
     /// P95 delay table: category → p95_hours (loaded from SQLite at startup)
     pub delay_table: Arc<Mutex<(std::collections::HashMap<String, f64>, f64)>>,
+    /// Latency instrumentation tracker
+    pub latency: Arc<LatencyTracker>,
 }
 
 /// Metrics updated by the Rust orchestrator each stats cycle.
@@ -725,6 +728,10 @@ fn build_system(s: &DashboardState) -> Value {
     let n_markets = s.book.live_count();
     let pm = s.positions.lock();
 
+    // Latency breakdown (only populated when instrumentation enabled)
+    let lat_snap = s.latency.snapshot();
+    let lat_enabled = s.latency.is_enabled();
+
     json!({
         "scanner": { "status": m.scanner_status, "ts": m.scanner_ts },
         "engine": {
@@ -745,6 +752,15 @@ fn build_system(s: &DashboardState) -> Value {
             "lat_p50": m.lat_p50_us,
             "lat_p95": m.lat_p95_us,
             "lat_max": m.lat_max_us,
+        },
+        "latency_breakdown": {
+            "enabled": lat_enabled,
+            "ws_network":    { "p50": lat_snap.ws_network.p50 as u64,    "p95": lat_snap.ws_network.p95 as u64,    "max": lat_snap.ws_network.max as u64,    "n": lat_snap.ws_network.count },
+            "ws_to_queue":   { "p50": lat_snap.ws_to_queue.p50 as u64,   "p95": lat_snap.ws_to_queue.p95 as u64,   "max": lat_snap.ws_to_queue.max as u64,   "n": lat_snap.ws_to_queue.count },
+            "queue_wait":    { "p50": lat_snap.queue_wait.p50 as u64,    "p95": lat_snap.queue_wait.p95 as u64,    "max": lat_snap.queue_wait.max as u64,    "n": lat_snap.queue_wait.count },
+            "eval_batch":    { "p50": lat_snap.eval_batch.p50 as u64,    "p95": lat_snap.eval_batch.p95 as u64,    "max": lat_snap.eval_batch.max as u64,    "n": lat_snap.eval_batch.count },
+            "eval_to_entry": { "p50": lat_snap.eval_to_entry.p50 as u64, "p95": lat_snap.eval_to_entry.p95 as u64, "max": lat_snap.eval_to_entry.max as u64, "n": lat_snap.eval_to_entry.count },
+            "e2e":           { "p50": lat_snap.e2e.p50 as u64,           "p95": lat_snap.e2e.p95 as u64,           "max": lat_snap.e2e.max as u64,           "n": lat_snap.e2e.count },
         },
     })
 }

@@ -28,6 +28,7 @@ pub mod postponement;
 pub mod scanner;
 pub mod detect;
 pub mod notify;
+pub mod latency;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,6 +40,7 @@ use types::LoggingCfg;
 use ws::WsManager;
 use position::PositionManager;
 use dashboard::{DashboardState, EngineMetrics};
+use latency::LatencyTracker;
 
 /// The core trading engine. Owns all hot-path state:
 /// WS connections, order books, eval queue, positions, dashboard.
@@ -59,6 +61,7 @@ pub struct TradingEngine {
     pub start_time: chrono::DateTime<chrono::Utc>,
     pub delay_table: Arc<parking_lot::Mutex<(HashMap<String, f64>, f64)>>,
     pub http_client: reqwest::blocking::Client,
+    pub latency: Arc<LatencyTracker>,
 }
 
 impl TradingEngine {
@@ -129,12 +132,13 @@ impl TradingEngine {
 
         let book = Arc::new(BookMirror::new(&cfg));
         let eval_queue = Arc::new(EvalQueue::new());
+        let latency = Arc::new(LatencyTracker::new(false)); // toggled via config
         let positions = Arc::new(parking_lot::Mutex::new(
             PositionManager::new(pos_cfg.initial_capital, pos_cfg.taker_fee)
         ));
         let ws = Arc::new(WsManager::new(
             cfg.clone(), Arc::clone(&book), Arc::clone(&eval_queue),
-            Arc::clone(&positions),
+            Arc::clone(&positions), Arc::clone(&latency),
         ));
         let constraints = Arc::new(ConstraintStore::new());
 
@@ -170,6 +174,7 @@ impl TradingEngine {
             start_time: chrono::Utc::now(),
             delay_table: Arc::new(parking_lot::Mutex::new((HashMap::new(), 33.5))),
             http_client,
+            latency,
         })
     }
 
@@ -197,6 +202,7 @@ impl TradingEngine {
                 mode: self.mode.clone(),
                 start_time: self.start_time,
                 delay_table: Arc::clone(&self.delay_table),
+                latency: Arc::clone(&self.latency),
             };
             self.runtime.spawn(async move {
                 dashboard::start(dash_state, dashboard_port).await;
@@ -298,7 +304,7 @@ impl TradingEngine {
         let ec = self.eval_config.lock().clone();
         let (opps, n_urg, n_bg, n_eval, n_held) = eval::evaluate_batch(
             &self.eval_queue, &self.book, &self.constraints, &ec,
-            max_evals, held_cids, held_mids, top_n, depth_haircut,
+            max_evals, held_cids, held_mids, top_n, depth_haircut, &self.latency,
         );
         EvalBatchResult {
             opportunities: opps,

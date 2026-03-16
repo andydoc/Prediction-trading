@@ -20,6 +20,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use serde_json::Value;
 use crate::book::BookMirror;
+use crate::latency::LatencyTracker;
 use crate::position::PositionManager;
 use crate::queue::EvalQueue;
 use crate::types::{BookLevel, EngineConfig};
@@ -47,6 +48,8 @@ pub struct WsManager {
     subscribed_count: Arc<AtomicU64>,
     /// Notify for shutdown.
     shutdown: Arc<Notify>,
+    /// Latency instrumentation tracker.
+    latency: Arc<LatencyTracker>,
 }
 
 impl WsManager {
@@ -55,6 +58,7 @@ impl WsManager {
         book: Arc<BookMirror>,
         eval_queue: Arc<EvalQueue>,
         positions: Arc<parking_lot::Mutex<PositionManager>>,
+        latency: Arc<LatencyTracker>,
     ) -> Self {
         Self {
             config,
@@ -66,6 +70,7 @@ impl WsManager {
             positions,
             subscribed_count: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(Notify::new()),
+            latency,
         }
     }
 
@@ -94,6 +99,7 @@ impl WsManager {
             let resolved = Arc::clone(&self.resolved_events);
             let positions = Arc::clone(&self.positions);
             let shutdown = Arc::clone(&self.shutdown);
+            let latency = Arc::clone(&self.latency);
             let ws_url = self.config.ws_url.clone();
             let hb_interval = self.config.heartbeat_interval_secs;
 
@@ -101,6 +107,7 @@ impl WsManager {
                 shard_loop(
                     shard_id, assets, ws_url, hb_interval,
                     book, queue, running, total_msgs, resolved, positions, shutdown,
+                    latency,
                 ).await;
             });
         }
@@ -151,6 +158,7 @@ async fn shard_loop(
     resolved: Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
     positions: Arc<parking_lot::Mutex<PositionManager>>,
     shutdown: Arc<Notify>,
+    latency: Arc<LatencyTracker>,
 ) {
     let mut backoff_ms: u64 = 1000;
     let max_backoff_ms: u64 = 60_000;
@@ -161,6 +169,7 @@ async fn shard_loop(
         match connect_and_run(
             shard_id, &assets, &ws_url, hb_interval_secs,
             &book, &queue, &running, &total_msgs, &resolved, &positions, &shutdown,
+            &latency,
         ).await {
             Ok(()) => {
                 tracing::info!("Shard {}: clean disconnect", shard_id);
@@ -198,6 +207,7 @@ async fn connect_and_run(
     resolved: &Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
     positions: &Arc<parking_lot::Mutex<PositionManager>>,
     shutdown: &Arc<Notify>,
+    latency: &Arc<LatencyTracker>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (ws_stream, _response) = tokio_tungstenite::connect_async(ws_url).await?;
     let (mut sink, mut stream) = ws_stream.split();
@@ -253,7 +263,7 @@ async fn connect_and_run(
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         total_msgs.fetch_add(1, Ordering::Relaxed);
-                        handle_message(shard_id, &text, book, queue, resolved, positions);
+                        handle_message(shard_id, &text, book, queue, resolved, positions, latency);
                     }
                     Some(Ok(WsMessage::Ping(data))) => {
                         let _ = sink.send(WsMessage::Pong(data)).await;
@@ -296,6 +306,7 @@ fn handle_message(
     queue: &Arc<EvalQueue>,
     resolved: &Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
     positions: &Arc<parking_lot::Mutex<PositionManager>>,
+    latency: &Arc<LatencyTracker>,
 ) {
     // Debug: log first 200 chars of every message for diagnosis
     tracing::trace!("Shard {} raw msg: {}", shard_id, &text[..text.len().min(200)]);
@@ -327,15 +338,26 @@ fn handle_message(
         .as_secs_f64();
 
     for msg in &messages {
+        // Extract Polymarket server timestamp (seconds or millis)
+        let origin_ts = extract_origin_ts(msg, now);
+
+        // Segment 1: WS network latency (Polymarket server → local receive)
+        if origin_ts > 0.0 && latency.is_enabled() {
+            let network_us = (now - origin_ts) * 1_000_000.0;
+            if network_us > 0.0 && network_us < 60_000_000.0 { // sanity: < 60s
+                latency.record_ws_network(network_us);
+            }
+        }
+
         let event_type = msg.get("event_type")
             .or_else(|| msg.get("type"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
         match event_type {
-            "book" => handle_book(msg, book, queue, now),
-            "price_change" => handle_price_change(msg, book, queue, now),
-            "best_bid_ask" => handle_best_bid_ask(msg, book, queue, now),
+            "book" => handle_book(msg, book, queue, now, origin_ts, latency),
+            "price_change" => handle_price_change(msg, book, queue, now, origin_ts, latency),
+            "best_bid_ask" => handle_best_bid_ask(msg, book, queue, now, origin_ts, latency),
             "market_resolved" => handle_resolved(msg, resolved, positions, now),
             "last_trade_price" | "pong" | "" => {} // ignore
             _ => {
@@ -348,6 +370,7 @@ fn handle_message(
 /// Handle full book snapshot.
 fn handle_book(
     msg: &Value, book: &Arc<BookMirror>, queue: &Arc<EvalQueue>, ts: f64,
+    origin_ts: f64, latency: &Arc<LatencyTracker>,
 ) {
     let asset_id = match msg.get("asset_id").and_then(|v| v.as_str()) {
         Some(id) => id,
@@ -383,13 +406,20 @@ fn handle_book(
     let bids = parse_levels("bids");
     let evals = book.apply_snapshot(asset_id, asks, bids, ts);
     for (cid, urgent) in evals {
-        queue.push(&cid, asset_id, urgent, ts);
+        queue.push(&cid, asset_id, urgent, ts, origin_ts);
+    }
+    // Segment 2: WS handler → queue push
+    if latency.is_enabled() {
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+        latency.record_ws_to_queue((after - ts) * 1_000_000.0);
     }
 }
 
 /// Handle price_change event (has price, best bid/ask fields).
 fn handle_price_change(
     msg: &Value, book: &Arc<BookMirror>, queue: &Arc<EvalQueue>, ts: f64,
+    origin_ts: f64, latency: &Arc<LatencyTracker>,
 ) {
     let asset_id = match msg.get("asset_id").and_then(|v| v.as_str()) {
         Some(id) => id,
@@ -405,8 +435,14 @@ fn handle_price_change(
             let is_ask = side == "SELL" || side == "sell" || side == "ask";
             let evals = book.apply_delta(asset_id, is_ask, price, size, ts);
             for (cid, urgent) in evals {
-                queue.push(&cid, asset_id, urgent, ts);
+                queue.push(&cid, asset_id, urgent, ts, origin_ts);
             }
+        }
+        // Segment 2: WS handler → queue push
+        if latency.is_enabled() {
+            let after = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+            latency.record_ws_to_queue((after - ts) * 1_000_000.0);
         }
         return;
     }
@@ -417,7 +453,13 @@ fn handle_price_change(
     if ask > 0.0 || bid > 0.0 {
         let evals = book.apply_best_prices(asset_id, bid, ask, ts);
         for (cid, urgent) in evals {
-            queue.push(&cid, asset_id, urgent, ts);
+            queue.push(&cid, asset_id, urgent, ts, origin_ts);
+        }
+        // Segment 2
+        if latency.is_enabled() {
+            let after = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+            latency.record_ws_to_queue((after - ts) * 1_000_000.0);
         }
     }
 }
@@ -425,6 +467,7 @@ fn handle_price_change(
 /// Handle best_bid_ask event.
 fn handle_best_bid_ask(
     msg: &Value, book: &Arc<BookMirror>, queue: &Arc<EvalQueue>, ts: f64,
+    origin_ts: f64, latency: &Arc<LatencyTracker>,
 ) {
     let asset_id = match msg.get("asset_id").and_then(|v| v.as_str()) {
         Some(id) => id,
@@ -435,7 +478,13 @@ fn handle_best_bid_ask(
     if ask > 0.0 || bid > 0.0 {
         let evals = book.apply_best_prices(asset_id, bid, ask, ts);
         for (cid, urgent) in evals {
-            queue.push(&cid, asset_id, urgent, ts);
+            queue.push(&cid, asset_id, urgent, ts, origin_ts);
+        }
+        // Segment 2
+        if latency.is_enabled() {
+            let after = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+            latency.record_ws_to_queue((after - ts) * 1_000_000.0);
         }
     }
 }
@@ -502,4 +551,29 @@ fn parse_f64_field(val: &Value, key: &str) -> Option<f64> {
     val.get(key).and_then(|v| {
         v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
     })
+}
+
+/// Extract Polymarket server timestamp from a WS message.
+/// Tries "timestamp" field — may be seconds, millis, or ISO string.
+/// Returns 0.0 if not available.
+fn extract_origin_ts(msg: &Value, now: f64) -> f64 {
+    if let Some(ts) = parse_f64_field(msg, "timestamp") {
+        // Polymarket sends millis (13-digit) or seconds (10-digit)
+        if ts > 1_000_000_000_000.0 {
+            ts / 1000.0  // millis → seconds
+        } else if ts > 1_000_000_000.0 {
+            ts  // already seconds
+        } else {
+            0.0  // too small, probably not a timestamp
+        }
+    } else if let Some(ts_str) = msg.get("timestamp").and_then(|v| v.as_str()) {
+        // Try ISO 8601 parse
+        chrono::DateTime::parse_from_rfc3339(ts_str)
+            .map(|dt| dt.timestamp_millis() as f64 / 1000.0)
+            .unwrap_or(0.0)
+    } else {
+        // No server timestamp — fall back to local receive time
+        // (segment 1 won't be measured, but origin_ts carries through for e2e)
+        now
+    }
 }

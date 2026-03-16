@@ -90,6 +90,7 @@ engine:
   max_book_staleness_secs: 30
   closed_position_retention_days: 90
   api_resolution_interval_seconds: 300
+  latency_instrumentation: true
 market_data:
   enabled_markets:
   - polymarket
@@ -189,4 +190,4 @@ notifications:
   on_circuit_breaker: true
   on_daily_summary: true
 state:
-  db_path: state_rust.db
+  db_path: data/state_rust.db

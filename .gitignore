@@ -15,6 +15,9 @@ logs/
 *.log
 *.pid
 
+# Runtime databases (in case any land outside data/)
+*.db
+
 # OS files
 .DS_Store
 Thumbs.db

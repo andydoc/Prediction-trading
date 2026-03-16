@@ -31,6 +31,8 @@ pub struct QueueEntry {
     pub constraint_id: String,
     pub trigger_asset: String,
     pub queued_at: f64,
+    /// Polymarket server timestamp (0.0 if unavailable).
+    pub origin_ts: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +40,8 @@ pub struct DrainResult {
     pub constraint_id: String,
     pub urgent: bool,
     pub queued_at: f64,
+    /// Polymarket server timestamp (0.0 if unavailable).
+    pub origin_ts: f64,
 }
 
 impl EvalQueue {
@@ -55,11 +59,13 @@ impl EvalQueue {
     }
 
     /// Push a constraint eval (called from WS handler threads).
-    pub fn push(&self, constraint_id: &str, asset_id: &str, urgent: bool, now: f64) {
+    /// `origin_ts`: Polymarket server timestamp (0.0 if not available).
+    pub fn push(&self, constraint_id: &str, asset_id: &str, urgent: bool, now: f64, origin_ts: f64) {
         let entry = QueueEntry {
             constraint_id: constraint_id.to_string(),
             trigger_asset: asset_id.to_string(),
             queued_at: now,
+            origin_ts,
         };
 
         let mut q = self.inner.lock();
@@ -111,6 +117,7 @@ impl EvalQueue {
                 constraint_id: entry.constraint_id,
                 urgent: true,
                 queued_at: entry.queued_at,
+                origin_ts: entry.origin_ts,
             });
         }
 
@@ -125,6 +132,7 @@ impl EvalQueue {
                     constraint_id: entry.constraint_id,
                     urgent: false,
                     queued_at: entry.queued_at,
+                    origin_ts: entry.origin_ts,
                 });
             }
         }

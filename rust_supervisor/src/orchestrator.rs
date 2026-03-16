@@ -130,6 +130,9 @@ pub struct OrchestratorConfig {
     pub postponement_check_interval: f64,
     pub postponement_rescore_days: u32,
     pub state_db_path: PathBuf,
+
+    // Latency instrumentation
+    pub latency_instrumentation: bool,
 }
 
 impl OrchestratorConfig {
@@ -229,6 +232,8 @@ impl OrchestratorConfig {
                 .and_then(|v| v.as_str())
                 .map(|s| workspace.join(s))
                 .unwrap_or_else(|| workspace.join("data").join("system_state").join("execution_state.db")),
+            latency_instrumentation: eng.get("latency_instrumentation")
+                .and_then(|v| v.as_bool()).unwrap_or(false),
         }
     }
 }
@@ -284,6 +289,11 @@ impl Orchestrator {
         let ws = cfg.workspace.to_string_lossy().to_string();
 
         let engine = TradingEngine::new(&ws)?;
+
+        // Enable latency instrumentation if configured
+        if cfg.latency_instrumentation {
+            engine.latency.set_enabled(true);
+        }
 
         let scanner = MarketScanner::new(
             &cfg.workspace.join("data").join("markets.db").to_string_lossy(),
@@ -493,14 +503,33 @@ impl Orchestrator {
         let batch_us = t0.elapsed().as_micros() as f64;
 
         if result.n_evaluated > 0 {
+            // Segment 4: eval batch duration
             self.recent_latencies.push_back(batch_us);
             while self.recent_latencies.len() > MAX_LATENCY_SAMPLES {
                 self.recent_latencies.pop_front();
             }
+            self.engine.latency.record_eval_batch(batch_us);
         }
 
         if !result.opportunities.is_empty() {
+            let entry_t0 = Instant::now();
             self.try_enter_or_replace(&result.opportunities, &held_cids, &held_mids);
+            // Segment 5: eval → entry decision
+            let entry_us = entry_t0.elapsed().as_micros() as f64;
+            self.engine.latency.record_eval_to_entry(entry_us);
+
+            // Segment 6 (e2e): origin_ts → now for each opportunity that had an entry attempt
+            if self.engine.latency.is_enabled() {
+                let now = now_secs();
+                for opp in &result.opportunities {
+                    if opp.origin_ts > 0.0 {
+                        let e2e_us = (now - opp.origin_ts) * 1_000_000.0;
+                        if e2e_us > 0.0 && e2e_us < 60_000_000.0 {
+                            self.engine.latency.record_e2e(e2e_us);
+                        }
+                    }
+                }
+            }
         }
 
         // --- Monitor (proactive exits) ---
@@ -1220,6 +1249,20 @@ impl Orchestrator {
             ws.subscribed, ws.total_msgs, ws.live_books,
             q_urg, q_bg, lat_p50, lat_p95, lat_max,
         );
+
+        // Per-segment latency breakdown (when instrumentation enabled)
+        if self.engine.latency.is_enabled() {
+            let snap = self.engine.latency.snapshot();
+            tracing::debug!(
+                "Latency breakdown (μs p50/p95/max): ws_net={:.0}/{:.0}/{:.0} ws→q={:.0}/{:.0}/{:.0} q_wait={:.0}/{:.0}/{:.0} eval={:.0}/{:.0}/{:.0} eval→entry={:.0}/{:.0}/{:.0} e2e={:.0}/{:.0}/{:.0}",
+                snap.ws_network.p50, snap.ws_network.p95, snap.ws_network.max,
+                snap.ws_to_queue.p50, snap.ws_to_queue.p95, snap.ws_to_queue.max,
+                snap.queue_wait.p50, snap.queue_wait.p95, snap.queue_wait.max,
+                snap.eval_batch.p50, snap.eval_batch.p95, snap.eval_batch.max,
+                snap.eval_to_entry.p50, snap.eval_to_entry.p95, snap.eval_to_entry.max,
+                snap.e2e.p50, snap.e2e.p95, snap.e2e.max,
+            );
+        }
 
         // Update dashboard metrics
         self.engine.update_dashboard_metrics(
