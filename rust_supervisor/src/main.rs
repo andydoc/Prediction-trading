@@ -89,7 +89,7 @@ impl SupervisorConfig {
     fn load(cli: &Cli) -> Self {
         let workspace = cli.workspace.as_deref()
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/home/andydoc/prediction-trader"));
+            .unwrap_or_else(|| PathBuf::from("."));
 
         let config_path = workspace.join("config").join("config.yaml");
         let yaml_val: serde_json::Value = fs::read_to_string(&config_path)
@@ -247,6 +247,11 @@ impl SupervisorConfig {
                 tracing::warn!("Ignoring unknown --set key: {} (not in allowlist)", key);
                 continue;
             }
+            // S2: Validate numeric bounds for known keys
+            if let Some(reason) = validate_override_value(key, value) {
+                tracing::warn!("Rejecting --set {}={}: {}", key, value, reason);
+                continue;
+            }
             let yaml_value = parse_yaml_value(value);
             set_yaml_path(&mut val, key, &yaml_value);
             tracing::info!("Config override: {} = {}", key, value);
@@ -281,6 +286,42 @@ fn parse_yaml_value(s: &str) -> serde_yaml_ng::Value {
         return serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(f));
     }
     serde_yaml_ng::Value::String(s.to_string())
+}
+
+/// S2: Validate numeric config override values are within sane bounds.
+/// Returns Some(reason) if the value should be rejected.
+fn validate_override_value(key: &str, value: &str) -> Option<&'static str> {
+    let f: f64 = match value.parse() {
+        Ok(v) => v,
+        Err(_) => return None, // non-numeric — let it through (booleans, strings)
+    };
+    match key {
+        "arbitrage.capital_per_trade_pct" if f <= 0.0 || f > 0.5 =>
+            Some("must be in (0, 0.5]"),
+        "arbitrage.max_concurrent_positions" if f < 1.0 || f > 200.0 =>
+            Some("must be in [1, 200]"),
+        "arbitrage.min_trade_size" if f < 0.0 || f > 10000.0 =>
+            Some("must be in [0, 10000]"),
+        "arbitrage.max_days_to_resolution" if f < 1.0 || f > 365.0 =>
+            Some("must be in [1, 365]"),
+        "arbitrage.min_profit_threshold" if f < 0.0 || f > 1.0 =>
+            Some("must be in [0, 1.0]"),
+        "arbitrage.max_profit_threshold" if f < 0.0 || f > 1.0 =>
+            Some("must be in [0, 1.0]"),
+        "arbitrage.replacement_cooldown_seconds" if f < 0.0 || f > 86400.0 =>
+            Some("must be in [0, 86400]"),
+        "arbitrage.max_exposure_per_market" if f < 0.0 || f > 100000.0 =>
+            Some("must be in [0, 100000]"),
+        "arbitrage.max_position_size" if f < 0.0 || f > 100000.0 =>
+            Some("must be in [0, 100000]"),
+        "engine.state_save_interval_seconds" if f < 1.0 || f > 3600.0 =>
+            Some("must be in [1, 3600]"),
+        "engine.monitor_interval_seconds" if f < 1.0 || f > 3600.0 =>
+            Some("must be in [1, 3600]"),
+        "dashboard.port" if f < 1.0 || f > 65535.0 =>
+            Some("must be in [1, 65535]"),
+        _ => None,
+    }
 }
 
 fn set_yaml_value(root: &mut serde_yaml_ng::Value, key: &str, val: &serde_yaml_ng::Value) {

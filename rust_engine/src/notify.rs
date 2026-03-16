@@ -10,7 +10,7 @@
 /// - Each event type can be independently enabled/disabled
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Events that can trigger a WhatsApp notification.
@@ -168,7 +168,7 @@ impl Notifier {
 
         // Check backoff (after consecutive failures)
         {
-            let backoff = self.backoff_until.lock().unwrap_or_else(|e| e.into_inner());
+            let backoff = self.backoff_until.lock();
             if now < *backoff {
                 tracing::debug!(
                     "Notifier in backoff until {:.0} (now={:.0}), skipping",
@@ -181,7 +181,7 @@ impl Notifier {
 
         // Rate limiting
         {
-            let mut last = self.last_send.lock().unwrap_or_else(|e| e.into_inner());
+            let mut last = self.last_send.lock();
             let elapsed = now - *last;
             if elapsed < self.config.rate_limit_seconds {
                 tracing::debug!(
@@ -318,7 +318,8 @@ impl Notifier {
         let count = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
         if count >= MAX_CONSECUTIVE_FAILURES {
             let until = now_secs() + BACKOFF_SECONDS;
-            if let Ok(mut bo) = self.backoff_until.lock() {
+            {
+                let mut bo = self.backoff_until.lock();
                 *bo = until;
             }
             tracing::warn!(

@@ -80,7 +80,7 @@ fn rank_opportunities(
             Some((score, hours, i))
         })
         .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     scored
 }
 
@@ -262,7 +262,7 @@ pub struct Orchestrator {
     last_api_resolution_check: f64,
     last_retention_prune: f64,
     iteration: u64,
-    recent_latencies: Vec<f64>,
+    recent_latencies: std::collections::VecDeque<f64>,
 
     // Delay table
     p95_table: HashMap<String, f64>,
@@ -273,6 +273,9 @@ pub struct Orchestrator {
 
     // WhatsApp notifier (C3)
     notifier: Arc<Notifier>,
+
+    // P1: Cached held IDs (invalidated on position entry/exit/resolution)
+    held_ids_cache: Option<(HashSet<String>, HashSet<String>)>,
 }
 
 impl Orchestrator {
@@ -370,10 +373,11 @@ impl Orchestrator {
             last_api_resolution_check: 0.0,
             last_retention_prune: 0.0,
             iteration: 0,
-            recent_latencies: Vec::new(),
+            recent_latencies: std::collections::VecDeque::with_capacity(MAX_LATENCY_SAMPLES),
             p95_table, p95_default,
             disk_save_handle: None,
             notifier,
+            held_ids_cache: None,
         })
     }
 
@@ -462,6 +466,7 @@ impl Orchestrator {
                 .map(|r| (r.market_cid.clone(), r.asset_id.clone()))
                 .collect();
             let closed = self.engine.resolve_by_ws_events(&events);
+            if !closed.is_empty() { self.held_ids_cache = None; }
             for (pid, winner) in &closed {
                 tracing::info!("WS RESOLUTION: {} → winner={}", pid, winner);
                 let _ = self.notifier.send(&NotifyEvent::PositionResolved {
@@ -473,7 +478,11 @@ impl Orchestrator {
         }
 
         // --- Evaluate batch ---
-        let (held_cids, held_mids) = self.engine.get_held_ids();
+        // P1: Use cached held IDs (rebuilt only when positions change)
+        if self.held_ids_cache.is_none() {
+            self.held_ids_cache = Some(self.engine.get_held_ids());
+        }
+        let (held_cids, held_mids) = self.held_ids_cache.clone().unwrap();
 
         let t0 = Instant::now();
         let result = self.engine.evaluate_batch(
@@ -484,9 +493,9 @@ impl Orchestrator {
         let batch_us = t0.elapsed().as_micros() as f64;
 
         if result.n_evaluated > 0 {
-            self.recent_latencies.push(batch_us);
-            if self.recent_latencies.len() > MAX_LATENCY_SAMPLES {
-                self.recent_latencies = self.recent_latencies[self.recent_latencies.len()-MAX_LATENCY_SAMPLES..].to_vec();
+            self.recent_latencies.push_back(batch_us);
+            while self.recent_latencies.len() > MAX_LATENCY_SAMPLES {
+                self.recent_latencies.pop_front();
             }
         }
 
@@ -546,6 +555,7 @@ impl Orchestrator {
             if self.engine.pm_open_count() > 0 {
                 let results = self.engine.check_api_resolutions();
                 if !results.is_empty() {
+                    self.held_ids_cache = None;
                     for r in &results {
                         tracing::info!("API RESOLUTION: {} → winner={}, profit=${:.4}",
                             r.position_id, r.winning_market_id, r.profit);
@@ -748,7 +758,17 @@ impl Orchestrator {
         // Sync closed (incremental)
         let counts = self.state_db.count_by_status();
         let db_closed = counts.iter().find(|(s, _)| s == "closed").map(|(_, c)| *c).unwrap_or(0) as usize;
-        debug_assert!(n_closed_total >= db_closed, "closed positions shrunk: {} < {}", n_closed_total, db_closed);
+        // B2 fix: runtime guard instead of debug_assert (protects release builds)
+        if n_closed_total < db_closed {
+            tracing::error!(
+                "Closed position count decreased: {} < {} (skipping incremental sync)",
+                n_closed_total, db_closed
+            );
+            let ms = self.state_db.mirror_to_disk();
+            tracing::info!("State saved: {} open, {} closed [{}ms]",
+                open_rows.len(), n_closed_total, ms as u64);
+            return;
+        }
         if closed_rows_data.len() > db_closed {
             let new_rows: Vec<(String, String, String, Option<String>, Option<String>)> =
                 closed_rows_data[db_closed..].iter()
@@ -830,6 +850,7 @@ impl Orchestrator {
                 None,  // new chain
             ) {
                 position::EntryResult::Entered(pos) => {
+                    self.held_ids_cache = None;
                     // B3: Store negRisk capital efficiency in position metadata
                     if opp.neg_risk {
                         if let Some(ce) = opp.capital_efficiency {
@@ -892,8 +913,18 @@ impl Orchestrator {
                         if let Some(eval) = pm.evaluate_replacement(pid, &bids, repl_profit) {
                             let total_cap = pos.total_capital;
                             let remaining_upside = pos.expected_profit - eval.liquidation.profit;
-                            // Use a rough hours estimate
-                            let hours_rem = 24.0_f64; // simplified
+                            // B1 fix: use actual end_date_ts for hours remaining
+                            let now_secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs_f64();
+                            let end_date_ts = pos.metadata.get("end_date_ts")
+                                .and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let hours_rem = if end_date_ts > now_secs {
+                                ((end_date_ts - now_secs) / 3600.0).max(1.0)
+                            } else {
+                                1.0 // already past or unknown — treat as imminent
+                            };
                             let rem_score = (remaining_upside / total_cap.max(0.01)) / hours_rem.max(0.01);
 
                             if worst.is_none() || rem_score < worst.as_ref().unwrap().1 {
@@ -920,6 +951,7 @@ impl Orchestrator {
 
                         // Execute replacement
                         if let Some((net, profit)) = self.engine.liquidate_position(&worst_pid, "replaced", &worst_bids) {
+                            self.held_ids_cache = None;
                             tracing::info!("REPLACE: liquidated {} → freed ${:.2}, profit=${:+.2}",
                                 &worst_pid[..worst_pid.len().min(30)], net, profit);
 
@@ -1057,7 +1089,7 @@ impl Orchestrator {
 
     // --- Proactive exits ---
 
-    fn check_proactive_exits(&self) {
+    fn check_proactive_exits(&mut self) {
         let all_bids = self.collect_all_position_bids();
         let exits = self.engine.check_proactive_exits(&all_bids, PROACTIVE_EXIT_MULTIPLIER);
         for exit in &exits {
@@ -1065,6 +1097,7 @@ impl Orchestrator {
                 &exit.position_id[..exit.position_id.len().min(40)], exit.ratio);
             let bids = self.get_position_bids_by_id(&exit.position_id);
             if let Some((net, profit)) = self.engine.liquidate_position(&exit.position_id, "proactive_exit", &bids) {
+                self.held_ids_cache = None;
                 tracing::info!("  Sold: freed ${:.2}, profit=${:+.2}", net, profit);
                 let _ = self.notifier.send(&NotifyEvent::ProactiveExit {
                     position_id: exit.position_id.clone(),
@@ -1171,8 +1204,8 @@ impl Orchestrator {
         let npos = self.engine.pm_open_count();
 
         let (lat_p50, lat_p95, lat_max) = if !self.recent_latencies.is_empty() {
-            let mut lats = self.recent_latencies.clone();
-            lats.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mut lats: Vec<f64> = self.recent_latencies.iter().copied().collect();
+            lats.sort_by(|a, b| a.total_cmp(b));
             let p50 = lats[lats.len() / 2];
             let p95 = lats[(lats.len() as f64 * 0.95) as usize];
             let max = *lats.last().unwrap_or(&0.0);

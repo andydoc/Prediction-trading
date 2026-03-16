@@ -10,6 +10,7 @@
 ///   postponement_cache(position_id TEXT PK, data TEXT JSON, cached_at REAL)
 use rusqlite::params;
 use parking_lot::Mutex;
+use secrecy::{ExposeSecret, SecretString};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use crate::cached_db::CachedSqliteDB;
@@ -451,7 +452,7 @@ pub struct PostponementDetector {
     cache: PostponementCache,
     client: reqwest::blocking::Client,
     config: PostponementConfig,
-    api_key: Mutex<String>,
+    api_key: Mutex<SecretString>,
     prompt_template: String,
     retry_prompt_template: String,
     last_api_call: Mutex<Instant>,
@@ -496,7 +497,7 @@ impl PostponementDetector {
             cache,
             client,
             config,
-            api_key: Mutex::new(api_key.to_string()),
+            api_key: Mutex::new(SecretString::from(api_key.to_string())),
             prompt_template,
             retry_prompt_template,
             last_api_call: Mutex::new(Instant::now() - Duration::from_secs(120)),
@@ -532,7 +533,7 @@ impl PostponementDetector {
             days_overdue);
 
         // 3. Attempt 1
-        let api_key = self.api_key.lock().clone();
+        let api_key = self.api_key.lock().expose_secret().to_string();
         let prompt = format_prompt(
             &self.prompt_template, market_names, original_date, &today, days_overdue,
         );
@@ -625,6 +626,6 @@ impl PostponementDetector {
 
     /// Update API key at runtime.
     pub fn set_api_key(&self, api_key: &str) {
-        *self.api_key.lock() = api_key.to_string();
+        *self.api_key.lock() = SecretString::from(api_key.to_string());
     }
 }

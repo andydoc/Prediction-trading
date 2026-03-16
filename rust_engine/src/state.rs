@@ -1,7 +1,7 @@
 /// SQLite state persistence — in-memory with periodic disk backup.
 ///
-/// Same schema as Python version. Key win: `backup_to_disk()` runs without
-/// holding the GIL, eliminating ~30-40ms of GIL contention every 30s.
+/// Atomic `mirror_to_disk()` runs on a background thread, never blocking
+/// the orchestrator tick loop.
 ///
 /// Schema:
 ///   state(key TEXT PK, value TEXT)        — scalars: capital, metrics
@@ -82,12 +82,17 @@ impl StateDB {
 
     pub fn get_all_scalars(&self) -> Vec<(String, f64)> {
         let db = self.db.conn();
-        let mut stmt = db.prepare("SELECT key, value FROM scalars").unwrap();
-        stmt.query_map([], |row| {
+        let mut stmt = match db.prepare("SELECT key, value FROM scalars") {
+            Ok(s) => s,
+            Err(e) => { tracing::warn!("get_all_scalars prepare failed: {}", e); return Vec::new(); }
+        };
+        let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-        }).unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
+        });
+        match rows {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(e) => { tracing::warn!("get_all_scalars query failed: {}", e); Vec::new() }
+        }
     }
 
     // --- Position CRUD ---
@@ -121,24 +126,30 @@ impl StateDB {
 
     pub fn load_by_status(&self, status: &str) -> Vec<String> {
         let db = self.db.conn();
-        let mut stmt = db.prepare(
-            "SELECT data FROM positions WHERE status = ?1"
-        ).unwrap();
-        stmt.query_map(params![status], |row| row.get::<_, String>(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+        let mut stmt = match db.prepare("SELECT data FROM positions WHERE status = ?1") {
+            Ok(s) => s,
+            Err(e) => { tracing::warn!("load_by_status prepare failed: {}", e); return Vec::new(); }
+        };
+        let rows = stmt.query_map(params![status], |row| row.get::<_, String>(0));
+        match rows {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(e) => { tracing::warn!("load_by_status query failed: {}", e); Vec::new() }
+        }
     }
 
     pub fn load_open(&self) -> Vec<String> {
         let db = self.db.conn();
-        let mut stmt = db.prepare(
+        let mut stmt = match db.prepare(
             "SELECT data FROM positions WHERE status IN ('open', 'monitoring')"
-        ).unwrap();
-        stmt.query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+        ) {
+            Ok(s) => s,
+            Err(e) => { tracing::warn!("load_open prepare failed: {}", e); return Vec::new(); }
+        };
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0));
+        match rows {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(e) => { tracing::warn!("load_open query failed: {}", e); Vec::new() }
+        }
     }
 
     pub fn load_closed(&self) -> Vec<String> {
@@ -147,25 +158,34 @@ impl StateDB {
 
     pub fn count_by_status(&self) -> Vec<(String, i64)> {
         let db = self.db.conn();
-        let mut stmt = db.prepare(
+        let mut stmt = match db.prepare(
             "SELECT status, COUNT(*) FROM positions GROUP BY status"
-        ).unwrap();
-        stmt.query_map([], |row| {
+        ) {
+            Ok(s) => s,
+            Err(e) => { tracing::warn!("count_by_status prepare failed: {}", e); return Vec::new(); }
+        };
+        let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        }).unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
+        });
+        match rows {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(e) => { tracing::warn!("count_by_status query failed: {}", e); Vec::new() }
+        }
     }
 
     pub fn get_open_position_ids(&self) -> Vec<String> {
         let db = self.db.conn();
-        let mut stmt = db.prepare(
+        let mut stmt = match db.prepare(
             "SELECT position_id FROM positions WHERE status IN ('open', 'monitoring')"
-        ).unwrap();
-        stmt.query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+        ) {
+            Ok(s) => s,
+            Err(e) => { tracing::warn!("get_open_position_ids prepare failed: {}", e); return Vec::new(); }
+        };
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0));
+        match rows {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(e) => { tracing::warn!("get_open_position_ids query failed: {}", e); Vec::new() }
+        }
     }
 
     // --- Delay P95 table ---
@@ -192,11 +212,13 @@ impl StateDB {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        stmt.query_map([], |row| {
+        let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-        }).unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
+        });
+        match rows {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Get full delay table as JSON-ready rows.
@@ -209,7 +231,7 @@ impl StateDB {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        stmt.query_map([], |row| {
+        let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, f64>(1)?,
@@ -219,9 +241,11 @@ impl StateDB {
                 row.get::<_, f64>(5)?,
                 row.get::<_, String>(6)?,
             ))
-        }).unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
+        });
+        match rows {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(e) => { tracing::warn!("get_delay_table_full query failed: {}", e); Vec::new() }
+        }
     }
 
     // --- Disk persistence ---

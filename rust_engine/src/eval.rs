@@ -260,7 +260,7 @@ pub fn evaluate_batch(
     }
 
     // Sort by score descending, return top N
-    opportunities.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    opportunities.sort_by(|a, b| b.score.total_cmp(&a.score));
     opportunities.truncate(top_n);
 
     (opportunities, n_urgent, n_bg, entries.len(), n_skipped_held)

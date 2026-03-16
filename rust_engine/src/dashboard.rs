@@ -41,7 +41,7 @@ pub struct DashboardState {
     pub delay_table: Arc<Mutex<(std::collections::HashMap<String, f64>, f64)>>,
 }
 
-/// Metrics updated by the Python engine loop each stats cycle.
+/// Metrics updated by the Rust orchestrator each stats cycle.
 #[derive(Default, Clone)]
 pub struct EngineMetrics {
     pub iteration: u64,

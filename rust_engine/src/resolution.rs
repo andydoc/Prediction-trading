@@ -7,6 +7,7 @@
 ///   resolution_cache(group_id TEXT PK, data TEXT JSON, cached_at REAL)
 use rusqlite::params;
 use parking_lot::Mutex;
+use secrecy::{ExposeSecret, SecretString};
 use std::path::PathBuf;
 use std::time::Duration;
 use crate::cached_db::CachedSqliteDB;
@@ -325,7 +326,7 @@ pub struct ResolutionValidator {
     cache: ResolutionCache,
     client: reqwest::blocking::Client,
     config: ValidatorConfig,
-    api_key: Mutex<String>,
+    api_key: Mutex<SecretString>,
     prompt_template: String,
 }
 
@@ -368,7 +369,7 @@ impl ResolutionValidator {
             cache,
             client,
             config,
-            api_key: Mutex::new(api_key.to_string()),
+            api_key: Mutex::new(SecretString::from(api_key.to_string())),
             prompt_template,
         })
     }
@@ -391,7 +392,7 @@ impl ResolutionValidator {
         };
 
         // 3. Format prompt
-        let api_key = self.api_key.lock().clone();
+        let api_key = self.api_key.lock().expose_secret().to_string();
         let prompt = format_prompt(&self.prompt_template, &question, &description, &end_date);
 
         // 4. Call Anthropic API
@@ -419,6 +420,6 @@ impl ResolutionValidator {
 
     /// Update API key at runtime.
     pub fn set_api_key(&self, api_key: &str) {
-        *self.api_key.lock() = api_key.to_string();
+        *self.api_key.lock() = SecretString::from(api_key.to_string());
     }
 }

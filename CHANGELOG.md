@@ -7,6 +7,32 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.11.1] — 2026-03-16 — Code Review v2: Bugs, Security, Performance & Style
+
+### Fixed
+- **B1**: Replacement scoring uses actual `end_date_ts` instead of hardcoded hours — imminent expirations now correctly prioritised
+- **B2**: `debug_assert!` on closed-position count replaced with runtime guard — logs error and continues instead of silent UB in release builds
+- **B3**: Latency ring buffer changed from `Vec<f64>` to `VecDeque<f64>` — eliminates O(n) shift on every tick
+- **B5**: Sort comparisons use `f64::total_cmp` instead of `partial_cmp().unwrap()` — handles NaN consistently (eval.rs, orchestrator.rs)
+- **B6**: Fallback workspace path changed from hardcoded `/home/andydoc/prediction-trader` to `.` (current directory)
+
+### Security
+- **S1**: API keys wrapped in `secrecy::SecretString` (zeroize-on-drop) in resolution.rs and postponement.rs
+- **S2**: Config `--set` bounds validation — 12 numeric keys range-checked before applying (e.g. `capital_per_trade_pct` must be in (0, 0.5])
+
+### Performance
+- **P1**: `held_ids_cache` — cached `(HashSet, HashSet)` of held condition/market IDs, invalidated on 5 mutation paths; avoids rebuilding per tick
+
+### Style & Maintainability
+- **ST1**: Stale Python-era comments updated in state.rs and dashboard.rs
+- **ST2**: All 7 `.unwrap()` calls on SQLite `prepare()`/`query_map()` in state.rs replaced with graceful `match` + `tracing::warn`
+- **ST3**: `std::sync::Mutex` → `parking_lot::Mutex` in notify.rs — consistent with codebase, no poisoning
+
+### Dependencies
+- `secrecy = "0.10"` added to rust_engine
+
+---
+
 ## [0.11.0] — 2026-03-16 — Notifications, Multi-Instance, Python Retirement
 
 ### Added
