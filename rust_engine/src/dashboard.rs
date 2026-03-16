@@ -136,11 +136,9 @@ async fn handle_sse(
                     serde_json::to_string(&build_opportunities(&s)).unwrap_or_default()));
             }
 
-            // Closed: every 60s (every 12th tick)
-            if tick % 12 == 0 {
-                yield Ok(sse::Event::default().event("closed").data(
-                    serde_json::to_string(&build_closed(&s)).unwrap_or_default()));
-            }
+            // C4.1: Send closed alongside positions (every 5s) to eliminate visual gap
+            yield Ok(sse::Event::default().event("closed").data(
+                serde_json::to_string(&build_closed(&s)).unwrap_or_default()));
         }
     };
 

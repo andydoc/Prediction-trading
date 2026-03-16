@@ -61,6 +61,11 @@ struct Cli {
     /// Skip PID lock check (for running alongside another instance)
     #[arg(long)]
     no_pid_lock: bool,
+
+    /// Instance name for multi-instance mode (e.g., shadow-a, shadow-b)
+    /// Auto-configures DB, logs, PID, and dashboard port per instance.
+    #[arg(short = 'i', long)]
+    instance: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +81,8 @@ struct SupervisorConfig {
     mode: Option<String>,
     dashboard_port: Option<u16>,
     config_overrides: Vec<(String, String)>,
+    instance: Option<String>,
+    log_prefix: String,
 }
 
 impl SupervisorConfig {
@@ -108,15 +115,66 @@ impl SupervisorConfig {
             })
             .collect();
 
+        // Instance-specific configuration
+        let (log_dir, pid_file, dashboard_port, log_prefix, instance_overrides) =
+            if let Some(ref name) = cli.instance {
+                let inst_log_dir = workspace.join("logs").join(name);
+                let inst_pid_file = workspace.join(format!("prediction-trader-{}.pid", name));
+                let inst_log_prefix = format!("supervisor-{}", name);
+
+                // Port auto-offset from base 5560: a→0, b→1, c→2, d→3, e→4
+                let port_offset = match name.chars().last() {
+                    Some(c @ 'a'..='e') => (c as u16) - ('a' as u16),
+                    _ => (name.len() as u16) % 10,
+                };
+                let inst_port = cli.port.unwrap_or(5560 + port_offset);
+
+                // Start with infrastructure overrides
+                let db_path = format!("data/system_state/execution_state_{}.db", name);
+                let mut inst_overrides = vec![
+                    ("state.db_path".to_string(), db_path),
+                    ("dashboard.port".to_string(), inst_port.to_string()),
+                ];
+
+                // Load instance config overlay (config/instances/{name}.yaml)
+                let overlay_path = workspace.join("config").join("instances").join(format!("{}.yaml", name));
+                if let Ok(overlay_str) = fs::read_to_string(&overlay_path) {
+                    if let Ok(overlay_val) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&overlay_str) {
+                        flatten_yaml(&overlay_val, "", &mut inst_overrides);
+                    }
+                }
+
+                (inst_log_dir, inst_pid_file, Some(inst_port), inst_log_prefix, inst_overrides)
+            } else {
+                (
+                    workspace.join("logs"),
+                    workspace.join("prediction-trader.pid"),
+                    cli.port,
+                    "supervisor".to_string(),
+                    vec![],
+                )
+            };
+
+        // Merge instance overrides with explicit --set overrides (explicit wins)
+        let explicit_keys: std::collections::HashSet<&str> =
+            config_overrides.iter().map(|(k, _)| k.as_str()).collect();
+        let mut merged_overrides: Vec<(String, String)> = instance_overrides
+            .into_iter()
+            .filter(|(k, _)| !explicit_keys.contains(k.as_str()))
+            .collect();
+        merged_overrides.extend(config_overrides);
+
         Self {
-            log_dir: workspace.join("logs"),
-            pid_file: workspace.join("prediction-trader.pid"),
+            log_dir,
+            pid_file,
             log_level,
             log_retention_days,
             mode: cli.mode.clone(),
-            dashboard_port: cli.port,
-            config_overrides,
+            dashboard_port,
+            config_overrides: merged_overrides,
             workspace,
+            instance: cli.instance.clone(),
+            log_prefix,
         }
     }
 
@@ -175,6 +233,10 @@ impl SupervisorConfig {
             "live_trading.shadow_only", "live_trading.enabled",
             "arbitrage.max_concurrent_positions", "arbitrage.capital_per_trade_pct",
             "arbitrage.min_trade_size", "arbitrage.max_days_to_resolution",
+            "arbitrage.min_profit_threshold", "arbitrage.max_profit_threshold",
+            "arbitrage.replacement_cooldown_seconds", "arbitrage.max_days_to_replacement",
+            "arbitrage.max_exposure_per_market", "arbitrage.max_position_size",
+            "arbitrage.min_resolution_time_secs",
             "engine.state_save_interval_seconds", "engine.monitor_interval_seconds",
             "engine.constraint_rebuild_interval_seconds",
             "monitoring.logging.level",
@@ -227,6 +289,31 @@ fn set_yaml_value(root: &mut serde_yaml_ng::Value, key: &str, val: &serde_yaml_n
     }
 }
 
+/// Flatten a nested YAML value to dot-notation key=value pairs.
+/// E.g. `{arbitrage: {capital_per_trade_pct: 0.05}}` → `("arbitrage.capital_per_trade_pct", "0.05")`
+fn flatten_yaml(val: &serde_yaml_ng::Value, prefix: &str, out: &mut Vec<(String, String)>) {
+    if let serde_yaml_ng::Value::Mapping(map) = val {
+        for (k, v) in map {
+            let key_str = match k {
+                serde_yaml_ng::Value::String(s) => s.clone(),
+                _ => continue,
+            };
+            let full_key = if prefix.is_empty() {
+                key_str
+            } else {
+                format!("{}.{}", prefix, key_str)
+            };
+            match v {
+                serde_yaml_ng::Value::Mapping(_) => flatten_yaml(v, &full_key, out),
+                serde_yaml_ng::Value::Bool(b) => out.push((full_key, b.to_string())),
+                serde_yaml_ng::Value::Number(n) => out.push((full_key, n.to_string())),
+                serde_yaml_ng::Value::String(s) => out.push((full_key, s.clone())),
+                _ => {}
+            }
+        }
+    }
+}
+
 fn set_yaml_path(root: &mut serde_yaml_ng::Value, path: &str, val: &serde_yaml_ng::Value) {
     let parts: Vec<&str> = path.split('.').collect();
     let mut current = root;
@@ -254,7 +341,7 @@ fn set_yaml_path(root: &mut serde_yaml_ng::Value, path: &str, val: &serde_yaml_n
 fn init_logging(cfg: &SupervisorConfig) {
     let _ = fs::create_dir_all(&cfg.log_dir);
 
-    let file_appender = tracing_appender::rolling::daily(&cfg.log_dir, "supervisor");
+    let file_appender = tracing_appender::rolling::daily(&cfg.log_dir, &cfg.log_prefix);
 
     let filter_str = format!(
         "prediction_trader={},rust_engine={}", cfg.log_level, cfg.log_level
@@ -410,9 +497,15 @@ fn main() {
 
     if cli.dry_run {
         println!("workspace:      {}", cfg.workspace.display());
+        if let Some(ref inst) = cfg.instance {
+            println!("instance:       {}", inst);
+        }
         println!("mode:           {}", cfg.mode.as_deref().unwrap_or("(from config)"));
         println!("dashboard_port: {}", cfg.dashboard_port.map_or("(from config)".into(), |p| p.to_string()));
         println!("log_level:      {}", cfg.log_level);
+        println!("log_dir:        {}", cfg.log_dir.display());
+        println!("log_prefix:     {}", cfg.log_prefix);
+        println!("pid_file:       {}", cfg.pid_file.display());
         if !cfg.config_overrides.is_empty() {
             println!("overrides:");
             for (k, v) in &cfg.config_overrides {
@@ -422,7 +515,12 @@ fn main() {
         return;
     }
 
-    if !cli.no_pid_lock {
+    // Instance mode uses its own PID file (not the default), so it never
+    // conflicts with the primary instance.  --no-pid-lock skips all PID logic.
+    if cfg.instance.is_some() {
+        // Always lock with instance-specific PID file
+        check_pid_lock(&cfg.pid_file);
+    } else if !cli.no_pid_lock {
         check_pid_lock(&cfg.pid_file);
     }
     cfg.apply_overrides_to_config();
@@ -433,6 +531,9 @@ fn main() {
     tracing::info!("{}", "=".repeat(60));
     tracing::info!("PREDICTION MARKET TRADING SYSTEM v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("PID: {} | Single binary (A10)", std::process::id());
+    if let Some(ref inst) = cfg.instance {
+        tracing::info!("Instance: {}", inst);
+    }
     tracing::info!("Workspace: {}", cfg.workspace.display());
     if let Some(ref mode) = cfg.mode {
         tracing::info!("Mode: {}", mode);
@@ -453,7 +554,7 @@ fn main() {
         }
     }
 
-    if !cli.no_pid_lock {
+    if cfg.instance.is_some() || !cli.no_pid_lock {
         remove_pid_file(&cfg.pid_file);
     }
     tracing::info!("System stopped.");

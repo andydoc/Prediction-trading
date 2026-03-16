@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use rust_engine::detect::{DetectableMarket, DetectionConfig};
 use rust_engine::eval::Opportunity;
+use rust_engine::notify::{Notifier, NotifyConfig, NotifyEvent};
 use rust_engine::position;
 use rust_engine::resolution::ResolutionValidator;
 use rust_engine::postponement::PostponementDetector;
@@ -113,6 +114,15 @@ pub struct OrchestratorConfig {
     pub stale_asset_threshold: f64,
     pub api_resolution_interval: f64,
 
+    // Pre-trade validation (B1.3)
+    pub min_depth_per_leg: f64,
+    pub depth_haircut: f64,
+    pub max_book_staleness_secs: f64,
+    pub min_profit_ratio: f64,
+
+    // Record retention (B1.2)
+    pub closed_retention_days: u32,
+
     // AI
     pub resolution_validation_enabled: bool,
     pub anthropic_api_key: String,
@@ -195,6 +205,17 @@ impl OrchestratorConfig {
             api_resolution_interval: eng.get("api_resolution_interval_seconds")
                 .and_then(|v| v.as_f64()).unwrap_or(300.0),
 
+            min_depth_per_leg: live_cfg.get("min_depth_per_leg")
+                .and_then(|v| v.as_f64()).unwrap_or(0.0),
+            depth_haircut: live_cfg.get("depth_haircut")
+                .and_then(|v| v.as_f64()).unwrap_or(0.80),
+            max_book_staleness_secs: eng.get("max_book_staleness_secs")
+                .and_then(|v| v.as_f64()).unwrap_or(30.0),
+            min_profit_ratio: live_cfg.get("min_profit_ratio")
+                .and_then(|v| v.as_f64()).unwrap_or(0.70),
+            closed_retention_days: eng.get("closed_position_retention_days")
+                .and_then(|v| v.as_u64()).unwrap_or(90) as u32,
+
             resolution_validation_enabled: rv_cfg.get("enabled")
                 .and_then(|v| v.as_bool()).unwrap_or(true),
             anthropic_api_key: api_key,
@@ -239,6 +260,7 @@ pub struct Orchestrator {
     last_stale_sweep: f64,
     last_postponement_check: f64,
     last_api_resolution_check: f64,
+    last_retention_prune: f64,
     iteration: u64,
     recent_latencies: Vec<f64>,
 
@@ -248,6 +270,9 @@ pub struct Orchestrator {
 
     // Background disk save thread handle
     disk_save_handle: Option<std::thread::JoinHandle<()>>,
+
+    // WhatsApp notifier (C3)
+    notifier: Arc<Notifier>,
 }
 
 impl Orchestrator {
@@ -259,7 +284,6 @@ impl Orchestrator {
 
         let scanner = MarketScanner::new(
             &cfg.workspace.join("data").join("markets.db").to_string_lossy(),
-            Some(&cfg.workspace.join("data").join("latest_markets.json").to_string_lossy()),
         )?;
 
         let state_db = StateDB::new(
@@ -310,6 +334,24 @@ impl Orchestrator {
             .and_then(|s| serde_yaml_ng::from_str(&s).ok())
             .unwrap_or_default();
 
+        // Load notification config (C3)
+        let notify_cfg = {
+            let n = cached_yaml.get("notifications").cloned().unwrap_or_default();
+            NotifyConfig {
+                enabled: n.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+                webhook_url: n.get("webhook_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                api_key: n.get("api_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                phone_number: n.get("phone_number").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                on_entry: n.get("on_entry").and_then(|v| v.as_bool()).unwrap_or(true),
+                on_resolution: n.get("on_resolution").and_then(|v| v.as_bool()).unwrap_or(true),
+                on_error: n.get("on_error").and_then(|v| v.as_bool()).unwrap_or(true),
+                on_circuit_breaker: n.get("on_circuit_breaker").and_then(|v| v.as_bool()).unwrap_or(true),
+                on_daily_summary: n.get("on_daily_summary").and_then(|v| v.as_bool()).unwrap_or(true),
+                rate_limit_seconds: n.get("rate_limit_seconds").and_then(|v| v.as_f64()).unwrap_or(10.0),
+            }
+        };
+        let notifier = Arc::new(Notifier::new(notify_cfg));
+
         Ok(Self {
             cfg, engine,
             scanner: Arc::new(scanner),
@@ -326,10 +368,12 @@ impl Orchestrator {
             last_stale_sweep: 0.0,
             last_postponement_check: 0.0,
             last_api_resolution_check: 0.0,
+            last_retention_prune: 0.0,
             iteration: 0,
             recent_latencies: Vec::new(),
             p95_table, p95_default,
             disk_save_handle: None,
+            notifier,
         })
     }
 
@@ -420,6 +464,11 @@ impl Orchestrator {
             let closed = self.engine.resolve_by_ws_events(&events);
             for (pid, winner) in &closed {
                 tracing::info!("WS RESOLUTION: {} → winner={}", pid, winner);
+                let _ = self.notifier.send(&NotifyEvent::PositionResolved {
+                    position_id: pid.clone(),
+                    profit: 0.0, // actual P&L computed at resolution
+                    method: format!("ws_resolution({})", winner),
+                });
             }
         }
 
@@ -430,6 +479,7 @@ impl Orchestrator {
         let result = self.engine.evaluate_batch(
             self.cfg.max_evals_per_batch,
             &held_cids, &held_mids, 20,
+            self.cfg.depth_haircut,
         );
         let batch_us = t0.elapsed().as_micros() as f64;
 
@@ -499,10 +549,25 @@ impl Orchestrator {
                     for r in &results {
                         tracing::info!("API RESOLUTION: {} → winner={}, profit=${:.4}",
                             r.position_id, r.winning_market_id, r.profit);
+                        let _ = self.notifier.send(&NotifyEvent::PositionResolved {
+                            position_id: r.position_id.clone(),
+                            profit: r.profit,
+                            method: format!("api_resolution({})", r.winning_market_id),
+                        });
                     }
                 }
             }
             self.last_api_resolution_check = now;
+        }
+
+        // --- Record retention pruning (B1.2) — daily ---
+        if self.cfg.closed_retention_days > 0 && (now - self.last_retention_prune) >= 86400.0 {
+            let cutoff = now - (self.cfg.closed_retention_days as f64 * 86400.0);
+            let pruned = self.engine.positions.lock().prune_closed_before(cutoff);
+            if pruned > 0 {
+                tracing::info!("Pruned {} closed positions (> {}d old)", pruned, self.cfg.closed_retention_days);
+            }
+            self.last_retention_prune = now;
         }
 
         // --- Stats ---
@@ -742,6 +807,10 @@ impl Orchestrator {
 
             if !self.validate_opportunity(opp, held_cids, held_mids) { continue; }
 
+            // B3: negRisk capital efficiency — for sell arbs on negRisk markets,
+            // collateral = $1.00/unit instead of sum(NO prices), so we can size larger
+            let is_sell = opp.method.to_lowercase().contains("sell");
+
             // Scale to dynamic capital
             let old_cap = opp.optimal_bets.values().sum::<f64>();
             let scale = if old_cap > 0.0 { cap / old_cap } else { 1.0 };
@@ -750,9 +819,7 @@ impl Orchestrator {
                 .collect();
             let scaled_profit = opp.expected_profit * scale;
 
-            let meta = opp.method.clone();
-            let is_sell = meta.to_lowercase().contains("sell");
-
+            // Store negRisk info in metadata via chain_info=None for new entries
             match self.engine.enter_position(
                 &opp.constraint_id, &opp.constraint_id,
                 if is_sell { "arb_sell" } else { "arb_buy" }, &opp.method,
@@ -760,11 +827,31 @@ impl Orchestrator {
                 &opp.current_prices, &opp.current_no_prices,
                 &scaled_bets, scaled_profit, opp.expected_profit_pct,
                 is_sell,
+                None,  // new chain
             ) {
-                position::EntryResult::Entered(_pos) => {
-                    tracing::info!("ENTER: {}... | ${:.2} | exp ${:.2} | {:.1}h | score={:.6}",
+                position::EntryResult::Entered(pos) => {
+                    // B3: Store negRisk capital efficiency in position metadata
+                    if opp.neg_risk {
+                        if let Some(ce) = opp.capital_efficiency {
+                            let mut pm = self.engine.positions.lock();
+                            if let Some(p) = pm.open_positions_mut().get_mut(&pos.position_id) {
+                                p.metadata.insert("is_neg_risk".into(), serde_json::json!(true));
+                                p.metadata.insert("capital_efficiency".into(), serde_json::json!(ce));
+                                if let Some(cpu) = opp.collateral_per_unit {
+                                    p.metadata.insert("collateral_per_unit".into(), serde_json::json!(cpu));
+                                }
+                            }
+                        }
+                    }
+                    tracing::info!("ENTER: {}... | ${:.2} | exp ${:.2} | {:.1}h | score={:.6} | depth=${:.0}",
                         &opp.constraint_id[..opp.constraint_id.len().min(30)],
-                        cap, scaled_profit, hours, score);
+                        cap, scaled_profit, hours, score, opp.min_leg_depth_usd);
+                    let _ = self.notifier.send(&NotifyEvent::PositionEntry {
+                        position_id: pos.position_id.clone(),
+                        strategy: opp.method.clone(),
+                        capital: cap,
+                        profit_pct: opp.expected_profit_pct,
+                    });
                     entered += 1;
                 }
                 position::EntryResult::InsufficientCapital { available, required } => {
@@ -821,12 +908,22 @@ impl Orchestrator {
 
                 if let Some((worst_pid, worst_score)) = worst {
                     if best_score > worst_score * PROACTIVE_EXIT_MULTIPLIER {
+                        // B1.1: Capture chain info from the position being replaced
+                        let chain_info_owned: Option<(String, u32, String)> = {
+                            let pm = self.engine.positions.lock();
+                            pm.get_position(&worst_pid).map(|p| {
+                                let chain_id = p.chain_id.clone().unwrap_or_else(|| worst_pid.clone());
+                                let next_gen = p.chain_generation + 1;
+                                (chain_id, next_gen, worst_pid.clone())
+                            })
+                        };
+
                         // Execute replacement
                         if let Some((net, profit)) = self.engine.liquidate_position(&worst_pid, "replaced", &worst_bids) {
                             tracing::info!("REPLACE: liquidated {} → freed ${:.2}, profit=${:+.2}",
                                 &worst_pid[..worst_pid.len().min(30)], net, profit);
 
-                            // Enter replacement
+                            // Enter replacement with chain tracking
                             let cap = dynamic_capital(self.engine.total_value(), self.cfg.capital_pct);
                             let old_cap = best_opp.optimal_bets.values().sum::<f64>();
                             let scale = if old_cap > 0.0 { cap / old_cap } else { 1.0 };
@@ -835,6 +932,9 @@ impl Orchestrator {
                                 .collect();
                             let is_sell = best_opp.method.to_lowercase().contains("sell");
 
+                            let chain_ref = chain_info_owned.as_ref()
+                                .map(|(cid, gen, ppid)| (cid.as_str(), *gen, ppid.as_str()));
+
                             let _ = self.engine.enter_position(
                                 &best_opp.constraint_id, &best_opp.constraint_id,
                                 if is_sell { "arb_sell" } else { "arb_buy" }, &best_opp.method,
@@ -842,12 +942,14 @@ impl Orchestrator {
                                 &best_opp.current_prices, &best_opp.current_no_prices,
                                 &scaled_bets, best_opp.expected_profit * scale,
                                 best_opp.expected_profit_pct, is_sell,
+                                chain_ref,
                             );
 
                             self.last_replacement = now;
-                            tracing::info!("  WITH: {}... | score={:.6} | {:.1}h",
+                            tracing::info!("  WITH: {}... | score={:.6} | {:.1}h | chain_gen={}",
                                 &best_opp.constraint_id[..best_opp.constraint_id.len().min(30)],
-                                best_score, best_hours);
+                                best_score, best_hours,
+                                chain_info_owned.as_ref().map(|(_, g, _)| *g).unwrap_or(0));
                         }
                     }
                 }
@@ -859,6 +961,37 @@ impl Orchestrator {
         if held_cids.contains(&opp.constraint_id) { return false; }
         for mid in &opp.market_ids {
             if held_mids.contains(mid) { return false; }
+        }
+
+        // B1.0: Depth gating — skip if any leg has insufficient depth
+        if self.cfg.min_depth_per_leg > 0.0 && opp.min_leg_depth_usd < self.cfg.min_depth_per_leg {
+            tracing::debug!("SKIP (depth): {}... min_depth=${:.2} < ${:.2}",
+                &opp.constraint_id[..opp.constraint_id.len().min(30)],
+                opp.min_leg_depth_usd, self.cfg.min_depth_per_leg);
+            return false;
+        }
+
+        // B1.3: Book staleness — check that all legs have fresh book data
+        if self.cfg.max_book_staleness_secs > 0.0 {
+            if let Some(constraint) = self.engine.constraints.get(&opp.constraint_id) {
+                for mref in &constraint.markets {
+                    let is_sell = opp.method.to_lowercase().contains("sell");
+                    let asset_id = if is_sell { &mref.no_asset_id } else { &mref.yes_asset_id };
+                    let age = self.engine.book.get_book_age_secs(asset_id);
+                    if age > self.cfg.max_book_staleness_secs {
+                        if age == f64::MAX {
+                            tracing::debug!("SKIP (no book): {}... asset {} has no book data",
+                                &opp.constraint_id[..opp.constraint_id.len().min(30)],
+                                &asset_id[..asset_id.len().min(16)]);
+                        } else {
+                            tracing::debug!("SKIP (stale book): {}... asset {} is {:.1}s old",
+                                &opp.constraint_id[..opp.constraint_id.len().min(30)],
+                                &asset_id[..asset_id.len().min(16)], age);
+                        }
+                        return false;
+                    }
+                }
+            }
         }
 
         // AI resolution validation
@@ -888,10 +1021,37 @@ impl Orchestrator {
         true
     }
 
-    /// Extract bid estimates from a typed Position (entry_price as bid proxy).
+    /// Extract LIVE bid prices for a position's markets from the order book.
+    /// Falls back to entry_price if no book data is available for a market.
     fn get_position_bids_typed(&self, pos: &rust_engine::position::Position) -> HashMap<String, f64> {
+        // Get constraint_id from position metadata to look up asset IDs
+        let constraint_id = pos.metadata.get("constraint_id")
+            .and_then(|v| v.as_str());
+
+        // Load constraint once (if available) for asset_id lookups
+        let constraint = constraint_id
+            .and_then(|cid| self.engine.constraints.get(cid));
+
         pos.markets.iter()
-            .map(|(mid, leg)| (mid.clone(), leg.entry_price))
+            .map(|(mid, leg)| {
+                let live_bid = constraint.as_ref().and_then(|c| {
+                    // Find the MarketRef matching this market_id
+                    c.markets.iter().find(|mref| mref.market_id == *mid).and_then(|mref| {
+                        // Use the outcome field to pick the right asset_id:
+                        // outcome "yes" → we hold YES shares → need YES bid
+                        // outcome "no"  → we hold NO shares  → need NO bid
+                        let asset_id = if leg.outcome == "no" {
+                            &mref.no_asset_id
+                        } else {
+                            &mref.yes_asset_id
+                        };
+                        let bid = self.engine.book.get_best_bid(asset_id);
+                        if bid > 0.0 { Some(bid) } else { None }
+                    })
+                });
+                let bid = live_bid.unwrap_or(leg.entry_price);
+                (mid.clone(), bid)
+            })
             .collect()
     }
 
@@ -906,6 +1066,11 @@ impl Orchestrator {
             let bids = self.get_position_bids_by_id(&exit.position_id);
             if let Some((net, profit)) = self.engine.liquidate_position(&exit.position_id, "proactive_exit", &bids) {
                 tracing::info!("  Sold: freed ${:.2}, profit=${:+.2}", net, profit);
+                let _ = self.notifier.send(&NotifyEvent::ProactiveExit {
+                    position_id: exit.position_id.clone(),
+                    profit,
+                    ratio: exit.ratio,
+                });
             }
         }
     }

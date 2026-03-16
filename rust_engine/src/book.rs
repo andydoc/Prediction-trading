@@ -128,6 +128,24 @@ impl BookMirror {
             .unwrap_or(0.0)
     }
 
+    /// Get ask depth in USD for an asset (with haircut).
+    pub fn get_ask_depth_usd(&self, asset_id: &str, haircut: f64) -> f64 {
+        self.books.get(asset_id)
+            .map(|b| b.ask_depth_usd(haircut))
+            .unwrap_or(0.0)
+    }
+
+    /// Get book age in seconds for an asset. Returns f64::MAX if not found.
+    pub fn get_book_age_secs(&self, asset_id: &str) -> f64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        self.books.get(asset_id)
+            .map(|b| now - b.last_update)
+            .unwrap_or(f64::MAX)
+    }
+
     pub fn live_count(&self) -> usize {
         self.books.len()
     }

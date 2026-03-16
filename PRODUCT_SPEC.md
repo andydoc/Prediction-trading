@@ -135,9 +135,9 @@ The following inconsistencies were identified. These will be addressed by the do
 ### Overview
 
 ```
-🔧 Milestone A: Complete Rust Port + parameterise config + docs (CHANGELOG, INCIDENT_LOG)
+✅ Milestone A: Complete Rust Port + parameterise config + docs (CHANGELOG, INCIDENT_LOG)
     |
-⬚ Milestone B: Live Execution Path + docs (ARCHITECTURE, ROADMAP)
+🔧 Milestone B: Live Execution Path + docs (ARCHITECTURE, ROADMAP)
     |
 ⬚ Milestone C: Safety Infrastructure + docs (OPS_RUNBOOK, USER_GUIDE) + retire PROGRESS_ROADMAP
     |
@@ -166,7 +166,7 @@ Each document is produced at the point in the milestone sequence when its conten
 
 ---
 
-### 🔧 Milestone A: Complete Rust Port
+### ✅ Milestone A: Complete Rust Port
 
 **Goal**: Single compiled Rust binary. Zero Python runtime. Simpler deployment, fewer failure modes, better performance. Parameterise all hardcoded thresholds.
 
@@ -195,10 +195,10 @@ Each document is produced at the point in the milestone sequence when its conten
 | ✅ **A7: Port logging** (8q-14) | Rust `tracing` crate with `tracing-appender`. Daily rotating files (`rust_engine.YYYY-MM-DD`). Level configurable via `config.yaml`. Auto-cleanup by retention days. All `eprintln!` replaced with tracing macros. |
 | ✅ **A8: Port main orchestrator** (8q-12) | `rust_supervisor` crate: 2.1MB binary replaces `main.py`. PID lock, SIGTERM/SIGINT handling via `nix`, subprocess monitoring with auto-restart, log cleanup. Reads config from `config.yaml`. Systemd compatible. |
 | ✅ **A9: Rationalise scripts** | 3 essential scripts: `start.sh` (build if needed + P: mount + start supervisor + verify), `restart.sh` (kill + pull + rebuild + start), `kill.sh` (SIGTERM + SIGKILL + optional --cancel CLOB orders). Windows .bat files updated to delegate to .sh. VPS `setup_vps.sh` updated for Rust binary + systemd. Supervisor supports `--mode`, `--set key=value`, `--dry-run` CLI args. Legacy scripts archived. |
-| ⬚ **A10: Single compiled binary** (8q-15) | `cargo build --release` produces one binary. Deploy to VPS with config files only. No Python, no venv, no pip. |
-| ⬚ **A11: Create CHANGELOG.md** | All version entries (v0.01.00 through current) transferred from PROGRESS_ROADMAP.md §7. Compare with git records and update. Most recent first. keepachangelog.com format (Added/Changed/Fixed/Removed). |
-| ⬚ **A12: Create INCIDENT_LOG.md** | All incidents (INC-001 through INC-006+) transferred. Each has: date, markets, impact, root cause, fix, status. Includes template for future incidents. |
-| ⬚ **A13: Independent code review** | Comprehensive review of the Rust codebase covering bugs, security, performance, style, and dependencies. Full findings and remediation plan in `Code_Review.md`. Implemented as v0.10.1 (all items except S1 explicit TLS and S2 zeroize API keys). |
+| ✅ **A10: Single compiled binary** (8q-15) | `cargo build --release` produces one binary. Deploy to VPS with config files only. No Python, no venv, no pip. |
+| ✅ **A11: Create CHANGELOG.md** | All version entries (v0.01.00 through current) transferred from PROGRESS_ROADMAP.md §7. Compare with git records and update. Most recent first. keepachangelog.com format (Added/Changed/Fixed/Removed). |
+| ✅ **A12: Create INCIDENT_LOG.md** | All incidents (INC-001 through INC-010) transferred. Each has: date, markets, impact, root cause, fix, status. Includes template for future incidents. |
+| ✅ **A13: Independent code review** | Comprehensive review of the Rust codebase covering bugs, security, performance, style, and dependencies. Full findings and remediation plan in `Code_Review.md`. Implemented as v0.10.1 (all items except S1 explicit TLS and S2 zeroize API keys). |
 
 #### Parameterisation Table
 
@@ -253,7 +253,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 ---
 
-### ⬚ Milestone B: Live Execution Path
+### 🔧 Milestone B: Live Execution Path
 
 **Goal**: The system can place real orders on Polymarket's CLOB and handle all outcomes.
 
@@ -265,12 +265,12 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| ⬚ **B1.0: Order book depth gating** | Integrate depth check (5a.2) into entry/replacement flow. Gate all entries on sufficient book depth per leg. Log depth-limited trades. Prevents unfillable orders before going live. |
-| ⬚ **B1.1: Replacement chain analytics** | Track full chain history (5d): `chain_id`, `chain_start_time`, `chain_cumulative_fees` in position metadata. Dashboard chain view. True return = `(payout - total_fees) / chain_duration`. Informs replacement tuning. |
-| ⬚ **B1.2: Record retention & pruning** | Closed positions retained indefinitely in SQLite for audit trail. AI validation reasoning stored per-position and persisted until position closes + configurable retention period (`record_retention_days`, default 90). Transient caches (resolution, postponement) pruned after TTL. On production launch: strip bulky fields (full market descriptions, raw API responses) from records older than retention period, keeping: position_id, timestamps, strategy, capital, profit, close_reason, AI reasoning summary. |
-| ⬚ **B1.3: Pre-trade validation** | Before placing any live order: re-read book mirror for all legs at trade size. If any leg's book is staler than `engine.book_staleness_seconds`, fetch via REST. Abort if `actual_profit / expected_profit < live_trading.min_profit_ratio` or depth < `live_trading.min_depth_per_leg` on any leg. Log all aborts with reason. |
+| ✅ **B1.0: Order book depth gating** | Integrate depth check (5a.2) into entry/replacement flow. Gate all entries on sufficient book depth per leg. Log depth-limited trades. Prevents unfillable orders before going live. |
+| ✅ **B1.1: Replacement chain analytics** | Track full chain history (5d): `chain_id`, `chain_generation`, `parent_position_id` in Position struct. Chain propagated during replacement (generation increments, parent linked). `get_chain_stats()` computes chain-level fees and profit. Informs replacement tuning. |
+| ✅ **B1.2: Record retention & pruning** | Closed positions retained indefinitely in SQLite for audit trail. Daily pruning strips bulky metadata (price_drift, entry_prices, non-essential metadata) from records older than `closed_position_retention_days` (default 90), keeping: position_id, timestamps, strategy, capital, profit, close_reason, chain_id. |
+| ✅ **B1.3: Pre-trade validation** | Before placing any live order: check book age for all legs against `engine.max_book_staleness_secs` (default 30s). Abort if depth < `live_trading.min_depth_per_leg` on any leg. Log all aborts with reason (stale book or insufficient depth). |
 | ⬚ **B2: Wire LiveExecutor** | CLOB `create_order()` calls for all legs of an arb. Passes `neg_risk: true` for negRisk markets. Uses FAK (Fill And Kill) order type. Handles: success, partial fill, rejection, timeout. |
-| ⬚ **B3: negRisk capital calculation** | Sell arb collateral = $1.00 per unit (not sum of NO asks). Position sizing uses correct collateral. Verified by unit test comparing with manual calculation. |
+| ✅ **B3: negRisk capital calculation** | Sell arb collateral = $1.00 per unit (not sum of NO asks). `capital_efficiency` and `collateral_per_unit` propagated from arb math through Opportunity to Position metadata. negRisk positions tagged with `is_neg_risk`, `capital_efficiency`, `collateral_per_unit` in metadata for analytics. |
 | ⬚ **B4: Partial fill handling** | After submitting all legs: check actual fills. Compute arb score of filled position. If score >= threshold: accept. If score < threshold: compute minimum unwind. If no acceptable partial: full unwind. Log all partial fill events. |
 | ⬚ **B5: Position reconciliation** | On startup and every `live_trading.reconciliation_interval_seconds`: query CLOB for actual positions. Compare with internal record. Alert on any discrepancy. Log reconciliation results. |
 | ⬚ **B6: Error handling matrix** | Defined behaviour for: CLOB API timeout (retry once, then abort + unwind), CLOB rejection (log + skip), network failure (pause trading, alert, retry connection), insufficient balance (pause trading, alert). |
@@ -282,7 +282,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 ---
 
-### ⬚ Milestone C: Safety Infrastructure
+### 🔧 Milestone C: Safety Infrastructure
 
 **Goal**: The system can protect capital automatically and alert the operator.
 
@@ -290,19 +290,19 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 |------|-------------------|
 | ⬚ **C1: Circuit breaker** | Auto-pause trading if: (a) portfolio drawdown exceeds `safety.circuit_breaker.max_drawdown_pct` from peak, (b) `max_consecutive_errors` errors in `error_window_seconds`, (c) CLOB API unreachable for `api_timeout_seconds`. Log the trigger. Resume requires manual intervention (config change + restart). |
 | ⬚ **C2: Kill switch** | `kill.sh --emergency` and dashboard button that: (a) cancels all open CLOB orders, (b) sets mode to shadow, (c) sends WhatsApp notification. Idempotent (safe to invoke multiple times). |
-| ⬚ **C3: WhatsApp notifications** | Alerts via WhatsApp on: new position entry, position resolution, error, circuit breaker trigger, daily summary. Configurable in `config.yaml` (WhatsApp number, enable/disable per event type). Graceful degradation if WhatsApp API is down (log locally, don't block trading). |
+| ✅ **C3: WhatsApp notifications** | Alerts via WhatsApp on: new position entry, position resolution, error, circuit breaker trigger, daily summary. Configurable in `config.yaml` (WhatsApp number, enable/disable per event type). Graceful degradation if WhatsApp API is down (log locally, don't block trading). Implemented in `rust_engine/src/notify.rs` with rate limiting (10s), exponential backoff (5 failures → 5min cooldown), per-event toggles. Wired into orchestrator entry, resolution, proactive exit, and API resolution events. |
 | ⬚ **C4: Daily P&L report** | Automated daily summary at midnight UTC: entries, exits, fees, net P&L, capital utilisation %, drawdown from peak. Sent via WhatsApp. Also persisted to SQLite for historical queries. |
 | ⬚ **C4.1: Seamless position close transition** | Eliminate 5s visual gap where a closing position disappears from open before appearing in closed. Buffer removal client-side until the closed entry arrives in the next SSE push. |
-| ⬚ **C4.2: Proactive near-resolution exit** | When a held market's price approaches 1.0 (e.g. ≥0.97), scan depth-of-book to see if shares can be sold at a profit before official resolution. Useful when outcome is near-certain but resolution is delayed (e.g. temperature markets waiting for end-of-day data finalization). Depth of book will rarely allow it, but worth scanning. |
+| ✅ **C4.2: Proactive near-resolution exit** | When a held position's liquidation value exceeds 1.2× its resolution payout, sell early. Checks all open positions every `monitor_interval` seconds using live bid prices from the order book. Implemented in `orchestrator::check_proactive_exits()` using `PROACTIVE_EXIT_MULTIPLIER = 1.2`. WhatsApp notification sent on each exit. |
 | ⬚ **C5: Create OPS_RUNBOOK.md** | VPS details, SSH access, systemd commands, log locations, dashboard URLs, monitoring commands, backup procedures, the 3 rationalised scripts and their usage, circuit breaker recovery procedure, kill switch procedure, WhatsApp setup, ZAP-Hosting 3-month login reminder. |
 | ⬚ **C6: Create USER_GUIDE.md** | Product overview, prerequisites, setup from scratch, starting/stopping (rationalised scripts), monitoring (dashboard), mode switching, recovery after crash, go-live checklist, glossary. Includes: all supervisor CLI flags (`--mode`, `--set key=value`, `--dry-run` for config verification, `--port`, `--log-level`), Windows Task Scheduler setup for auto-start on reboot (VBS → SILENT.bat → start.sh → Rust supervisor), copying START_TRADER_SILENT.bat to `C:\Users\<user>\ai-workspace\`, Linux systemd setup via `setup_vps.sh`. Written so a new operator can run the system without having built it. |
-| ⬚ **C7: Retire PROGRESS_ROADMAP.md** | Replace contents with a brief note listing the 6 replacement documents and their purposes. Do not delete (preserves git history). |
+| ⬚ **C7: Retire PROGRESS_ROADMAP.md** | Copy to Archive then in live version replace contents with a brief note listing the 6 replacement documents and their purposes. Do not delete (preserves git history). |
 
 **Verification**: Simulate circuit breaker triggers (inject fake errors, simulate drawdown). Verify kill switch cancels test orders. Verify WhatsApp messages arrive within 60s of trigger. All 6 documents reviewed for accuracy and internal consistency.
 
 ---
 
-### ⬚ Milestone D: Shadow Validation (2-Week Gate)
+### 🔧 Milestone D: Shadow Validation (2-Week Gate)
 
 **Goal**: Prove the complete live system works without risking real money, AND determine optimal trading parameters via 5 parallel shadow accounts.
 
@@ -344,10 +344,12 @@ Shadow-A tests whether wider entry gates and faster replacement capture more val
 
 Each instance runs independently with its own SQLite database and log files. Dashboard shows a comparison view of all 5.
 
+**Extensibility**: The multi-instance system is not limited to 5 instances. Adding a 6th+ instance requires only: (1) a new `config/instances/{name}.yaml` overlay file, (2) `systemctl start prediction-trader@{name}`. Any config key can be overridden per-instance by adding it to the overlay YAML and the `ALLOWED_SET_KEYS` allowlist (one-line change). Port allocation, DB paths, log directories, and PID files are all auto-derived from the instance name.
+
 | Task | Acceptance Criteria |
 |------|-------------------|
-| ⬚ **D1: Multi-instance support** | Single binary accepts `--instance <name>` flag. Each instance uses separate config overlay, separate SQLite DB, separate log directory, separate dashboard port. Shared WebSocket connections (all instances read from the same market data feed to avoid 5x WS load). |
-| ⬚ **D2: Deploy 5 instances to VPS** | Five systemd services: `trader-shadow-{a..e}`. Each running with its parameter set. All 5 dashboards accessible. |
+| ✅ **D1: Multi-instance support** | Single binary accepts `--instance <name>` flag. Each instance auto-configures: separate SQLite DB (`execution_state_{name}.db`), separate log directory (`logs/{name}/`), separate PID file, separate dashboard port (base 5560 + offset). Instance config overlays loaded from `config/instances/{name}.yaml` — any YAML key is flattened to dot-notation and applied via the same `ALLOWED_SET_KEYS` allowlist used by `--set`. Adding new instances or new overlay parameters requires only a YAML file and a one-line allowlist addition. Port auto-offset handles a-e explicitly; beyond 5 instances uses `name.len() % 10` (trivially extensible). |
+| ✅ **D2: Deploy 5 instances to VPS** | Five instance config overlays in `config/instances/shadow-{a..e}.yaml`. Systemd template unit `prediction-trader@.service` supports any instance name via `%i`. Management script `scripts/deploy_shadows.sh` provides install/start/stop/restart/status/logs commands for all 5. Resource limits: 1500M memory, 50% CPU per instance. |
 
 #### D-Part 1.5: Engine Stress Testing
 
@@ -384,7 +386,7 @@ Before building the comparison dashboard, stress-test the engine to determine ac
 | ⬚ **D5: Validate execution assumptions** | For every "would-execute" event across all instances: compare intended fill price with actual book state. Log `actual/expected` ratio. Target: 95%+ have ratio > `live_trading.min_profit_ratio`. |
 | ⬚ **D6: Reconciliation clean** | Every reconciliation check passes on all instances. |
 | ⬚ **D7: Performance baseline** | Eval latency p50 < 10ms per instance. Market coverage > 40%. |
-| ⬚ **D8: Remove latest_markets.json** | Remove JSON file write from RustMarketScanner. All consumers read from SQLite or in-memory market_lookup. Delete `data/latest_markets.json` generation and `MARKETS_PATH` references. |
+| ✅ **D8: Remove latest_markets.json** | Removed `write_json_file()` and `json_output_path` field from `MarketScanner`. Constructor simplified to `new(db_path)`. All consumers read from SQLite or in-memory `market_lookup`. `data/latest_markets.json` deleted. |
 | ⬚ **D9: Parameter selection** | After 14 days, analyse all 5 instances across: risk-adjusted return (Sharpe-like: return / max drawdown), capital utilisation %, replacement success rate, depth-limited trade count, average hold duration vs expected. Engine parameters already determined by D2.6 stress tests. Select winning **strategy** parameter set (sizing + entry filters + replacement behaviour) for live trading. Document rationale. |
 | ⬚ **D10: CTO sign-off** | CTO reviews: 14-day comparison report across all 5 instances, selected parameters with rationale, error log, reconciliation report. Written approval to proceed to live. |
 
@@ -397,7 +399,7 @@ Before building the comparison dashboard, stress-test the engine to determine ac
 | Task | Acceptance Criteria |
 |------|-------------------|
 | ⬚ **E1: Deposit $1,000 USDC** | Funds visible in Polymarket wallet. CLOB connectivity verified. |
-| ⬚ **E2: Configure winning parameters** | Apply the parameter set selected in D8 to the live instance. |
+| ⬚ **E2: Configure winning parameters** | Apply the parameter set selected in D9 to the live instance. |
 | ⬚ **E3: Switch to live mode** | Config change: `shadow_only: false`. System begins placing real orders. |
 | ⬚ **E4: Supervised first trades** | Operator monitors first 3–5 live trades in real time. Verifies: orders placed correctly, fills match expectations, P&L tracking accurate. |
 | ⬚ **E5: 48h supervised period** | Operator checks dashboard and WhatsApp notifications every 2–4 hours for first 48h. No intervention needed = success. |

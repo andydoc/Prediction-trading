@@ -1,0 +1,14 @@
+# Shadow-D: High concentration
+arbitrage:
+  capital_per_trade_pct: 0.30
+  max_concurrent_positions: 8
+  max_position_size: 1500
+  min_profit_threshold: 0.04
+  max_profit_threshold: 0.20
+  min_resolution_time_secs: 900
+  max_days_to_resolution: 30
+  replacement_cooldown_seconds: 120
+  max_days_to_replacement: 21
+  max_exposure_per_market: 750
+dashboard:
+  port: 5563

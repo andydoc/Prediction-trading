@@ -6,7 +6,6 @@
 /// Schema:
 ///   markets(market_id TEXT PK, data TEXT JSON, updated_at REAL)
 use rusqlite::params;
-use std::path::PathBuf;
 use std::time::Duration;
 use crate::cached_db::CachedSqliteDB;
 
@@ -282,25 +281,6 @@ fn fetch_all_markets(
     (all_markets, skipped)
 }
 
-/// Write backward-compat latest_markets.json
-fn write_json_file(path: &std::path::Path, markets: &[(String, serde_json::Value)]) {
-    let market_list: Vec<&serde_json::Value> = markets.iter().map(|(_, v)| v).collect();
-    let output = serde_json::json!({
-        "markets": market_list,
-        "count": markets.len(),
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-    });
-
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    match std::fs::write(path, serde_json::to_string(&output).unwrap_or_default()) {
-        Ok(_) => {}
-        Err(e) => tracing::warn!("[scanner] Failed to write JSON file: {}", e),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // ScanResult
 // ---------------------------------------------------------------------------
@@ -319,11 +299,10 @@ pub struct ScanResult {
 pub struct MarketScanner {
     db: ScannerDB,
     client: reqwest::blocking::Client,
-    json_output_path: Option<PathBuf>,
 }
 
 impl MarketScanner {
-    pub fn new(db_path: &str, json_path: Option<&str>) -> Result<Self, String> {
+    pub fn new(db_path: &str) -> Result<Self, String> {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -331,23 +310,12 @@ impl MarketScanner {
 
         let db = ScannerDB::new(db_path)?;
 
-        Ok(Self {
-            db,
-            client,
-            json_output_path: json_path.map(PathBuf::from),
-        })
+        Ok(Self { db, client })
     }
 
     /// Fetch all markets from Gamma API, convert, store in SQLite, return as ScanResult.
     pub fn scan(&self) -> Result<ScanResult, String> {
         let (markets, skipped) = fetch_all_markets(&self.client);
-
-        if !markets.is_empty() {
-            // Write to JSON file (backward compat)
-            if let Some(ref path) = self.json_output_path {
-                write_json_file(path, &markets);
-            }
-        }
 
         if markets.is_empty() {
             return Err("No markets fetched from Gamma API".into());

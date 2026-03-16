@@ -1,0 +1,14 @@
+# Shadow-C: Moderate concentration
+arbitrage:
+  capital_per_trade_pct: 0.20
+  max_concurrent_positions: 15
+  max_position_size: 1000
+  min_profit_threshold: 0.03
+  max_profit_threshold: 0.25
+  min_resolution_time_secs: 600
+  max_days_to_resolution: 45
+  replacement_cooldown_seconds: 120
+  max_days_to_replacement: 30
+  max_exposure_per_market: 500
+dashboard:
+  port: 5562

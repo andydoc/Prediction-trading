@@ -4,6 +4,81 @@ Operational incidents for the Prediction Market Arbitrage System. Most recent fi
 
 ---
 
+## INC-010: Rust Initial Capital Defaulting to $1000
+
+**Date**: 2026-03-16
+**Severity**: Low
+**Markets**: None directly
+**Impact**: Dashboard showed incorrect capital ($1000 instead of $100). No trades affected — capital tracking is display-only until a position is opened.
+
+### What happened
+
+After the Rust-only cutover, the dashboard reported $1000 available capital. The Rust orchestrator had a hardcoded fallback of `1000.0` for `initial_capital` when the config key was missing or unparseable, rather than reading from `config.yaml` (which specifies `100`).
+
+### Root cause
+
+Hardcoded fallback value in `orchestrator.rs` didn't match the actual configured capital. The Python version read from config correctly.
+
+### Fix
+
+Changed `OrchestratorConfig` to read `initial_capital` from `config.yaml`, falling back to `100.0` (matching the actual bankroll).
+
+**Status**: ✅ Resolved
+
+---
+
+## INC-009: No Periodic API Resolution Polling
+
+**Date**: 2026-03-16 (identified during Cúcuta investigation)
+**Severity**: Medium
+**Markets**: All open positions relying on API resolution fallback
+**Impact**: 2 positions stuck as "overdue" (Cúcuta Deportivo +$0.31, Sparta Praha +$0.55) for days after markets resolved on-chain.
+
+### What happened
+
+The Rust engine's `check_api_resolutions()` only ran at startup. If a WebSocket resolution event was missed (connection drop, message parsing error, etc.), there was no fallback — positions remained open indefinitely until the next full restart.
+
+### Root cause
+
+Python had periodic re-checks via its async event loop. The Rust port implemented the API resolution function but only called it once during initialisation, with no periodic schedule.
+
+### Fix
+
+Added periodic API resolution polling to the orchestrator tick loop, running every 5 minutes (configurable via `api_resolution_interval_seconds` in config). Immediately resolved the 2 overdue positions on first run after deployment.
+
+**Status**: ✅ Resolved
+
+---
+
+## INC-008: outcomePrices Parsing Bug — API Resolution Non-Functional
+
+**Date**: 2026-03-16 (identified during Cúcuta investigation)
+**Severity**: High
+**Markets**: All resolved markets since Rust port
+**Impact**: API resolution path completely broken — no positions could ever resolve via API polling. Combined with INC-009 (no periodic polling), this meant resolution depended entirely on WebSocket events.
+
+### What happened
+
+Polymarket's CLOB API returns `outcomePrices` as a JSON string wrapping an array of strings: `"[\"0.123\", \"0.877\"]"`. The Rust implementation parsed this with `serde_json::from_str::<Vec<f64>>()`, which silently returned an empty Vec (strings aren't floats). Every market appeared to have zero-price outcomes, so the resolution logic never triggered.
+
+Additionally, the resolution function inferred resolution status from prices (checking if any price was near 1.0) rather than checking the definitive `umaResolutionStatus` field from the UMA oracle. This meant even with correct price parsing, a market could appear "resolved" based on price movement before actual on-chain settlement.
+
+### Root cause
+
+Two compounding failures:
+1. **Parsing**: `outcomePrices` is a string-encoded array of string-encoded floats — double serialisation not handled
+2. **Resolution inference**: Prices near 0/1 don't guarantee resolution. The UMA oracle `umaResolutionStatus` field is the authoritative source.
+
+### Fix
+
+1. Parse `outcomePrices` as `Vec<serde_json::Value>`, then convert each element (handling both numeric and string representations)
+2. Check `umaResolutionStatus == "resolved"` before reading prices — skip markets that haven't been settled by the oracle
+3. Added periodic polling (see INC-009) so the fix actually runs regularly
+
+**Status**: ✅ Resolved
+
+---
+
 ## INC-007: State Lost on A1 Restart — Pre-existing State-Load Bug
 
 **Date**: 2026-03-14

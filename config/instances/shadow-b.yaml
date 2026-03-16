@@ -1,0 +1,14 @@
+# Shadow-B: Current baseline (default config)
+arbitrage:
+  capital_per_trade_pct: 0.10
+  max_concurrent_positions: 20
+  max_position_size: 1000
+  min_profit_threshold: 0.03
+  max_profit_threshold: 0.30
+  min_resolution_time_secs: 300
+  max_days_to_resolution: 60
+  replacement_cooldown_seconds: 60
+  max_days_to_replacement: 30
+  max_exposure_per_market: 500
+dashboard:
+  port: 5561

@@ -1,558 +1,192 @@
-# ============================================================================
-#  PREDICTION TRADER — Configuration
-#  Organised: strategy → risk → execution → detection → engine → infrastructure
-# ============================================================================
-
-# --- Operating Mode ---
-
-# Operating mode. "dual" runs both constraint detection and trading engine together.
-# Other modes (scanner-only, engine-only) are for debugging or split deployments.
 mode: dual
-
-# Enable verbose debug logging across all modules. Set false in production to reduce log volume.
 debug: true
-
-# --- Trading Strategy ---
-
 live_trading:
-  # Master switch for the trading engine. Always true; use shadow_only to control mode.
   enabled: true
-
-  # true = shadow mode (simulate trades, validate against real orderbook, no real money).
-  # false = LIVE mode (real CLOB orders with real USDC). Change with extreme caution.
   shadow_only: true
-
-  # Starting capital for the position manager when no prior state exists.
-  # Only used on first run; subsequent runs load persisted state from SQLite.
   initial_capital: 100
-
-  # Maximum capital the system is allowed to deploy. Even if profits grow the balance,
-  # position sizing will not exceed this ceiling. Safety limit for early operation.
   max_capital: 1000
-
-  # Maximum simultaneous open positions for the live/shadow engine.
-  # This is the operational limit applied at entry time.
   max_positions: 20
-
-  # If available USDC balance drops below this, pause new entries until capital frees up.
-  # Default of 20 means the engine pauses entries when balance falls below $20.
   low_balance_pause_usd: 0
-
-  # --- Live-mode-specific gates (stricter than shadow) ---
-
-  # Minimum seconds until market resolution for live order placement. Originally 86400 (24h).
-  # Default of 3600 means markets resolving within 1 hour are excluded — too little time for
-  # the arb to play out and too high a risk of resolution-related price spikes. Stricter than
-  # the shadow-mode gate (arbitrage.min_resolution_time_secs). 0 = no filter.
   min_resolution_time_secs: 300
-
-  # Maximum allowed price movement (fraction) between opportunity detection and order placement.
-  # Default of 0.05 means trades are aborted if any leg's price drifted more than 5% since scoring. CHECK THIS
   max_price_drift_pct: 0.05
-
-  # Minimum USD depth required on each leg's orderbook side before placing a live order.
-  # Default of 50 means legs with <$50 book depth are rejected to avoid adverse price impact. SHOULD BE % OF TRADE
   min_orderbook_depth_usd: 50
-
-  # Minimum expected profit (fraction) after all fees for a live trade to proceed.
-  # Default of 0.03 means live trades must clear a 3% profit bar after fees — more
-  # conservative than shadow mode.
+  min_depth_per_leg: 0
+  depth_haircut: 0.8
+  min_profit_ratio: 0.7
   min_profit_after_fees: 0.03
-
-  # How often (seconds) to check whether a placed live order has been filled.
-  # Default of 2 means fills are detected within 2 seconds, at the cost of more API calls. NEEDS CHECKING WS?
   fill_check_interval_secs: 2
-
-  # Seconds to wait for a live order to fill before cancelling.
   order_timeout_secs: 60
-
 arbitrage:
-  # --- Position Sizing ---
-
-  # Fraction of current capital allocated per new position entry.
-  # Default of 0.10 means 10% of current capital per trade, with floor of min_trade_size
-  # and ceiling of max_position_size applied after.
-  capital_per_trade_pct: 0.10
-
-  # Minimum USD trade size. Positions sized below this are not worth the fees and
-  # execution overhead. Default of 10 means trades below $10 are skipped.
+  capital_per_trade_pct: 0.1
   min_trade_size: 10.0
-
-  # Maximum dollar size for any single position entry.
-  # Default of 1000 is a hard cap regardless of capital_per_trade_pct calculation.
   max_position_size: 1000
-
-  # Maximum dollar exposure allowed on any single market across all positions.
-  # Default of 500 prevents concentration risk if multiple constraints share a market.
   max_exposure_per_market: 500
-
-  # Hard ceiling on simultaneous open positions across all constraints.
-  # Default of 20 prevents over-diversification that dilutes per-position capital below
-  # useful levels. 0 = no limit (not recommended).
   max_concurrent_positions: 20
-
-  # --- Profit Thresholds ---
-
-  # Minimum expected profit percentage to consider an opportunity worth entering.
-  # Default of 0.03 means edges below 3% are too thin to justify fees and capital lock-up.
   min_profit_threshold: 0.03
-
-  # Upper bound on expected profit percentage. Default of 0.3 means opportunities claiming
-  # >30% profit are likely data errors or illiquid markets and are filtered out as suspicious.
   max_profit_threshold: 0.3
-
-  # --- Entry Filters ---
-
-  # Minimum seconds until market resolution for an opportunity to be ranked and entered.
-  # Originally 86400 (24h). Default of 300 means markets resolving within 5 minutes are
-  # excluded from shadow ranking — too close to resolution for reliable arb execution.
-  # Live mode uses live_trading.min_resolution_time_secs (3600) as a stricter gate. 0 = no filter.
   min_resolution_time_secs: 300
-
-  # Entry filter: skip opportunities whose latest market resolves more than N days from now.
-  # Default of 60 caps capital lock-up to ~2 months. 0 = no filter.
   max_days_to_resolution: 60
-
-  # --- Replacement ---
-
-  # Replacement filter: only consider replacement candidates resolving within N days.
-  # Default of 30 is tighter than entry filter — replacements should unlock capital faster.
-  # 0 = no filter.
   max_days_to_replacement: 30
-
-  # Minimum seconds between replacement attempts. Prevents rapid-fire replacements
-  # when multiple positions become eligible simultaneously. Default of 60 means at most
-  # one replacement per minute.
   replacement_cooldown_seconds: 60
-
-  # When AI detects a position's underlying event has been postponed or cancelled,
-  # automatically attempt to replace it with a better opportunity.
   replace_on_postponement: true
-
-  # When replacing a postponed position, only proceed if the current liquidation value
-  # is >= capital deployed (i.e. no realised loss on exit). Prevents locking in losses.
   postponement_replace_breakeven_only: true
-
-  # When scoring a held position that is postponed/overdue, pretend it resolves N days
-  # from now instead of its original date. Default of 14 prevents artificially high scores
-  # that would block replacement by a genuinely better opportunity.
   postponement_rescore_days: 14
-
-  # --- Resolution Validation ---
-
   resolution_validation:
-    # Whether to use AI (Claude) to validate that market resolution dates are plausible
-    # before entering a position. Catches markets with misleading or ambiguous end dates.
     enabled: true
-    # anthropic_api_key: moved to secrets.yaml → resolution_validation.anthropic_api_key
-
-    # How long (hours) to cache a validated resolution date before re-checking with the AI.
-    # Default of 168 (7 days) reduces API costs for stable markets.
     cache_ttl_hours: 168
-
-  # --- Optimizer ---
-
   optimization:
-    # Algorithm for computing optimal position allocations across constraint legs.
-    # frank_wolfe: projection-free convex optimizer, fast for simplex constraints.
     algorithm: frank_wolfe
-
-    # Maximum iterations before the optimizer stops, even if not fully converged.
     max_iterations: 100
-
-    # Convergence tolerance — optimizer stops when improvement per iteration drops below this.
     tolerance: 0.0001
-
-  # --- Fees ---
-
   fees:
-    # Combined per-trade fee used in profit calculations when maker/taker split is unknown.
-    # Conservative estimate — arb math subtracts this from expected profit on each leg.
     trading_fee: 0.0001
-
-    # Fee for limit orders that rest on the book (provide liquidity).
-    # Polymarket currently rewards makers (0%) — may go negative (rebate) in future.
     polymarket_maker_fee: 0.0
-
-    # Fee for market orders that cross the spread (take liquidity).
-    # Polymarket charges a small taker fee on each fill.
     polymarket_taker_fee: 0.0001
-
-    # Platform-wide fee applied to all trades regardless of maker/taker status.
-    # Polymarket currently charges zero global fee.
     polymarket_global_fee: 0.0
-
-    # Whether Polymarket charges fees on the winning payout (true) or on the trade itself (false).
-    # Currently false — fees are per-trade, not on resolution winnings.
     fee_on_winnings: false
-
-    # Fee charged on crypto deposits/withdrawals processed within 15 minutes.
-    # Currently zero on Polymarket but kept configurable for future changes.
     crypto_15min_fee: 0.001
-
-    # Fee for withdrawing USDC from Polymarket to an external wallet.
-    # Currently zero but configurable in case the platform adds withdrawal fees.
     withdrawal_fee: 0.0
-
-# Duplicate of arbitrage fees section — used by the standalone fee calculation module.
 fees:
-  # Trades with expected profit below this after fees are filtered out.
   min_profit_threshold: 0.03
-
-# --- Risk Management ---
-
 risk:
-  # Maximum absolute dollar loss allowed in a single calendar day.
-  # Default of 500 means the engine pauses new entries after $500 cumulative daily loss.
   max_daily_loss: 500
-
-  # Maximum daily loss as a fraction of total portfolio value. Default of 0.05 means
-  # a 5% drawdown pauses entries. Whichever limit (absolute or percentage) hits first wins.
   max_daily_loss_pct: 0.05
-
   volatility:
-    # Whether to monitor price volatility and factor it into entry decisions.
     enabled: true
-
-    # Window (seconds) over which to measure price volatility. Default of 3600 (1 hour)
-    # provides enough data for meaningful volatility estimation without diluting recent moves.
     lookback_period: 3600
-
-    # Maximum allowed volatility (standard deviation of returns) for a market to be tradeable.
-    # Default of 0.15 means markets with >15% volatility in the lookback window are skipped.
     max_volatility: 0.15
-
   whale_detection:
-    # Whether to detect large single-party trades that may indicate informed trading.
     enabled: true
-
-    # Minimum price impact (fraction) of a single trade to classify it as a whale trade.
     price_impact_threshold: 0.05
-
-    # Minimum USD volume of a single trade to classify it as a whale trade.
     volume_threshold: 10000
-
-# --- Execution (live mode) ---
-
 execution:
-  # Order type strategy. limit_orders: place resting limit orders at target price.
-  # Alternative would be market_orders (immediate fill, worse price).
   strategy: limit_orders
-
-  # Maximum allowed price slippage (fraction) between quote and fill.
-  # Default of 0.005 means orders are rejected if fill price drifts more than 0.5% from quote.
   max_slippage: 0.005
-
-  # Seconds to wait for an order to fill before cancelling it.
-  # Default of 60 prevents capital from being locked in unfilled limit orders indefinitely.
   order_timeout: 60
-
-  # Maximum retry attempts for a failed order placement before abandoning the trade.
   max_retries: 3
-
-  # Seconds to wait between retry attempts after a failed order.
   retry_delay: 5
-
-# --- Constraint Detection ---
-
 constraint_detection:
-  # Types of market relationships the detector looks for when building constraints.
-  # Each type uses different math to identify arbitrage-exploitable groups of markets.
   detect_types:
-  - logical_implication    # A implies B (e.g. "team wins division" implies "team makes playoffs")
-  - mutual_exclusivity     # Exactly one outcome wins (e.g. "who wins the election" with N candidates)
-  - complementary          # Outcomes that together must sum to 1 (binary yes/no pairs)
-  - correlated             # Markets whose prices move together due to shared underlying events
-
-  # Minimum number of markets required to form a valid constraint.
-  # A single market alone cannot be arbitraged; need at least 2 legs.
+  - logical_implication
+  - mutual_exclusivity
+  - complementary
+  - correlated
   min_markets: 2
-
-  # Maximum number of markets in a single constraint group.
-  # Default of 5 caps compute time — larger groups have exponentially more allocation paths.
   max_markets: 5
-
-  # Minimum confidence score (0–1) for a detected constraint to be loaded.
-  # Default of 0.7 means relationships below 70% confidence are too uncertain to trade on.
   min_confidence: 0.7
-
-  # Lower bound on the sum of YES prices across a constraint's markets.
-  # Default of 0.85 means groups where prices sum to <85% have too many missing or
-  # mispriced markets to form a reliable constraint.
   min_price_sum: 0.85
-
-  # Upper bound on the sum of YES prices. Default of 1.15 means groups where prices sum
-  # to >115% are likely stale data or illiquid markets and are excluded.
   max_price_sum: 1.15
-
-  # How often (seconds) to rebuild constraints from fresh scanner data.
-  # Default of 300 (5 minutes) balances freshness against API rate limits and CPU cost.
   rebuild_interval: 300
-
-# --- Engine Internals ---
-
 engine:
-  # Maximum constraint evaluations per event-loop iteration. Rust arb math runs at ~4µs
-  # per eval. Default of 500 means each batch costs ~2ms CPU — negligible overhead while
-  # keeping the eval queue responsive.
   max_evals_per_batch: 500
-
-  # How often (seconds) to rebuild constraints when new markets arrive from the scanner.
-  # Default of 600 means at most one rebuild every 10 minutes per new_market batch.
   constraint_rebuild_interval_seconds: 600
-
-  # Minimum effective fill price (efp) drift ($) to promote an asset to the urgent eval queue.
-  # Default of 0.005 means a $0.005 price change triggers immediate re-evaluation rather
-  # than waiting for the next background cycle.
   efp_drift_threshold: 0.005
-
-  # Seconds since last eval before an asset is considered stale and re-queued for
-  # background evaluation. Default of 5.0 means assets not evaluated in the last 5 seconds
-  # are eligible for a background refresh.
   efp_staleness_seconds: 5.0
-
-  # How often (seconds) to save engine state to SQLite. Default of 30 means at most
-  # 30 seconds of state can be lost on a crash.
   state_save_interval_seconds: 30
-
-  # How often (seconds) to run the monitoring/status update cycle. Default of 30 means
-  # the dashboard and status file refresh every 30 seconds.
   monitor_interval_seconds: 30
-
-  # How often (seconds) to log WS/eval/position stats to the console. Default of 30
-  # provides regular visibility without flooding the log.
   stats_log_interval_seconds: 30
-
-  # How often (seconds) to sweep for stale WS assets and trigger re-subscription.
-  # Default of 60 means stale assets are detected within 1 minute of going silent.
   stale_sweep_interval_seconds: 60
-
-  # Seconds without a WS update before an asset's book is considered stale.
-  # Default of 30 means assets silent for >30 seconds are flagged for re-subscription.
   stale_asset_threshold_seconds: 30
-
-# --- Infrastructure ---
-
+  max_book_staleness_secs: 30
+  closed_position_retention_days: 90
+  api_resolution_interval_seconds: 300
 market_data:
-  # Which prediction market platforms to pull data from.
-  # Currently only Polymarket is supported.
   enabled_markets:
   - polymarket
-
-  # How often (seconds) the scanner polls the Gamma API for new/updated markets.
   poll_interval: 30
-
   polymarket:
-    # Base URL for Polymarket's Gamma API (market metadata, prices, resolution status).
     api_url: https://gamma-api.polymarket.com
-
-    # Maximum API requests per second to Gamma API. Prevents rate-limiting (HTTP 429).
     rate_limit: 10
-
   storage:
-    # Whether to gzip-compress stored market data snapshots. Saves disk at slight CPU cost.
     compress: true
-
-    # File format for market data snapshots. JSON is human-readable and debuggable.
     format: json
-
-    # Days to retain historical market data snapshots before auto-pruning.
     retention_days: 30
-
 websocket:
-  # Whether to connect to Polymarket's WebSocket feed for real-time orderbook updates.
   enabled: true
-
-  # WebSocket URL for subscribing to market-level orderbook changes (bids/asks).
   market_channel_url: wss://ws-subscriptions-clob.polymarket.com/ws/market
-
-  # WebSocket URL for subscribing to user-level events (fills, cancellations).
-  # Used in live mode to track order status without polling.
   user_channel_url: wss://ws-subscriptions-clob.polymarket.com/ws/user
-
-  # Seconds between WebSocket ping frames. Default of 10 keeps the connection alive
-  # through proxies and NAT without excessive overhead.
   heartbeat_interval: 10
-
-  # Initial delay (seconds) before first reconnect attempt after a WS disconnect.
   reconnect_base_delay: 1.0
-
-  # Maximum delay (seconds) between reconnect attempts. Default of 60.0 caps the
-  # exponential backoff — reconnects will never wait longer than 1 minute.
   reconnect_max_delay: 60.0
-
-  # If no update is received for an asset within this many seconds, its book data is
-  # considered stale. Default of 30 means assets silent for >30 seconds are re-subscribed
-  # or their books are cleared.
   max_book_staleness_secs: 30
-
 execution_control:
-  # Whether the execution control dashboard (ZMQ-based) is enabled.
-  # Allows external tools to pause/resume/inspect the engine at runtime.
   enabled: true
-
-  # ZMQ endpoint for the execution control interface.
   url: http://localhost:5557
-
 communication:
   auto_retry:
-    # Multiplier for exponential backoff between retries (delay = backoff_factor^attempt).
     backoff_factor: 2
-
-    # Whether to automatically retry failed communication attempts.
     enabled: true
-
-    # Maximum number of retry attempts before giving up.
     max_retries: 3
-
-  # How often (seconds) to poll for new tasks from the communication layer.
   task_check_interval: 30
-
   urgency_levels:
-    # Response time targets (seconds) for different urgency classifications.
-    # Used by the communication layer to prioritise task processing.
     high: 60
     low: 3600
     medium: 600
     urgent: 10
-
 monitoring:
   alerts:
-    # Number of errors within the monitoring window before triggering an alert.
     error_count_threshold: 5
-
-    # Alert when portfolio exposure exceeds this fraction of max_capital.
-    # 0.8 = warn at 80% capital utilisation.
     high_exposure_threshold: 0.8
-
-    # Alert when available balance drops below this USD amount.
-    # Different from low_balance_pause — this is for notification, not pausing.
     low_balance_threshold: 1000
-
-  # Seconds between heartbeat writes to the status file.
-  # Default of 60 means external monitors (supervisor, systemd) can detect a hung engine
-  # within 1 minute.
   heartbeat_interval: 60
-
   logging:
-    # Python logging format string. Timestamps, module name, level, and message.
     format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-
-    # Minimum log level to emit. DEBUG for development, INFO or WARNING for production.
     level: DEBUG
-
-    # Days to retain log files before auto-rotation deletes old ones.
     retention: 30
-
-    # How often to rotate log files. "daily" creates a new file each day.
     rotation: daily
-
-    # Directory for Rust engine log files (relative to workspace root).
     log_dir: logs
-
-    # Filename prefix for Rust engine logs. Produces files like rust_engine.2026-03-15.
     rust_file_prefix: rust_engine
-
 performance:
   cache:
-    # Whether to enable in-memory caching of frequently accessed data (market lookups, prices).
     enabled: true
-
-    # Maximum memory (MB) the cache is allowed to consume before evicting old entries.
     max_size_mb: 500
-
-    # Cache entry time-to-live (seconds). Entries older than this are considered stale.
     ttl: 300
-
-  # Number of connections in the SQLite connection pool.
-  # Higher = more concurrent DB operations, but diminishing returns past ~10.
   db_pool_size: 10
-
-  # Number of worker threads for parallel processing (constraint detection, scoring).
   worker_threads: 4
-
 workspace:
-  # Directory paths used by the system. Absolute paths for WSL/Windows interop.
   brain_inbox: /mnt/c/Users/andyd/ai-workspace/brain-inbox
   data: /home/andydoc/prediction-trader/data
   logs: /home/andydoc/prediction-trader/logs
   results: /mnt/c/Users/andyd/ai-workspace/results
   root: /home/andydoc/prediction-trader
   tasks: /mnt/c/Users/andyd/ai-workspace/tasks
-
-# --- AI Configuration ---
-# All AI model, prompt, and behaviour settings in one place.
-# API key remains in secrets.yaml for security.
 ai:
-  # Which AI provider to use for resolution validation and postponement detection.
   provider: anthropic
-
-  # Base URL for the Anthropic Messages API.
   api_url: https://api.anthropic.com/v1/messages
-
-  # Anthropic API version header. Must match the SDK version in use.
-  api_version: "2023-06-01"
-
+  api_version: 2023-06-01
   models:
-    # Model used to extract and validate market resolution dates from market rules text.
-    # Needs to understand natural language rules and extract specific dates.
     resolution_validation: claude-sonnet-4-20250514
-
-    # Model used for web-search-based postponement detection.
-    # Searches for evidence that a market's underlying event has been rescheduled.
     postponement_detection: claude-sonnet-4-20250514
-
   max_tokens:
-    # Token budget for resolution validation responses. Short — just needs a date + confidence.
     resolution_validation: 256
-
-    # Token budget for postponement detection. Longer — includes search reasoning and date extraction.
     postponement_detection: 1024
-
   postponement:
-    # Whether the postponement detection system is active.
-    # When enabled, positions past their expected resolution trigger a web search for new dates.
     enabled: true
-
-    # Hours past expected resolution before triggering a postponement search.
-    # Default of 24 provides a 24h buffer to avoid false alarms from minor resolution delays.
     overdue_threshold_hours: 24
-
-    # Hours between re-checks if a previous search found no new date.
-    # Default of 24 avoids burning API credits on repeated searches for the same position.
     check_interval_hours: 24
-
-    # Minimum seconds between any two AI API calls (across all positions).
-    # Default of 60 rate-limits costs — each web search uses ~15k tokens.
     rate_limit_seconds: 60
-
-    # Maximum API calls per postponement check (1st = general search, 2nd = targeted if no date found).
     max_attempts: 2
-
-    # If no postponed date is found after max_attempts, fall back to using the season end date
-    # as the new expected resolution. Better than leaving the position in perpetual "overdue" state.
     fallback_to_season_end: true
-
-    # Hours to add to any found postponed date, then round up to next midnight UTC.
-    # Default of 24 buffers against timezone ambiguity and partial-day resolution windows.
     date_buffer_hours: 24
-
-    # Hours to cache a postponement detection result before allowing a re-check.
-    # Shorter than resolution validation (24h vs 168h) because postponements are time-sensitive.
     cache_ttl_hours: 24
-
 ollama:
-  # API key for local Ollama instance. Not a real secret — Ollama uses it as a placeholder.
   api_key: ollama-local
-
-  # URL for the local Ollama OpenAI-compatible API endpoint.
   base_url: http://127.0.0.1:11434/v1
-
-  # Maximum context window size (tokens) for the local model.
   context_window: 128000
-
-  # Maximum tokens to generate in a single response from the local model.
   max_tokens: 8192
-
-  # Ollama model identifier. Used for local inference tasks that don't need cloud AI.
   model: lfm2.5-thinking:1.2b
+dashboard:
+  port: 5558
+notifications:
+  enabled: false
+  webhook_url: ''
+  api_key: ''
+  phone_number: ''
+  rate_limit_seconds: 10
+  on_entry: true
+  on_resolution: true
+  on_error: true
+  on_circuit_breaker: true
+  on_daily_summary: true
+state:
+  db_path: state_rust.db

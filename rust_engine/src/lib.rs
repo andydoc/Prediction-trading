@@ -11,6 +11,7 @@
 /// - Market scanner (Gamma API + SQLite cache)
 /// - AI resolution validator (Anthropic API)
 /// - AI postponement detector (Anthropic API + web search)
+/// - WhatsApp notifications (C3)
 
 pub mod types;
 pub mod cached_db;
@@ -26,6 +27,7 @@ pub mod resolution;
 pub mod postponement;
 pub mod scanner;
 pub mod detect;
+pub mod notify;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -291,11 +293,12 @@ impl TradingEngine {
         held_cids: &std::collections::HashSet<String>,
         held_mids: &std::collections::HashSet<String>,
         top_n: usize,
+        depth_haircut: f64,
     ) -> EvalBatchResult {
         let ec = self.eval_config.lock().clone();
         let (opps, n_urg, n_bg, n_eval, n_held) = eval::evaluate_batch(
             &self.eval_queue, &self.book, &self.constraints, &ec,
-            max_evals, held_cids, held_mids, top_n,
+            max_evals, held_cids, held_mids, top_n, depth_haircut,
         );
         EvalBatchResult {
             opportunities: opps,
@@ -354,6 +357,7 @@ impl TradingEngine {
         optimal_bets: &HashMap<String, f64>,
         expected_profit: f64, expected_profit_pct: f64,
         is_sell: bool,
+        chain_info: Option<(&str, u32, &str)>,
     ) -> position::EntryResult {
         let end_date_ts = self.constraints.get(constraint_id)
             .map(|c| c.end_date_ts).unwrap_or(0.0);
@@ -362,7 +366,7 @@ impl TradingEngine {
             opportunity_id, constraint_id, strategy, method,
             market_ids, market_names, current_prices, current_no_prices,
             optimal_bets, expected_profit, expected_profit_pct, is_sell,
-            end_date_ts,
+            end_date_ts, chain_info,
         )
     }
 

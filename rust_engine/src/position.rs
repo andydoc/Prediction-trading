@@ -49,6 +49,14 @@ pub struct Position {
     pub profit_delta: f64,
     pub profit_accuracy: f64,
     pub metadata: HashMap<String, serde_json::Value>,
+
+    // Replacement chain tracking (B1.1)
+    #[serde(default)]
+    pub chain_id: Option<String>,
+    #[serde(default)]
+    pub chain_generation: u32,
+    #[serde(default)]
+    pub parent_position_id: Option<String>,
 }
 
 /// Result of attempting to enter a position
@@ -181,6 +189,7 @@ impl PositionManager {
         expected_profit_pct: f64,
         is_sell: bool,
         end_date_ts: f64,
+        chain_info: Option<(&str, u32, &str)>,  // (chain_id, generation, parent_position_id)
     ) -> EntryResult {
         let total_cost: f64 = optimal_bets.values().sum();
         let fees = total_cost * self.taker_fee;
@@ -227,6 +236,12 @@ impl PositionManager {
             meta.insert("end_date_ts".into(), serde_json::json!(end_date_ts));
         }
 
+        // Chain tracking: use provided chain info or start a new chain
+        let (chain_id, chain_gen, parent_pid) = match chain_info {
+            Some((cid, gen, ppid)) => (Some(cid.to_string()), gen, Some(ppid.to_string())),
+            None => (Some(pid.clone()), 0, None),  // new chain starts with own position_id
+        };
+
         let position = Position {
             position_id: pid.clone(),
             opportunity_id: opportunity_id.to_string(),
@@ -249,6 +264,9 @@ impl PositionManager {
             profit_delta: 0.0,
             profit_accuracy: 0.0,
             metadata: meta,
+            chain_id,
+            chain_generation: chain_gen,
+            parent_position_id: parent_pid,
         };
 
         // Deduct capital
@@ -567,6 +585,11 @@ impl PositionManager {
         &self.open_positions
     }
 
+    /// Mutable access to open positions (for metadata updates).
+    pub fn open_positions_mut(&mut self) -> &mut HashMap<String, Position> {
+        &mut self.open_positions
+    }
+
     /// Direct access to closed positions (no JSON serialization).
     pub fn closed_positions(&self) -> &[Position] {
         &self.closed_positions
@@ -588,6 +611,46 @@ impl PositionManager {
         let open_fees: f64 = self.open_positions.values().map(|p| p.fees_paid).sum();
         let closed_fees: f64 = self.closed_positions.iter().map(|p| p.fees_paid).sum();
         open_fees + closed_fees
+    }
+
+    // --- Record retention (B1.2) ---
+
+    /// Prune closed positions older than `cutoff_ts` (unix timestamp).
+    /// Strips bulky metadata fields (raw API responses, full market descriptions)
+    /// from pruned records but retains core audit fields. Returns count pruned.
+    pub fn prune_closed_before(&mut self, cutoff_ts: f64) -> usize {
+        let mut pruned = 0;
+        for pos in self.closed_positions.iter_mut() {
+            let close_ts = pos.close_timestamp.unwrap_or(0.0);
+            if close_ts > 0.0 && close_ts < cutoff_ts {
+                // Strip bulky fields but keep audit-essential metadata
+                let keep_keys = ["constraint_id", "strategy", "method", "close_reason",
+                                 "chain_id", "chain_generation", "parent_position_id"];
+                pos.metadata.retain(|k, _| keep_keys.contains(&k.as_str()));
+                pos.price_drift.clear();
+                pos.entry_prices.clear();
+                pruned += 1;
+            }
+        }
+        pruned
+    }
+
+    /// Get replacement chain analytics for a given chain_id.
+    /// Returns (chain_length, total_fees, total_liquidation_costs, final_profit).
+    pub fn get_chain_stats(&self, chain_id: &str) -> (u32, f64, f64, f64) {
+        let chain_positions: Vec<&Position> = self.closed_positions.iter()
+            .chain(self.open_positions.values())
+            .filter(|p| p.chain_id.as_deref() == Some(chain_id))
+            .collect();
+        let count = chain_positions.len() as u32;
+        let total_fees: f64 = chain_positions.iter().map(|p| p.fees_paid).sum();
+        let total_liq_costs: f64 = chain_positions.iter()
+            .filter_map(|p| p.metadata.get("liquidation_sale_proceeds")
+                .and_then(|v| v.as_f64()))
+            .sum::<f64>()
+            .abs();
+        let final_profit: f64 = chain_positions.iter().map(|p| p.actual_profit).sum();
+        (count, total_fees, total_liq_costs, final_profit)
     }
 
     // --- Data export (for state persistence — JSON strings for SQLite) ---

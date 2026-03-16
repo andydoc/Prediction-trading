@@ -7,6 +7,40 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.11.0] — 2026-03-16 — Notifications, Multi-Instance, Python Retirement
+
+### Added
+- **C3**: WhatsApp notification module (`notify.rs`) — rate-limited (10s), exponential backoff (5 failures → 5min cooldown), per-event toggles, generic HTTP webhook POST
+- **C3**: Notifier wired into orchestrator for entry, WS resolution, API resolution, and proactive exit events
+- **C4.2**: Proactive exit — sells position when liquidation value > 1.2× expected resolution payout
+- **D1**: Multi-instance support — `--instance <name>` auto-configures DB, logs, PID file, and dashboard port
+- **D1**: Instance config overlays loaded from `config/instances/{name}.yaml` with dot-notation flattening
+- **D2**: `scripts/deploy_shadows.sh` — systemd management for 5 shadow instances (install/start/stop/restart/status/logs)
+- **D2**: `scripts/systemd/prediction-trader@.service` — template unit with MemoryMax=1500M, CPUQuota=50%
+- **D2**: 5 shadow instance configs (`shadow-a` through `shadow-e`) with varied strategy parameters
+- `scripts/watch_trader.sh` — color-coded real-time log monitor (entries, resolutions, exits, errors, circuit breaker)
+- `notifications` section in `config.yaml` with webhook URL, API key, phone number, per-event toggles
+
+### Changed
+- **D8**: Removed `latest_markets.json` generation — scanner uses SQLite-only storage, saves disk space pre-VPS migration
+
+### Removed
+- All Python source files archived — `main.py`, `trading/`, `utilities/`, `arbitrage_math/`, `constraint_detection/`, `market_data/`, `scripts/*.py`
+- Unused JSON files moved to `archive/` or deleted (large market snapshots)
+
+### Fixed
+- **INC-008**: UMA resolution status — use `umaResolutionStatus` field instead of inferring from prices
+- **INC-009**: Periodic API resolution polling restored + `outcomePrices` string parsing
+- **INC-010**: Initial capital defaulting to $1000 instead of reading from config
+
+### Performance
+- **L1**: Event-driven wake — `Condvar` replaces unconditional 50ms sleep; WS handlers signal on urgent push
+- **L2**: Batched PositionManager locks — `get_held_ids()` single-lock accessor replaces 4–5 separate lock acquisitions per tick
+- **L3**: Dashboard clone-then-release — position data cloned under lock, JSON built after `drop(pm)`
+- **L4**: Async disk I/O — state saves spawned in background thread, no longer block the tick loop
+
+---
+
 ## [0.10.1] — 2026-03-15 — Code Review: Bugs, Performance, Security & Cleanup
 
 ### Fixed

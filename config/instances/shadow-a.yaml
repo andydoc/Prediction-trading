@@ -1,0 +1,14 @@
+# Shadow-A: Maximum diversification
+arbitrage:
+  capital_per_trade_pct: 0.05
+  max_concurrent_positions: 40
+  max_position_size: 500
+  min_profit_threshold: 0.02
+  max_profit_threshold: 0.30
+  min_resolution_time_secs: 300
+  max_days_to_resolution: 90
+  replacement_cooldown_seconds: 30
+  max_days_to_replacement: 60
+  max_exposure_per_market: 250
+dashboard:
+  port: 5560

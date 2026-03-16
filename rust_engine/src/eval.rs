@@ -98,6 +98,12 @@ pub struct Opportunity {
     pub hours_to_resolve: f64,
     /// Score = profit_pct / effective_hours (higher = better)
     pub score: f64,
+    /// Minimum ask depth (USD) across all legs — for depth gating (B1.0)
+    pub min_leg_depth_usd: f64,
+    /// Capital efficiency for negRisk sell arbs (B3): no_cost / collateral
+    pub capital_efficiency: Option<f64>,
+    /// Collateral per unit for negRisk sell arbs (B3)
+    pub collateral_per_unit: Option<f64>,
 }
 
 /// Evaluate a batch of constraints from the queue.
@@ -112,6 +118,7 @@ pub fn evaluate_batch(
     held_cids: &HashSet<String>,
     held_mids: &HashSet<String>,
     top_n: usize,
+    depth_haircut: f64,
 ) -> (Vec<Opportunity>, usize, usize, usize, usize) {
     let entries = queue.drain(max_evals);
     if entries.is_empty() {
@@ -210,6 +217,15 @@ pub fn evaluate_batch(
                 current_no_prices.insert(mid.clone(), no_prices[i]);
             }
 
+            // Compute minimum ask depth across all legs (B1.0)
+            let min_leg_depth_usd = constraint.markets.iter()
+                .map(|mref| {
+                    let is_sell = arb.method.contains("sell");
+                    let asset_id = if is_sell { &mref.no_asset_id } else { &mref.yes_asset_id };
+                    book.get_ask_depth_usd(asset_id, depth_haircut)
+                })
+                .fold(f64::INFINITY, f64::min);
+
             // Compute hours to resolution (end_date_ts > 0 guaranteed by filter above)
             let hours = if constraint.end_date_ts > now_ts {
                 (constraint.end_date_ts - now_ts) / 3600.0
@@ -236,6 +252,9 @@ pub fn evaluate_batch(
                 n_scenarios: arb.n_scenarios,
                 hours_to_resolve: hours,
                 score,
+                min_leg_depth_usd: if min_leg_depth_usd.is_infinite() { 0.0 } else { min_leg_depth_usd },
+                capital_efficiency: arb.capital_efficiency,
+                collateral_per_unit: arb.collateral_per_unit,
             });
         }
     }

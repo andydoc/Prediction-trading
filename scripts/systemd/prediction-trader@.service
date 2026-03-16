@@ -1,0 +1,22 @@
+[Unit]
+Description=Prediction Trader - Instance %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/home/trader/prediction-trader
+ExecStart=/home/trader/prediction-trader/target/release/prediction-trader \
+    --workspace /home/trader/prediction-trader \
+    --instance %i \
+    --mode shadow
+Restart=always
+RestartSec=30
+MemoryMax=1500M
+CPUQuota=50%
+Environment=PATH=/home/trader/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

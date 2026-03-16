@@ -1,0 +1,14 @@
+# Shadow-E: Maximum concentration
+arbitrage:
+  capital_per_trade_pct: 0.50
+  max_concurrent_positions: 8
+  max_position_size: 2000
+  min_profit_threshold: 0.05
+  max_profit_threshold: 0.20
+  min_resolution_time_secs: 1800
+  max_days_to_resolution: 21
+  replacement_cooldown_seconds: 300
+  max_days_to_replacement: 14
+  max_exposure_per_market: 1000
+dashboard:
+  port: 5564
