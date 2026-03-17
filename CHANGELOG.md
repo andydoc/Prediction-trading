@@ -7,6 +7,38 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.12.2] — 2026-03-17 — Dashboard Monitor Tab + Log Viewer
+
+### Added
+- **Monitor tab**: real-time system/app/financial metrics with time-series charts
+  - System resources: CPU %, memory (MB), disk (GB) with live charts
+  - App stats: markets, constraints, WS msg/s, latency p50/p95, queue depth
+  - Financial stats: total value, deployed %, drawdown, Sharpe, Sortino, recovery ratio, win rate, profit factor, avg hold, max DD
+  - Portfolio chart: combined dual-axis chart ($ value left, % deployed/drawdown right) with filled area for value
+  - Profitability tables: by-category and by-duration breakdowns
+  - Latency breakdown table: per-segment p50/p95/max/samples
+- **Log viewer**: live tracing log capture in dashboard
+  - `MonitorLayer` tracing subscriber pipes events to separate `LogRing` buffer (avoids monitor lock contention)
+  - Configurable last-N display, text + level filtering, keyword highlighting (entry/exit/error/warn)
+  - Copy-to-clipboard with proper delta tracking (only new entries per SSE update)
+- **Splash screen**: waits for monitor data before dismissing — no empty graphs on load
+- **Loading placeholders** for all monitor sections while data arrives
+- Log-scale y-axes with smart auto-base (next lower power of 10 below data minimum)
+- Chart tooltips with 2 decimal places, always showing all datasets
+
+### Changed
+- Brighter UI: stat labels, chart axes, legend text, tab buttons all brightened from #555/#888 to #999/#aaa
+- Chart legends use thin line indicators (boxHeight: 2) instead of boxes; portfolio chart uses mixed style (filled box for value, lines for deployed/drawdown)
+- Disk chart y-axis labels rounded to 2 decimal places
+- Docs reorganized: older specs moved to docs/, PRODUCT_SPEC_v2.md is now active spec
+
+### Removed
+- `rust_arb/` — deprecated PyO3 arb library (superseded by `rust_engine/src/arb.rs`), archived to `archive/rust_arb_deprecated/`
+- Orphan build artifacts: `rust_engine/target/` (1.6GB), `rust_engine/Cargo.lock`, `rust_engine/pyproject.toml`
+- Zone.Identifier files, stale root-level log file
+
+---
+
 ## [0.12.0] — 2026-03-17 — Tiered WebSocket Architecture
 
 ### Added
