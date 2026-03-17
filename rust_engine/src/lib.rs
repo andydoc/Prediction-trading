@@ -36,6 +36,8 @@ pub mod latency;
 pub mod monitor;
 pub mod signing;
 pub mod instrument;
+pub mod rate_limiter;
+pub mod executor;
 
 use std::collections::HashMap;
 use std::sync::Arc;

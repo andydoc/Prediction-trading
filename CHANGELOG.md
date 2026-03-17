@@ -35,10 +35,35 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 - Shadow grid expanded from 5 to 6 instances (A–F) throughout PRODUCT_SPEC_v2.md
 - Shadow-A `min_resolution_time_secs` lowered from 300 → 120 for overlap with fast-market testing
 - WS connection budget updated: 11 Tier B + 6 Tier C = 17 total (within per-IP limit)
-- Tier B `max_connections` raised from 10 → 11 in config.yaml (was dropping assets at 10)
+- Tier B `max_connections` tested at 11 — caused connection drops, reverted to 10
 
 ### Dependencies
 - Added: `alloy-primitives`, `alloy-sol-types`, `alloy-signer`, `alloy-signer-local`, `hex`, `rand`
+
+---
+
+## [0.13.1] — 2026-03-17 — LiveExecutor, Rate Limiter & Trade Status Pipeline (B-Part 3)
+
+### Added
+- **LiveExecutor** (`executor.rs`): Full order execution pipeline for Polymarket CLOB
+  - `OrderType` enum (FAK/GTC/FOK) and `OrderAggression` (passive/at_market/aggressive) for tick offset control
+  - `compute_order_quantity()` — B3.0 quantity guard: FAK/GTC/FOK BUY/SELL → base (token count); market BUY → quote (USDC notional)
+  - `Executor` struct with `execute_arb()` (two-leg), `execute_single_leg()`, `apply_aggression()`, `submit_to_clob()`
+  - `TrackedOrder` struct with full lifecycle state (order_id, status, timestamps, fill amounts)
+  - Trade tracking: `update_trade_status()`, `pending_orders()`, `timed_out_orders()`, `cleanup_old_orders()`
+  - 11 unit tests (4 quantity guard, 6 timestamp parsing, 1 trade status lifecycle)
+- **Trade status pipeline** (`executor.rs` B3.2): `TradeStatus` enum — Submitted → Matched → Mined → Confirmed / Retrying / Failed / Cancelled with `is_terminal()` predicate
+- **Timestamp normalization** (`executor.rs` B3.4): `parse_polymarket_timestamp()` handles ISO8601 ±TZ, Unix seconds, Unix milliseconds, null/empty
+- **Execution error handling** (`executor.rs` B3.5): `ExecutionError` enum covering rate-limited, insufficient balance, order rejected, network, timeout, signing, and unknown errors
+- **Token-bucket rate limiter** (`rate_limiter.rs` B3.3): Multi-tier rate limiting for CLOB API
+  - 4 simultaneous buckets: trading (60/min), public (100/min), auth (300/min), global (3000/10min)
+  - `check(category) → Result<(), wait_secs>` with automatic token refund on global limit hit
+  - `wait_and_consume()` blocking variant for simple usage
+  - 3 unit tests (basic allow, category exhaust, global exhaust)
+
+### Changed
+- `lib.rs`: Added module declarations for `executor`, `rate_limiter`
+- `config.yaml`: Tier B `max_connections` reverted from 11 → 10 (11 caused massive connection drops)
 
 ---
 

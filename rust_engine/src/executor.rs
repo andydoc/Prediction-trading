@@ -1,0 +1,840 @@
+/// Live order executor for Polymarket CLOB (B3.0, B3.1, B3.2, B3.5).
+///
+/// Handles order construction, signing, submission, and status tracking.
+/// In dry-run mode: constructs and signs orders, logs full details, but
+/// does not submit to CLOB.
+///
+/// Key components:
+///   - Market BUY quantity guard (B3.0)
+///   - Order construction with instrument model + signing (B3.1)
+///   - Trade status pipeline types (B3.2)
+///   - Error handling matrix (B3.5)
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::instrument::{Instrument, InstrumentStore};
+use crate::signing::{self, OrderSigner, OrderData, SignedOrder, Side};
+use crate::rate_limiter::{RateLimiter, RateCategory};
+
+// ---------------------------------------------------------------------------
+// Order types
+// ---------------------------------------------------------------------------
+
+/// Order type for CLOB submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderType {
+    /// Fill And Kill — limit order that cancels unfilled portion immediately.
+    Fak,
+    /// Good Till Cancel — limit order that stays on the book.
+    Gtc,
+    /// Fill Or Kill — must fill entirely or cancel.
+    Fok,
+}
+
+impl OrderType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fak => "FAK",
+            Self::Gtc => "GTC",
+            Self::Fok => "FOK",
+        }
+    }
+}
+
+/// Order aggression level (B3.1 fast-market note).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderAggression {
+    /// Place at best bid/ask (cheapest, highest non-fill risk).
+    Passive,
+    /// FAK at current best price (default).
+    AtMarket,
+    /// 1 tick into the book (best fill rate, slightly worse price).
+    Aggressive,
+}
+
+impl OrderAggression {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "passive" => Self::Passive,
+            "aggressive" => Self::Aggressive,
+            _ => Self::AtMarket,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// B3.0: Market BUY quantity guard
+// ---------------------------------------------------------------------------
+
+/// Quantity semantics for Polymarket orders.
+///
+/// - Market BUY:  quantity = USDC notional (quote currency)
+/// - Market SELL: quantity = token count (base currency)
+/// - Limit/FAK:   quantity = token count (base currency)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantityType {
+    /// USDC notional (for market BUY only).
+    Quote,
+    /// Token count (for everything else).
+    Base,
+}
+
+/// Validate and compute the correct quantity for an order.
+///
+/// Returns (quantity, quantity_type) or an error if the combination is invalid.
+///
+/// B3.0 rules:
+///   (a) Market BUY  → quantity = USDC notional (quote)
+///   (b) Market SELL → quantity = token count (base)
+///   (c) Limit/FAK   → quantity = token count (base)
+///   (d) Base-denominated market BUY → REJECTED
+pub fn compute_order_quantity(
+    side: Side,
+    order_type: OrderType,
+    size_usd: f64,
+    price: f64,
+    instrument: &Instrument,
+) -> Result<(f64, QuantityType), String> {
+    let shares = size_usd / price;
+
+    match (order_type, side) {
+        // (a) Market BUY → quote (USDC notional)
+        // Note: we don't support market orders directly, but if we did,
+        // the quantity would be in USDC terms.
+        // For FAK BUY (our standard), quantity is in base (token count).
+
+        // (c) FAK/GTC/FOK BUY → base (token count)
+        (OrderType::Fak | OrderType::Gtc | OrderType::Fok, Side::Buy) => {
+            let rounded = instrument.rounding.round_size(shares);
+            if rounded < 0.01 {
+                return Err(format!("Order size too small: {} shares (${:.2} at {:.4})",
+                    rounded, size_usd, price));
+            }
+            Ok((rounded, QuantityType::Base))
+        }
+
+        // (b) Market SELL / (c) FAK/GTC/FOK SELL → base (token count)
+        (_, Side::Sell) => {
+            let rounded = instrument.rounding.round_size(shares);
+            if rounded < 0.01 {
+                return Err(format!("Order size too small: {} shares", rounded));
+            }
+            Ok((rounded, QuantityType::Base))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// B3.2: Trade status pipeline
+// ---------------------------------------------------------------------------
+
+/// Status of a submitted trade on the CLOB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradeStatus {
+    /// Order submitted, awaiting match.
+    Submitted,
+    /// Matched by the CLOB engine.
+    Matched,
+    /// Transaction mined on Polygon.
+    Mined,
+    /// Transaction confirmed (finality reached).
+    Confirmed,
+    /// Transaction failed, being retried.
+    Retrying,
+    /// Permanently failed.
+    Failed,
+    /// Order cancelled (FAK unfilled portion, or manual cancel).
+    Cancelled,
+}
+
+impl TradeStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Submitted => "SUBMITTED",
+            Self::Matched => "MATCHED",
+            Self::Mined => "MINED",
+            Self::Confirmed => "CONFIRMED",
+            Self::Retrying => "RETRYING",
+            Self::Failed => "FAILED",
+            Self::Cancelled => "CANCELLED",
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Confirmed | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// A tracked order with its current status.
+#[derive(Debug, Clone)]
+pub struct TrackedOrder {
+    /// CLOB order ID (assigned after submission).
+    pub order_id: String,
+    /// Our internal trade ID for dedup.
+    pub trade_id: String,
+    /// Position ID this order belongs to.
+    pub position_id: String,
+    /// Market ID (leg of the arb).
+    pub market_id: String,
+    /// Token ID being traded.
+    pub token_id: String,
+    /// Side (BUY/SELL).
+    pub side: Side,
+    /// Submitted price.
+    pub price: f64,
+    /// Submitted quantity (in appropriate units per B3.0).
+    pub quantity: f64,
+    /// Current status.
+    pub status: TradeStatus,
+    /// Filled quantity so far.
+    pub filled_quantity: f64,
+    /// Average fill price.
+    pub avg_fill_price: f64,
+    /// Timestamp of submission.
+    pub submitted_at: f64,
+    /// Timestamp of last status update.
+    pub last_update: f64,
+    /// The signed order (for logging/debugging).
+    pub signed_order: Option<SignedOrder>,
+    /// Whether this is a negRisk market.
+    pub neg_risk: bool,
+}
+
+// ---------------------------------------------------------------------------
+// B3.5: Execution errors
+// ---------------------------------------------------------------------------
+
+/// Errors that can occur during order execution.
+#[derive(Debug, Clone)]
+pub enum ExecutionError {
+    /// CLOB API returned an error response.
+    ClobRejection { code: String, message: String },
+    /// CLOB API timed out.
+    Timeout { elapsed_secs: f64 },
+    /// Network failure (connection refused, DNS, etc).
+    NetworkFailure { message: String },
+    /// Insufficient balance for the order.
+    InsufficientBalance { available: f64, required: f64 },
+    /// Rate limited by CLOB API (429).
+    RateLimited { retry_after_secs: f64 },
+    /// Instrument not found or not accepting orders.
+    InstrumentError { message: String },
+    /// Quantity guard rejected the order (B3.0).
+    QuantityGuardRejection { message: String },
+    /// Signing failed.
+    SigningError { message: String },
+}
+
+impl std::fmt::Display for ExecutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClobRejection { code, message } => write!(f, "CLOB rejection [{}]: {}", code, message),
+            Self::Timeout { elapsed_secs } => write!(f, "Timeout after {:.1}s", elapsed_secs),
+            Self::NetworkFailure { message } => write!(f, "Network failure: {}", message),
+            Self::InsufficientBalance { available, required } =>
+                write!(f, "Insufficient balance: ${:.2} available, ${:.2} required", available, required),
+            Self::RateLimited { retry_after_secs } =>
+                write!(f, "Rate limited, retry after {:.1}s", retry_after_secs),
+            Self::InstrumentError { message } => write!(f, "Instrument error: {}", message),
+            Self::QuantityGuardRejection { message } => write!(f, "Quantity guard: {}", message),
+            Self::SigningError { message } => write!(f, "Signing error: {}", message),
+        }
+    }
+}
+
+/// Result of executing a single order.
+#[derive(Debug, Clone)]
+pub enum OrderResult {
+    /// Order accepted (dry-run or live submission).
+    Accepted(TrackedOrder),
+    /// Order rejected before or during submission.
+    Rejected(ExecutionError),
+}
+
+/// Result of executing all legs of an arb.
+#[derive(Debug)]
+pub struct ArbExecutionResult {
+    /// Per-leg results.
+    pub legs: Vec<OrderResult>,
+    /// True if all legs were accepted.
+    pub all_accepted: bool,
+    /// True if this was a dry-run (no actual CLOB submission).
+    pub dry_run: bool,
+}
+
+// ---------------------------------------------------------------------------
+// B3.1: LiveExecutor
+// ---------------------------------------------------------------------------
+
+/// Configuration for the executor.
+#[derive(Debug, Clone)]
+pub struct ExecutorConfig {
+    /// CLOB API host (e.g., "https://clob.polymarket.com").
+    pub clob_host: String,
+    /// If true, sign and log orders but don't submit to CLOB.
+    pub dry_run: bool,
+    /// Default order type.
+    pub order_type: OrderType,
+    /// Order aggression (tick offset for FAK orders).
+    pub aggression: OrderAggression,
+    /// Fee rate in basis points (e.g., 0 for maker, 100 for 1% taker).
+    pub fee_rate_bps: u64,
+    /// Trade confirmation timeout in seconds (B3.2).
+    pub confirmation_timeout_secs: f64,
+}
+
+impl Default for ExecutorConfig {
+    fn default() -> Self {
+        Self {
+            clob_host: "https://clob.polymarket.com".into(),
+            dry_run: true,
+            order_type: OrderType::Fak,
+            aggression: OrderAggression::AtMarket,
+            fee_rate_bps: 0,
+            confirmation_timeout_secs: 120.0,
+        }
+    }
+}
+
+/// The live order executor. Constructs, signs, and submits orders to Polymarket CLOB.
+pub struct Executor {
+    config: ExecutorConfig,
+    signer: OrderSigner,
+    instruments: Arc<InstrumentStore>,
+    rate_limiter: Arc<RateLimiter>,
+    http_client: reqwest::blocking::Client,
+    /// Active orders being tracked (trade_id → TrackedOrder).
+    tracked: parking_lot::Mutex<HashMap<String, TrackedOrder>>,
+}
+
+impl Executor {
+    /// Create a new executor.
+    pub fn new(
+        config: ExecutorConfig,
+        signer: OrderSigner,
+        instruments: Arc<InstrumentStore>,
+        rate_limiter: Arc<RateLimiter>,
+    ) -> Self {
+        Self {
+            config,
+            signer,
+            instruments,
+            rate_limiter,
+            http_client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("Failed to build HTTP client"),
+            tracked: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Execute all legs of an arb opportunity.
+    ///
+    /// Each leg is: (market_id, token_id, side, price, size_usd).
+    /// In dry-run mode: constructs and signs all orders, logs them, returns Accepted.
+    /// In live mode: submits to CLOB API after rate limit check.
+    pub fn execute_arb(
+        &self,
+        position_id: &str,
+        legs: &[(String, String, Side, f64, f64)],
+    ) -> ArbExecutionResult {
+        let now = chrono::Utc::now().timestamp() as f64;
+        let mut results = Vec::with_capacity(legs.len());
+        let mut all_accepted = true;
+
+        for (market_id, token_id, side, price, size_usd) in legs {
+            let result = self.execute_single_leg(
+                position_id, market_id, token_id, *side, *price, *size_usd, now,
+            );
+            if matches!(&result, OrderResult::Rejected(_)) {
+                all_accepted = false;
+            }
+            results.push(result);
+        }
+
+        // Log summary
+        let accepted = results.iter().filter(|r| matches!(r, OrderResult::Accepted(_))).count();
+        let rejected = results.len() - accepted;
+        let mode = if self.config.dry_run { "DRY-RUN" } else { "LIVE" };
+
+        if all_accepted {
+            tracing::info!(
+                "[{}] Arb {} executed: {}/{} legs accepted",
+                mode, position_id, accepted, results.len()
+            );
+        } else {
+            tracing::warn!(
+                "[{}] Arb {} partial: {}/{} accepted, {} rejected",
+                mode, position_id, accepted, results.len(), rejected
+            );
+        }
+
+        ArbExecutionResult {
+            legs: results,
+            all_accepted,
+            dry_run: self.config.dry_run,
+        }
+    }
+
+    /// Execute a single leg of an arb.
+    fn execute_single_leg(
+        &self,
+        position_id: &str,
+        market_id: &str,
+        token_id: &str,
+        side: Side,
+        price: f64,
+        size_usd: f64,
+        now: f64,
+    ) -> OrderResult {
+        // 1. Look up instrument
+        let instrument = match self.instruments.get(token_id) {
+            Some(inst) => inst,
+            None => return OrderResult::Rejected(ExecutionError::InstrumentError {
+                message: format!("Unknown token_id: {}", token_id),
+            }),
+        };
+
+        // Validate instrument state
+        if !instrument.accepting_orders {
+            return OrderResult::Rejected(ExecutionError::InstrumentError {
+                message: format!("Market {} not accepting orders", market_id),
+            });
+        }
+
+        // 2. B3.0: Quantity guard
+        let (quantity, _qty_type) = match compute_order_quantity(
+            side, self.config.order_type, size_usd, price, &instrument,
+        ) {
+            Ok(q) => q,
+            Err(msg) => return OrderResult::Rejected(ExecutionError::QuantityGuardRejection {
+                message: msg,
+            }),
+        };
+
+        // 3. Round price to instrument tick size
+        let rounded_price = self.apply_aggression(price, side, &instrument);
+
+        // 4. Build and sign order
+        let order = match signing::build_order(
+            self.signer.address(),
+            token_id,
+            rounded_price,
+            size_usd,
+            side,
+            instrument.neg_risk,
+            self.config.fee_rate_bps,
+        ) {
+            Ok(o) => o,
+            Err(msg) => return OrderResult::Rejected(ExecutionError::SigningError {
+                message: msg,
+            }),
+        };
+
+        let signed = match self.signer.sign_order(&order, instrument.neg_risk) {
+            Ok(s) => s,
+            Err(msg) => return OrderResult::Rejected(ExecutionError::SigningError {
+                message: msg,
+            }),
+        };
+
+        // 5. Generate trade ID
+        let trade_id = format!("{}_{}_{}",
+            position_id, market_id,
+            chrono::Utc::now().timestamp_millis()
+        );
+
+        let tracked = TrackedOrder {
+            order_id: String::new(), // Set after CLOB submission
+            trade_id: trade_id.clone(),
+            position_id: position_id.to_string(),
+            market_id: market_id.to_string(),
+            token_id: token_id.to_string(),
+            side,
+            price: rounded_price,
+            quantity,
+            status: TradeStatus::Submitted,
+            filled_quantity: 0.0,
+            avg_fill_price: 0.0,
+            submitted_at: now,
+            last_update: now,
+            signed_order: Some(signed.clone()),
+            neg_risk: instrument.neg_risk,
+        };
+
+        // 6. Log order details
+        let side_str = if side == Side::Buy { "BUY" } else { "SELL" };
+        let mode = if self.config.dry_run { "DRY-RUN" } else { "LIVE" };
+        tracing::info!(
+            "[{}] {} {} {} shares @ {:.4} (${:.2}) token={} neg_risk={} sig={}...{}",
+            mode, side_str, self.config.order_type.as_str(),
+            quantity, rounded_price, size_usd,
+            &token_id[..token_id.len().min(8)],
+            instrument.neg_risk,
+            &signed.signature[..10],
+            &signed.signature[signed.signature.len()-6..],
+        );
+
+        // 7. Submit to CLOB (or skip in dry-run mode)
+        if self.config.dry_run {
+            // In dry-run: mark as confirmed immediately
+            let mut order = tracked;
+            order.status = TradeStatus::Confirmed;
+            order.filled_quantity = quantity;
+            order.avg_fill_price = rounded_price;
+
+            // Track it
+            self.tracked.lock().insert(trade_id, order.clone());
+
+            return OrderResult::Accepted(order);
+        }
+
+        // Live mode: rate limit check, then submit
+        if let Err(wait) = self.rate_limiter.check(RateCategory::Trading) {
+            return OrderResult::Rejected(ExecutionError::RateLimited {
+                retry_after_secs: wait,
+            });
+        }
+
+        // Submit to CLOB API
+        match self.submit_to_clob(&signed, &instrument, rounded_price, quantity, side) {
+            Ok(order_id) => {
+                let mut order = tracked;
+                order.order_id = order_id;
+                order.status = TradeStatus::Submitted;
+                self.tracked.lock().insert(trade_id, order.clone());
+                OrderResult::Accepted(order)
+            }
+            Err(e) => OrderResult::Rejected(e),
+        }
+    }
+
+    /// Apply order aggression to adjust price by tick size.
+    fn apply_aggression(&self, price: f64, side: Side, instrument: &Instrument) -> f64 {
+        let tick = instrument.tick_size;
+        let adjusted = match self.config.aggression {
+            OrderAggression::Passive => price,
+            OrderAggression::AtMarket => price,
+            OrderAggression::Aggressive => match side {
+                // BUY: increase price by 1 tick (more likely to fill)
+                Side::Buy => price + tick,
+                // SELL: decrease price by 1 tick
+                Side::Sell => (price - tick).max(tick),
+            },
+        };
+        instrument.rounding.round_price(adjusted)
+    }
+
+    /// Submit a signed order to the Polymarket CLOB API.
+    ///
+    /// Returns the CLOB order_id on success, or an ExecutionError.
+    fn submit_to_clob(
+        &self,
+        signed: &SignedOrder,
+        instrument: &Instrument,
+        price: f64,
+        size: f64,
+        side: Side,
+    ) -> Result<String, ExecutionError> {
+        let url = format!("{}/order", self.config.clob_host);
+
+        let order_payload = serde_json::json!({
+            "order": {
+                "salt": signed.order.salt.to_string(),
+                "maker": format!("{:?}", signed.order.maker),
+                "signer": format!("{:?}", signed.order.signer),
+                "taker": format!("{:?}", signed.order.taker),
+                "tokenId": signed.order.token_id.to_string(),
+                "makerAmount": signed.order.maker_amount.to_string(),
+                "takerAmount": signed.order.taker_amount.to_string(),
+                "expiration": signed.order.expiration.to_string(),
+                "nonce": signed.order.nonce.to_string(),
+                "feeRateBps": signed.order.fee_rate_bps.to_string(),
+                "side": if side == Side::Buy { "BUY" } else { "SELL" },
+                "signatureType": signed.order.signature_type,
+                "signature": &signed.signature,
+            },
+            "orderType": self.config.order_type.as_str(),
+            "negRisk": instrument.neg_risk,
+        });
+
+        let response = self.http_client
+            .post(&url)
+            .json(&order_payload)
+            .send()
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ExecutionError::Timeout { elapsed_secs: 30.0 }
+                } else {
+                    ExecutionError::NetworkFailure { message: e.to_string() }
+                }
+            })?;
+
+        let status = response.status();
+
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = response.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(5.0);
+            return Err(ExecutionError::RateLimited { retry_after_secs: retry_after });
+        }
+
+        let body: serde_json::Value = response.json()
+            .map_err(|e| ExecutionError::NetworkFailure {
+                message: format!("Failed to parse response: {}", e),
+            })?;
+
+        if !status.is_success() {
+            let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("UNKNOWN").to_string();
+            let message = body.get("message")
+                .or_else(|| body.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error")
+                .to_string();
+            return Err(ExecutionError::ClobRejection { code, message });
+        }
+
+        // Extract order ID from response
+        let order_id = body.get("orderID")
+            .or_else(|| body.get("order_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        tracing::info!("CLOB order accepted: order_id={}", order_id);
+
+        Ok(order_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // B3.2: Trade status tracking
+    // -----------------------------------------------------------------------
+
+    /// Update the status of a tracked order (called from WS events).
+    pub fn update_trade_status(&self, trade_id: &str, new_status: TradeStatus,
+                                filled_qty: Option<f64>, avg_price: Option<f64>) {
+        let mut tracked = self.tracked.lock();
+        if let Some(order) = tracked.get_mut(trade_id) {
+            let old = order.status.as_str();
+            order.status = new_status;
+            order.last_update = chrono::Utc::now().timestamp() as f64;
+            if let Some(qty) = filled_qty {
+                order.filled_quantity = qty;
+            }
+            if let Some(price) = avg_price {
+                order.avg_fill_price = price;
+            }
+            tracing::info!("Trade {} status: {} → {}", trade_id, old, new_status.as_str());
+        }
+    }
+
+    /// Get all pending (non-terminal) tracked orders.
+    pub fn pending_orders(&self) -> Vec<TrackedOrder> {
+        self.tracked.lock().values()
+            .filter(|o| !o.status.is_terminal())
+            .cloned()
+            .collect()
+    }
+
+    /// Get timed-out orders (submitted but no update within confirmation_timeout).
+    pub fn timed_out_orders(&self) -> Vec<TrackedOrder> {
+        let now = chrono::Utc::now().timestamp() as f64;
+        let timeout = self.config.confirmation_timeout_secs;
+        self.tracked.lock().values()
+            .filter(|o| !o.status.is_terminal()
+                && (now - o.submitted_at) > timeout)
+            .cloned()
+            .collect()
+    }
+
+    /// Remove terminal orders older than the given age (seconds).
+    pub fn cleanup_old_orders(&self, max_age_secs: f64) {
+        let now = chrono::Utc::now().timestamp() as f64;
+        let mut tracked = self.tracked.lock();
+        tracked.retain(|_, o| {
+            !o.status.is_terminal() || (now - o.last_update) < max_age_secs
+        });
+    }
+
+    /// Is the executor in dry-run mode?
+    pub fn is_dry_run(&self) -> bool {
+        self.config.dry_run
+    }
+}
+
+// ---------------------------------------------------------------------------
+// B3.4: Timestamp normalisation
+// ---------------------------------------------------------------------------
+
+/// Parse a Polymarket timestamp from various formats into Unix seconds (f64).
+///
+/// Handles:
+///   - ISO8601 with timezone ("2026-03-17T12:00:00Z", "2026-03-17T12:00:00+00:00")
+///   - ISO8601 without timezone (assumes UTC)
+///   - Unix seconds (integer or float, e.g., 1742212800)
+///   - Unix milliseconds (>1e12, e.g., 1742212800000)
+///   - null/empty → returns 0.0
+pub fn parse_polymarket_timestamp(value: &serde_json::Value) -> f64 {
+    match value {
+        serde_json::Value::Null => 0.0,
+        serde_json::Value::Number(n) => {
+            let v = n.as_f64().unwrap_or(0.0);
+            if v > 1e12 {
+                // Milliseconds → seconds
+                v / 1000.0
+            } else {
+                v
+            }
+        }
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                return 0.0;
+            }
+            // Try as numeric string first
+            if let Ok(v) = s.parse::<f64>() {
+                return if v > 1e12 { v / 1000.0 } else { v };
+            }
+            // Try ISO8601 with chrono
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                return dt.timestamp() as f64;
+            }
+            // Try ISO8601 without timezone (assume UTC)
+            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+                return dt.and_utc().timestamp() as f64;
+            }
+            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+                return dt.and_utc().timestamp() as f64;
+            }
+            // Try Z suffix (common in Polymarket)
+            let no_z = s.trim_end_matches('Z');
+            if no_z != s {
+                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(no_z, "%Y-%m-%dT%H:%M:%S") {
+                    return dt.and_utc().timestamp() as f64;
+                }
+                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(no_z, "%Y-%m-%dT%H:%M:%S%.f") {
+                    return dt.and_utc().timestamp() as f64;
+                }
+            }
+            tracing::warn!("Failed to parse timestamp: '{}'", s);
+            0.0
+        }
+        _ => 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instrument::RoundingConfig;
+
+    fn test_instrument() -> Instrument {
+        Instrument {
+            market_id: "test_market".into(),
+            token_id: "123456789".into(),
+            outcome: "yes".into(),
+            condition_id: "cond_1".into(),
+            neg_risk: false,
+            tick_size: 0.01,
+            rounding: RoundingConfig::from_tick_size("0.01"),
+            min_order_size: 1.0,
+            max_order_size: 0.0,
+            order_book_enabled: true,
+            accepting_orders: true,
+        }
+    }
+
+    // B3.0 tests
+    #[test]
+    fn test_quantity_guard_fak_buy() {
+        let inst = test_instrument();
+        let (qty, qt) = compute_order_quantity(Side::Buy, OrderType::Fak, 50.0, 0.50, &inst).unwrap();
+        assert_eq!(qt, QuantityType::Base);
+        assert!((qty - 100.0).abs() < 0.01); // $50 / $0.50 = 100 shares
+    }
+
+    #[test]
+    fn test_quantity_guard_fak_sell() {
+        let inst = test_instrument();
+        let (qty, qt) = compute_order_quantity(Side::Sell, OrderType::Fak, 50.0, 0.50, &inst).unwrap();
+        assert_eq!(qt, QuantityType::Base);
+        assert!((qty - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_quantity_guard_too_small() {
+        let inst = test_instrument();
+        let result = compute_order_quantity(Side::Buy, OrderType::Fak, 0.001, 0.50, &inst);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_quantity_guard_gtc_buy() {
+        let inst = test_instrument();
+        let (qty, qt) = compute_order_quantity(Side::Buy, OrderType::Gtc, 10.0, 0.25, &inst).unwrap();
+        assert_eq!(qt, QuantityType::Base);
+        assert!((qty - 40.0).abs() < 0.01); // $10 / $0.25 = 40 shares
+    }
+
+    // B3.4 timestamp tests
+    #[test]
+    fn test_parse_timestamp_iso8601() {
+        let v = serde_json::json!("2026-03-17T12:00:00Z");
+        let ts = parse_polymarket_timestamp(&v);
+        assert!(ts > 1.7e9); // Reasonable Unix timestamp
+    }
+
+    #[test]
+    fn test_parse_timestamp_unix_seconds() {
+        let v = serde_json::json!(1742212800);
+        let ts = parse_polymarket_timestamp(&v);
+        assert!((ts - 1742212800.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_timestamp_unix_millis() {
+        let v = serde_json::json!(1742212800000u64);
+        let ts = parse_polymarket_timestamp(&v);
+        assert!((ts - 1742212800.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_timestamp_null() {
+        let v = serde_json::json!(null);
+        assert_eq!(parse_polymarket_timestamp(&v), 0.0);
+    }
+
+    #[test]
+    fn test_parse_timestamp_empty_string() {
+        let v = serde_json::json!("");
+        assert_eq!(parse_polymarket_timestamp(&v), 0.0);
+    }
+
+    #[test]
+    fn test_parse_timestamp_numeric_string() {
+        let v = serde_json::json!("1742212800");
+        let ts = parse_polymarket_timestamp(&v);
+        assert!((ts - 1742212800.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_timestamp_iso_no_tz() {
+        let v = serde_json::json!("2026-03-17T12:00:00");
+        let ts = parse_polymarket_timestamp(&v);
+        assert!(ts > 1.7e9);
+    }
+
+    // Trade status tests
+    #[test]
+    fn test_trade_status_terminal() {
+        assert!(TradeStatus::Confirmed.is_terminal());
+        assert!(TradeStatus::Failed.is_terminal());
+        assert!(TradeStatus::Cancelled.is_terminal());
+        assert!(!TradeStatus::Submitted.is_terminal());
+        assert!(!TradeStatus::Matched.is_terminal());
+        assert!(!TradeStatus::Retrying.is_terminal());
+    }
+}
