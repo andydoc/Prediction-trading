@@ -50,6 +50,7 @@ use ws::WsManager;
 use ws_tiered::{TieredWsManager, TieredWsConfig, TieredWsStats};
 use ws_tier_c::NewMarketBurst;
 use position::PositionManager;
+use instrument::InstrumentStore;
 use dashboard::{DashboardState, EngineMetrics};
 use latency::LatencyTracker;
 use monitor::MonitorState;
@@ -82,6 +83,8 @@ pub struct TradingEngine {
     pub log_ring: Arc<parking_lot::Mutex<monitor::LogRing>>,
     /// Shared resolved events vec — used by both old WS and tiered WS.
     resolved_events: Arc<parking_lot::Mutex<Vec<ws::ResolvedEvent>>>,
+    /// Instrument store — token_id → Instrument (tick_size, rounding, neg_risk, etc.)
+    pub instruments: Arc<InstrumentStore>,
 }
 
 impl TradingEngine {
@@ -193,9 +196,10 @@ impl TradingEngine {
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
         let resolved_events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let instruments = Arc::new(InstrumentStore::new());
 
         Ok(Self {
-            book, eval_queue, ws, constraints,
+            book, eval_queue, ws, constraints, instruments,
             ws_tiered: parking_lot::Mutex::new(None),
             eval_config: parking_lot::Mutex::new(eval_config),
             runtime, positions,
@@ -215,6 +219,14 @@ impl TradingEngine {
     /// Set the asset_id → constraint_id index.
     pub fn set_asset_index(&self, index: HashMap<String, Vec<String>>) {
         self.book.set_asset_index(index);
+    }
+
+    /// Load instruments from scanner market data.
+    ///
+    /// Called by the orchestrator after scanner completes. Each market produces
+    /// two instruments (YES and NO tokens) with tick_size, rounding config, etc.
+    pub fn load_instruments(&self, markets: &HashMap<String, serde_json::Value>) {
+        self.instruments.load_from_markets(markets);
     }
 
     /// Start WS connections and dashboard server.
@@ -294,7 +306,7 @@ impl TradingEngine {
             Arc::clone(&self.resolved_events),
             Arc::clone(&self.positions),
             Arc::clone(&self.latency),
-            None, // InstrumentStore: wired when executor is integrated with engine
+            Some(Arc::clone(&self.instruments)),
         );
 
         let rt = self.runtime.handle();

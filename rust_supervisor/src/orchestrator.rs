@@ -760,6 +760,8 @@ impl Orchestrator {
                 self.market_lookup.insert(mid.to_string(), m.clone());
             }
         }
+        // Load instruments from market data (token_id → tick_size, rounding, neg_risk, etc.)
+        self.engine.load_instruments(&self.market_lookup);
     }
 
     // --- Constraint detection ---
