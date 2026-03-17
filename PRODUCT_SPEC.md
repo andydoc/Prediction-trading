@@ -122,6 +122,13 @@ The following inconsistencies were identified. These will be addressed by the do
 - Monitoring and alerting beyond dashboard
 - Disaster recovery / rollback
 - Multi-shadow parameter optimisation (5 parallel accounts — see Milestone D)
+- Batch order submission (multi-leg atomic entry)
+- Cross-asset fill matching (negRisk synthetic NO fills)
+- Formal instrument model (tick size, precision hierarchy)
+- Execution rate limiting (token bucket, Polymarket limits)
+- Timestamp normalisation (robust parsing across API responses)
+- FAK overfill handling
+- Venue-side reconciliation on startup (cold-start state recovery)
 
 ---
 
@@ -233,6 +240,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | Tier B max connections | orchestrator | 10 | `websocket.tier_b_max_connections` |
 | Tier B hysteresis scans | orchestrator | 3 | `websocket.tier_b_hysteresis_scans` |
 | Tier B consolidation threshold | orchestrator | 300 | `websocket.tier_b_consolidation_threshold` |
+| Tier B top N constraints | orchestrator | 0 (no limit) | `websocket.tier_b_top_n_constraints` |
 | Tier C new market buffer | orchestrator | 2.5 s | `websocket.tier_c_new_market_buffer_secs` |
 | **Position Lifecycle** | | | |
 | Replacement cooldown | `trading_engine.py` | 60 s | `arbitrage.replacement_cooldown_seconds` |
@@ -279,6 +287,13 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | ⬚ **B7: Live P&L tracking** | Dashboard shows: realised P&L (closed positions), unrealised P&L (open positions marked to market), fees paid, net return %. Updated via SSE. |
 | ⬚ **B8: Create ARCHITECTURE.md** | Covers: post-Rust-port architecture, data flow, component descriptions, file structure (verified against actual repo), config reference (including all parameterised values from A6), glossary. Current state only — not historical. |
 | ⬚ **B9: Create ROADMAP.md** | Phases renumbered by actual priority. Each phase: goal, status, items. Cross-references ARCHITECTURE.md. No version history or incident detail. Accurately reflects A+B as complete, C–F as remaining. |
+| ⬚ **B10: Batch order submission** | Submit all legs of a multi-leg arb as a single batch request to Polymarket CLOB. Reduces latency window for partial-fill exposure on 3+ leg positions. **Pre-req: study NT PR #3506 source before building.** |
+| ⬚ **B11: Cross-asset fill matching** | When a YES fill executes on a negRisk market, Polymarket implicitly creates corresponding NO positions on complementary outcomes. Detect and reconcile these synthetic fills against internal position state. **Pre-req: study NT PR #3345/#3357 source before building.** |
+| ⬚ **B12: Formal instrument model** | Typed Rust struct encoding Polymarket instrument precision: `tick_size`, `price_increment`, `size_increment`, `min_order_size`, `max_order_size`, `neg_risk`, `condition_id`. Encode ROUNDING_CONFIG rules from py-clob-client (tick size → price precision hierarchy). Prevents decimal/rounding bugs at order submission. **Pre-req: study NT `BinaryOption` type and py-clob-client `ROUNDING_CONFIG` before building.** |
+| ⬚ **B13: Execution rate limiting** | Explicit rate limiter on the execution path: 60 orders/min, 100 req/min public, 300 req/min authenticated, 3,000 req/10min global. Token-bucket implementation. Logs when throttled. Prevents 429 bans during high-activity periods. **Pre-req: study NT rate limit implementation and Polymarket API docs for current limits.** |
+| ⬚ **B14: Timestamp normalisation** | Robust parsing of Polymarket timestamps across all API responses (order status, trade history, market metadata). Handle: ISO8601 with/without timezone, Unix seconds vs milliseconds, missing/null timestamps. **Pre-req: study NT issue #3273 and fix for edge cases before building.** |
+| ⬚ **B15: FOK/FAK overfill handling** | Handle edge case where FAK (Fill And Kill) limit orders receive more fill than expected due to race conditions or matching engine behaviour. Detect overfill, adjust internal position state, log discrepancy. **Pre-req: study NT issue #3221 and fix for exact failure mode before building.** |
+| ⬚ **B16: Venue-side reconciliation on startup** | On every startup: query Polymarket CLOB for actual contract balances and open orders. Compare against internal SQLite state. Report discrepancies before resuming trading. Extends B5 (periodic reconciliation) to cover cold-start state recovery. **Pre-req: study NT `generate_order_status_reports` pattern before building.** |
 
 **Verification**: Run in shadow mode with live execution logging for 48h. Every "would-execute" event shows: pre-trade validation result, order details, expected fills, reconciliation status.
 

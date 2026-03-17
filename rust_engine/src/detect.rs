@@ -36,6 +36,10 @@ pub struct DetectionResult {
     pub all_asset_ids: Vec<String>,
     /// constraint_id → [asset_ids] (for Tier B hot constraint management)
     pub constraint_to_assets: HashMap<String, Vec<String>>,
+    /// constraint_id → |price_sum - 1.0| (spread tightness; lower = better for arb)
+    pub constraint_spread: HashMap<String, f64>,
+    /// constraint_id → end_date_ts (earliest resolution unix timestamp; 0 = unknown)
+    pub constraint_end_ts: HashMap<String, f64>,
     // Stats
     pub n_markets_input: usize,
     pub n_groups: usize,
@@ -68,6 +72,8 @@ pub fn detect_constraints(
 
     // Step 2: Build constraints from valid groups
     let mut constraints = Vec::new();
+    let mut constraint_spread: HashMap<String, f64> = HashMap::new();
+    let mut constraint_end_ts: HashMap<String, f64> = HashMap::new();
     let mut n_skipped_incomplete = 0usize;
     let mut n_skipped_overpriced = 0usize;
 
@@ -121,6 +127,7 @@ pub fn detect_constraints(
             continue;
         }
 
+        let cid = constraint_id.clone();
         constraints.push(Constraint {
             constraint_id,
             constraint_type: "mutex".to_string(),
@@ -129,6 +136,8 @@ pub fn detect_constraints(
             implications: Vec::new(),
             end_date_ts: earliest_end,
         });
+        constraint_spread.insert(cid.clone(), (price_sum - 1.0).abs());
+        constraint_end_ts.insert(cid, earliest_end);
     }
 
     // Step 3: Build index maps from constraints
@@ -170,6 +179,8 @@ pub fn detect_constraints(
         asset_to_market,
         all_asset_ids,
         constraint_to_assets,
+        constraint_spread,
+        constraint_end_ts,
         n_markets_input,
         n_groups,
         n_skipped_incomplete,

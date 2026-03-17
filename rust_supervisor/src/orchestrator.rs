@@ -146,6 +146,7 @@ pub struct OrchestratorConfig {
     pub ws_stagger_ms: u64,
     pub ws_max_assets_per_connection: usize,
     pub ws_heartbeat_interval_secs: u64,
+    pub tier_b_top_n_constraints: usize,  // 0 = no limit
 }
 
 impl OrchestratorConfig {
@@ -272,6 +273,8 @@ impl OrchestratorConfig {
                 .and_then(|v| v.as_u64()).unwrap_or(450) as usize,
             ws_heartbeat_interval_secs: ws_cfg.get("heartbeat_interval")
                 .and_then(|v| v.as_u64()).unwrap_or(10),
+            tier_b_top_n_constraints: ws_cfg.get("tier_b_top_n_constraints")
+                .and_then(|v| v.as_u64()).unwrap_or(0) as usize,
         }
     }
 }
@@ -759,6 +762,8 @@ impl Orchestrator {
     // --- Constraint detection ---
 
     /// Detect constraints and return (all_asset_ids, constraint_to_assets).
+    /// When `tier_b_top_n_constraints > 0`, constraint_to_assets is filtered to the
+    /// top N constraints by tightest spread (|price_sum - 1.0|, ascending).
     fn detect_constraints(&mut self) -> (Vec<String>, HashMap<String, Vec<String>>) {
         if self.market_lookup.is_empty() {
             tracing::warn!("Cannot detect constraints: no markets loaded");
@@ -819,7 +824,41 @@ impl Orchestrator {
         tracing::info!("Constraints: {} detected, {} assets (capital=${:.2})",
             result.constraints.len(), result.all_asset_ids.len(), cap);
 
-        let constraint_to_assets = result.constraint_to_assets.clone();
+        let mut constraint_to_assets = result.constraint_to_assets.clone();
+
+        // Filter to top N constraints by composite score for Tier B.
+        // Score = spread / time_factor  (lower = better).
+        // spread = |price_sum - 1.0|  (tighter = better)
+        // time_factor = max(hours_to_resolution, 1.0)  (sooner = better, divides score down)
+        // So constraints with tight spreads resolving soon rank highest.
+        let top_n = self.cfg.tier_b_top_n_constraints;
+        if top_n > 0 && constraint_to_assets.len() > top_n {
+            let spread = &result.constraint_spread;
+            let end_ts = &result.constraint_end_ts;
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+
+            let mut ranked: Vec<_> = constraint_to_assets.keys().cloned().collect();
+            ranked.sort_by(|a, b| {
+                let score = |cid: &str| -> f64 {
+                    let s = spread.get(cid).copied().unwrap_or(1.0);
+                    let ets = end_ts.get(cid).copied().unwrap_or(0.0);
+                    let hours = if ets > now_ts { (ets - now_ts) / 3600.0 } else { 8760.0 }; // unknown → 1yr
+                    let time_factor = hours.max(1.0);
+                    s / time_factor  // lower = better (tight spread + soon resolution)
+                };
+                score(a).total_cmp(&score(b))
+            });
+            let keep: std::collections::HashSet<String> = ranked.into_iter().take(top_n).collect();
+            let removed = constraint_to_assets.len() - keep.len();
+            constraint_to_assets.retain(|k, _| keep.contains(k));
+            let hot_assets: usize = constraint_to_assets.values().map(|v| v.len()).sum();
+            tracing::info!("Tier B filter: top {} constraints ({} assets), {} demoted to Tier A (scored by spread/time_to_resolve)",
+                top_n, hot_assets, removed);
+        }
+
         (result.all_asset_ids, constraint_to_assets)
     }
 

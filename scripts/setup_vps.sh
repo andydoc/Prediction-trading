@@ -133,7 +133,7 @@ sudo -u ${TRADER_USER} mkdir -p \
 # --- 5. Build single binary ---
 echo "[5/8] Building prediction-trader binary..."
 sudo -u ${TRADER_USER} bash -c "source ~/.cargo/env && cd ${REPO_DIR} && cargo build --release"
-BINARY="${REPO_DIR}/rust_supervisor/target/release/prediction-trader"
+BINARY="${REPO_DIR}/target/release/prediction-trader"
 echo "  Binary: ${BINARY}"
 echo "  Size: $(du -h ${BINARY} | cut -f1)"
 
@@ -171,7 +171,7 @@ Type=simple
 User=${TRADER_USER}
 Group=${TRADER_USER}
 WorkingDirectory=${REPO_DIR}
-ExecStart=${REPO_DIR}/rust_supervisor/target/release/prediction-trader --workspace ${REPO_DIR}
+ExecStart=${REPO_DIR}/target/release/prediction-trader --workspace ${REPO_DIR}
 Restart=always
 RestartSec=30
 
@@ -215,7 +215,7 @@ echo ""
 echo "System:"
 echo "  User:    ${TRADER_USER}"
 echo "  Repo:    ${REPO_DIR}"
-echo "  Binary:  ${REPO_DIR}/rust_supervisor/target/release/prediction-trader"
+echo "  Binary:  ${REPO_DIR}/target/release/prediction-trader"
 echo "  Service: prediction-trader.service"
 echo "  Arch:    $(uname -m)"
 echo "  RAM:     $(free -h | awk '/Mem:/{print $2}')"
@@ -260,8 +260,8 @@ echo ""
 echo "7. Test run:"
 echo "   sudo su - ${TRADER_USER}"
 echo "   cd ${REPO_DIR}"
-echo "   ./rust_supervisor/target/release/prediction-trader --dry-run  # Verify config"
-echo "   ./rust_supervisor/target/release/prediction-trader  # Watch for errors, Ctrl+C to stop"
+echo "   ./target/release/prediction-trader --dry-run  # Verify config"
+echo "   ./target/release/prediction-trader  # Watch for errors, Ctrl+C to stop"
 echo ""
 echo "8. Start as service:"
 echo "   sudo systemctl start prediction-trader"

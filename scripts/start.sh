@@ -11,7 +11,7 @@
 
 set -e
 WORKSPACE="${TRADER_WORKSPACE:-/home/andydoc/prediction-trader}"
-BINARY="$WORKSPACE/rust_supervisor/target/release/prediction-trader"
+BINARY="$WORKSPACE/target/release/prediction-trader"
 
 cd "$WORKSPACE"
 
