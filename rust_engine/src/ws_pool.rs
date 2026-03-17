@@ -86,6 +86,8 @@ pub struct ConnectionPool {
     connections: Mutex<Vec<ManagedConnection>>,
     running: Arc<AtomicBool>,
     shutdown: Arc<Notify>,
+    /// Stored runtime handle from start() — used for dynamic connection spawns.
+    rt_handle: Mutex<Option<tokio::runtime::Handle>>,
     // Shared engine state
     book: Arc<BookMirror>,
     eval_queue: Arc<EvalQueue>,
@@ -111,6 +113,7 @@ impl ConnectionPool {
             connections: Mutex::new(Vec::new()),
             running: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(Notify::new()),
+            rt_handle: Mutex::new(None),
             book,
             eval_queue,
             resolved_events,
@@ -124,6 +127,7 @@ impl ConnectionPool {
     /// Distributes assets across connections (up to max_assets_per_connection each).
     pub fn start(&self, initial_assets: Vec<String>, rt: &tokio::runtime::Handle) {
         self.running.store(true, Ordering::SeqCst);
+        *self.rt_handle.lock() = Some(rt.clone());
 
         if initial_assets.is_empty() {
             // Start one warm connection with no subscriptions (for Tier C: new market events)
@@ -154,7 +158,8 @@ impl ConnectionPool {
     /// Subscribe to additional asset IDs. Distributes across connections with capacity.
     /// Spawns new connections dynamically if existing ones are full.
     pub fn subscribe(&self, asset_ids: Vec<String>) {
-        self.subscribe_with_rt(asset_ids, None);
+        let rt = self.rt_handle.lock().clone();
+        self.subscribe_with_rt(asset_ids, rt.as_ref());
     }
 
     /// Subscribe with an explicit runtime handle (used during start when not in async context).

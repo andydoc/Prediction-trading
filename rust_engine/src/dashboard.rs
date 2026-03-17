@@ -21,6 +21,7 @@ use crate::latency::LatencyTracker;
 use crate::queue::EvalQueue;
 use crate::eval::ConstraintStore;
 use crate::ws::WsManager;
+use crate::monitor::MonitorState;
 
 /// Shared state passed to all axum handlers via Arc.
 #[derive(Clone)]
@@ -42,6 +43,10 @@ pub struct DashboardState {
     pub delay_table: Arc<Mutex<(std::collections::HashMap<String, f64>, f64)>>,
     /// Latency instrumentation tracker
     pub latency: Arc<LatencyTracker>,
+    /// Monitor state for time-series metrics and system resources
+    pub monitor: Arc<Mutex<MonitorState>>,
+    /// Separate log ring buffer (avoids monitor lock contention)
+    pub log_ring: Arc<Mutex<crate::monitor::LogRing>>,
 }
 
 /// Metrics updated by the Rust orchestrator each stats cycle.
@@ -55,6 +60,11 @@ pub struct EngineMetrics {
     pub scanner_ts: String,
     pub engine_status: String,
     pub engine_ts: String,
+    // Tiered WS stats (set by orchestrator each stats cycle)
+    pub ws_subscribed: u64,
+    pub ws_total_msgs: u64,
+    pub ws_live_books: u64,
+    pub ws_connections: u32,
 }
 
 /// Static HTML — loaded at compile time from the extracted template.
@@ -114,6 +124,9 @@ async fn handle_sse(
             serde_json::to_string(&build_system(&s)).unwrap_or_default()));
         yield Ok(sse::Event::default().event("closed").data(
             serde_json::to_string(&build_closed(&s)).unwrap_or_default()));
+        // Monitor: full snapshot on connect
+        yield Ok(sse::Event::default().event("monitor").data(
+            serde_json::to_string(&build_monitor(&s, true)).unwrap_or_default()));
 
         let mut tick = 0u64;
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -131,6 +144,9 @@ async fn handle_sse(
             if tick % 2 == 0 {
                 yield Ok(sse::Event::default().event("system").data(
                     serde_json::to_string(&build_system(&s)).unwrap_or_default()));
+                // Monitor: delta every 10s
+                yield Ok(sse::Event::default().event("monitor").data(
+                    serde_json::to_string(&build_monitor(&s, false)).unwrap_or_default()));
             }
 
             // Opportunities: every 15s (every 3rd tick)
@@ -722,7 +738,6 @@ fn build_closed(s: &DashboardState) -> Value {
 
 fn build_system(s: &DashboardState) -> Value {
     let m = s.engine_metrics.lock().clone();
-    let ws = s.ws.stats();
     let (q_urg, q_bg) = s.eval_queue.depths();
     let n_constraints = s.constraints.len();
     let n_markets = s.book.live_count();
@@ -744,9 +759,9 @@ fn build_system(s: &DashboardState) -> Value {
             "constraints": n_constraints,
             "markets_total": n_markets,
             "iteration": m.iteration,
-            "ws_subscribed": ws.subscribed,
-            "ws_msgs": ws.total_msgs,
-            "ws_live": ws.live_books,
+            "ws_subscribed": m.ws_subscribed,
+            "ws_msgs": m.ws_total_msgs,
+            "ws_live": m.ws_live_books,
             "queue_urgent": q_urg,
             "queue_background": q_bg,
             "lat_p50": m.lat_p50_us,
@@ -763,4 +778,64 @@ fn build_system(s: &DashboardState) -> Value {
             "e2e":           { "p50": lat_snap.e2e.p50 as u64,           "p95": lat_snap.e2e.p95 as u64,           "max": lat_snap.e2e.max as u64,           "n": lat_snap.e2e.count },
         },
     })
+}
+
+fn build_monitor(s: &DashboardState, full: bool) -> Value {
+    let mut mon = s.monitor.lock();
+
+    // Collect fresh metrics each time we build
+    mon.collect_system_metrics();
+
+    // App metrics from engine state (use EngineMetrics which includes tiered WS stats)
+    let (q_urg, q_bg) = s.eval_queue.depths();
+    let n_constraints = s.constraints.len();
+    let n_markets = s.book.live_count();
+    let m = s.engine_metrics.lock();
+    mon.collect_app_metrics(
+        m.ws_subscribed, m.ws_total_msgs, m.ws_live_books,
+        n_constraints, n_markets,
+        m.lat_p50_us, m.lat_p95_us,
+        q_urg, q_bg,
+    );
+    drop(m);
+
+    // Financial metrics
+    let pm = s.positions.lock();
+    let cap = pm.current_capital();
+    let deployed: f64 = pm.open_positions().values().map(|p| p.total_capital).sum();
+    let total_value = cap + deployed;
+    let perf = pm.get_performance_metrics();
+    let realized = perf.get("total_actual_profit").copied().unwrap_or(0.0);
+    let closed_snapshot: Vec<crate::position::Position> = pm.closed_positions().to_vec();
+    drop(pm);
+
+    mon.collect_financial_metrics(total_value, cap, deployed, realized);
+
+    // Build the JSON (pass separate log ring to avoid lock contention)
+    let mut log_ring = s.log_ring.lock();
+    let mut result = mon.build_json(full, &mut log_ring);
+    drop(log_ring);
+
+    // Add financial summary from closed positions
+    let financial = mon.compute_financial_summary(&closed_snapshot);
+    if let Value::Object(ref mut map) = result {
+        map.insert("financial".to_string(), financial);
+    }
+
+    // Add latency breakdown (migrated from system section)
+    let lat_snap = s.latency.snapshot();
+    let lat_enabled = s.latency.is_enabled();
+    if let Value::Object(ref mut map) = result {
+        map.insert("latency_breakdown".to_string(), json!({
+            "enabled": lat_enabled,
+            "ws_network":    { "p50": lat_snap.ws_network.p50 as u64,    "p95": lat_snap.ws_network.p95 as u64,    "max": lat_snap.ws_network.max as u64,    "n": lat_snap.ws_network.count },
+            "ws_to_queue":   { "p50": lat_snap.ws_to_queue.p50 as u64,   "p95": lat_snap.ws_to_queue.p95 as u64,   "max": lat_snap.ws_to_queue.max as u64,   "n": lat_snap.ws_to_queue.count },
+            "queue_wait":    { "p50": lat_snap.queue_wait.p50 as u64,    "p95": lat_snap.queue_wait.p95 as u64,    "max": lat_snap.queue_wait.max as u64,    "n": lat_snap.queue_wait.count },
+            "eval_batch":    { "p50": lat_snap.eval_batch.p50 as u64,    "p95": lat_snap.eval_batch.p95 as u64,    "max": lat_snap.eval_batch.max as u64,    "n": lat_snap.eval_batch.count },
+            "eval_to_entry": { "p50": lat_snap.eval_to_entry.p50 as u64, "p95": lat_snap.eval_to_entry.p95 as u64, "max": lat_snap.eval_to_entry.max as u64, "n": lat_snap.eval_to_entry.count },
+            "e2e":           { "p50": lat_snap.e2e.p50 as u64,           "p95": lat_snap.e2e.p95 as u64,           "max": lat_snap.e2e.max as u64,           "n": lat_snap.e2e.count },
+        }));
+    }
+
+    result
 }

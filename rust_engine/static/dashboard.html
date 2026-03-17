@@ -9,12 +9,12 @@
   .mode-badge { display: inline-block; padding: 3px 12px; border-radius: 4px; font-size: 13px; font-weight: bold; margin-left: 12px; vertical-align: middle; letter-spacing: 1px; border: 1px solid; }
   .{{MODE_CLASS}} { color: #fa0; background: #332800; border-color: #fa0; }
   .mode-live { color: #f44; background: #3a1111; border-color: #f44; }
-  .meta { text-align: right; line-height: 1.8; font-size: 12px; color: #888; }
+  .meta { text-align: right; line-height: 1.8; font-size: 12px; color: #aaa; }
   .meta span { color: #ccc; }
   h2 { color: #0af; margin: 20px 0 8px 0; font-size: 16px; }
   .stats { display: flex; gap: 12px; margin: 10px 0; flex-wrap: wrap; }
-  .stat { background: #1a1a1a; border: 1px solid #333; padding: 8px 14px; border-radius: 8px; }
-  .stat .label { color: #888; font-size: 11px; }
+  .stat { background: #1a1a1a; border: 1px solid #444; padding: 8px 14px; border-radius: 8px; }
+  .stat .label { color: #aaa; font-size: 11px; }
   .stat .value { color: #0f0; font-size: 16px; font-weight: bold; white-space: nowrap; }
   .value.bad { color: #f44; }
   .value.good { color: #0f0; }
@@ -50,8 +50,8 @@
   .color-red { color: #f44; }
   .color-amber { color: #fa0; }
   .color-cyan { color: #0af; }
-  .color-muted { color: #555; }
-  .color-dim { color: #888; }
+  .color-muted { color: #777; }
+  .color-dim { color: #bbb; }
 </style>
 <style>
   .sub-section-title { cursor:pointer; font-size:13px; color:#aaa; padding:4px 8px; margin:8px 0 2px 0; border-left:3px solid #333; }
@@ -67,7 +67,7 @@
   .collapse-all-btn.visible { display: inline-block; }
   .collapse-all-btn:hover { background: #0af; color: #000; }
   .tab-bar { display: flex; gap: 0; margin: 12px 0 0 0; border-bottom: 2px solid #333; }
-  .tab-btn { padding: 8px 20px; background: #111; color: #888; border: 1px solid #333; border-bottom: none; cursor: pointer; font-family: 'Courier New', monospace; font-size: 13px; font-weight: bold; letter-spacing: 0.5px; border-radius: 6px 6px 0 0; margin-right: 2px; transition: all 0.15s; }
+  .tab-btn { padding: 8px 20px; background: #111; color: #aaa; border: 1px solid #333; border-bottom: none; cursor: pointer; font-family: 'Courier New', monospace; font-size: 13px; font-weight: bold; letter-spacing: 0.5px; border-radius: 6px 6px 0 0; margin-right: 2px; transition: all 0.15s; }
   .tab-btn:hover { color: #ccc; background: #1a1a2a; }
   .tab-btn.active { color: #0af; background: #0a0a0a; border-color: #0af; border-bottom: 2px solid #0a0a0a; margin-bottom: -2px; }
   .tab-content { display: none; padding-top: 5px; }
@@ -97,6 +97,41 @@
   #main-content { opacity: 0; transition: opacity 0.4s; }
   #main-content.visible { opacity: 1; }
 </style>
+<style>
+  .monitor-controls { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
+  .timespan-btn { background: #1a1a1a; color: #aaa; border: 1px solid #333; padding: 4px 14px; font-family: 'Courier New', monospace; font-size: 12px; cursor: pointer; border-radius: 4px; transition: all 0.15s; }
+  .timespan-btn:hover { color: #ccc; border-color: #555; }
+  .timespan-btn.active { color: #0af; border-color: #0af; background: #0a1a2a; }
+  .chart-row { display: flex; gap: 12px; margin: 10px 0; flex-wrap: wrap; }
+  .chart-container { flex: 1; min-width: 280px; max-width: 33.33%; background: #111; border: 1px solid #222; border-radius: 6px; padding: 8px 10px; height: 200px; position: relative; box-sizing: border-box; }
+  .chart-label { color: #aaa; font-size: 11px; margin-bottom: 4px; }
+  .chart-container canvas { width: 100% !important; height: calc(100% - 20px) !important; }
+  .log-viewer { max-height: 400px; overflow-y: auto; background: #0d0d0d; border: 1px solid #222; border-radius: 4px; padding: 6px 10px; font-size: 11px; line-height: 1.5; }
+  .log-controls { display: flex; gap: 10px; margin: 6px 0; align-items: center; }
+  .log-controls input, .log-controls select { background: #1a1a1a; color: #ccc; border: 1px solid #333; padding: 4px 8px; font-family: 'Courier New', monospace; font-size: 11px; border-radius: 4px; }
+  .log-controls input { flex: 1; }
+  .log-entry { white-space: pre-wrap; word-break: break-all; padding: 1px 0; border-bottom: 1px solid #1a1a1a; }
+  .log-entry.ERROR { color: #f44; }
+  .log-entry.WARN { color: #fa0; }
+  .log-entry.INFO { color: #8c8; }
+  .log-entry.DEBUG { color: #888; }
+  .log-entry.log-entry-enter { border-left: 3px solid #0f0; padding-left: 6px; }
+  .log-entry.log-entry-exit { border-left: 3px solid #f0f; padding-left: 6px; }
+  .log-entry.log-entry-error { border-left: 3px solid #f44; padding-left: 6px; background: rgba(255,68,68,0.05); }
+  .log-kw { font-weight: bold; }
+  .log-kw-enter { color: #0f0; }
+  .log-kw-exit { color: #f0f; }
+  .log-kw-error { color: #f44; }
+  .log-entry.log-entry-warn { border-left: 3px solid #fa0; padding-left: 6px; background: rgba(255,170,0,0.05); }
+  .log-kw-warn { color: #fa0; }
+  .monitor-stat { background: #1a1a1a; border: 1px solid #333; padding: 8px 14px; border-radius: 8px; }
+  .monitor-stat .label { color: #aaa; font-size: 11px; }
+  .monitor-stat .value { color: #0f0; font-size: 16px; font-weight: bold; white-space: nowrap; }
+  .loading-placeholder { color: #555; font-size: 12px; padding: 12px; text-align: center; font-style: italic; }
+  .monitor-section { margin-bottom: 16px; }
+</style>
+<script defer src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
 </head><body>
 <div id="splash">
   <div class="logo">&#x1F4C8; PREDICTION TRADER</div>
@@ -119,6 +154,7 @@
 
 <div class="tab-bar">
   <div class="tab-btn active" data-tab="positions" onclick="switchTab('positions')">Positions <span id="tab-ann-paper" class="tab-annualized"></span></div>
+  <div class="tab-btn" data-tab="monitor" onclick="switchTab('monitor')">Monitor</div>
   <div class="tab-btn" data-tab="shadow" onclick="switchTab('shadow')">Shadow</div>
   <div class="tab-btn" data-tab="live" onclick="switchTab('live')">Live</div>
 </div>
@@ -159,18 +195,92 @@
     </thead><tbody id="opp-body"></tbody></table>
   </div>
 
-  <h2 class="section-title collapsed" onclick="toggleSection(this)">SYSTEM</h2>
-  <div class="section-content hidden">
-    <table><thead>
-      <tr><th>Process</th><th>Status</th><th>Info</th></tr>
-    </thead><tbody id="system-body"></tbody></table>
-  </div>
-
   <h2 class="section-title collapsed" onclick="toggleSection(this)">CLOSED POSITIONS (<span id="closed-count">0</span>)
     <button id="cl-collapse-btn" class="collapse-all-btn" onclick="event.stopPropagation(); collapseAll('cl')">Collapse All</button>
   </h2>
   <div class="section-content hidden" id="closed-container"></div>
 </div><!-- end tab-positions -->
+
+<div id="tab-monitor" class="tab-content">
+  <!-- Timespan selector -->
+  <div class="monitor-controls">
+    <span class="color-dim">Timespan:</span>
+    <button class="timespan-btn active" onclick="setMonitorSpan('1h')">1h</button>
+    <button class="timespan-btn" onclick="setMonitorSpan('6h')">6h</button>
+    <button class="timespan-btn" onclick="setMonitorSpan('24h')">24h</button>
+    <button class="timespan-btn" onclick="setMonitorSpan('7d')">7d</button>
+  </div>
+
+  <!-- Section 1: System Resources -->
+  <h2 class="section-title" onclick="toggleSection(this)">SYSTEM RESOURCES</h2>
+  <div class="section-content">
+    <div class="stats" id="mon-sys-stats"><div class="loading-placeholder">Loading system metrics...</div></div>
+    <div class="chart-row">
+      <div class="chart-container"><div class="chart-label">CPU %</div><canvas id="chart-cpu"></canvas></div>
+      <div class="chart-container"><div class="chart-label">Memory (MB)</div><canvas id="chart-memory"></canvas></div>
+      <div class="chart-container"><div class="chart-label">Disk (GB)</div><canvas id="chart-disk"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Section 2: App Stats -->
+  <h2 class="section-title" onclick="toggleSection(this)">APP STATS</h2>
+  <div class="section-content">
+    <div class="stats" id="mon-app-stats"><div class="loading-placeholder">Loading app stats...</div></div>
+    <div class="chart-row">
+      <div class="chart-container"><div class="chart-label">Eval Latency (&#956;s)</div><canvas id="chart-latency"></canvas></div>
+      <div class="chart-container"><div class="chart-label">WS Messages/sec</div><canvas id="chart-ws-rate"></canvas></div>
+      <div class="chart-container"><div class="chart-label">Markets &amp; Constraints</div><canvas id="chart-markets"></canvas></div>
+    </div>
+    <!-- Latency breakdown table -->
+    <table id="mon-latency-table" style="margin-top:10px"><thead>
+      <tr><th>Segment</th><th>p50 (&#956;s)</th><th>p95 (&#956;s)</th><th>Max (&#956;s)</th><th>Samples</th></tr>
+    </thead><tbody id="mon-latency-body"><tr><td colspan="5" class="loading-placeholder">Loading latency data...</td></tr></tbody></table>
+    <!-- Log viewer -->
+    <h3 class="sub-section-title" onclick="toggleSection(this)">LOGS</h3>
+    <div class="section-content">
+      <div class="log-controls">
+        <input type="text" id="log-filter-text" placeholder="Filter..." oninput="renderFilteredLogs()">
+        <select id="log-filter-level" onchange="renderFilteredLogs()">
+          <option value="all">All Levels</option>
+          <option value="ERROR">Error</option>
+          <option value="WARN">Warn</option>
+          <option value="INFO">Info</option>
+          <option value="DEBUG">Debug</option>
+        </select>
+        <label style="color:#888;font-size:11px">Last:</label>
+        <input type="number" id="log-limit" value="200" min="1" max="5000" style="width:60px" oninput="renderFilteredLogs()">
+        <button onclick="copyFilteredLogs()" style="background:#333;color:#ccc;border:1px solid #555;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px" title="Copy filtered logs to clipboard">Copy</button>
+      </div>
+      <div id="log-viewer" class="log-viewer"></div>
+    </div>
+  </div>
+
+  <!-- Section 3: Financial Stats -->
+  <h2 class="section-title" onclick="toggleSection(this)">FINANCIAL STATS</h2>
+  <div class="section-content">
+    <div class="stats" id="mon-fin-stats"><div class="loading-placeholder">Loading financial stats...</div></div>
+    <div class="chart-row">
+      <div class="chart-container" style="flex:3;min-width:600px"><div class="chart-label">Portfolio</div><canvas id="chart-portfolio"></canvas></div>
+    </div>
+    <!-- Profitability tables -->
+    <div style="display:flex;gap:20px;flex-wrap:wrap;margin-top:10px">
+      <div style="flex:1;min-width:300px">
+        <h3 class="sub-section-title" onclick="toggleSection(this)">BY CATEGORY</h3>
+        <div class="section-content">
+          <table><thead><tr><th>Category</th><th>Trades</th><th>Win%</th><th>Avg P&amp;L</th><th>Total</th></tr></thead>
+          <tbody id="mon-cat-body"><tr><td colspan="5" class="loading-placeholder">Loading...</td></tr></tbody></table>
+        </div>
+      </div>
+      <div style="flex:1;min-width:300px">
+        <h3 class="sub-section-title" onclick="toggleSection(this)">BY DURATION</h3>
+        <div class="section-content">
+          <table><thead><tr><th>Duration</th><th>Trades</th><th>Win%</th><th>Avg P&amp;L</th><th>Total</th></tr></thead>
+          <tbody id="mon-dur-body"><tr><td colspan="5" class="loading-placeholder">Loading...</td></tr></tbody></table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 
 <div id="tab-shadow" class="tab-content"></div>
 <div id="tab-live" class="tab-content"></div>
@@ -428,36 +538,50 @@ function renderOpportunities(d) {
   restoreExpanded('opp-body', expanded, 'opp');
 }
 
-// === System renderer ===
+// === System renderer (now routes data to Monitor tab app stats) ===
 function renderSystem(d) {
-  var sb = document.getElementById('system-body');
-  if (!sb) return;
-  var h = '';
-  var scCls = (d.scanner.status==='running'||d.scanner.status==='scanning') ? 'color-green' : 'color-amber';
-  h += '<tr><td>Market Scanner</td><td class="'+scCls+'">'+esc(d.scanner.status)+'</td><td>'+esc(d.scanner.ts||'')+'</td></tr>';
-  var eCls = d.engine.status==='running' ? 'color-green' : 'color-amber';
-  h += '<tr><td>Trading Engine</td><td class="'+eCls+'">'+esc(d.engine.status)+'</td>';
-  h += '<td>total=$'+_lastTotalValue.toFixed(2)+' | cash=$'+(d.engine.capital||0).toFixed(2)+' | pos='+(d.engine.positions||0)+'</td></tr>';
+  var el = document.getElementById('mon-app-stats');
+  if (!el) return;
   var m = d.metrics || {};
-  if (m) {
-    var rustTag = m.has_rust ? '<span class="color-green">Rust</span>' : '<span class="color-amber">Python</span>';
-    h += '<tr><td class="pl-indent color-dim">Arb Engine</td><td>'+rustTag+'</td>';
-    h += '<td>constraints='+(m.constraints||0)+' | markets='+(m.markets_total||0)+' | iter='+(m.iteration||0)+'</td></tr>';
-    var wl=m.ws_live||0, wt=m.markets_total||1, wp=wt?Math.round(wl/wt*100):0;
-    var wCls = wp>20?'color-green':'color-amber';
-    h += '<tr><td class="pl-indent color-dim">WebSocket</td><td class="'+wCls+'">subs='+(m.ws_subscribed||0)+'</td>';
-    h += '<td>msgs='+(m.ws_msgs||0).toLocaleString()+' | live='+wl+'/'+wt+' ('+wp+'%)</td></tr>';
-    var qb=m.queue_background||0, qu=m.queue_urgent||0;
-    var qCls = qb<500?'color-green':(qb<2000?'color-amber':'color-red');
-    h += '<tr><td class="pl-indent color-dim">Eval Queue</td><td class="'+qCls+'">bg='+qb+'</td>';
-    h += '<td>urgent='+qu+' | bg='+qb+'</td></tr>';
-    var lp=m.lat_p50_us||m.lat_p50_ms||m.lat_p50||0, l9=m.lat_p95_us||m.lat_p95_ms||m.lat_p95||0, lm=m.lat_max_us||m.lat_max_ms||m.lat_max||0;
-    var lCls = lp<100000?'color-green':(lp<1000000?'color-amber':'color-red');
-    h += '<tr><td class="pl-indent color-dim">Latency</td><td class="'+lCls+'">p50='+lp+'μs</td>';
-    h += '<td>p50='+lp+'μs | p95='+l9+'μs | max='+lm+'μs</td></tr>';
+  function st(label, val, cls) {
+    return '<div class="stat"><div class="label">'+label+'</div><div class="value '+(cls||'')+'">'+val+'</div></div>';
   }
-  h += '<tr><td>Dashboard</td><td class="color-positive">running</td><td>'+esc(d.dashboard_ts)+'</td></tr>';
-  sb.innerHTML = h;
+  var h = '';
+  var scCls = (d.scanner.status==='running'||d.scanner.status==='scanning') ? 'good' : 'color-amber';
+  h += st('Scanner', esc(d.scanner.status), scCls);
+  var eCls = d.engine.status==='running' ? 'good' : 'color-amber';
+  h += st('Engine', esc(d.engine.status), eCls);
+  h += st('Constraints', m.constraints||0);
+  h += st('Markets', m.markets_total||0);
+  var wl=m.ws_live||0, wt=m.markets_total||1, wp=wt?Math.round(wl/wt*100):0;
+  h += st('WS Subs', (m.ws_subscribed||0)+' ('+wp+'% live)', wp>20?'good':'color-amber');
+  h += st('WS Msgs', (m.ws_msgs||0).toLocaleString());
+  var qb=m.queue_background||0, qu=m.queue_urgent||0;
+  var qCls = qb<500?'good':(qb<2000?'color-amber':'bad');
+  h += st('Queue BG', qb, qCls);
+  h += st('Queue Urgent', qu);
+  var lp=m.lat_p50_us||m.lat_p50_ms||m.lat_p50||0, l9=m.lat_p95_us||m.lat_p95_ms||m.lat_p95||0;
+  var lCls = lp<100000?'good':(lp<1000000?'color-amber':'bad');
+  h += st('Latency p50', lp+'\u03BCs', lCls);
+  h += st('Latency p95', l9+'\u03BCs');
+  h += st('Iteration', m.iteration||0);
+  el.innerHTML = h;
+
+  // Latency breakdown table (from system data — latency_breakdown is an object with named segments)
+  if (d.latency_breakdown && d.latency_breakdown.enabled) {
+    var lb = document.getElementById('mon-latency-body');
+    if (lb) {
+      var lh = '';
+      var segments = ['ws_network','ws_to_queue','queue_wait','eval_batch','eval_to_entry','e2e'];
+      segments.forEach(function(seg) {
+        var r = d.latency_breakdown[seg];
+        if (!r) return;
+        lh += '<tr><td>'+esc(seg)+'</td>';
+        lh += '<td>'+(r.p50||0)+'</td><td>'+(r.p95||0)+'</td><td>'+(r.max||0)+'</td><td>'+(r.n||0)+'</td></tr>';
+      });
+      lb.innerHTML = lh;
+    }
+  }
 }
 // === Closed positions sort ===
 var _clSortKeys = {}, _clSortDirs = {}, _lastClosedData = null;
@@ -602,6 +726,438 @@ function renderLive(d) {
   el.innerHTML = h;
 }
 
+// === Monitor tab: chart management ===
+var monitorCharts = {};
+var _monitorSpan = '1h';
+var _monitorSeries = {};
+var _allLogs = [];
+var _monitorChartsInited = false;
+
+function createMonitorChart(id, label, color, yUnit, datasets) {
+  var ctx = document.getElementById(id);
+  if (!ctx) return null;
+  var dsList = datasets || [{
+    label: label,
+    borderColor: color,
+    backgroundColor: color + '22',
+    data: [],
+    pointRadius: 0,
+    borderWidth: 1.5,
+    fill: true,
+    tension: 0.2
+  }];
+  var chart = new Chart(ctx, {
+    type: 'line',
+    data: { datasets: dsList },
+    options: {
+      animation: false,
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: dsList.length > 1, labels: { color: '#aaa', font: { size: 10 }, boxWidth: 20, boxHeight: 2 } },
+        tooltip: {
+          enabled: true,
+          filter: function() { return true; },
+          callbacks: {
+            label: function(ctx) { var v = ctx.parsed.y; return ctx.dataset.label + ': ' + (typeof v === 'number' ? v.toFixed(2) : v) + (yUnit || ''); }
+          }
+        }
+      },
+      scales: {
+        x: {
+          type: 'time',
+          time: { tooltipFormat: 'HH:mm:ss', displayFormats: { second: 'HH:mm:ss', minute: 'HH:mm', hour: 'HH:mm', day: 'MMM d' } },
+          ticks: { color: '#999', maxTicksLimit: 8, font: { size: 10 }, autoSkip: true },
+          grid: { color: '#1a1a1a' },
+          adapters: { date: {} }
+        },
+        y: {
+          beginAtZero: false,
+          ticks: {
+            color: '#999',
+            font: { size: 10 },
+            callback: function(v) { return v + (yUnit || ''); }
+          },
+          grid: { color: '#1a1a1a' }
+        }
+      }
+    }
+  });
+  return chart;
+}
+
+// Smart log base: set y-axis min to next lower power of 10 below the data minimum
+// e.g. min=3000 → base 1000, min=120 → base 100, min=0.5 → base 0.1
+function smartLogBase(axis) {
+  if (axis.min <= 0) { axis.min = 1; return; }
+  var power = Math.floor(Math.log10(axis.min));
+  axis.min = Math.pow(10, power);
+}
+
+function initMonitorCharts() {
+  if (_monitorChartsInited) return;
+  if (typeof Chart === 'undefined') return; // Chart.js not loaded yet
+  _monitorChartsInited = true;
+  monitorCharts['chart-cpu'] = createMonitorChart('chart-cpu', 'CPU', '#0f0', '%');
+  monitorCharts['chart-memory'] = createMonitorChart('chart-memory', 'Memory', '#0af', ' MB');
+  monitorCharts['chart-disk'] = createMonitorChart('chart-disk', 'Disk', '#fa0', ' GB');
+  if (monitorCharts['chart-disk']) {
+    monitorCharts['chart-disk'].options.scales.y.ticks.callback = function(v) { return v.toFixed(2) + ' GB'; };
+    monitorCharts['chart-disk'].update('none');
+  }
+  monitorCharts['chart-latency'] = createMonitorChart('chart-latency', 'p50', '#0f0', ' \u03BCs', [
+    { label: 'p50', borderColor: '#0f0', backgroundColor: '#0f022', data: [], pointRadius: 0, borderWidth: 1.5, fill: true, tension: 0.2 },
+    { label: 'p95', borderColor: '#fa0', backgroundColor: '#fa022', data: [], pointRadius: 0, borderWidth: 1.5, fill: false, tension: 0.2 }
+  ]);
+  if (monitorCharts['chart-latency']) {
+    monitorCharts['chart-latency'].options.scales.y.type = 'logarithmic';
+    monitorCharts['chart-latency'].options.scales.y.min = 1;
+    monitorCharts['chart-latency'].options.scales.y.ticks.callback = function(v) { return v + ' \u03BCs'; };
+    monitorCharts['chart-latency'].options.scales.y.afterDataLimits = smartLogBase;
+    monitorCharts['chart-latency'].update('none');
+  }
+  monitorCharts['chart-ws-rate'] = createMonitorChart('chart-ws-rate', 'WS msg/s', '#0f0', ' msg/s');
+  monitorCharts['chart-markets'] = createMonitorChart('chart-markets', 'Markets', '#0af', '', [
+    { label: 'Markets', borderColor: '#0af', backgroundColor: 'transparent', data: [], pointRadius: 0, borderWidth: 1.5, fill: false, tension: 0.2 },
+    { label: 'Constraints', borderColor: '#fa0', backgroundColor: 'transparent', data: [], pointRadius: 0, borderWidth: 1.5, fill: false, tension: 0.2 }
+  ]);
+  if (monitorCharts['chart-markets']) {
+    monitorCharts['chart-markets'].options.scales.y.type = 'logarithmic';
+    monitorCharts['chart-markets'].options.scales.y.afterDataLimits = smartLogBase;
+    monitorCharts['chart-markets'].update('none');
+  }
+  // Combined portfolio chart: value (pale green filled), deployed (blue line), drawdown (red line, right y-axis)
+  monitorCharts['chart-portfolio'] = createMonitorChart('chart-portfolio', 'Portfolio', '#0f0', '', [
+    { label: 'Total Value ($)', borderColor: '#4c8', backgroundColor: 'rgba(68,204,136,0.15)', data: [], pointRadius: 0, borderWidth: 1.5, fill: true, tension: 0.2, yAxisID: 'y' },
+    { label: 'Capital Deployed (%)', borderColor: '#0af', backgroundColor: 'transparent', data: [], pointRadius: 0, borderWidth: 1.5, fill: false, tension: 0.2, yAxisID: 'y1' },
+    { label: 'Drawdown (%)', borderColor: '#f44', backgroundColor: 'transparent', data: [], pointRadius: 0, borderWidth: 1.5, fill: false, tension: 0.2, yAxisID: 'y1' }
+  ]);
+  // Add right y-axis to portfolio chart
+  if (monitorCharts['chart-portfolio']) {
+    monitorCharts['chart-portfolio'].options.scales.y1 = {
+      position: 'right',
+      ticks: { color: '#999', font: { size: 10 }, callback: function(v) { return v + '%'; } },
+      grid: { drawOnChartArea: false }
+    };
+    monitorCharts['chart-portfolio'].options.scales.y.type = 'logarithmic';
+    monitorCharts['chart-portfolio'].options.scales.y.afterDataLimits = smartLogBase;
+    monitorCharts['chart-portfolio'].options.scales.y.ticks.callback = function(v) { return '$' + v; };
+    // Legend: Total Value = filled rect, Deployed/Drawdown = dash lines
+    var pChart = monitorCharts['chart-portfolio'];
+    pChart.data.datasets[0].pointStyle = 'rect';
+    pChart.data.datasets[1].pointStyle = 'dash';
+    pChart.data.datasets[2].pointStyle = 'dash';
+    pChart.options.plugins.legend.labels = {
+      color: '#aaa', font: { size: 10 },
+      usePointStyle: true,
+      pointStyleWidth: 20
+    };
+    monitorCharts['chart-portfolio'].update('none');
+  }
+}
+
+function setMonitorSpan(span) {
+  _monitorSpan = span;
+  document.querySelectorAll('.timespan-btn').forEach(function(b) {
+    b.classList.toggle('active', b.textContent.trim() === span);
+  });
+  applyMonitorSpan();
+}
+
+function getSpanMs(span) {
+  switch(span) {
+    case '1h': return 3600000;
+    case '6h': return 21600000;
+    case '24h': return 86400000;
+    case '7d': return 604800000;
+    default: return 3600000;
+  }
+}
+
+function applyMonitorSpan() {
+  var cutoff = Date.now() - getSpanMs(_monitorSpan);
+  Object.keys(monitorCharts).forEach(function(chartId) {
+    var chart = monitorCharts[chartId];
+    if (!chart) return;
+    var seriesKey = chartId.replace('chart-', '');
+    chart.data.datasets.forEach(function(ds, i) {
+      var fullKey = ds._seriesKey || seriesKey;
+      var full = _monitorSeries[fullKey];
+      if (full) {
+        ds.data = full.filter(function(pt) { return pt.x >= cutoff; });
+      }
+    });
+    chart.update('none');
+  });
+}
+
+function updateChartSeries(chartId, datasetIdx, seriesKey, points) {
+  if (!_monitorSeries[seriesKey]) _monitorSeries[seriesKey] = [];
+  _monitorSeries[seriesKey] = _monitorSeries[seriesKey].concat(points);
+  // Cap at 10000 points
+  if (_monitorSeries[seriesKey].length > 10000) {
+    _monitorSeries[seriesKey] = _monitorSeries[seriesKey].slice(-10000);
+  }
+  var chart = monitorCharts[chartId];
+  if (!chart) return;
+  var ds = chart.data.datasets[datasetIdx || 0];
+  if (!ds) return;
+  ds._seriesKey = seriesKey;
+  var cutoff = Date.now() - getSpanMs(_monitorSpan);
+  ds.data = _monitorSeries[seriesKey].filter(function(pt) { return pt.x >= cutoff; });
+  chart.update('none');
+}
+
+function convertSeries(arr) {
+  // Backend sends [[ts_secs, val], ...] — convert to [{x: ts_ms, y: val}, ...]
+  if (!arr || !arr.length) return [];
+  return arr.map(function(pt) { return { x: pt[0] * 1000, y: pt[1] }; });
+}
+
+function renderMonitor(d) {
+  initMonitorCharts();
+  var cur = d.current || {};
+
+  // System resource stats cards (from d.current)
+  var el = document.getElementById('mon-sys-stats');
+  if (el) {
+    function mst(label, val, cls) {
+      return '<div class="stat"><div class="label">'+label+'</div><div class="value '+(cls||'')+'">'+val+'</div></div>';
+    }
+    var h = '';
+    h += mst('CPU', (cur.cpu_pct||0).toFixed(1)+'%', (cur.cpu_pct||0)>80?'bad':'good');
+    h += mst('Memory', (cur.mem_used_mb||0).toFixed(0)+' / '+(cur.mem_total_mb||0).toFixed(0)+' MB');
+    h += mst('Disk', (cur.disk_used_gb||0).toFixed(1)+' / '+(cur.disk_total_gb||0).toFixed(1)+' GB');
+    el.innerHTML = h;
+  }
+
+  // App stats cards (from d.current — same data as system event but keyed differently)
+  var ael = document.getElementById('mon-app-stats');
+  if (ael) {
+    function ast(label, val, cls) {
+      return '<div class="stat"><div class="label">'+label+'</div><div class="value '+(cls||'')+'">'+val+'</div></div>';
+    }
+    var ah = '';
+    ah += ast('Markets', Math.round(cur.total_markets||0));
+    ah += ast('Constraints', Math.round(cur.total_constraints||0));
+    var wsRate = cur.ws_msg_rate||0;
+    ah += ast('WS Msgs/s', wsRate.toFixed(1), wsRate>0?'good':'color-amber');
+    var lp50 = cur.lat_p50||0, lp95 = cur.lat_p95||0;
+    var lCls = lp50<100000?'good':(lp50<1000000?'color-amber':'bad');
+    ah += ast('Latency p50', Math.round(lp50)+'\u03BCs', lCls);
+    ah += ast('Latency p95', Math.round(lp95)+'\u03BCs');
+    var qd = cur.queue_depth||0;
+    ah += ast('Queue Depth', Math.round(qd), qd<500?'good':(qd<2000?'color-amber':'bad'));
+    ael.innerHTML = ah;
+  }
+
+  // Financial stats cards
+  var fin = d.financial || {};
+  var fel = document.getElementById('mon-fin-stats');
+  if (fel) {
+    function fst(label, val, cls) {
+      return '<div class="stat"><div class="label">'+label+'</div><div class="value '+(cls||'')+'">'+val+'</div></div>';
+    }
+    var tv = cur.total_value || 0;
+    var dp = cur.deployed_pct || 0;
+    var dd = cur.drawdown_pct || 0;
+    var fh = '';
+    fh += fst('Total Value', '$'+tv.toFixed(2), tv>=0?'good':'bad');
+    fh += fst('Deployed %', dp.toFixed(1)+'%');
+    fh += fst('Drawdown', dd.toFixed(2)+'%', dd>5?'bad':'good');
+    if (fin.sharpe !== undefined) fh += fst('Sharpe', (fin.sharpe||0).toFixed(2));
+    if (fin.sortino !== undefined) fh += fst('Sortino', (fin.sortino||0).toFixed(2));
+    if (fin.recovery_ratio !== undefined) fh += fst('Recovery', (fin.recovery_ratio||0).toFixed(2));
+    if (fin.win_rate !== undefined) fh += fst('Win %', ((fin.win_rate||0)*100).toFixed(1)+'%');
+    if (fin.profit_factor !== undefined) fh += fst('Profit Factor', (fin.profit_factor||0).toFixed(2));
+    if (fin.avg_hold_hours !== undefined) {
+      var ah = fin.avg_hold_hours || 0;
+      var holdStr = ah < 1 ? (ah*60).toFixed(0)+'m' : ah < 24 ? ah.toFixed(1)+'h' : (ah/24).toFixed(1)+'d';
+      fh += fst('Avg Hold', holdStr);
+    }
+    if (fin.max_drawdown_pct !== undefined) fh += fst('Max DD', (fin.max_drawdown_pct||0).toFixed(2)+'%', (fin.max_drawdown_pct||0)>10?'bad':'good');
+    fel.innerHTML = fh;
+  }
+
+  // By-category table (object: { "Sports": { count, win_rate, total_pnl, avg_pnl }, ... })
+  if (fin.by_category && typeof fin.by_category === 'object') {
+    var cb = document.getElementById('mon-cat-body');
+    if (cb) {
+      var ch = '';
+      Object.entries(fin.by_category).forEach(function(e) {
+        var cat = e[0], r = e[1];
+        ch += '<tr><td>'+esc(cat)+'</td><td>'+(r.count||0)+'</td>';
+        ch += '<td>'+((r.win_rate||0)*100).toFixed(1)+'%</td><td>$'+(r.avg_pnl||0).toFixed(2)+'</td>';
+        ch += '<td class="'+((r.total_pnl||0)>=0?'good':'bad')+'">$'+(r.total_pnl||0).toFixed(2)+'</td></tr>';
+      });
+      cb.innerHTML = ch;
+    }
+  }
+
+  // By-duration table (object: { "<1h": { count, win_rate, total_pnl, avg_pnl }, ... })
+  if (fin.by_duration && typeof fin.by_duration === 'object') {
+    var db = document.getElementById('mon-dur-body');
+    if (db) {
+      var dh = '';
+      var durOrder = ['<1h','1-6h','6-24h','1-3d','3-7d','7d+'];
+      durOrder.forEach(function(key) {
+        var r = fin.by_duration[key];
+        if (!r) return;
+        dh += '<tr><td>'+esc(key)+'</td><td>'+(r.count||0)+'</td>';
+        dh += '<td>'+((r.win_rate||0)*100).toFixed(1)+'%</td><td>$'+(r.avg_pnl||0).toFixed(2)+'</td>';
+        dh += '<td class="'+((r.total_pnl||0)>=0?'good':'bad')+'">$'+(r.total_pnl||0).toFixed(2)+'</td></tr>';
+      });
+      db.innerHTML = dh;
+    }
+  }
+
+  // Latency breakdown table (object with named segments, same as system event)
+  if (d.latency_breakdown && d.latency_breakdown.enabled) {
+    var lb = document.getElementById('mon-latency-body');
+    if (lb) {
+      var lh = '';
+      var segments = ['ws_network','ws_to_queue','queue_wait','eval_batch','eval_to_entry','e2e'];
+      segments.forEach(function(seg) {
+        var r = d.latency_breakdown[seg];
+        if (!r) return;
+        lh += '<tr><td>'+esc(seg)+'</td>';
+        lh += '<td>'+(r.p50||0)+'</td><td>'+(r.p95||0)+'</td><td>'+(r.max||0)+'</td><td>'+(r.n||0)+'</td></tr>';
+      });
+      lb.innerHTML = lh;
+    }
+  }
+
+  // Time series data — convert backend keys to chart series
+  if (d.series) {
+    var s = d.series;
+    if (s.cpu_pct) updateChartSeries('chart-cpu', 0, 'cpu', convertSeries(s.cpu_pct));
+    if (s.mem_used_mb) updateChartSeries('chart-memory', 0, 'memory', convertSeries(s.mem_used_mb));
+    if (s.disk_used_gb) updateChartSeries('chart-disk', 0, 'disk', convertSeries(s.disk_used_gb));
+    if (s.lat_p50) updateChartSeries('chart-latency', 0, 'latency_p50', convertSeries(s.lat_p50));
+    if (s.lat_p95) updateChartSeries('chart-latency', 1, 'latency_p95', convertSeries(s.lat_p95));
+    if (s.ws_msg_rate) updateChartSeries('chart-ws-rate', 0, 'ws_rate', convertSeries(s.ws_msg_rate));
+    if (s.total_markets) updateChartSeries('chart-markets', 0, 'markets', convertSeries(s.total_markets));
+    if (s.total_constraints) updateChartSeries('chart-markets', 1, 'constraints', convertSeries(s.total_constraints));
+    // Portfolio chart: 3 datasets on one chart
+    if (s.total_value) updateChartSeries('chart-portfolio', 0, 'portfolio_value', convertSeries(s.total_value));
+    if (s.deployed_pct) updateChartSeries('chart-portfolio', 1, 'portfolio_deployed', convertSeries(s.deployed_pct));
+    if (s.drawdown_pct) updateChartSeries('chart-portfolio', 2, 'portfolio_drawdown', convertSeries(s.drawdown_pct));
+  }
+
+  // Delta updates (non-full): append single point from current values
+  if (!d.full && d.ts && cur) {
+    var tsMs = d.ts * 1000;
+    if (cur.cpu_pct !== undefined) updateChartSeries('chart-cpu', 0, 'cpu', [{x:tsMs, y:cur.cpu_pct}]);
+    if (cur.mem_used_mb !== undefined) updateChartSeries('chart-memory', 0, 'memory', [{x:tsMs, y:cur.mem_used_mb}]);
+    if (cur.disk_used_gb !== undefined) updateChartSeries('chart-disk', 0, 'disk', [{x:tsMs, y:cur.disk_used_gb}]);
+    if (cur.lat_p50 !== undefined) updateChartSeries('chart-latency', 0, 'latency_p50', [{x:tsMs, y:cur.lat_p50}]);
+    if (cur.lat_p95 !== undefined) updateChartSeries('chart-latency', 1, 'latency_p95', [{x:tsMs, y:cur.lat_p95}]);
+    if (cur.ws_msg_rate !== undefined) updateChartSeries('chart-ws-rate', 0, 'ws_rate', [{x:tsMs, y:cur.ws_msg_rate}]);
+    if (cur.total_markets !== undefined) updateChartSeries('chart-markets', 0, 'markets', [{x:tsMs, y:cur.total_markets}]);
+    if (cur.total_constraints !== undefined) updateChartSeries('chart-markets', 1, 'constraints', [{x:tsMs, y:cur.total_constraints}]);
+    if (cur.total_value !== undefined) updateChartSeries('chart-portfolio', 0, 'portfolio_value', [{x:tsMs, y:cur.total_value}]);
+    if (cur.deployed_pct !== undefined) updateChartSeries('chart-portfolio', 1, 'portfolio_deployed', [{x:tsMs, y:cur.deployed_pct}]);
+    if (cur.drawdown_pct !== undefined) updateChartSeries('chart-portfolio', 2, 'portfolio_drawdown', [{x:tsMs, y:cur.drawdown_pct}]);
+  }
+
+  // Logs (entries have .message not .msg, and .target)
+  if (d.logs && d.logs.length > 0) {
+    appendLogs(d.logs);
+  }
+  if (d.logs_delta && d.logs_delta.length > 0) {
+    appendLogs(d.logs_delta);
+  }
+  // Show diagnostic if no logs received yet
+  if (_allLogs.length === 0) {
+    var viewer = document.getElementById('log-viewer');
+    if (viewer) viewer.innerHTML = '<div class="color-dim" style="padding:8px">Waiting for log entries...</div>';
+  }
+}
+
+function appendLogs(entries) {
+  if (!entries || entries.length === 0) return;
+  _allLogs = _allLogs.concat(entries);
+  if (_allLogs.length > 2000) _allLogs = _allLogs.slice(-2000);
+  renderFilteredLogs();
+}
+
+function getFilteredLogs() {
+  var textFilter = (document.getElementById('log-filter-text').value || '').toLowerCase();
+  var levelFilter = document.getElementById('log-filter-level').value;
+  var limit = parseInt(document.getElementById('log-limit').value) || 200;
+  var filtered = _allLogs.filter(function(entry) {
+    if (levelFilter !== 'all' && entry.level !== levelFilter) return false;
+    var text = (entry.message || entry.msg || '') + ' ' + (entry.target || '');
+    if (textFilter && text.toLowerCase().indexOf(textFilter) === -1) return false;
+    return true;
+  });
+  return filtered.slice(-limit);
+}
+
+function classifyLogEntry(msg) {
+  var lower = msg.toLowerCase();
+  if (/\b(enter|entered|entry|opening|buy|bought)\b/.test(lower)) return 'enter';
+  if (/\b(exit|exited|closing|sell|sold|redeem)\b/.test(lower)) return 'exit';
+  if (/\b(error|fail|panic|crash|exception)\b/.test(lower)) return 'error';
+  if (/\b(warn|warning|timeout|retry|retrying|slow|degraded)\b/.test(lower)) return 'warn';
+  return '';
+}
+
+function highlightKeywords(escaped) {
+  return escaped
+    .replace(/\b(enter(?:ed)?|entry|opening|buy|bought)\b/gi, '<span class="log-kw log-kw-enter">$1</span>')
+    .replace(/\b(exit(?:ed)?|closing|sell|sold|redeem)\b/gi, '<span class="log-kw log-kw-exit">$1</span>')
+    .replace(/\b(error|fail(?:ed)?|panic|crash|exception)\b/gi, '<span class="log-kw log-kw-error">$1</span>')
+    .replace(/\b(warn(?:ing)?|timeout|retry(?:ing)?|slow|degraded)\b/gi, '<span class="log-kw log-kw-warn">$1</span>');
+}
+
+function renderFilteredLogs() {
+  var viewer = document.getElementById('log-viewer');
+  if (!viewer) return;
+  var entries = getFilteredLogs();
+  var h = '';
+  entries.forEach(function(entry) {
+    var lvl = entry.level || 'INFO';
+    var tgt = entry.target ? ' '+entry.target : '';
+    var msg = entry.message || entry.msg || '';
+    var cls = classifyLogEntry(msg);
+    var tsStr = entry.ts || '';
+    if (typeof tsStr === 'number' && tsStr > 1e9) {
+      tsStr = new Date(tsStr * 1000).toLocaleTimeString();
+    }
+    h += '<div class="log-entry '+lvl+(cls ? ' log-entry-'+cls : '')+'">';
+    h += '<span class="color-dim">'+tsStr+'</span> ';
+    h += '<span>['+lvl+']</span>';
+    if (tgt) h += '<span class="color-dim">'+esc(tgt)+'</span>';
+    h += ' '+highlightKeywords(esc(msg));
+    h += '</div>';
+  });
+  viewer.innerHTML = h;
+  viewer.scrollTop = viewer.scrollHeight;
+}
+
+function copyFilteredLogs() {
+  var entries = getFilteredLogs();
+  var text = entries.map(function(entry) {
+    var lvl = entry.level || 'INFO';
+    var tgt = entry.target ? ' '+entry.target : '';
+    var msg = entry.message || entry.msg || '';
+    var tsStr = entry.ts || '';
+    if (typeof tsStr === 'number' && tsStr > 1e9) {
+      tsStr = new Date(tsStr * 1000).toLocaleTimeString();
+    }
+    return tsStr + ' [' + lvl + ']' + tgt + ' ' + msg;
+  }).join('\n');
+  navigator.clipboard.writeText(text).then(function() {
+    var btn = document.querySelector('.log-controls button');
+    var orig = btn.textContent;
+    btn.textContent = 'Copied!';
+    btn.style.borderColor = '#0f0';
+    setTimeout(function() { btn.textContent = orig; btn.style.borderColor = '#555'; }, 1500);
+  });
+}
+
 // === Splash screen state machine ===
 var _splashDismissed = false;
 var _dataReceived = {};
@@ -611,8 +1167,8 @@ function splashStatus(msg) {
 }
 function markDataReceived(key) {
   _dataReceived[key] = true;
-  // Dismiss only when we have stats + positions + system (the visible sections)
-  if (_dataReceived.stats && _dataReceived.positions && _dataReceived.system) {
+  // Dismiss only when we have stats + positions + system + monitor (all visible sections)
+  if (_dataReceived.stats && _dataReceived.positions && _dataReceived.system && _dataReceived.monitor) {
     dismissSplash();
   }
 }
@@ -663,6 +1219,9 @@ document.addEventListener('DOMContentLoaded', function() { splashStatus('connect
     });
     es.addEventListener('live', function(e) {
       try { renderLive(JSON.parse(e.data)); } catch(ex) { console.warn('live parse error', ex); }
+    });
+    es.addEventListener('monitor', function(e) {
+      try { renderMonitor(JSON.parse(e.data)); markDataReceived('monitor'); } catch(ex) { console.warn('monitor parse error', ex); }
     });
 
     es.onerror = function() {

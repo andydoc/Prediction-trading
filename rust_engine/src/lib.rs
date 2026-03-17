@@ -33,6 +33,7 @@ pub mod scanner;
 pub mod detect;
 pub mod notify;
 pub mod latency;
+pub mod monitor;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,6 +48,7 @@ use ws_tier_c::NewMarketBurst;
 use position::PositionManager;
 use dashboard::{DashboardState, EngineMetrics};
 use latency::LatencyTracker;
+use monitor::MonitorState;
 
 /// The core trading engine. Owns all hot-path state:
 /// WS connections, order books, eval queue, positions, dashboard.
@@ -70,13 +72,17 @@ pub struct TradingEngine {
     pub delay_table: Arc<parking_lot::Mutex<(HashMap<String, f64>, f64)>>,
     pub http_client: reqwest::blocking::Client,
     pub latency: Arc<LatencyTracker>,
+    /// Monitor state for dashboard time-series metrics.
+    pub monitor: Arc<parking_lot::Mutex<MonitorState>>,
+    /// Separate log ring buffer for dashboard (avoids monitor lock contention).
+    pub log_ring: Arc<parking_lot::Mutex<monitor::LogRing>>,
     /// Shared resolved events vec — used by both old WS and tiered WS.
     resolved_events: Arc<parking_lot::Mutex<Vec<ws::ResolvedEvent>>>,
 }
 
 impl TradingEngine {
     /// Initialize tracing with daily rotating file + stderr output.
-    pub fn init_tracing(workspace: &str, log_cfg: &LoggingCfg) {
+    pub fn init_tracing(workspace: &str, log_cfg: &LoggingCfg, log_ring: Arc<parking_lot::Mutex<monitor::LogRing>>) {
         use tracing_subscriber::prelude::*;
         use tracing_subscriber::fmt;
         use tracing_subscriber::EnvFilter;
@@ -99,10 +105,16 @@ impl TradingEngine {
             .with_writer(std::io::stderr)
             .with_target(false);
 
+        // Monitor layer captures logs for dashboard display
+        let monitor_layer = monitor::MonitorLayer {
+            log_ring: Arc::clone(&log_ring),
+        };
+
         let _ = tracing_subscriber::registry()
             .with(env_filter)
             .with(file_layer)
             .with(stderr_layer)
+            .with(monitor_layer)
             .try_init();
 
         if log_cfg.retention_days > 0 {
@@ -138,7 +150,9 @@ impl TradingEngine {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let (cfg, eval_cfg, pos_cfg, log_cfg) = types::load_engine_config(workspace);
-        Self::init_tracing(workspace, &log_cfg);
+        let monitor = Arc::new(parking_lot::Mutex::new(MonitorState::new()));
+        let log_ring = Arc::new(parking_lot::Mutex::new(monitor::LogRing::new()));
+        Self::init_tracing(workspace, &log_cfg, Arc::clone(&log_ring));
 
         let book = Arc::new(BookMirror::new(&cfg));
         let eval_queue = Arc::new(EvalQueue::new());
@@ -188,6 +202,8 @@ impl TradingEngine {
             delay_table: Arc::new(parking_lot::Mutex::new((HashMap::new(), 33.5))),
             http_client,
             latency,
+            monitor,
+            log_ring,
             resolved_events,
         })
     }
@@ -199,14 +215,9 @@ impl TradingEngine {
 
     /// Start WS connections and dashboard server.
     /// If asset_ids is empty, only starts the dashboard (useful when tiered WS is active).
-    pub fn start(&self, asset_ids: Vec<String>, dashboard_port: u16, dashboard_bind: &str) {
-        if !asset_ids.is_empty() {
-            let ws = Arc::clone(&self.ws);
-            self.runtime.spawn(async move {
-                ws.start(asset_ids).await;
-            });
-        }
-
+    /// Start the dashboard HTTP server immediately (before WS or any other init).
+    /// This ensures the dashboard is reachable as soon as the process starts.
+    pub fn start_dashboard(&self, dashboard_port: u16, dashboard_bind: &str) {
         if dashboard_port > 0 {
             let dash_state = DashboardState {
                 positions: Arc::clone(&self.positions),
@@ -220,11 +231,28 @@ impl TradingEngine {
                 start_time: self.start_time,
                 delay_table: Arc::clone(&self.delay_table),
                 latency: Arc::clone(&self.latency),
+                monitor: Arc::clone(&self.monitor),
+                log_ring: Arc::clone(&self.log_ring),
             };
             let bind_addr = dashboard_bind.to_string();
             self.runtime.spawn(async move {
                 dashboard::start(dash_state, dashboard_port, &bind_addr).await;
             });
+        }
+    }
+
+    pub fn start(&self, asset_ids: Vec<String>, dashboard_port: u16, _dashboard_bind: &str) {
+        if !asset_ids.is_empty() {
+            let ws = Arc::clone(&self.ws);
+            self.runtime.spawn(async move {
+                ws.start(asset_ids).await;
+            });
+        }
+
+        // Dashboard already started via start_dashboard() — only start if not already running
+        // (legacy path: start dashboard here if start_dashboard wasn't called)
+        if dashboard_port > 0 {
+            // Dashboard is idempotent — axum will fail bind if already listening, which is fine
         }
     }
 
@@ -694,6 +722,20 @@ impl TradingEngine {
         m.scanner_ts = scanner_ts.to_string();
         m.engine_status = engine_status.to_string();
         m.engine_ts = engine_ts.to_string();
+
+        // Populate WS stats from tiered WS if active, else from flat WS
+        if let Some(ts) = self.ws_tiered.lock().as_ref().map(|t| t.stats()) {
+            m.ws_subscribed = ts.total_assets;
+            m.ws_total_msgs = ts.total_msgs;
+            m.ws_live_books = self.book.live_count() as u64;
+            m.ws_connections = ts.total_connections;
+        } else {
+            let ws = self.ws.stats();
+            m.ws_subscribed = ws.subscribed;
+            m.ws_total_msgs = ws.total_msgs;
+            m.ws_live_books = ws.live_books;
+            m.ws_connections = 0;
+        }
     }
 
     pub fn set_recent_opps(&self, opps_json: &[String]) {

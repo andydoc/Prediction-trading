@@ -379,7 +379,7 @@ fn set_yaml_path(root: &mut serde_yaml_ng::Value, path: &str, val: &serde_yaml_n
 // Logging
 // ---------------------------------------------------------------------------
 
-fn init_logging(cfg: &SupervisorConfig) {
+fn init_logging(cfg: &SupervisorConfig, log_ring: Arc<parking_lot::Mutex<rust_engine::monitor::LogRing>>) {
     let _ = fs::create_dir_all(&cfg.log_dir);
 
     let file_appender = tracing_appender::rolling::daily(&cfg.log_dir, &cfg.log_prefix);
@@ -401,10 +401,15 @@ fn init_logging(cfg: &SupervisorConfig) {
         .with_writer(std::io::stderr)
         .with_target(false);
 
+    let monitor_layer = rust_engine::monitor::MonitorLayer {
+        log_ring,
+    };
+
     let _ = tracing_subscriber::registry()
         .with(env_filter)
         .with(file_layer)
         .with(stderr_layer)
+        .with(monitor_layer)
         .try_init();
 }
 
@@ -533,7 +538,8 @@ fn main() {
     let cli = Cli::parse();
     let cfg = SupervisorConfig::load(&cli);
 
-    init_logging(&cfg);
+    let log_ring = Arc::new(parking_lot::Mutex::new(rust_engine::monitor::LogRing::new()));
+    init_logging(&cfg, Arc::clone(&log_ring));
     cleanup_old_logs(&cfg.log_dir, cfg.log_retention_days);
 
     if cli.dry_run {
@@ -585,7 +591,7 @@ fn main() {
     let orch_cfg = OrchestratorConfig::load(&cfg.workspace);
 
     // Create and run orchestrator
-    match Orchestrator::new(orch_cfg) {
+    match Orchestrator::new(orch_cfg, log_ring) {
         Ok(mut orchestrator) => {
             orchestrator.run(running.clone());
         }

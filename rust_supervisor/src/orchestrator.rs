@@ -329,10 +329,11 @@ pub struct Orchestrator {
 
 impl Orchestrator {
     /// Create a new orchestrator from config.
-    pub fn new(cfg: OrchestratorConfig) -> Result<Self, String> {
+    pub fn new(cfg: OrchestratorConfig, log_ring: std::sync::Arc<parking_lot::Mutex<rust_engine::monitor::LogRing>>) -> Result<Self, String> {
         let ws = cfg.workspace.to_string_lossy().to_string();
 
-        let engine = TradingEngine::new(&ws)?;
+        let mut engine = TradingEngine::new(&ws)?;
+        engine.log_ring = log_ring;
 
         // Enable latency instrumentation if configured
         if cfg.latency_instrumentation {
@@ -440,6 +441,10 @@ impl Orchestrator {
     pub fn run(&mut self, running: Arc<AtomicBool>) {
         tracing::info!("Orchestrator starting...");
 
+        // 0. Start dashboard server IMMEDIATELY so it's reachable during init
+        self.engine.start_dashboard(self.cfg.dashboard_port, &self.cfg.dashboard_bind);
+        tracing::info!("Dashboard server started on port {} (splash screen ready)", self.cfg.dashboard_port);
+
         // 1. Load markets: cache-first, then refresh
         self.load_markets_cached();
         tracing::info!("Loaded {} markets from cache", self.market_lookup.len());
@@ -461,7 +466,7 @@ impl Orchestrator {
             self.p95_table.iter().map(|(k, v)| (k.clone(), *v)).collect()
         );
 
-        // 4. Start WS + dashboard
+        // 4. Start WS (dashboard already started in step 0)
         if !all_assets.is_empty() {
             if self.cfg.use_tiered_ws {
                 // Tiered WS: Tier C gets position assets, Tier B gets all hot constraint assets
@@ -484,13 +489,10 @@ impl Orchestrator {
                 self.engine.start_tiered(ws_config, hot_asset_ids, position_asset_ids);
                 self.last_constraint_to_assets = constraint_to_assets;
                 tracing::info!("Tiered WS started (Tier B + C)");
-
-                // Still start dashboard via the old path (port > 0 triggers dashboard only)
-                self.engine.start(Vec::new(), self.cfg.dashboard_port, &self.cfg.dashboard_bind);
             } else {
-                self.engine.start(all_assets, self.cfg.dashboard_port, &self.cfg.dashboard_bind);
+                self.engine.start(all_assets, 0, "");  // port=0: skip dashboard, already running
             }
-            tracing::info!("WS engine + dashboard started (port {})", self.cfg.dashboard_port);
+            tracing::info!("WS engine started");
         }
 
         // 5. Load state from SQLite
