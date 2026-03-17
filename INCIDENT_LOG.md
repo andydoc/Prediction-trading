@@ -4,6 +4,39 @@ Operational incidents for the Prediction Market Arbitrage System. Most recent fi
 
 ---
 
+## INC-011: WebSocket Connection Leak on Constraint Rebuild
+
+**Date**: 2026-03-17
+**Severity**: High
+**Markets**: All — affects entire WS subscription infrastructure
+**Impact**: 11,000+ WS disconnects/day observed on VPS. Progressively degrading book freshness and increasing missed resolution events over time.
+
+### What happened
+
+The system was experiencing massive WebSocket instability on the VPS — thousands of disconnects per day, stale order books, and missed resolution events. Investigation revealed two root causes:
+
+1. **Polymarket undocumented limits**: 500 subscriptions per connection (above this, initial snapshots stop arriving) and ~20-30 concurrent connections per IP.
+2. **Connection leak in constraint rebuild**: Every ~10 minutes, `orchestrator.rs` line 562 called `self.engine.start(all_assets, 0, ...)` which spawned **new** shard tasks without stopping the old ones. Over hours, this accumulated dozens of zombie connections all competing for the same subscriptions.
+
+### Root cause
+
+The flat sharding approach (`assets_per_shard = 400`, creating ~6-8 shards) was fundamentally incompatible with Polymarket's connection limits. Combined with the leak, the system would exceed the per-IP connection limit within 2-3 hours of running.
+
+### Fix
+
+Implemented a three-tier WebSocket architecture:
+- **Tier A**: REST-only scanning (no WS connections) — every ~10min
+- **Tier B**: Hot constraint monitoring — 5-10 long-lived connections with dynamic subscribe/unsubscribe (no reconnection needed), hysteresis on removal (3 cold scans), hourly consolidation
+- **Tier C**: Open positions + command connection — 1 connection, receives global events (`new_market`, `market_resolved`, `best_bid_ask`)
+
+Constraint rebuilds now call `update_tier_b()` which sends incremental subscription changes instead of tearing down and rebuilding connections. Asset migration between tiers uses overlap-first protocol (subscribe destination before unsubscribing source).
+
+Activation: Set `websocket.use_tiered_ws: true` in config.yaml.
+
+**Status**: ✅ Implemented, pending production validation
+
+---
+
 ## INC-010: Rust Initial Capital Defaulting to $1000
 
 **Date**: 2026-03-16

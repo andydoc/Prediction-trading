@@ -34,6 +34,8 @@ pub struct DetectionResult {
     pub asset_to_market: HashMap<String, (String, bool)>,
     /// All asset IDs that should be subscribed to via WS
     pub all_asset_ids: Vec<String>,
+    /// constraint_id → [asset_ids] (for Tier B hot constraint management)
+    pub constraint_to_assets: HashMap<String, Vec<String>>,
     // Stats
     pub n_markets_input: usize,
     pub n_groups: usize,
@@ -132,9 +134,11 @@ pub fn detect_constraints(
     // Step 3: Build index maps from constraints
     let mut asset_to_constraints: HashMap<String, Vec<String>> = HashMap::new();
     let mut asset_to_market: HashMap<String, (String, bool)> = HashMap::new();
+    let mut constraint_to_assets: HashMap<String, Vec<String>> = HashMap::new();
     let mut all_asset_ids = Vec::new();
 
     for c in &constraints {
+        let mut c_assets = Vec::new();
         for mref in &c.markets {
             // YES asset
             if !mref.yes_asset_id.is_empty() {
@@ -144,6 +148,7 @@ pub fn detect_constraints(
                 asset_to_market.entry(mref.yes_asset_id.clone())
                     .or_insert_with(|| (mref.market_id.clone(), true));
                 all_asset_ids.push(mref.yes_asset_id.clone());
+                c_assets.push(mref.yes_asset_id.clone());
             }
             // NO asset
             if !mref.no_asset_id.is_empty() {
@@ -153,8 +158,10 @@ pub fn detect_constraints(
                 asset_to_market.entry(mref.no_asset_id.clone())
                     .or_insert_with(|| (mref.market_id.clone(), false));
                 all_asset_ids.push(mref.no_asset_id.clone());
+                c_assets.push(mref.no_asset_id.clone());
             }
         }
+        constraint_to_assets.insert(c.constraint_id.clone(), c_assets);
     }
 
     DetectionResult {
@@ -162,6 +169,7 @@ pub fn detect_constraints(
         asset_to_constraints,
         asset_to_market,
         all_asset_ids,
+        constraint_to_assets,
         n_markets_input,
         n_groups,
         n_skipped_incomplete,

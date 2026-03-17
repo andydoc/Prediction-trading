@@ -100,7 +100,7 @@ The following inconsistencies were identified. These will be addressed by the do
 - Market scanning (33k+ markets, full pagination)
 - Constraint detection (mutex group finder with completeness guards)
 - Arb math (Rust: direct mutex + polytope Frank-Wolfe, 4.2 us/eval)
-- WebSocket (Rust tokio-tungstenite, 9 shards, ~2,148 msg/s)
+- WebSocket — tiered architecture (Tier A: REST scanner, Tier B: hot constraint WS pool 5-10 conns, Tier C: position + command WS 1 conn)
 - Order book mirror (Rust DashMap, EFP drift detection)
 - Eval pipeline (full Rust hot path, p50 = 1–5 ms)
 - Position lifecycle (Rust: entry, replacement, resolution)
@@ -111,13 +111,8 @@ The following inconsistencies were identified. These will be addressed by the do
 - Shadow mode validation (paper trades cross-checked against live books)
 
 ### 4.2 Designed but Not Implemented
-- Pre-trade validation (re-read books at execution time)
-- negRisk sell arb capital calculations
-- Order book depth gating for entry/replacement
 - Partial fill handling (score-based unwind)
 - FAK live orders
-- Replacement chain tracking analytics
-- Notification alerts
 - Dashboard control panel (mode switch via UI)
 
 ### 4.3 Not Yet Designed
@@ -231,7 +226,14 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | **WebSocket** | | | |
 | WS stale-asset re-subscribe interval | `trading_engine.py` | 60 s | `websocket.stale_resub_interval_seconds` |
 | WS stale-asset threshold | `trading_engine.py` | 30 s | `websocket.stale_threshold_seconds` |
-| WS assets per shard | `trading_engine.py` | 2,000 | `websocket.assets_per_shard` |
+| WS assets per shard (legacy flat mode) | `trading_engine.py` | 400 | `websocket.assets_per_shard` |
+| WS tiered mode enabled | orchestrator | false | `websocket.use_tiered_ws` |
+| WS max assets per connection | orchestrator | 450 | `websocket.max_assets_per_connection` |
+| WS connection stagger | orchestrator | 150 ms | `websocket.stagger_ms` |
+| Tier B max connections | orchestrator | 10 | `websocket.tier_b_max_connections` |
+| Tier B hysteresis scans | orchestrator | 3 | `websocket.tier_b_hysteresis_scans` |
+| Tier B consolidation threshold | orchestrator | 300 | `websocket.tier_b_consolidation_threshold` |
+| Tier C new market buffer | orchestrator | 2.5 s | `websocket.tier_c_new_market_buffer_secs` |
 | **Position Lifecycle** | | | |
 | Replacement cooldown | `trading_engine.py` | 60 s | `arbitrage.replacement_cooldown_seconds` |
 | Replacement protection window | `paper_trading.py` | 24 h | `arbitrage.replacement_protection_hours` |

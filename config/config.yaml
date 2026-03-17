@@ -111,6 +111,14 @@ websocket:
   reconnect_max_delay: 60.0
   assets_per_shard: 400
   max_book_staleness_secs: 30
+  # Tiered WS architecture (Tier B + C)
+  use_tiered_ws: false              # Set to true to enable tiered WS (replaces flat sharding)
+  max_assets_per_connection: 450    # Hard limit per connection (Polymarket max ~500)
+  stagger_ms: 150                   # Delay between connection starts
+  tier_b_max_connections: 10        # Max Tier B connections (hot constraint monitoring)
+  tier_b_hysteresis_scans: 3        # Scans a constraint must be cold before unsubscribing
+  tier_b_consolidation_threshold: 300  # Assets/conn below which hourly consolidation triggers
+  tier_c_new_market_buffer_secs: 2.5   # Buffer time for new market event bursts
 execution_control:
   enabled: true
   url: http://localhost:5557

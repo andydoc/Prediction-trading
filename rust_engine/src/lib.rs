@@ -22,6 +22,10 @@ pub mod arb;
 pub mod eval;
 pub mod position;
 pub mod ws;
+pub mod ws_pool;
+pub mod ws_tier_b;
+pub mod ws_tier_c;
+pub mod ws_tiered;
 pub mod dashboard;
 pub mod resolution;
 pub mod postponement;
@@ -38,6 +42,8 @@ use queue::EvalQueue;
 use eval::{ConstraintStore, EvalConfig, Constraint};
 use types::LoggingCfg;
 use ws::WsManager;
+use ws_tiered::{TieredWsManager, TieredWsConfig, TieredWsStats};
+use ws_tier_c::NewMarketBurst;
 use position::PositionManager;
 use dashboard::{DashboardState, EngineMetrics};
 use latency::LatencyTracker;
@@ -51,6 +57,8 @@ pub struct TradingEngine {
     pub book: Arc<BookMirror>,
     pub eval_queue: Arc<EvalQueue>,
     pub ws: Arc<WsManager>,
+    /// Tiered WS manager (Tier B + C). Created lazily on first tiered start.
+    pub ws_tiered: parking_lot::Mutex<Option<TieredWsManager>>,
     pub constraints: Arc<ConstraintStore>,
     pub eval_config: parking_lot::Mutex<EvalConfig>,
     pub runtime: tokio::runtime::Runtime,
@@ -62,6 +70,8 @@ pub struct TradingEngine {
     pub delay_table: Arc<parking_lot::Mutex<(HashMap<String, f64>, f64)>>,
     pub http_client: reqwest::blocking::Client,
     pub latency: Arc<LatencyTracker>,
+    /// Shared resolved events vec — used by both old WS and tiered WS.
+    resolved_events: Arc<parking_lot::Mutex<Vec<ws::ResolvedEvent>>>,
 }
 
 impl TradingEngine {
@@ -164,8 +174,11 @@ impl TradingEngine {
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
+        let resolved_events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
         Ok(Self {
             book, eval_queue, ws, constraints,
+            ws_tiered: parking_lot::Mutex::new(None),
             eval_config: parking_lot::Mutex::new(eval_config),
             runtime, positions,
             engine_metrics: Arc::new(parking_lot::Mutex::new(EngineMetrics::default())),
@@ -175,6 +188,7 @@ impl TradingEngine {
             delay_table: Arc::new(parking_lot::Mutex::new((HashMap::new(), 33.5))),
             http_client,
             latency,
+            resolved_events,
         })
     }
 
@@ -184,11 +198,14 @@ impl TradingEngine {
     }
 
     /// Start WS connections and dashboard server.
+    /// If asset_ids is empty, only starts the dashboard (useful when tiered WS is active).
     pub fn start(&self, asset_ids: Vec<String>, dashboard_port: u16, dashboard_bind: &str) {
-        let ws = Arc::clone(&self.ws);
-        self.runtime.spawn(async move {
-            ws.start(asset_ids).await;
-        });
+        if !asset_ids.is_empty() {
+            let ws = Arc::clone(&self.ws);
+            self.runtime.spawn(async move {
+                ws.start(asset_ids).await;
+            });
+        }
 
         if dashboard_port > 0 {
             let dash_state = DashboardState {
@@ -214,6 +231,96 @@ impl TradingEngine {
     /// Stop all WS connections.
     pub fn stop(&self) {
         self.ws.stop();
+        if let Some(ref tiered) = *self.ws_tiered.lock() {
+            tiered.stop();
+        }
+    }
+
+    // === Tiered WS management ===
+
+    /// Start the tiered WS system (Tier B + C). Creates the TieredWsManager if needed.
+    /// `hot_constraints` maps constraint_id → asset_ids for Tier B.
+    /// `position_asset_ids` are assets from open positions for Tier C.
+    pub fn start_tiered(
+        &self,
+        ws_config: TieredWsConfig,
+        hot_asset_ids: Vec<String>,
+        position_asset_ids: Vec<String>,
+    ) {
+        let mut tiered = self.ws_tiered.lock();
+        if tiered.is_some() {
+            tracing::warn!("TieredWS: already running, stopping old instance first");
+            if let Some(ref old) = *tiered {
+                old.stop();
+            }
+        }
+
+        let mgr = TieredWsManager::new(
+            ws_config,
+            Arc::clone(&self.book),
+            Arc::clone(&self.eval_queue),
+            Arc::clone(&self.resolved_events),
+            Arc::clone(&self.positions),
+            Arc::clone(&self.latency),
+        );
+
+        let rt = self.runtime.handle();
+        mgr.start(hot_asset_ids, position_asset_ids, rt);
+        *tiered = Some(mgr);
+    }
+
+    /// Update Tier B hot constraints after scanner rebuild.
+    pub fn update_tier_b(&self, hot_constraints: HashMap<String, Vec<String>>) {
+        if let Some(ref tiered) = *self.ws_tiered.lock() {
+            tiered.update_tier_b(hot_constraints);
+        }
+    }
+
+    /// Handle position entry on the tiered WS system.
+    pub fn tiered_on_position_entry(&self, constraint_id: &str, asset_ids: Vec<String>) {
+        if let Some(ref tiered) = *self.ws_tiered.lock() {
+            tiered.on_position_entry(constraint_id, asset_ids);
+        }
+    }
+
+    /// Handle position exit on the tiered WS system.
+    pub fn tiered_on_position_exit(&self, constraint_id: &str, asset_ids: Vec<String>, still_hot: bool) {
+        if let Some(ref tiered) = *self.ws_tiered.lock() {
+            tiered.on_position_exit(constraint_id, asset_ids, still_hot);
+        }
+    }
+
+    /// Flush new market bursts from Tier C buffer.
+    pub fn tiered_flush_new_markets(&self) -> Vec<NewMarketBurst> {
+        if let Some(ref tiered) = *self.ws_tiered.lock() {
+            tiered.flush_new_markets()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Add a new market constraint to Tier B (from Tier C detection).
+    pub fn tiered_add_new_market_constraint(&self, constraint_id: String, asset_ids: Vec<String>) {
+        if let Some(ref tiered) = *self.ws_tiered.lock() {
+            tiered.add_new_market_constraint(constraint_id, asset_ids);
+        }
+    }
+
+    /// Periodic maintenance for the tiered WS system.
+    pub fn tiered_periodic_maintenance(&self) {
+        if let Some(ref tiered) = *self.ws_tiered.lock() {
+            tiered.periodic_maintenance();
+        }
+    }
+
+    /// Get tiered WS stats (returns None if tiered WS not active).
+    pub fn tiered_stats(&self) -> Option<TieredWsStats> {
+        self.ws_tiered.lock().as_ref().map(|t| t.stats())
+    }
+
+    /// Check if tiered WS is active.
+    pub fn is_tiered_ws_active(&self) -> bool {
+        self.ws_tiered.lock().is_some()
     }
 
     /// Load constraint definitions directly.
@@ -329,7 +436,13 @@ impl TradingEngine {
     pub fn get_stale_assets(&self, max_age_secs: f64) -> Vec<String> { self.book.get_stale_assets(max_age_secs) }
 
     pub fn drain_resolved(&self) -> Vec<ws::ResolvedEvent> {
-        self.ws.drain_resolved()
+        let mut events = self.ws.drain_resolved();
+        // Also drain from tiered WS resolved events
+        let mut tiered_events = std::mem::take(&mut *self.resolved_events.lock());
+        if !tiered_events.is_empty() {
+            events.append(&mut tiered_events);
+        }
+        events
     }
 
     pub fn stats(&self) -> ws::WsStats {

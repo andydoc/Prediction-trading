@@ -278,7 +278,7 @@ async fn connect_and_run(
                             last_pong = std::time::Instant::now();
                             continue;
                         }
-                        handle_message(shard_id, &text, book, queue, resolved, positions, latency);
+                        handle_message_shared(&format!("Shard {}", shard_id), &text, book, queue, resolved, positions, latency);
                     }
                     Some(Ok(WsMessage::Ping(data))) => {
                         let _ = sink.send(WsMessage::Pong(data)).await;
@@ -317,9 +317,9 @@ async fn connect_and_run(
     }
 }
 
-/// Parse and dispatch a single WS message.
-fn handle_message(
-    shard_id: usize,
+/// Parse and dispatch a single WS message (shared between WsManager and ConnectionPool).
+pub fn handle_message_shared(
+    label: &str,
     text: &str,
     book: &Arc<BookMirror>,
     queue: &Arc<EvalQueue>,
@@ -328,7 +328,7 @@ fn handle_message(
     latency: &Arc<LatencyTracker>,
 ) {
     // Debug: log first 200 chars of every message for diagnosis
-    tracing::trace!("Shard {} raw msg: {}", shard_id, &text[..text.len().min(200)]);
+    tracing::trace!("{} raw msg: {}", label, &text[..text.len().min(200)]);
 
     // Polymarket sends arrays of events
     let messages: Vec<Value> = if text.starts_with('[') {
@@ -558,7 +558,7 @@ fn handle_resolved(
 }
 
 /// Parse a JSON field that might be string or number.
-fn parse_f64_field(val: &Value, key: &str) -> Option<f64> {
+pub fn parse_f64_field(val: &Value, key: &str) -> Option<f64> {
     val.get(key).and_then(|v| {
         v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
     })
@@ -567,7 +567,7 @@ fn parse_f64_field(val: &Value, key: &str) -> Option<f64> {
 /// Extract Polymarket server timestamp from a WS message.
 /// Tries "timestamp" field — may be seconds, millis, or ISO string.
 /// Returns 0.0 if not available.
-fn extract_origin_ts(msg: &Value, now: f64) -> f64 {
+pub fn extract_origin_ts(msg: &Value, now: f64) -> f64 {
     if let Some(ts) = parse_f64_field(msg, "timestamp") {
         // Polymarket sends millis (13-digit) or seconds (10-digit)
         if ts > 1_000_000_000_000.0 {

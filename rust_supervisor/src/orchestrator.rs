@@ -22,6 +22,7 @@ use rust_engine::resolution::ResolutionValidator;
 use rust_engine::postponement::PostponementDetector;
 use rust_engine::scanner::MarketScanner;
 use rust_engine::state::StateDB;
+use rust_engine::ws_tiered::TieredWsConfig;
 use rust_engine::TradingEngine;
 
 // ---------------------------------------------------------------------------
@@ -134,6 +135,17 @@ pub struct OrchestratorConfig {
 
     // Latency instrumentation
     pub latency_instrumentation: bool,
+
+    // Tiered WS
+    pub use_tiered_ws: bool,
+    pub tiered_ws_url: String,
+    pub tier_b_max_connections: usize,
+    pub tier_b_hysteresis_scans: u32,
+    pub tier_b_consolidation_threshold: usize,
+    pub tier_c_new_market_buffer_secs: f64,
+    pub ws_stagger_ms: u64,
+    pub ws_max_assets_per_connection: usize,
+    pub ws_heartbeat_interval_secs: u64,
 }
 
 impl OrchestratorConfig {
@@ -156,6 +168,7 @@ impl OrchestratorConfig {
         let eng = yaml.get("engine").cloned().unwrap_or_default();
         let live_cfg = yaml.get("live_trading").cloned().unwrap_or_default();
         let ai = yaml.get("ai").cloned().unwrap_or_default();
+        let ws_cfg = yaml.get("websocket").cloned().unwrap_or_default();
 
         let shadow_only = live_cfg.get("shadow_only").and_then(|v| v.as_bool()).unwrap_or(true);
         let mode_str = yaml.get("mode").and_then(|v| v.as_str()).unwrap_or("dual");
@@ -237,6 +250,28 @@ impl OrchestratorConfig {
                 .unwrap_or_else(|| workspace.join("data").join("system_state").join("execution_state.db")),
             latency_instrumentation: eng.get("latency_instrumentation")
                 .and_then(|v| v.as_bool()).unwrap_or(false),
+
+            // Tiered WS config
+            use_tiered_ws: ws_cfg.get("use_tiered_ws")
+                .and_then(|v| v.as_bool()).unwrap_or(false),
+            tiered_ws_url: ws_cfg.get("market_channel_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("wss://ws-subscriptions-clob.polymarket.com/ws/market")
+                .to_string(),
+            tier_b_max_connections: ws_cfg.get("tier_b_max_connections")
+                .and_then(|v| v.as_u64()).unwrap_or(10) as usize,
+            tier_b_hysteresis_scans: ws_cfg.get("tier_b_hysteresis_scans")
+                .and_then(|v| v.as_u64()).unwrap_or(3) as u32,
+            tier_b_consolidation_threshold: ws_cfg.get("tier_b_consolidation_threshold")
+                .and_then(|v| v.as_u64()).unwrap_or(300) as usize,
+            tier_c_new_market_buffer_secs: ws_cfg.get("tier_c_new_market_buffer_secs")
+                .and_then(|v| v.as_f64()).unwrap_or(2.5),
+            ws_stagger_ms: ws_cfg.get("stagger_ms")
+                .and_then(|v| v.as_u64()).unwrap_or(150),
+            ws_max_assets_per_connection: ws_cfg.get("max_assets_per_connection")
+                .and_then(|v| v.as_u64()).unwrap_or(450) as usize,
+            ws_heartbeat_interval_secs: ws_cfg.get("heartbeat_interval")
+                .and_then(|v| v.as_u64()).unwrap_or(10),
         }
     }
 }
@@ -284,6 +319,9 @@ pub struct Orchestrator {
 
     // P1: Cached held IDs (invalidated on position entry/exit/resolution)
     held_ids_cache: Option<(HashSet<String>, HashSet<String>)>,
+
+    /// Tiered WS: last constraint→assets map (for Tier B hot constraint diffing).
+    last_constraint_to_assets: HashMap<String, Vec<String>>,
 }
 
 impl Orchestrator {
@@ -391,6 +429,7 @@ impl Orchestrator {
             disk_save_handle: None,
             notifier,
             held_ids_cache: None,
+            last_constraint_to_assets: HashMap::new(),
         })
     }
 
@@ -412,7 +451,7 @@ impl Orchestrator {
         }
 
         // 2. Detect constraints
-        let all_assets = self.detect_constraints();
+        let (all_assets, constraint_to_assets) = self.detect_constraints();
 
         // 3. Load delay table into engine
         self.engine.set_delay_table(
@@ -421,7 +460,33 @@ impl Orchestrator {
 
         // 4. Start WS + dashboard
         if !all_assets.is_empty() {
-            self.engine.start(all_assets, self.cfg.dashboard_port, &self.cfg.dashboard_bind);
+            if self.cfg.use_tiered_ws {
+                // Tiered WS: Tier C gets position assets, Tier B gets all hot constraint assets
+                let position_asset_ids = self.engine.get_open_position_asset_ids();
+                let hot_asset_ids: Vec<String> = constraint_to_assets.values()
+                    .flat_map(|v| v.iter().cloned())
+                    .collect();
+
+                let ws_config = TieredWsConfig {
+                    ws_url: self.cfg.tiered_ws_url.clone(),
+                    heartbeat_interval_secs: self.cfg.ws_heartbeat_interval_secs,
+                    max_assets_per_connection: self.cfg.ws_max_assets_per_connection,
+                    stagger_ms: self.cfg.ws_stagger_ms,
+                    tier_b_max_connections: self.cfg.tier_b_max_connections,
+                    tier_b_hysteresis_scans: self.cfg.tier_b_hysteresis_scans,
+                    tier_b_consolidation_threshold: self.cfg.tier_b_consolidation_threshold,
+                    tier_c_new_market_buffer_secs: self.cfg.tier_c_new_market_buffer_secs,
+                };
+
+                self.engine.start_tiered(ws_config, hot_asset_ids, position_asset_ids);
+                self.last_constraint_to_assets = constraint_to_assets;
+                tracing::info!("Tiered WS started (Tier B + C)");
+
+                // Still start dashboard via the old path (port > 0 triggers dashboard only)
+                self.engine.start(Vec::new(), self.cfg.dashboard_port, &self.cfg.dashboard_bind);
+            } else {
+                self.engine.start(all_assets, self.cfg.dashboard_port, &self.cfg.dashboard_bind);
+            }
             tracing::info!("WS engine + dashboard started (port {})", self.cfg.dashboard_port);
         }
 
@@ -478,10 +543,34 @@ impl Orchestrator {
             let events: Vec<(String, String)> = resolved.iter()
                 .map(|r| (r.market_cid.clone(), r.asset_id.clone()))
                 .collect();
+
+            // Before resolving, capture constraint info for tiered WS exit hooks
+            let pre_resolve_info: Vec<(String, String, Vec<String>)> = if self.cfg.use_tiered_ws {
+                let pm = self.engine.positions.lock();
+                pm.open_positions().values()
+                    .map(|p| {
+                        let cid = p.metadata.get("constraint_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let assets: Vec<String> = p.markets.keys().cloned().collect();
+                        (p.position_id.clone(), cid, assets)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
             let closed = self.engine.resolve_by_ws_events(&events);
             if !closed.is_empty() { self.held_ids_cache = None; }
             for (pid, winner) in &closed {
                 tracing::info!("WS RESOLUTION: {} → winner={}", pid, winner);
+
+                // Tiered WS: migrate resolved position assets from Tier C → possibly Tier B
+                if self.cfg.use_tiered_ws {
+                    if let Some((_, cid, assets)) = pre_resolve_info.iter().find(|(p, _, _)| p == pid) {
+                        let still_hot = self.last_constraint_to_assets.contains_key(cid);
+                        self.engine.tiered_on_position_exit(cid, assets.clone(), still_hot);
+                    }
+                }
+
                 let _ = self.notifier.send(&NotifyEvent::PositionResolved {
                     position_id: pid.clone(),
                     profit: 0.0, // actual P&L computed at resolution
@@ -557,9 +646,15 @@ impl Orchestrator {
             match self.scanner.scan() {
                 Ok(result) => {
                     self.ingest_scan_result(&result);
-                    let all_assets = self.detect_constraints();
+                    let (all_assets, constraint_to_assets) = self.detect_constraints();
                     if !all_assets.is_empty() {
-                        self.engine.start(all_assets, 0, &self.cfg.dashboard_bind); // port=0 skips dashboard restart
+                        if self.cfg.use_tiered_ws {
+                            // Tiered WS: incremental update — no connection churn!
+                            self.engine.update_tier_b(constraint_to_assets.clone());
+                            self.last_constraint_to_assets = constraint_to_assets;
+                        } else {
+                            self.engine.start(all_assets, 0, &self.cfg.dashboard_bind); // port=0 skips dashboard restart
+                        }
                     }
                 }
                 Err(e) => tracing::warn!("Constraint rebuild scan failed: {}", e),
@@ -580,6 +675,28 @@ impl Orchestrator {
                 tracing::debug!("Stale assets: {} > {:.0}s old", stale.len(), self.cfg.stale_asset_threshold);
             }
             self.last_stale_sweep = now;
+        }
+
+        // --- Tiered WS: flush new markets + periodic maintenance ---
+        if self.cfg.use_tiered_ws {
+            // Flush new market bursts from Tier C buffer
+            let bursts = self.engine.tiered_flush_new_markets();
+            for burst in &bursts {
+                tracing::info!("New market burst: event='{}' ({} markets)",
+                    burst.event_title, burst.markets.len());
+                // Collect all asset IDs from the burst for Tier B subscription
+                let all_burst_assets: Vec<String> = burst.markets.iter()
+                    .flat_map(|m| m.asset_ids.iter().cloned())
+                    .collect();
+                if !all_burst_assets.is_empty() {
+                    // Use event_id as a synthetic constraint_id for new market tracking
+                    let synthetic_cid = format!("newmkt_{}", &burst.event_id[..burst.event_id.len().min(32)]);
+                    self.engine.tiered_add_new_market_constraint(synthetic_cid, all_burst_assets);
+                }
+            }
+
+            // Periodic maintenance (hourly consolidation)
+            self.engine.tiered_periodic_maintenance();
         }
 
         // --- API resolution poll (safety net for missed WS events) ---
@@ -641,10 +758,11 @@ impl Orchestrator {
 
     // --- Constraint detection ---
 
-    fn detect_constraints(&mut self) -> Vec<String> {
+    /// Detect constraints and return (all_asset_ids, constraint_to_assets).
+    fn detect_constraints(&mut self) -> (Vec<String>, HashMap<String, Vec<String>>) {
         if self.market_lookup.is_empty() {
             tracing::warn!("Cannot detect constraints: no markets loaded");
-            return Vec::new();
+            return (Vec::new(), HashMap::new());
         }
 
         let markets_for_detect: Vec<DetectableMarket> = self.market_lookup.values()
@@ -701,7 +819,8 @@ impl Orchestrator {
         tracing::info!("Constraints: {} detected, {} assets (capital=${:.2})",
             result.constraints.len(), result.all_asset_ids.len(), cap);
 
-        result.all_asset_ids
+        let constraint_to_assets = result.constraint_to_assets.clone();
+        (result.all_asset_ids, constraint_to_assets)
     }
 
     // --- State management ---
@@ -883,6 +1002,24 @@ impl Orchestrator {
             ) {
                 position::EntryResult::Entered(pos) => {
                     self.held_ids_cache = None;
+                    // Tiered WS: migrate assets from Tier B → Tier C on position entry
+                    if self.cfg.use_tiered_ws {
+                        let entry_assets: Vec<String> = opp.market_ids.iter()
+                            .flat_map(|mid| {
+                                // Get YES and NO asset IDs for this market from the constraint
+                                self.engine.constraints.get(&opp.constraint_id)
+                                    .map(|c| c.markets.iter()
+                                        .filter(|m| &m.market_id == mid)
+                                        .flat_map(|m| vec![m.yes_asset_id.clone(), m.no_asset_id.clone()])
+                                        .filter(|a| !a.is_empty())
+                                        .collect::<Vec<_>>())
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+                        if !entry_assets.is_empty() {
+                            self.engine.tiered_on_position_entry(&opp.constraint_id, entry_assets);
+                        }
+                    }
                     // B3: Store negRisk capital efficiency in position metadata
                     if opp.neg_risk {
                         if let Some(ce) = opp.capital_efficiency {
@@ -972,17 +1109,33 @@ impl Orchestrator {
                 if let Some((worst_pid, worst_score)) = worst {
                     if best_score > worst_score * PROACTIVE_EXIT_MULTIPLIER {
                         // B1.1: Capture chain info from the position being replaced
-                        let chain_info_owned: Option<(String, u32, String)> = {
+                        let (chain_info_owned, replace_exit_info): (Option<(String, u32, String)>, Option<(String, Vec<String>)>) = {
                             let pm = self.engine.positions.lock();
-                            pm.get_position(&worst_pid).map(|p| {
+                            let chain = pm.get_position(&worst_pid).map(|p| {
                                 let chain_id = p.chain_id.clone().unwrap_or_else(|| worst_pid.clone());
                                 let next_gen = p.chain_generation + 1;
                                 (chain_id, next_gen, worst_pid.clone())
-                            })
+                            });
+                            let exit_info = if self.cfg.use_tiered_ws {
+                                pm.get_position(&worst_pid).map(|p| {
+                                    let cid = p.metadata.get("constraint_id")
+                                        .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let assets: Vec<String> = p.markets.keys().cloned().collect();
+                                    (cid, assets)
+                                })
+                            } else {
+                                None
+                            };
+                            (chain, exit_info)
                         };
 
                         // Execute replacement
                         if let Some((net, profit)) = self.engine.liquidate_position(&worst_pid, "replaced", &worst_bids) {
+                            // Tiered WS: move replaced position assets back to B if still hot
+                            if let Some((cid, assets)) = replace_exit_info {
+                                let still_hot = self.last_constraint_to_assets.contains_key(&cid);
+                                self.engine.tiered_on_position_exit(&cid, assets, still_hot);
+                            }
                             self.held_ids_cache = None;
                             tracing::info!("REPLACE: liquidated {} → freed ${:.2}, profit=${:+.2}",
                                 &worst_pid[..worst_pid.len().min(30)], net, profit);
@@ -1127,9 +1280,27 @@ impl Orchestrator {
         for exit in &exits {
             tracing::info!("PROACTIVE EXIT: {}... ratio={:.3}",
                 &exit.position_id[..exit.position_id.len().min(40)], exit.ratio);
+
+            // Capture tiered WS exit info before liquidation
+            let exit_info = if self.cfg.use_tiered_ws {
+                let pm = self.engine.positions.lock();
+                pm.get_position(&exit.position_id).map(|p| {
+                    let cid = p.metadata.get("constraint_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let assets: Vec<String> = p.markets.keys().cloned().collect();
+                    (cid, assets)
+                })
+            } else {
+                None
+            };
+
             let bids = self.get_position_bids_by_id(&exit.position_id);
             if let Some((net, profit)) = self.engine.liquidate_position(&exit.position_id, "proactive_exit", &bids) {
                 self.held_ids_cache = None;
+                // Tiered WS: move assets back to Tier B if still hot
+                if let Some((cid, assets)) = exit_info {
+                    let still_hot = self.last_constraint_to_assets.contains_key(&cid);
+                    self.engine.tiered_on_position_exit(&cid, assets, still_hot);
+                }
                 tracing::info!("  Sold: freed ${:.2}, profit=${:+.2}", net, profit);
                 let _ = self.notifier.send(&NotifyEvent::ProactiveExit {
                     position_id: exit.position_id.clone(),
@@ -1230,7 +1401,6 @@ impl Orchestrator {
     // --- Stats ---
 
     fn log_stats(&self) {
-        let ws = self.engine.stats();
         let (q_urg, q_bg) = self.engine.queue_depths();
         let cap = self.engine.current_capital();
         let npos = self.engine.pm_open_count();
@@ -1246,12 +1416,23 @@ impl Orchestrator {
             (0.0, 0.0, 0.0)
         };
 
-        tracing::info!(
-            "[iter {}] Capital=${:.2} positions={} | WS: subs={} msgs={} live={} urgent={} bg={} lat_μs p50={:.0} p95={:.0} max={:.0}",
-            self.iteration, cap, npos,
-            ws.subscribed, ws.total_msgs, ws.live_books,
-            q_urg, q_bg, lat_p50, lat_p95, lat_max,
-        );
+        if let Some(ts) = self.engine.tiered_stats() {
+            tracing::info!(
+                "[iter {}] Capital=${:.2} positions={} | TieredWS: B={} conns/{} assets/{} hot, C={} conns/{} assets/{} pos | msgs={} urg={} bg={} lat_μs p50={:.0} p95={:.0} max={:.0}",
+                self.iteration, cap, npos,
+                ts.tier_b_connections, ts.tier_b_assets, ts.tier_b_hot_constraints,
+                ts.tier_c_connections, ts.tier_c_assets, ts.tier_c_position_assets,
+                ts.total_msgs, q_urg, q_bg, lat_p50, lat_p95, lat_max,
+            );
+        } else {
+            let ws = self.engine.stats();
+            tracing::info!(
+                "[iter {}] Capital=${:.2} positions={} | WS: subs={} msgs={} live={} urgent={} bg={} lat_μs p50={:.0} p95={:.0} max={:.0}",
+                self.iteration, cap, npos,
+                ws.subscribed, ws.total_msgs, ws.live_books,
+                q_urg, q_bg, lat_p50, lat_p95, lat_max,
+            );
+        }
 
         // Per-segment latency breakdown (when instrumentation enabled)
         if self.engine.latency.is_enabled() {

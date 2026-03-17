@@ -7,6 +7,37 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.12.0] — 2026-03-17 — Tiered WebSocket Architecture
+
+### Added
+- **Tiered WS system** replacing flat sharding — solves Polymarket's undocumented 500 subscription/connection limit and per-IP connection cap
+  - **Tier A**: REST-only universe scanning (every ~10min via MarketScanner) — unchanged
+  - **Tier B**: Hot constraint monitoring pool (5-10 long-lived connections, max 450 assets each, ~2,000-3,000 assets)
+  - **Tier C**: Open positions + command connection (1 connection, receives `new_market`, `market_resolved`, `best_bid_ask` global events)
+- `ws_pool.rs` — Core `ConnectionPool` with long-lived connections, dynamic subscribe/unsubscribe via WS messages (no reconnection needed), auto-reconnect with exponential backoff, dynamic connection scaling
+- `ws_tier_b.rs` — Tier B manager with hot constraint tracking, hysteresis on removal (3 consecutive cold scans before unsubscribe), hourly consolidation, promote/demote between tiers
+- `ws_tier_c.rs` — Tier C manager with position asset management, new market event buffering (2.5s burst collection), `parse_new_market_event()` and `parse_market_resolved_event()` parsers
+- `ws_tiered.rs` — Facade coordinating Tier B and Tier C with unified API for orchestrator
+- **Asset migration protocol**: Subscribe on destination FIRST (overlap > gap), then unsubscribe from source — zero-gap coverage on position entry/exit
+- **Incremental constraint rebuild**: `update_tier_b()` sends only subscription deltas instead of tearing down and rebuilding connections — **fixes connection leak bug** (old code spawned new shard tasks every ~10min without stopping old ones)
+- **New market detection pipeline**: Tier C buffers `new_market` events, groups by `event_id`, flushes bursts to orchestrator for Tier B subscription
+- Config toggle: `websocket.use_tiered_ws: true` to enable (default: false, old flat sharding preserved as fallback)
+- Per-tier stats in log output: B connections/assets/hot constraints, C connections/assets/position count
+- `constraint_to_assets` map in `DetectionResult` for Tier B hot constraint management
+
+### Changed
+- `detect_constraints()` now returns `(Vec<String>, HashMap<String, Vec<String>>)` tuple (all_asset_ids + constraint→assets map)
+- `engine.start()` skips WS spawn when asset_ids is empty (dashboard-only mode for tiered WS)
+- `drain_resolved()` now drains from both old WsManager and tiered WS resolved events
+- `engine.stop()` stops both old WS and tiered WS
+- Stats logging shows tiered breakdown when tiered WS is active
+- `ws::handle_message` renamed to `handle_message_shared` and made `pub` for reuse by connection pool
+
+### Fixed
+- **INC-011**: WebSocket connection leak on constraint rebuild — old sharding code at orchestrator line 562 spawned new tasks without stopping old ones every ~10min, accumulating disconnected shards
+
+---
+
 ## [0.11.1] — 2026-03-16 — Code Review v2: Bugs, Security, Performance & Style
 
 ### Fixed
