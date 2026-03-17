@@ -14,6 +14,8 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 - **B3.6: Partial fill evaluation** (`executor.rs`): `evaluate_partial_fills()` + `evaluate_arb_fills()` — checks fill status of all arb legs, computes profit ratio, returns Accept/AcceptPartial/Unwind/NoFill decision. 6 unit tests.
 - **B3.7: Batch order submission** (`executor.rs`): `execute_arb_batch()` — signs all legs upfront, submits as single `/orders` batch request. Falls back to sequential on batch endpoint failure. Aborts all legs if any fail during signing/validation.
 
+- **InstrumentStore wired into engine** — `TradingEngine` owns `Arc<InstrumentStore>`, loaded from scanner data on every `ingest_scan_result()`. Passed to TieredWsManager so `tick_size_change` events update instruments live.
+
 ### Changed
 - WS reconnect backoff now includes random jitter (50% of backoff + idx × stagger_ms) to prevent reconnect stampede after Polymarket mass-disconnects
 - Dashboard clipboard: `execCommand('copy')` fallback for non-HTTPS contexts (fixes copy on Linux tab via VPS IP)
