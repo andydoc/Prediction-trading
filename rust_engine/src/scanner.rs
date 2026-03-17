@@ -182,6 +182,10 @@ fn convert_market(raw: &serde_json::Value) -> Option<(String, serde_json::Value)
         "clobTokenIds": raw.get("clobTokenIds").cloned().unwrap_or(serde_json::Value::String(String::new())),
         "enableOrderBook": raw.get("enableOrderBook").and_then(|v| v.as_bool()).unwrap_or(false),
         "acceptingOrders": raw.get("acceptingOrders").and_then(|v| v.as_bool()).unwrap_or(false),
+        "tick_size": raw.get("minimum_tick_size")
+            .or_else(|| raw.get("tick_size"))
+            .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+            .unwrap_or(0.01),
         "end_date": end_date_raw,
         "description": raw.get("description").and_then(|v| v.as_str()).unwrap_or(""),
     });

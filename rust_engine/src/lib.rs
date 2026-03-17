@@ -34,6 +34,8 @@ pub mod detect;
 pub mod notify;
 pub mod latency;
 pub mod monitor;
+pub mod signing;
+pub mod instrument;
 
 use std::collections::HashMap;
 use std::sync::Arc;

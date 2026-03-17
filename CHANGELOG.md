@@ -7,6 +7,41 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.13.0] — 2026-03-17 — EIP-712 Signing, Instrument Model & Fast-Market Support
+
+### Added
+- **EIP-712 order signing** (`signing.rs`): Pure Rust implementation using `alloy` crates
+  - OrderSigner with pre-computed domain separators for CTF Exchange and Neg Risk CTF Exchange
+  - Full EIP-712 typed data hashing (domain separator + order struct hash)
+  - ECDSA signing via alloy-signer-local (PrivateKeySigner), signature type 0 (EOA)
+  - `build_order()` helper with correct maker/taker amount computation for BUY and SELL
+  - Correct taker address routing (Address::ZERO for regular, Neg Risk Adapter for negRisk)
+  - 6 unit tests covering signing, amounts, domain separation, negRisk routing
+- **Instrument model** (`instrument.rs`): Formal typed struct for Polymarket conditional tokens
+  - `RoundingConfig` encoding py-clob-client's 4-tier ROUNDING_CONFIG (tick_size → price/size/amount precision)
+  - `Instrument` struct: token_id, condition_id, neg_risk, tick_size, rounding, min/max order size, order_book_enabled
+  - `InstrumentStore` (thread-safe RwLock): load from scanner data, update on tick_size_change events
+  - 4 unit tests covering rounding, price validation, store load/update
+- **Crypto price prediction category** (`types.rs`): `crypto_price` classification for short-lived 5-15 min markets (BTC/ETH/SOL above/below patterns)
+- **`crypto_price` delay table entry**: 0.05h p95 (3 min) — crypto price markets resolve near-instantly on expiry
+- **WS `tick_size_change` event handler**: Recognized and logged (previously fell through to unknown)
+- **Scanner `tick_size` capture**: Now reads `minimum_tick_size` from Gamma API responses into market metadata
+- **Shadow-F instance** in PRODUCT_SPEC_v2.md: Dedicated fast-market shadow for 5-15 min crypto price predictions
+  - 60s constraint rebuild, 60s min resolution, 10s replacement cooldown, 0.1h replacement protection
+  - 5% capital, 50 max positions, $200 max size, 1% min profit threshold
+- **`order_aggression` config parameter**: `passive`/`at_market`/`aggressive` for tick offset control per instance
+
+### Changed
+- Shadow grid expanded from 5 to 6 instances (A–F) throughout PRODUCT_SPEC_v2.md
+- Shadow-A `min_resolution_time_secs` lowered from 300 → 120 for overlap with fast-market testing
+- WS connection budget updated: 11 Tier B + 6 Tier C = 17 total (within per-IP limit)
+- Tier B `max_connections` raised from 10 → 11 in config.yaml (was dropping assets at 10)
+
+### Dependencies
+- Added: `alloy-primitives`, `alloy-sol-types`, `alloy-signer`, `alloy-signer-local`, `hex`, `rand`
+
+---
+
 ## [0.12.2] — 2026-03-17 — Dashboard Monitor Tab + Log Viewer
 
 ### Added

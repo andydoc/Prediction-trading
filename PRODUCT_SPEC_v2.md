@@ -23,7 +23,7 @@ A senior developer built an automated prediction market arbitrage system under p
 - **Production target**: VPS only (ZAP-Hosting, Germany, always-on, 4 vCPU, **8 GB RAM**, 25 GB NVMe). Laptop is dev-only.
 - **Rust port**: Complete before go-live. Single compiled binary is the target state before real money flows.
 - **Notifications**: WhatsApp (not OpenClaw, not email).
-- **Shadow strategy**: Run 5 parallel shadow accounts with different parameter combinations to optimise % capital per position and max concurrent positions before committing real money.
+- **Shadow strategy**: Run 6 parallel shadow accounts with different parameter combinations (including a fast-market instance for 5-15 min crypto price predictions) to optimise strategy before committing real money.
 
 ---
 
@@ -53,7 +53,7 @@ Automated detection and execution of guaranteed-profit arbitrage on Polymarket p
 | Market coverage | 52% (18.5k/35.8k assets) | Maintain or improve |
 | Uptime | Manual restarts | 99%+ (systemd, auto-restart) |
 
-### 2.4 Architecture (current state: v0.12.0)
+### 2.4 Architecture (current state: v0.13.0)
 
 **Pure Rust system** (single compiled binary since v0.10.0):
 - `rust_supervisor` crate: orchestrator, CLI, config loading, systemd integration
@@ -111,7 +111,7 @@ The following inconsistencies were identified. These will be addressed by the do
 - AI postponement detector (web search for rescheduled events)
 - Shadow mode validation (paper trades cross-checked against live books)
 - WhatsApp notifications (rate-limited, per-event toggles, exponential backoff)
-- Multi-instance support (5 shadow configs, systemd template)
+- Multi-instance support (6 shadow configs incl. fast-market, systemd template)
 - Proactive exit (liquidation value > 1.2× resolution payout)
 
 ### 4.2 Designed but Not Implemented
@@ -158,7 +158,7 @@ The following inconsistencies were identified. These will be addressed by the do
     |                Prove the execution path works against the real CLOB.
     |                Place, fill, cancel, and reconcile real micro-orders.
     |
-⬚ Milestone E: Shadow Validation (14 days, 5× shadow accounts, parameter optimisation)
+⬚ Milestone E: Shadow Validation (14 days, 6× shadow accounts, parameter optimisation)
     |                No additional funds required. Shadow trades only.
     |
 ⬚ Milestone F: Go Live ($1,000 USDC, supervised, VPS)
@@ -278,6 +278,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | Min depth per leg | designed (Phase 5a) | $5.00 | `live_trading.min_depth_per_leg` |
 | Reconciliation interval | designed (Phase B5) | 5 min | `live_trading.reconciliation_interval_seconds` |
 | Trade confirmation timeout | new (B2.1) | 120 s | `live_trading.trade_confirmation_timeout_seconds` |
+| Order aggression (tick offset) | new (B3.1) | `at_market` | `live_trading.order_aggression` (`passive`/`at_market`/`aggressive`) |
 | **Safety** | | | |
 | Circuit breaker drawdown | designed (Phase C1) | 10% | `safety.circuit_breaker.max_drawdown_pct` |
 | Circuit breaker error count | designed (Phase C1) | 3 | `safety.circuit_breaker.max_consecutive_errors` |
@@ -327,7 +328,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | Task | Acceptance Criteria |
 |------|-------------------|
 | ⬚ **B3.0: Market BUY quantity guard** | Enforced at executor boundary: (a) Market BUY → quantity = USDC notional (quote). (b) Market SELL → quantity = token count (base). (c) Limit/FAK → quantity = token count (base). (d) Base-denominated market BUY rejected with error log, never submitted. Prevents oversized fills. Unit test covers all 4 cases. |
-| ⬚ **B3.1: Wire LiveExecutor (dry-run)** | CLOB `create_order()` calls for all legs of an arb. Uses B2.0 signing, B2.3 instrument model, B3.0 quantity guard. Passes `neg_risk: true` for negRisk markets. Uses FAK (Fill And Kill) order type. In `--dry-run` mode: constructs and signs orders, logs full details, but does not submit to CLOB. Handles: success, partial fill, rejection, timeout as state transitions. **Design decision**: signature type 0 (EOA). Document in ARCHITECTURE.md. |
+| ⬚ **B3.1: Wire LiveExecutor (dry-run)** | CLOB `create_order()` calls for all legs of an arb. Uses B2.0 signing, B2.3 instrument model, B3.0 quantity guard. Passes `neg_risk: true` for negRisk markets. Uses FAK (Fill And Kill) order type. In `--dry-run` mode: constructs and signs orders, logs full details, but does not submit to CLOB. Handles: success, partial fill, rejection, timeout as state transitions. **Design decision**: signature type 0 (EOA). Document in ARCHITECTURE.md. **Fast-market note**: For short-lived markets (Shadow-F), FAK limit orders placed 1 tick into the book provide the best fill-rate vs price tradeoff. Market orders guarantee fill but sacrifice spread; passive limit orders risk non-fill on a 5-min market. Config key `live_trading.order_aggression` (values: `passive`, `at_market`, `aggressive`) controls tick offset per instance. |
 | ⬚ **B3.2: Trade status pipeline** | After MATCHED, track status via Tier C WebSocket: MATCHED → MINED → CONFIRMED → RETRYING → FAILED. (a) CONFIRMED: finalise position entry. (b) RETRYING: log warning, hold in "pending" state, exclude from replacement queue. (c) FAILED: roll back entry, restore capital, WhatsApp alert. (d) No update within `live_trading.trade_confirmation_timeout_seconds` (default 120s): query CLOB API, reconcile. Position not "open" until CONFIRMED. Dedup on `trade_id`. |
 | ⬚ **B3.3: Execution rate limiting** | Token-bucket rate limiter: 60 orders/min trading, 100 req/min public, 300 req/min auth, 3,000 req/10min global. Logs when throttled. Prevents 429 bans. **Pre-req**: study NT rate limit implementation and Polymarket API docs for current limits. |
 | ⬚ **B3.4: Timestamp normalisation** | Robust parsing across all API responses: ISO8601 with/without timezone, Unix seconds vs milliseconds, missing/null timestamps. Single `parse_polymarket_timestamp()` function used everywhere. **Pre-req**: study NT issue #3273 and fix for edge cases. |
@@ -402,11 +403,11 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 ### ⬚ Milestone E: Shadow Validation (14-Day Gate)
 
-**Goal**: Prove the complete system works without risking real money, AND determine optimal trading parameters via 5 parallel shadow accounts. **No additional funds required beyond Milestone D deposit** (shadow trades are paper-only).
+**Goal**: Prove the complete system works without risking real money, AND determine optimal trading parameters via 6 parallel shadow accounts (including a fast-market instance for 5-15 min crypto price predictions). **No additional funds required beyond Milestone D deposit** (shadow trades are paper-only).
 
 #### E-Part 1: Multi-Shadow Parameter Optimisation
 
-Run 5 parallel shadow instances on the VPS (8 GB RAM supports this) with different parameter combinations. Each instance varies strategy parameters (not just sizing) to find the optimal balance across capital concentration, entry aggression, and replacement behaviour.
+Run 6 parallel shadow instances on the VPS (8 GB RAM supports this) with different parameter combinations. Each instance varies strategy parameters (not just sizing) to find the optimal balance across capital concentration, entry aggression, and replacement behaviour. Shadow-F is a dedicated fast-market instance targeting 5-15 minute crypto price prediction markets.
 
 **Sizing & Concentration**
 
@@ -417,16 +418,18 @@ Run 5 parallel shadow instances on the VPS (8 GB RAM supports this) with differe
 | **Shadow-C** | 20% | 15 | $1,000 | $1,000 | Moderate concentration |
 | **Shadow-D** | 30% | 8 | $1,500 | $1,000 | High concentration |
 | **Shadow-E** | 50% | 8 | $2,000 | $1,000 | Maximum concentration |
+| **Shadow-F** | 5% | 50 | $200 | $1,000 | Fast markets (5-15 min crypto price) |
 
 **Entry Filters**
 
 | Instance | `min_profit_threshold` | `max_profit_threshold` | `min_resolution_time_secs` | `max_days_to_resolution` |
 |----------|----------------------|----------------------|---------------------------|-------------------------|
-| **Shadow-A** | 0.02 (2%) | 0.30 | 300 | 90 |
+| **Shadow-A** | 0.02 (2%) | 0.30 | 120 | 90 |
 | **Shadow-B** | 0.03 (current) | 0.30 (current) | 300 (current) | 60 (current) |
 | **Shadow-C** | 0.03 | 0.25 | 600 | 45 |
 | **Shadow-D** | 0.04 | 0.20 | 900 | 30 |
 | **Shadow-E** | 0.05 | 0.20 | 1800 | 21 |
+| **Shadow-F** | 0.01 (1%) | 0.30 | 60 | 1 |
 
 **Replacement & Risk**
 
@@ -437,19 +440,27 @@ Run 5 parallel shadow instances on the VPS (8 GB RAM supports this) with differe
 | **Shadow-C** | 120 | 30 | $500 | Slower replacement |
 | **Shadow-D** | 120 | 21 | $750 | Slower, tighter time window |
 | **Shadow-E** | 300 | 14 | $1,000 | Very selective replacement |
+| **Shadow-F** | 10 | 1 | $100 | Ultra-fast turnover, crypto price markets |
 
-Shadow-A tests whether wider entry gates and faster replacement capture more value. Shadow-D/E test whether stricter filters and larger positions outperform despite fewer trades. Shadow-B remains the unchanged baseline.
+**Engine Timing (per-instance overrides)**
+
+| Instance | `constraint_rebuild_interval_seconds` | `replacement_protection_hours` | Notes |
+|----------|--------------------------------------|-------------------------------|-------|
+| **Shadow-A–E** | 600 (default) | 24 (default) | Standard markets |
+| **Shadow-F** | 60 | 0.1 (6 min) | Must detect + enter markets within minutes of appearing |
+
+Shadow-A tests whether wider entry gates (lowered to 120s min resolution) and faster replacement capture more value. Shadow-D/E test whether stricter filters and larger positions outperform despite fewer trades. Shadow-B remains the unchanged baseline. Shadow-F tests an entirely different market class: short-lived crypto price predictions that resolve in 5-15 minutes.
 
 Each instance runs independently with its own SQLite database and log files. Dashboard shows a comparison view of all 5.
 
-**WebSocket connection budget**: With 5 instances sharing one IP, total Tier B connections must stay within Polymarket's per-IP limit (~20-30, per INC-011). Each shadow instance config sets `websocket.tier_b_max_connections: 2` (5×2 = 10 Tier B + 5 Tier C = 15 total, safely within budget). Stagger instance startup by 30s to avoid connection burst.
+**WebSocket connection budget**: With 6 instances sharing one IP, total Tier B connections must stay within Polymarket's per-IP limit (~20-30, per INC-011). Shadow-A–E set `websocket.tier_b_max_connections: 2`; Shadow-F sets `websocket.tier_b_max_connections: 1` (crypto price is a smaller market subset). Total: 5×2 + 1×1 = 11 Tier B + 6 Tier C = 17 total, safely within budget. Stagger instance startup by 30s to avoid connection burst.
 
-**Extensibility**: The multi-instance system is not limited to 5 instances. Adding a 6th+ instance requires only: (1) a new `config/instances/{name}.yaml` overlay file, (2) `systemctl start prediction-trader@{name}`. Any config key can be overridden per-instance.
+**Extensibility**: The multi-instance system is not limited to 6 instances. Adding more requires only: (1) a new `config/instances/{name}.yaml` overlay file, (2) `systemctl start prediction-trader@{name}`. Any config key can be overridden per-instance.
 
 | Task | Acceptance Criteria |
 |------|-------------------|
 | ✅ **E1: Multi-instance support** | Single binary accepts `--instance <n>` flag. Each instance auto-configures: separate SQLite DB, log directory, PID file, dashboard port. Instance config overlays loaded from `config/instances/{name}.yaml`. |
-| ✅ **E2: Deploy 5 instances to VPS** | Five instance config overlays. Systemd template unit. Management script. Resource limits: 1500M memory, 50% CPU per instance. |
+| ✅ **E2: Deploy 6 instances to VPS** | Six instance config overlays (A–F). Systemd template unit. Management script. Resource limits: 1500M memory, 50% CPU per instance. Shadow-F uses fast-market overrides (60s constraint rebuild, 60s min resolution, 10s replacement cooldown). |
 
 #### E-Part 1.5: Engine Stress Testing
 
@@ -476,19 +487,19 @@ Before building the comparison dashboard, stress-test the engine to determine ac
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| ⬚ **E3: Comparison dashboard** | A summary page (or tab on main dashboard) showing side-by-side: P&L, capital utilisation, position count, replacement rate, arb detection rate, average position size, depth-limited trade count for all 5 instances. |
+| ⬚ **E3: Comparison dashboard** | A summary page (or tab on main dashboard) showing side-by-side: P&L, capital utilisation, position count, replacement rate, arb detection rate, average position size, depth-limited trade count for all 6 instances. Shadow-F additionally shows: average hold duration, turnover rate, and markets-per-hour. |
 
 #### E-Part 2: Validation Gate
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| ⬚ **E4: Run for 14 consecutive days** | All 5 instances: zero unhandled errors. Auto-recover from transient failures. |
+| ⬚ **E4: Run for 14 consecutive days** | All 6 instances: zero unhandled errors. Auto-recover from transient failures. |
 | ⬚ **E5: Validate execution assumptions** | For every "would-execute" event across all instances: compare intended fill price with actual book state. Log `actual/expected` ratio. Target: 95%+ have ratio > `live_trading.min_profit_ratio`. |
 | ⬚ **E6: Reconciliation clean** | Every reconciliation check passes on all instances. |
 | ⬚ **E7: Performance baseline** | Eval latency p50 < 10ms per instance. Market coverage > 40%. |
 | ✅ **E8: Remove latest_markets.json** | Removed `write_json_file()` and `json_output_path` field. All consumers read from SQLite. |
-| ⬚ **E9: Parameter selection** | After 14 days, analyse all 5 instances across: risk-adjusted return (Sharpe-like: return / max drawdown), capital utilisation %, replacement success rate, depth-limited trade count, average hold duration vs expected. Engine parameters already determined by E2.6 stress tests. Select winning **strategy** parameter set for live trading. Document rationale. |
-| ⬚ **E10: CTO sign-off** | CTO reviews: 14-day comparison report across all 5 instances, selected parameters with rationale, error log, reconciliation report. Written approval to proceed to live. |
+| ⬚ **E9: Parameter selection** | After 14 days, analyse all 6 instances across: risk-adjusted return (Sharpe-like: return / max drawdown), capital utilisation %, replacement success rate, depth-limited trade count, average hold duration vs expected. Engine parameters already determined by E2.6 stress tests. Select winning **strategy** parameter set(s) for live trading — may select different params for fast vs standard markets. Document rationale. |
+| ⬚ **E10: CTO sign-off** | CTO reviews: 14-day comparison report across all 6 instances, selected parameters with rationale, error log, reconciliation report. Written approval to proceed to live. |
 
 ---
 
@@ -545,11 +556,11 @@ The following should be noted but NOT implemented now:
 | Polymarket blocks automated trading | Low | High | ToS review. FAK orders look like normal trading. No market manipulation. |
 | Capital locked in postponed events | Medium | Low | AI postponement detector identifies and rescores. Capital velocity impact only. |
 | Thin order books at scale | High | Medium | Depth gating (B1.0). Start with $1k, not $10k. |
-| 5 shadow instances overwhelm VPS | Low | Low | 8 GB RAM is ample. Per-instance resource limits. Monitor with `htop`. |
+| 6 shadow instances overwhelm VPS | Low | Low | 8 GB RAM is ample. Per-instance resource limits. Monitor with `htop`. |
 | EIP-712 signing incompatible with CLOB | Low | Critical | B2.0: verify against py-clob-client output before any live use. Use Polymarket sandbox for integration test (Milestone D). |
 | Market BUY with base quantity causes oversized fill | Low | High | B3.0: explicit guard at executor boundary rejects base-denominated market BUYs. |
 | POL gas exhaustion blocks settlement | Low | High | C1.1: gas balance monitoring + circuit breaker trigger. Maintain ≥ 5 POL buffer. |
-| 5 shadow instances exceed per-IP WS connection limit | Medium | Medium | Cap Tier B to 2 connections per shadow instance (5×2 + 5×1 = 15 total). Stagger startup by 30s. |
+| 6 shadow instances exceed per-IP WS connection limit | Medium | Medium | Shadow-A–E: 2 Tier B each, Shadow-F: 1 Tier B (11 Tier B + 6 Tier C = 17 total). Stagger startup by 30s. |
 | Trade CONFIRMED after RETRYING creates duplicate position | Low | Medium | B3.2: position state machine prevents double-entry. Dedup on `trade_id`. |
 | Tick size change mid-position invalidates order precision | Low | Medium | B2.4: dynamic tick size handling via WS event. Recalculate precision for pending orders. |
 | UMA dispute locks capital with volatile prices | Low | Medium | B4.0: flag disputed positions, exclude from replacement, alert operator. |
@@ -564,7 +575,7 @@ The system is production-ready when ALL of these are true:
 2. All hardcoded thresholds parameterised in `config.yaml` (see Parameterisation Table)
 3. EIP-712 order signing verified against py-clob-client reference (Milestone B)
 4. CLOB integration test passed with real micro-orders — zero unexplained discrepancies (Milestone D)
-5. 14 consecutive days of 5-way shadow trading at $1,000 capital with zero unhandled errors (Milestone E)
+5. 14 consecutive days of 6-way shadow trading at $1,000 capital with zero unhandled errors (Milestone E)
 6. Optimal parameters selected from shadow comparison (capital_per_trade_pct, max_concurrent_positions)
 7. Circuit breaker, kill switch, POL gas monitoring, and WhatsApp notifications all tested and working
 8. Position reconciliation passes every check for 14 days across all instances

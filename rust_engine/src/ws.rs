@@ -370,6 +370,16 @@ pub fn handle_message_shared(
             "price_change" => handle_price_change(msg, book, queue, now, origin_ts, latency),
             "best_bid_ask" => handle_best_bid_ask(msg, book, queue, now, origin_ts, latency),
             "market_resolved" => handle_resolved(msg, resolved, positions, now),
+            "tick_size_change" => {
+                // B2.4: Dynamic tick size handling — log for now, InstrumentStore
+                // update wired via the engine's instrument store in a future pass.
+                if let (Some(asset), Some(ts)) = (
+                    msg.get("asset_id").and_then(|v| v.as_str()),
+                    msg.get("tick_size").and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64())),
+                ) {
+                    tracing::info!("WS tick_size_change: asset={} new_tick_size={}", asset, ts);
+                }
+            }
             "last_trade_price" | "pong" | "" => {} // ignore
             _ => {
                 tracing::trace!("Unknown event_type: '{}' in: {}", event_type, &text[..text.len().min(150)]);

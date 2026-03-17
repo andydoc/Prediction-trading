@@ -32,7 +32,8 @@ use rust_engine::TradingEngine;
 const FALLBACK_P95: &[(&str, f64)] = &[
     ("football", 14.8), ("us_sports", 33.6), ("esports", 20.0), ("tennis", 20.8),
     ("mma_boxing", 50.3), ("cricket", 21.8), ("rugby", 23.3), ("politics", 350.2),
-    ("gov_policy", 44.3), ("crypto", 3.4), ("sports_props", 6.5), ("other", 33.5),
+    ("gov_policy", 44.3), ("crypto", 3.4), ("crypto_price", 0.05), ("sports_props", 6.5),
+    ("other", 33.5),
 ];
 const FALLBACK_DEFAULT: f64 = 33.5;
 

@@ -352,6 +352,11 @@ pub fn classify_category(market_names: &[String]) -> &'static str {
     if has(&["ufc ", "mma ", "boxing", "pfl ", "bellator"]) { return "mma_boxing"; }
     if has(&["cricket", "ipl ", "t20 "]) { return "cricket"; }
     if has(&["rugby", "super rugby", "waratahs"]) { return "rugby"; }
+    // Short-lived crypto price predictions (5-15 min) — resolve near-instantly on expiry
+    if has(&["price at", "price above", "price below", "above or below",
+            "up or down at", "btc above", "btc below", "eth above", "eth below",
+            "sol above", "sol below", "bitcoin above", "bitcoin below",
+            "ethereum above", "ethereum below"]) { return "crypto_price"; }
     if has(&["bitcoin", "ethereum", "solana", "btc ", "eth ", "up or down"]) { return "crypto"; }
     if has(&["governor", "congress", "senate", "primary",
             "democrat", "republican", "election", "president"]) { return "politics"; }
