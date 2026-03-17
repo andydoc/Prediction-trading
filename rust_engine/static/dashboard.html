@@ -1151,13 +1151,28 @@ function copyFilteredLogs() {
     }
     return tsStr + ' [' + lvl + ']' + tgt + ' ' + msg;
   }).join('\n');
-  navigator.clipboard.writeText(text).then(function() {
+  function onCopySuccess() {
     var btn = document.querySelector('.log-controls button');
     var orig = btn.textContent;
     btn.textContent = 'Copied!';
     btn.style.borderColor = '#0f0';
     setTimeout(function() { btn.textContent = orig; btn.style.borderColor = '#555'; }, 1500);
-  });
+  }
+  // navigator.clipboard requires secure context (HTTPS/localhost).
+  // Fallback to execCommand for non-secure contexts (e.g. http://vps-ip:port).
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(onCopySuccess);
+  } else {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    onCopySuccess();
+  }
 }
 
 // === Splash screen state machine ===

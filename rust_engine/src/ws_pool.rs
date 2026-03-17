@@ -502,8 +502,15 @@ async fn connection_loop(
             }
         }
 
+        // Jitter: spread reconnects to avoid stampede when Polymarket mass-disconnects
+        let jitter_ms = {
+            let base_jitter = (backoff_ms as f64 * 0.5 * rand::random::<f64>()) as u64;
+            let stagger = idx as u64 * config.stagger_ms;
+            base_jitter + stagger
+        };
+        let delay_ms = backoff_ms + jitter_ms;
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
             _ = shutdown.notified() => { break; }
         }
         backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
