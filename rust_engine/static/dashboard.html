@@ -829,9 +829,9 @@ function initMonitorCharts() {
   }
   // Combined portfolio chart: value (pale green filled), deployed (blue line), drawdown (red line, right y-axis)
   monitorCharts['chart-portfolio'] = createMonitorChart('chart-portfolio', 'Portfolio', '#0f0', '', [
-    { label: 'Total Value ($)', borderColor: '#4c8', backgroundColor: 'rgba(68,204,136,0.15)', data: [], pointRadius: 0, borderWidth: 1.5, fill: true, tension: 0.2, yAxisID: 'y' },
-    { label: 'Capital Deployed (%)', borderColor: '#0af', backgroundColor: 'transparent', data: [], pointRadius: 0, borderWidth: 1.5, fill: false, tension: 0.2, yAxisID: 'y1' },
-    { label: 'Drawdown (%)', borderColor: '#f44', backgroundColor: 'transparent', data: [], pointRadius: 0, borderWidth: 1.5, fill: false, tension: 0.2, yAxisID: 'y1' }
+    { label: 'Total Value ($)', borderColor: '#4c8', backgroundColor: 'rgba(68,204,136,0.10)', data: [], pointRadius: 0, borderWidth: 1.5, fill: true, tension: 0.2, yAxisID: 'y', order: 2 },
+    { label: 'Capital Deployed (%)', borderColor: '#0af', backgroundColor: 'transparent', data: [], pointRadius: 0, borderWidth: 2, fill: false, tension: 0.2, yAxisID: 'y1', order: 0 },
+    { label: 'Drawdown (%)', borderColor: '#f44', backgroundColor: 'transparent', data: [], pointRadius: 0, borderWidth: 2, fill: false, tension: 0.2, yAxisID: 'y1', order: 1 }
   ]);
   // Add right y-axis to portfolio chart
   if (monitorCharts['chart-portfolio']) {
