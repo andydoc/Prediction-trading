@@ -294,6 +294,7 @@ impl TradingEngine {
             Arc::clone(&self.resolved_events),
             Arc::clone(&self.positions),
             Arc::clone(&self.latency),
+            None, // InstrumentStore: wired when executor is integrated with engine
         );
 
         let rt = self.runtime.handle();

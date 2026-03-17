@@ -264,6 +264,127 @@ pub struct ArbExecutionResult {
 }
 
 // ---------------------------------------------------------------------------
+// B3.6: Partial fill evaluation
+// ---------------------------------------------------------------------------
+
+/// Decision from evaluating partial fills after arb execution.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartialFillAction {
+    /// All legs fully filled — accept the position.
+    Accept,
+    /// Partial fill is still profitable — accept as-is.
+    AcceptPartial { filled_pct: f64, estimated_profit_pct: f64 },
+    /// Partial fill is unprofitable — unwind filled legs.
+    Unwind { filled_legs: Vec<String>, reason: String },
+    /// No fills at all — nothing to do.
+    NoFill,
+}
+
+/// Evaluate the fill status of an arb after execution.
+///
+/// B3.6 rules:
+///   1. Check actual fills via tracked orders.
+///   2. Compute arb score of the filled position.
+///   3. If score >= min_profit_threshold: accept.
+///   4. If score < threshold: mark for unwind.
+///   5. If no fills: NoFill.
+pub fn evaluate_partial_fills(
+    tracked_orders: &[TrackedOrder],
+    min_profit_threshold: f64,
+) -> PartialFillAction {
+    if tracked_orders.is_empty() {
+        return PartialFillAction::NoFill;
+    }
+
+    let total_legs = tracked_orders.len();
+    let filled_legs: Vec<&TrackedOrder> = tracked_orders.iter()
+        .filter(|o| o.filled_quantity > 0.0)
+        .collect();
+
+    if filled_legs.is_empty() {
+        return PartialFillAction::NoFill;
+    }
+
+    // All legs fully filled?
+    let all_filled = filled_legs.len() == total_legs
+        && tracked_orders.iter().all(|o| {
+            (o.filled_quantity - o.quantity).abs() < 0.01
+        });
+
+    if all_filled {
+        return PartialFillAction::Accept;
+    }
+
+    // Partial fill: estimate profit from filled legs.
+    // For a 2-leg arb: BUY leg cost + SELL leg revenue.
+    // Positive = profitable partial.
+    let mut total_cost = 0.0;
+    let mut total_revenue = 0.0;
+
+    for order in &filled_legs {
+        let notional = order.filled_quantity * order.avg_fill_price;
+        match order.side {
+            Side::Buy => total_cost += notional,
+            Side::Sell => total_revenue += notional,
+        }
+    }
+
+    let filled_pct = filled_legs.len() as f64 / total_legs as f64;
+
+    // If only BUY legs filled (no revenue yet), we can't compute profit.
+    // This is a one-sided fill — needs unwind unless the arb is still executable.
+    if total_cost > 0.0 && total_revenue == 0.0 {
+        // One-sided fill: we bought but didn't sell. Need to unwind.
+        let filled_ids: Vec<String> = filled_legs.iter()
+            .map(|o| o.trade_id.clone())
+            .collect();
+        return PartialFillAction::Unwind {
+            filled_legs: filled_ids,
+            reason: format!("One-sided fill: {}/{} legs filled (cost ${:.2}, no revenue)",
+                filled_legs.len(), total_legs, total_cost),
+        };
+    }
+
+    if total_revenue > 0.0 && total_cost == 0.0 {
+        // Only SELL legs filled — unusual but possible. Revenue without cost = profit.
+        return PartialFillAction::AcceptPartial {
+            filled_pct,
+            estimated_profit_pct: 1.0, // All revenue, no cost
+        };
+    }
+
+    // Both sides partially filled — compute profit ratio
+    let estimated_profit_pct = if total_cost > 0.0 {
+        (total_revenue - total_cost) / total_cost
+    } else {
+        0.0
+    };
+
+    if estimated_profit_pct >= min_profit_threshold {
+        tracing::info!(
+            "Partial fill accepted: {}/{} legs, est. profit {:.2}% (threshold {:.2}%)",
+            filled_legs.len(), total_legs,
+            estimated_profit_pct * 100.0, min_profit_threshold * 100.0,
+        );
+        PartialFillAction::AcceptPartial { filled_pct, estimated_profit_pct }
+    } else {
+        let filled_ids: Vec<String> = filled_legs.iter()
+            .map(|o| o.trade_id.clone())
+            .collect();
+        tracing::warn!(
+            "Partial fill unprofitable: {}/{} legs, est. profit {:.2}% < threshold {:.2}%",
+            filled_legs.len(), total_legs,
+            estimated_profit_pct * 100.0, min_profit_threshold * 100.0,
+        );
+        PartialFillAction::Unwind {
+            filled_legs: filled_ids,
+            reason: format!("Unprofitable partial: {:.2}% < {:.2}% threshold",
+                estimated_profit_pct * 100.0, min_profit_threshold * 100.0),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // B3.1: LiveExecutor
 // ---------------------------------------------------------------------------
 
@@ -663,6 +784,269 @@ impl Executor {
     pub fn is_dry_run(&self) -> bool {
         self.config.dry_run
     }
+
+    // -----------------------------------------------------------------------
+    // B3.6: Evaluate partial fills after arb execution
+    // -----------------------------------------------------------------------
+
+    /// Evaluate the fill status of a previously executed arb.
+    ///
+    /// Retrieves tracked orders for the position and runs partial fill evaluation.
+    pub fn evaluate_arb_fills(&self, position_id: &str, min_profit_threshold: f64) -> PartialFillAction {
+        let tracked = self.tracked.lock();
+        let orders: Vec<TrackedOrder> = tracked.values()
+            .filter(|o| o.position_id == position_id)
+            .cloned()
+            .collect();
+        evaluate_partial_fills(&orders, min_profit_threshold)
+    }
+
+    // -----------------------------------------------------------------------
+    // B3.7: Batch order submission
+    // -----------------------------------------------------------------------
+
+    /// Execute all legs of an arb as a single batch request to the CLOB API.
+    ///
+    /// Reduces latency window for partial-fill exposure on multi-leg positions.
+    /// Falls back to sequential submission if batch endpoint fails.
+    pub fn execute_arb_batch(
+        &self,
+        position_id: &str,
+        legs: &[(String, String, Side, f64, f64)],
+    ) -> ArbExecutionResult {
+        let now = chrono::Utc::now().timestamp() as f64;
+
+        // Build and sign all orders first (before any submission)
+        let mut prepared: Vec<(TrackedOrder, SignedOrder, Instrument)> = Vec::with_capacity(legs.len());
+        let mut results: Vec<OrderResult> = Vec::new();
+
+        for (market_id, token_id, side, price, size_usd) in legs {
+            // Look up instrument
+            let instrument = match self.instruments.get(token_id) {
+                Some(inst) => inst,
+                None => {
+                    results.push(OrderResult::Rejected(ExecutionError::InstrumentError {
+                        message: format!("Unknown token_id: {}", token_id),
+                    }));
+                    continue;
+                }
+            };
+
+            if !instrument.accepting_orders {
+                results.push(OrderResult::Rejected(ExecutionError::InstrumentError {
+                    message: format!("Market {} not accepting orders", market_id),
+                }));
+                continue;
+            }
+
+            // B3.0: Quantity guard
+            let (quantity, _) = match compute_order_quantity(
+                *side, self.config.order_type, *size_usd, *price, &instrument,
+            ) {
+                Ok(q) => q,
+                Err(msg) => {
+                    results.push(OrderResult::Rejected(ExecutionError::QuantityGuardRejection { message: msg }));
+                    continue;
+                }
+            };
+
+            let rounded_price = self.apply_aggression(*price, *side, &instrument);
+
+            let order = match signing::build_order(
+                self.signer.address(),
+                token_id,
+                rounded_price,
+                *size_usd,
+                *side,
+                instrument.neg_risk,
+                self.config.fee_rate_bps,
+            ) {
+                Ok(o) => o,
+                Err(msg) => {
+                    results.push(OrderResult::Rejected(ExecutionError::SigningError { message: msg }));
+                    continue;
+                }
+            };
+
+            let signed = match self.signer.sign_order(&order, instrument.neg_risk) {
+                Ok(s) => s,
+                Err(msg) => {
+                    results.push(OrderResult::Rejected(ExecutionError::SigningError { message: msg }));
+                    continue;
+                }
+            };
+
+            let trade_id = format!("{}_{}_{}",
+                position_id, market_id,
+                chrono::Utc::now().timestamp_millis()
+            );
+
+            let tracked = TrackedOrder {
+                order_id: String::new(),
+                trade_id,
+                position_id: position_id.to_string(),
+                market_id: market_id.to_string(),
+                token_id: token_id.to_string(),
+                side: *side,
+                price: rounded_price,
+                quantity,
+                status: TradeStatus::Submitted,
+                filled_quantity: 0.0,
+                avg_fill_price: 0.0,
+                submitted_at: now,
+                last_update: now,
+                signed_order: Some(signed.clone()),
+                neg_risk: instrument.neg_risk,
+            };
+
+            prepared.push((tracked, signed, instrument));
+        }
+
+        // If any legs failed during preparation, don't submit any
+        if !results.is_empty() {
+            // Some legs couldn't be prepared — abort batch
+            let accepted = 0;
+            let rejected = results.len();
+            tracing::warn!(
+                "[BATCH] Arb {} preparation failed: {} rejected during signing/validation",
+                position_id, rejected
+            );
+            return ArbExecutionResult {
+                legs: results,
+                all_accepted: false,
+                dry_run: self.config.dry_run,
+            };
+        }
+
+        if self.config.dry_run {
+            // Dry run: mark all as confirmed
+            for (mut tracked, _signed, _inst) in prepared {
+                tracked.status = TradeStatus::Confirmed;
+                tracked.filled_quantity = tracked.quantity;
+                tracked.avg_fill_price = tracked.price;
+                let side_str = if tracked.side == Side::Buy { "BUY" } else { "SELL" };
+                tracing::info!(
+                    "[DRY-RUN BATCH] {} {} shares @ {:.4} token={}",
+                    side_str, tracked.quantity, tracked.price,
+                    &tracked.token_id[..tracked.token_id.len().min(8)],
+                );
+                self.tracked.lock().insert(tracked.trade_id.clone(), tracked.clone());
+                results.push(OrderResult::Accepted(tracked));
+            }
+            return ArbExecutionResult {
+                legs: results,
+                all_accepted: true,
+                dry_run: true,
+            };
+        }
+
+        // Live mode: rate limit check
+        if let Err(wait) = self.rate_limiter.check(RateCategory::Trading) {
+            return ArbExecutionResult {
+                legs: vec![OrderResult::Rejected(ExecutionError::RateLimited {
+                    retry_after_secs: wait,
+                })],
+                all_accepted: false,
+                dry_run: false,
+            };
+        }
+
+        // Build batch payload
+        let mut order_payloads = Vec::with_capacity(prepared.len());
+        for (tracked, signed, instrument) in &prepared {
+            let side_str = if tracked.side == Side::Buy { "BUY" } else { "SELL" };
+            order_payloads.push(serde_json::json!({
+                "order": {
+                    "salt": signed.order.salt.to_string(),
+                    "maker": format!("{:?}", signed.order.maker),
+                    "signer": format!("{:?}", signed.order.signer),
+                    "taker": format!("{:?}", signed.order.taker),
+                    "tokenId": signed.order.token_id.to_string(),
+                    "makerAmount": signed.order.maker_amount.to_string(),
+                    "takerAmount": signed.order.taker_amount.to_string(),
+                    "expiration": signed.order.expiration.to_string(),
+                    "nonce": signed.order.nonce.to_string(),
+                    "feeRateBps": signed.order.fee_rate_bps.to_string(),
+                    "side": side_str,
+                    "signatureType": signed.order.signature_type,
+                    "signature": &signed.signature,
+                },
+                "orderType": self.config.order_type.as_str(),
+                "negRisk": instrument.neg_risk,
+            }));
+        }
+
+        let url = format!("{}/orders", self.config.clob_host);
+        let response = self.http_client
+            .post(&url)
+            .json(&order_payloads)
+            .send();
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return ArbExecutionResult {
+                        legs: vec![OrderResult::Rejected(ExecutionError::RateLimited {
+                            retry_after_secs: 5.0,
+                        })],
+                        all_accepted: false,
+                        dry_run: false,
+                    };
+                }
+
+                let body: serde_json::Value = resp.json().unwrap_or_default();
+
+                if status.is_success() {
+                    // Parse batch response: array of order IDs or individual results
+                    let order_ids: Vec<String> = if let Some(arr) = body.as_array() {
+                        arr.iter().map(|v| {
+                            v.get("orderID").or_else(|| v.get("order_id"))
+                                .and_then(|id| id.as_str())
+                                .unwrap_or("")
+                                .to_string()
+                        }).collect()
+                    } else {
+                        vec![]
+                    };
+
+                    let mut all_accepted = true;
+                    for (i, (mut tracked, _signed, _inst)) in prepared.into_iter().enumerate() {
+                        if let Some(oid) = order_ids.get(i) {
+                            tracked.order_id = oid.clone();
+                            self.tracked.lock().insert(tracked.trade_id.clone(), tracked.clone());
+                            results.push(OrderResult::Accepted(tracked));
+                        } else {
+                            all_accepted = false;
+                            results.push(OrderResult::Rejected(ExecutionError::ClobRejection {
+                                code: "BATCH_MISSING".into(),
+                                message: format!("No order ID for leg {}", i),
+                            }));
+                        }
+                    }
+
+                    tracing::info!("[BATCH] Arb {} submitted: {}/{} legs accepted",
+                        position_id, results.len(), legs.len());
+
+                    ArbExecutionResult { legs: results, all_accepted, dry_run: false }
+                } else {
+                    // Batch rejected — fall back to sequential
+                    tracing::warn!(
+                        "[BATCH] Batch endpoint returned {}, falling back to sequential",
+                        status
+                    );
+                    drop(body);
+                    // Re-prepare legs from scratch via sequential path
+                    return self.execute_arb(position_id, legs);
+                }
+            }
+            Err(e) => {
+                // Network error — fall back to sequential
+                tracing::warn!("[BATCH] Network error: {}, falling back to sequential", e);
+                self.execute_arb(position_id, legs)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -836,5 +1220,95 @@ mod tests {
         assert!(!TradeStatus::Submitted.is_terminal());
         assert!(!TradeStatus::Matched.is_terminal());
         assert!(!TradeStatus::Retrying.is_terminal());
+    }
+
+    // B3.6: Partial fill tests
+    fn make_tracked(side: Side, qty: f64, price: f64, filled_qty: f64, avg_price: f64) -> TrackedOrder {
+        TrackedOrder {
+            order_id: "ord1".into(),
+            trade_id: "t1".into(),
+            position_id: "pos1".into(),
+            market_id: "mkt1".into(),
+            token_id: "tok1".into(),
+            side,
+            price,
+            quantity: qty,
+            status: if filled_qty > 0.0 { TradeStatus::Confirmed } else { TradeStatus::Cancelled },
+            filled_quantity: filled_qty,
+            avg_fill_price: avg_price,
+            submitted_at: 0.0,
+            last_update: 0.0,
+            signed_order: None,
+            neg_risk: false,
+        }
+    }
+
+    #[test]
+    fn test_partial_fill_all_filled() {
+        let orders = vec![
+            make_tracked(Side::Buy, 100.0, 0.40, 100.0, 0.40),
+            make_tracked(Side::Sell, 100.0, 0.60, 100.0, 0.60),
+        ];
+        assert_eq!(evaluate_partial_fills(&orders, 0.03), PartialFillAction::Accept);
+    }
+
+    #[test]
+    fn test_partial_fill_no_fills() {
+        let orders = vec![
+            make_tracked(Side::Buy, 100.0, 0.40, 0.0, 0.0),
+            make_tracked(Side::Sell, 100.0, 0.60, 0.0, 0.0),
+        ];
+        assert_eq!(evaluate_partial_fills(&orders, 0.03), PartialFillAction::NoFill);
+    }
+
+    #[test]
+    fn test_partial_fill_one_sided_buy() {
+        let orders = vec![
+            make_tracked(Side::Buy, 100.0, 0.40, 100.0, 0.40),
+            make_tracked(Side::Sell, 100.0, 0.60, 0.0, 0.0),
+        ];
+        match evaluate_partial_fills(&orders, 0.03) {
+            PartialFillAction::Unwind { reason, .. } => {
+                assert!(reason.contains("One-sided"));
+            }
+            other => panic!("Expected Unwind, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_partial_fill_profitable() {
+        // BUY 50 @ 0.40 = $20 cost, SELL 50 @ 0.65 = $32.50 revenue
+        // Profit = $12.50 / $20 = 62.5%
+        let orders = vec![
+            make_tracked(Side::Buy, 100.0, 0.40, 50.0, 0.40),
+            make_tracked(Side::Sell, 100.0, 0.60, 50.0, 0.65),
+        ];
+        match evaluate_partial_fills(&orders, 0.03) {
+            PartialFillAction::AcceptPartial { estimated_profit_pct, .. } => {
+                assert!(estimated_profit_pct > 0.5); // >50% profit
+            }
+            other => panic!("Expected AcceptPartial, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_partial_fill_unprofitable() {
+        // BUY 50 @ 0.50 = $25 cost, SELL 50 @ 0.50 = $25 revenue
+        // Profit = 0%
+        let orders = vec![
+            make_tracked(Side::Buy, 100.0, 0.50, 50.0, 0.50),
+            make_tracked(Side::Sell, 100.0, 0.50, 50.0, 0.50),
+        ];
+        match evaluate_partial_fills(&orders, 0.03) {
+            PartialFillAction::Unwind { reason, .. } => {
+                assert!(reason.contains("Unprofitable"));
+            }
+            other => panic!("Expected Unwind, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_partial_fill_empty() {
+        assert_eq!(evaluate_partial_fills(&[], 0.03), PartialFillAction::NoFill);
     }
 }

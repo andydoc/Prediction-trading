@@ -84,6 +84,7 @@ impl TierC {
         resolved_events: Arc<Mutex<Vec<ResolvedEvent>>>,
         positions: Arc<Mutex<PositionManager>>,
         latency: Arc<LatencyTracker>,
+        instruments: Option<Arc<crate::instrument::InstrumentStore>>,
     ) -> Self {
         let pool_config = PoolConfig {
             ws_url: config.ws_url,
@@ -102,6 +103,7 @@ impl TierC {
             resolved_events,
             positions,
             latency,
+            instruments,
         );
 
         Self {

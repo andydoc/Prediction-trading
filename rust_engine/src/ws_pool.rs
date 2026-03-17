@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::book::BookMirror;
+use crate::instrument::InstrumentStore;
 use crate::latency::LatencyTracker;
 use crate::position::PositionManager;
 use crate::queue::EvalQueue;
@@ -94,6 +95,7 @@ pub struct ConnectionPool {
     resolved_events: Arc<Mutex<Vec<ResolvedEvent>>>,
     positions: Arc<Mutex<PositionManager>>,
     latency: Arc<LatencyTracker>,
+    instruments: Option<Arc<InstrumentStore>>,
     pub stats: PoolStats,
 }
 
@@ -106,6 +108,7 @@ impl ConnectionPool {
         resolved_events: Arc<Mutex<Vec<ResolvedEvent>>>,
         positions: Arc<Mutex<PositionManager>>,
         latency: Arc<LatencyTracker>,
+        instruments: Option<Arc<InstrumentStore>>,
     ) -> Self {
         Self {
             tier,
@@ -119,6 +122,7 @@ impl ConnectionPool {
             resolved_events,
             positions,
             latency,
+            instruments,
             stats: PoolStats::default(),
         }
     }
@@ -419,6 +423,7 @@ impl ConnectionPool {
         let resolved = Arc::clone(&self.resolved_events);
         let positions = Arc::clone(&self.positions);
         let latency = Arc::clone(&self.latency);
+        let instruments = self.instruments.clone();
         let stats = self.stats.clone();
         let sub_clone = Arc::clone(&subscribed);
         let stagger = Duration::from_millis(self.config.stagger_ms * idx as u64);
@@ -427,7 +432,7 @@ impl ConnectionPool {
             tokio::time::sleep(stagger).await;
             connection_loop(
                 tier, idx, config, cmd_rx, sub_clone,
-                book, eval_queue, resolved, positions, latency,
+                book, eval_queue, resolved, positions, latency, instruments,
                 running, shutdown, stats,
             ).await;
         });
@@ -453,6 +458,7 @@ async fn connection_loop(
     resolved: Arc<Mutex<Vec<ResolvedEvent>>>,
     positions: Arc<Mutex<PositionManager>>,
     latency: Arc<LatencyTracker>,
+    instruments: Option<Arc<InstrumentStore>>,
     running: Arc<AtomicBool>,
     shutdown: Arc<Notify>,
     stats: PoolStats,
@@ -471,6 +477,7 @@ async fn connection_loop(
         match connection_session(
             &label, &config, &mut cmd_rx, &subscribed,
             &book, &eval_queue, &resolved, &positions, &latency,
+            &instruments,
             &running, &shutdown, &stats,
         ).await {
             Ok(()) => {
@@ -531,6 +538,7 @@ async fn connection_session(
     resolved: &Arc<Mutex<Vec<ResolvedEvent>>>,
     positions: &Arc<Mutex<PositionManager>>,
     latency: &Arc<LatencyTracker>,
+    instruments: &Option<Arc<InstrumentStore>>,
     running: &Arc<AtomicBool>,
     shutdown: &Arc<Notify>,
     stats: &PoolStats,
@@ -606,6 +614,7 @@ async fn connection_session(
                         }
                         handle_message_shared(
                             label, &text, book, eval_queue, resolved, positions, latency,
+                            instruments.as_ref(),
                         );
                     }
                     Some(Ok(WsMessage::Ping(data))) => {

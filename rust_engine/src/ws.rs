@@ -278,7 +278,7 @@ async fn connect_and_run(
                             last_pong = std::time::Instant::now();
                             continue;
                         }
-                        handle_message_shared(&format!("Shard {}", shard_id), &text, book, queue, resolved, positions, latency);
+                        handle_message_shared(&format!("Shard {}", shard_id), &text, book, queue, resolved, positions, latency, None);
                     }
                     Some(Ok(WsMessage::Ping(data))) => {
                         let _ = sink.send(WsMessage::Pong(data)).await;
@@ -326,6 +326,7 @@ pub fn handle_message_shared(
     resolved: &Arc<parking_lot::Mutex<Vec<ResolvedEvent>>>,
     positions: &Arc<parking_lot::Mutex<PositionManager>>,
     latency: &Arc<LatencyTracker>,
+    instruments: Option<&Arc<crate::instrument::InstrumentStore>>,
 ) {
     // Debug: log first 200 chars of every message for diagnosis
     tracing::trace!("{} raw msg: {}", label, &text[..text.len().min(200)]);
@@ -371,13 +372,20 @@ pub fn handle_message_shared(
             "best_bid_ask" => handle_best_bid_ask(msg, book, queue, now, origin_ts, latency),
             "market_resolved" => handle_resolved(msg, resolved, positions, now),
             "tick_size_change" => {
-                // B2.4: Dynamic tick size handling — log for now, InstrumentStore
-                // update wired via the engine's instrument store in a future pass.
-                if let (Some(asset), Some(ts)) = (
+                // B2.4: Dynamic tick size handling — update InstrumentStore precision.
+                if let (Some(asset), Some(new_ts)) = (
                     msg.get("asset_id").and_then(|v| v.as_str()),
                     msg.get("tick_size").and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64())),
                 ) {
-                    tracing::info!("WS tick_size_change: asset={} new_tick_size={}", asset, ts);
+                    if let Some(store) = instruments {
+                        if store.update_tick_size(asset, new_ts) {
+                            tracing::info!("B2.4 tick_size_change: asset={} new_tick_size={} — instrument updated", asset, new_ts);
+                        } else {
+                            tracing::warn!("B2.4 tick_size_change: asset={} new_tick_size={} — unknown token", asset, new_ts);
+                        }
+                    } else {
+                        tracing::info!("WS tick_size_change: asset={} new_tick_size={} (no instrument store)", asset, new_ts);
+                    }
                 }
             }
             "last_trade_price" | "pong" | "" => {} // ignore

@@ -66,6 +66,7 @@ impl TieredWsManager {
         resolved_events: Arc<Mutex<Vec<ResolvedEvent>>>,
         positions: Arc<Mutex<PositionManager>>,
         latency: Arc<LatencyTracker>,
+        instruments: Option<Arc<crate::instrument::InstrumentStore>>,
     ) -> Self {
         let tier_b = TierB::new(
             TierBConfig {
@@ -82,6 +83,7 @@ impl TieredWsManager {
             Arc::clone(&resolved_events),
             Arc::clone(&positions),
             Arc::clone(&latency),
+            instruments.clone(),
         );
 
         let tier_c = TierC::new(
@@ -97,6 +99,7 @@ impl TieredWsManager {
             resolved_events,
             positions,
             latency,
+            instruments,
         );
 
         Self { tier_b, tier_c }

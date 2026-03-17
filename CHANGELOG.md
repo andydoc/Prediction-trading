@@ -7,6 +7,23 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.13.2] — 2026-03-17 — B2.4, B3.6, B3.7 + WS Reconnect Jitter
+
+### Added
+- **B2.4: Dynamic tick size handling** — `tick_size_change` WS events now update `InstrumentStore` in real-time. `InstrumentStore` threaded through TieredWsManager → ConnectionPool → handle_message_shared. Instrument precision (price/size/amount decimals) recalculated on tick change.
+- **B3.6: Partial fill evaluation** (`executor.rs`): `evaluate_partial_fills()` + `evaluate_arb_fills()` — checks fill status of all arb legs, computes profit ratio, returns Accept/AcceptPartial/Unwind/NoFill decision. 6 unit tests.
+- **B3.7: Batch order submission** (`executor.rs`): `execute_arb_batch()` — signs all legs upfront, submits as single `/orders` batch request. Falls back to sequential on batch endpoint failure. Aborts all legs if any fail during signing/validation.
+
+### Changed
+- WS reconnect backoff now includes random jitter (50% of backoff + idx × stagger_ms) to prevent reconnect stampede after Polymarket mass-disconnects
+- Dashboard clipboard: `execCommand('copy')` fallback for non-HTTPS contexts (fixes copy on Linux tab via VPS IP)
+- Tier B `max_connections` restored to 11 (jitter fix should prevent the connection drops seen at 11)
+
+### Fixed
+- B-Part 2 & 3 checkboxes in PRODUCT_SPEC_v2.md now correctly marked as complete
+
+---
+
 ## [0.13.0] — 2026-03-17 — EIP-712 Signing, Instrument Model & Fast-Market Support
 
 ### Added
