@@ -328,10 +328,10 @@ impl Notifier {
         };
 
         let body = if self.is_telegram() {
+            // No parse_mode — plain text handles <, >, & and emojis without escaping.
             serde_json::json!({
                 "chat_id": self.config.phone_number,
                 "text": message,
-                "parse_mode": "HTML",
             })
         } else {
             serde_json::json!({
