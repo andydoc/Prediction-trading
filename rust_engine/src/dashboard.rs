@@ -847,14 +847,34 @@ fn build_monitor(s: &DashboardState, full: bool) -> Value {
     // Financial metrics
     let pm = s.positions.lock();
     let cap = pm.current_capital();
-    let deployed: f64 = pm.open_positions().values().map(|p| p.total_capital).sum();
+    let open_snapshot: Vec<crate::position::Position> = pm.open_positions().values().cloned().collect();
+    let deployed: f64 = open_snapshot.iter().map(|p| p.total_capital).sum();
     let total_value = cap + deployed;
     let perf = pm.get_performance_metrics();
     let realized = perf.get("total_actual_profit").copied().unwrap_or(0.0);
     let closed_snapshot: Vec<crate::position::Position> = pm.closed_positions().to_vec();
     drop(pm);
 
-    mon.collect_financial_metrics(total_value, cap, deployed, realized);
+    // Unrealized P&L: mark-to-market using live bids
+    let mut unrealized = 0.0f64;
+    for p in &open_snapshot {
+        let cid = p.metadata.get("constraint_id").and_then(|v| v.as_str()).unwrap_or("");
+        let constraint = s.constraints.get(cid);
+        let mut sale_proceeds = 0.0f64;
+        for (mid, leg) in &p.markets {
+            let live_bid = constraint.as_ref().and_then(|c| {
+                c.markets.iter().find(|mref| mref.market_id == *mid).and_then(|mref| {
+                    let asset_id = if leg.outcome == "no" { &mref.no_asset_id } else { &mref.yes_asset_id };
+                    let bid = s.book.get_best_bid(asset_id);
+                    if bid > 0.0 { Some(bid) } else { None }
+                })
+            });
+            sale_proceeds += leg.shares * live_bid.unwrap_or(leg.entry_price);
+        }
+        unrealized += sale_proceeds - p.total_capital;
+    }
+
+    mon.collect_financial_metrics(total_value, cap, deployed, realized, unrealized);
 
     // Build the JSON (pass separate log ring to avoid lock contention)
     let mut log_ring = s.log_ring.lock();

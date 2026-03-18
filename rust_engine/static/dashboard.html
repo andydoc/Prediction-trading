@@ -260,7 +260,7 @@
   <div class="section-content">
     <div class="stats" id="mon-fin-stats"><div class="loading-placeholder">Loading financial stats...</div></div>
     <div class="chart-row">
-      <div class="chart-container" style="flex:3;min-width:600px"><div class="chart-label">Portfolio</div><canvas id="chart-portfolio"></canvas></div>
+      <div class="chart-container" style="flex:1;min-width:100%;max-width:100%;height:350px"><div class="chart-label">Portfolio</div><canvas id="chart-portfolio"></canvas></div>
     </div>
     <!-- Profitability tables -->
     <div style="display:flex;gap:20px;flex-wrap:wrap;margin-top:10px">
@@ -827,9 +827,11 @@ function initMonitorCharts() {
     monitorCharts['chart-markets'].options.scales.y.afterDataLimits = smartLogBase;
     monitorCharts['chart-markets'].update('none');
   }
-  // Combined portfolio chart: value (pale green filled), deployed (blue line), drawdown (red line, right y-axis)
+  // Combined portfolio chart: value, unrealized P&L, realized P&L on left $-axis; deployed%, drawdown% on right %-axis
   monitorCharts['chart-portfolio'] = createMonitorChart('chart-portfolio', 'Portfolio', '#0f0', '', [
     { label: 'Total Value ($)', borderColor: '#4c8', backgroundColor: 'rgba(68,204,136,0.10)', data: [], pointRadius: 0, borderWidth: 1.5, fill: true, tension: 0.2, yAxisID: 'y' },
+    { label: 'Unrealized P&L ($)', borderColor: '#ff0', backgroundColor: 'rgba(255,255,0,0.08)', data: [], pointRadius: 0, borderWidth: 1.5, fill: true, tension: 0.2, yAxisID: 'y' },
+    { label: 'Realized P&L ($)', borderColor: '#f0f', backgroundColor: 'transparent', data: [], pointRadius: 0, borderWidth: 1.5, borderDash: [6,3], fill: false, tension: 0.2, yAxisID: 'y' },
     { label: 'Capital Deployed (%)', borderColor: '#0af', backgroundColor: 'transparent', data: [], pointRadius: 0, borderWidth: 1.5, fill: false, tension: 0.2, yAxisID: 'y1' },
     { label: 'Drawdown (%)', borderColor: '#f44', backgroundColor: 'transparent', data: [], pointRadius: 0, borderWidth: 1.5, fill: false, tension: 0.2, yAxisID: 'y1' }
   ]);
@@ -842,14 +844,13 @@ function initMonitorCharts() {
       ticks: { color: '#999', font: { size: 10 }, callback: function(v) { return v + '%'; } },
       grid: { drawOnChartArea: false }
     };
-    monitorCharts['chart-portfolio'].options.scales.y.type = 'logarithmic';
-    monitorCharts['chart-portfolio'].options.scales.y.afterDataLimits = smartLogBase;
-    monitorCharts['chart-portfolio'].options.scales.y.ticks.callback = function(v) { return '$' + v; };
-    // Legend: Total Value = filled rect, Deployed/Drawdown = dash lines
+    monitorCharts['chart-portfolio'].options.scales.y.ticks.callback = function(v) { return '$' + v.toFixed(0); };
     var pChart = monitorCharts['chart-portfolio'];
     pChart.data.datasets[0].pointStyle = 'rect';
-    pChart.data.datasets[1].pointStyle = 'dash';
-    pChart.data.datasets[2].pointStyle = 'dash';
+    pChart.data.datasets[1].pointStyle = 'rect';
+    pChart.data.datasets[2].pointStyle = 'line';
+    pChart.data.datasets[3].pointStyle = 'dash';
+    pChart.data.datasets[4].pointStyle = 'dash';
     pChart.options.plugins.legend.labels = {
       color: '#aaa', font: { size: 10 },
       usePointStyle: true,
@@ -964,21 +965,21 @@ function renderMonitor(d) {
     var tv = cur.total_value || 0;
     var dp = cur.deployed_pct || 0;
     var dd = cur.drawdown_pct || 0;
+    var maxDD = fin.max_drawdown_pct || 0;
     var fh = '';
     fh += fst('Total Value', '$'+tv.toFixed(2), tv>=0?'good':'bad');
     fh += fst('Deployed %', dp.toFixed(1)+'%');
-    fh += fst('Drawdown', dd.toFixed(2)+'%', dd>5?'bad':'good');
+    if (fin.win_rate !== undefined) fh += fst('Win %', ((fin.win_rate||0)*100).toFixed(1)+'%');
+    fh += fst('Drawdown', dd.toFixed(2)+'% / '+maxDD.toFixed(2)+'%', dd>5?'bad':'good');
+    if (fin.profit_factor !== undefined) fh += fst('Profit Factor', (fin.profit_factor||0).toFixed(2));
+    if (fin.recovery_ratio !== undefined) fh += fst('Recovery', (fin.recovery_ratio||0).toFixed(2));
     if (fin.sharpe !== undefined) fh += fst('Sharpe', (fin.sharpe||0).toFixed(2));
     if (fin.sortino !== undefined) fh += fst('Sortino', (fin.sortino||0).toFixed(2));
-    if (fin.recovery_ratio !== undefined) fh += fst('Recovery', (fin.recovery_ratio||0).toFixed(2));
-    if (fin.win_rate !== undefined) fh += fst('Win %', ((fin.win_rate||0)*100).toFixed(1)+'%');
-    if (fin.profit_factor !== undefined) fh += fst('Profit Factor', (fin.profit_factor||0).toFixed(2));
     if (fin.avg_hold_hours !== undefined) {
       var ah = fin.avg_hold_hours || 0;
       var holdStr = ah < 1 ? (ah*60).toFixed(0)+'m' : ah < 24 ? ah.toFixed(1)+'h' : (ah/24).toFixed(1)+'d';
       fh += fst('Avg Hold', holdStr);
     }
-    if (fin.max_drawdown_pct !== undefined) fh += fst('Max DD', (fin.max_drawdown_pct||0).toFixed(2)+'%', (fin.max_drawdown_pct||0)>10?'bad':'good');
     fel.innerHTML = fh;
   }
 
@@ -1041,10 +1042,12 @@ function renderMonitor(d) {
     if (s.ws_msg_rate) updateChartSeries('chart-ws-rate', 0, 'ws_rate', convertSeries(s.ws_msg_rate));
     if (s.total_markets) updateChartSeries('chart-markets', 0, 'markets', convertSeries(s.total_markets));
     if (s.total_constraints) updateChartSeries('chart-markets', 1, 'constraints', convertSeries(s.total_constraints));
-    // Portfolio chart: 3 datasets on one chart
+    // Portfolio chart: 5 datasets on one chart
     if (s.total_value) updateChartSeries('chart-portfolio', 0, 'portfolio_value', convertSeries(s.total_value));
-    if (s.deployed_pct) updateChartSeries('chart-portfolio', 1, 'portfolio_deployed', convertSeries(s.deployed_pct));
-    if (s.drawdown_pct) updateChartSeries('chart-portfolio', 2, 'portfolio_drawdown', convertSeries(s.drawdown_pct));
+    if (s.unrealized_pnl) updateChartSeries('chart-portfolio', 1, 'portfolio_unrealized', convertSeries(s.unrealized_pnl));
+    if (s.realized_pnl) updateChartSeries('chart-portfolio', 2, 'portfolio_realized', convertSeries(s.realized_pnl));
+    if (s.deployed_pct) updateChartSeries('chart-portfolio', 3, 'portfolio_deployed', convertSeries(s.deployed_pct));
+    if (s.drawdown_pct) updateChartSeries('chart-portfolio', 4, 'portfolio_drawdown', convertSeries(s.drawdown_pct));
   }
 
   // Delta updates (non-full): append single point from current values
@@ -1059,8 +1062,10 @@ function renderMonitor(d) {
     if (cur.total_markets !== undefined) updateChartSeries('chart-markets', 0, 'markets', [{x:tsMs, y:cur.total_markets}]);
     if (cur.total_constraints !== undefined) updateChartSeries('chart-markets', 1, 'constraints', [{x:tsMs, y:cur.total_constraints}]);
     if (cur.total_value !== undefined) updateChartSeries('chart-portfolio', 0, 'portfolio_value', [{x:tsMs, y:cur.total_value}]);
-    if (cur.deployed_pct !== undefined) updateChartSeries('chart-portfolio', 1, 'portfolio_deployed', [{x:tsMs, y:cur.deployed_pct}]);
-    if (cur.drawdown_pct !== undefined) updateChartSeries('chart-portfolio', 2, 'portfolio_drawdown', [{x:tsMs, y:cur.drawdown_pct}]);
+    if (cur.unrealized_pnl !== undefined) updateChartSeries('chart-portfolio', 1, 'portfolio_unrealized', [{x:tsMs, y:cur.unrealized_pnl}]);
+    if (cur.realized_pnl !== undefined) updateChartSeries('chart-portfolio', 2, 'portfolio_realized', [{x:tsMs, y:cur.realized_pnl}]);
+    if (cur.deployed_pct !== undefined) updateChartSeries('chart-portfolio', 3, 'portfolio_deployed', [{x:tsMs, y:cur.deployed_pct}]);
+    if (cur.drawdown_pct !== undefined) updateChartSeries('chart-portfolio', 4, 'portfolio_drawdown', [{x:tsMs, y:cur.drawdown_pct}]);
   }
 
   // Logs (entries have .message not .msg, and .target)

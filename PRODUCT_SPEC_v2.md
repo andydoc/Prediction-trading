@@ -261,7 +261,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | WS tiered mode enabled | orchestrator | false | `websocket.use_tiered_ws` |
 | WS max assets per connection | orchestrator | 450 | `websocket.max_assets_per_connection` |
 | WS connection stagger | orchestrator | 150 ms | `websocket.stagger_ms` |
-| Tier B max connections | orchestrator | 10 | `websocket.tier_b_max_connections` |
+| Tier B max connections | orchestrator | 15 | `websocket.tier_b_max_connections` |
 | Tier B hysteresis scans | orchestrator | 3 | `websocket.tier_b_hysteresis_scans` |
 | Tier B consolidation threshold | orchestrator | 300 | `websocket.tier_b_consolidation_threshold` |
 | Tier B top N constraints | orchestrator | 0 (no limit) | `websocket.tier_b_top_n_constraints` |
@@ -340,11 +340,11 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| ✅ **B4.0: Position reconciliation (periodic)** | Every `live_trading.reconciliation_interval_seconds`: query CLOB for actual positions. Compare with internal record. Alert on discrepancy. Log results. Source of truth: CLOB API contract balances (same as NT Gamma API approach). On-chain `balanceOf` query as escalation when CLOB/internal differ by > `live_trading.reconciliation_escalation_threshold` (default $1.00). If `umaResolutionStatus == "disputed"` on a market: flag position as `disputed`, exclude from replacement queue, WhatsApp alert. Resume normal lifecycle when dispute resolves. |
+| ✅ **B4.0: Position reconciliation (periodic)** | Every `live_trading.reconciliation_interval_seconds`: query CLOB for actual positions. Compare with internal record. Alert on discrepancy. Log results. Source of truth: CLOB API contract balances (same as NT Gamma API approach). On-chain `balanceOf` query as escalation when CLOB/internal differ by > `live_trading.reconciliation_escalation_threshold` (default $1.00). If `umaResolutionStatus == "disputed"` on a market: flag position as `disputed`, exclude from replacement queue, WhatsApp alert. Resume normal lifecycle when dispute resolves. **Shadow mode**: when no venue credentials are configured, reconciliation skips CLOB comparison and reports positions as checked (no false alarms). |
 | ✅ **B4.1: Venue-side reconciliation on startup** | On every startup: query CLOB for contract balances and open orders. Compare against SQLite state. Report discrepancies before resuming trading. **Pre-req**: study NT `generate_order_status_reports` pattern. |
 | ✅ **B4.2: Cross-asset fill matching** | When a YES fill executes on a negRisk market, Polymarket implicitly creates corresponding NO positions on complementary outcomes. Detect and reconcile these synthetic fills against internal position state. **Pre-req**: study NT PR #3345/#3357 source. |
 | ✅ **B4.3: FOK/FAK overfill handling** | Detect when FAK limit orders receive more fill than expected. Adjust internal position state, log discrepancy. **Pre-req**: study NT issue #3221 and fix. |
-| ✅ **B4.4: Live P&L tracking** | Dashboard shows: realised P&L (closed), unrealised P&L (open, marked to market), fees paid, net return %. Updated via SSE. |
+| ✅ **B4.4: Live P&L tracking** | Dashboard shows: realised P&L (closed), unrealised P&L (open, marked to market via BookMirror best bids), fees paid, net return %. Portfolio chart plots 5 time-series: Total Value ($), Unrealized P&L ($, yellow filled), Realized P&L ($, magenta dashed), Deployed (%), Drawdown (%). Stats bar: Total Value → Deployed % → Win % → Drawdown (now/max) → Profit Factor → Recovery → Sharpe → Sortino → Avg Hold. Updated via SSE every 5s (full snapshot + delta). |
 
 #### B-Part 5: Documentation
 

@@ -7,6 +7,23 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.14.1] — 2026-03-18 — Shadow Reconciliation Fix + Dashboard P&L Charts
+
+### Fixed
+- **Reconciliation false alarms in shadow mode**: `reconcile_startup()` and `reconcile_periodic()` now detect empty venue credentials and skip CLOB comparison, preventing CRITICAL-level spam for all positions on VPS.
+
+### Added
+- **Unrealized P&L time-series**: Mark-to-market P&L computed from BookMirror live bids, tracked in `MonitorState` ring buffer, emitted via SSE full snapshots and deltas.
+- **Portfolio chart P&L lines**: Unrealized P&L (yellow filled area) and Realized P&L (magenta dashed) alongside existing Total Value, Deployed %, Drawdown %.
+- Chart legend ordered: dollar series first (Total Value, Unrealized P&L, Realized P&L), then percentage series (Deployed %, Drawdown %).
+
+### Changed
+- Portfolio chart: full width, 350px tall, linear Y-axis (was logarithmic — P&L can be negative).
+- Financial stats bar reordered: Total Value → Deployed % → Win % → Drawdown (now/max) → Profit Factor → Recovery → Sharpe → Sortino → Avg Hold (smart units).
+- Drawdown card now shows current/max combined (e.g. "1.23% / 4.56%").
+
+---
+
 ## [0.14.0] — 2026-03-18 — B4 Reconciliation + Live P&L
 
 ### Added

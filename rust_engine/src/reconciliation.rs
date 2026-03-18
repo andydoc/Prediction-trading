@@ -309,6 +309,17 @@ pub fn reconcile_startup(
         }
     };
 
+    // No credentials configured — skip comparison (shadow mode)
+    if venue.is_empty() {
+        tracing::info!(
+            "B4.1 startup reconciliation: skipped (no venue credentials, {} internal positions)",
+            open_positions.len()
+        );
+        let mut report = ReconciliationReport::new(true);
+        report.positions_checked = open_positions.len();
+        return report;
+    }
+
     let report = compare_positions(open_positions, &venue, escalation_threshold, true);
 
     if report.passed {
@@ -350,6 +361,14 @@ pub fn reconcile_periodic(
             return report;
         }
     };
+
+    // No credentials configured — skip comparison (shadow mode)
+    if venue.is_empty() {
+        tracing::debug!("B4.0 periodic reconciliation: skipped (no venue credentials)");
+        let mut report = ReconciliationReport::new(false);
+        report.positions_checked = open_positions.len();
+        return report;
+    }
 
     let report = compare_positions(open_positions, &venue, escalation_threshold, false);
 

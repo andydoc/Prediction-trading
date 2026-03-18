@@ -96,6 +96,7 @@ pub struct MonitorState {
     pub total_value: TimeSeries,
     pub capital_deployed_pct: TimeSeries,
     pub realized_pnl: TimeSeries,
+    pub unrealized_pnl: TimeSeries,
     pub drawdown_pct: TimeSeries,
 
     // Log buffer
@@ -130,6 +131,7 @@ impl MonitorState {
             total_value: TimeSeries::new(),
             capital_deployed_pct: TimeSeries::new(),
             realized_pnl: TimeSeries::new(),
+            unrealized_pnl: TimeSeries::new(),
             drawdown_pct: TimeSeries::new(),
 
             log_buffer: VecDeque::with_capacity(MAX_LOG_ENTRIES),
@@ -224,6 +226,7 @@ impl MonitorState {
         capital: f64,
         deployed: f64,
         realized_pnl: f64,
+        unrealized_pnl: f64,
     ) {
         let ts = now_ts();
 
@@ -236,6 +239,7 @@ impl MonitorState {
         };
         self.capital_deployed_pct.push(ts, deployed_pct);
         self.realized_pnl.push(ts, realized_pnl);
+        self.unrealized_pnl.push(ts, unrealized_pnl);
 
         // Track peak and drawdown
         if total_value > self.peak_value {
@@ -288,6 +292,8 @@ impl MonitorState {
                 "total_value": self.total_value.as_json_array(since),
                 "deployed_pct": self.capital_deployed_pct.as_json_array(since),
                 "drawdown_pct": self.drawdown_pct.as_json_array(since),
+                "realized_pnl": self.realized_pnl.as_json_array(since),
+                "unrealized_pnl": self.unrealized_pnl.as_json_array(since),
             });
 
             json!({
@@ -325,6 +331,8 @@ impl MonitorState {
             "total_value": self.total_value.latest().unwrap_or(0.0),
             "deployed_pct": self.capital_deployed_pct.latest().unwrap_or(0.0),
             "drawdown_pct": self.drawdown_pct.latest().unwrap_or(0.0),
+            "realized_pnl": self.realized_pnl.latest().unwrap_or(0.0),
+            "unrealized_pnl": self.unrealized_pnl.latest().unwrap_or(0.0),
         })
     }
 
