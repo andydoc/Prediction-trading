@@ -23,6 +23,7 @@ use rust_engine::postponement::PostponementDetector;
 use rust_engine::scanner::MarketScanner;
 use rust_engine::state::StateDB;
 use rust_engine::ws_tiered::TieredWsConfig;
+use rust_engine::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use rust_engine::TradingEngine;
 
 // ---------------------------------------------------------------------------
@@ -148,6 +149,13 @@ pub struct OrchestratorConfig {
     pub ws_max_assets_per_connection: usize,
     pub ws_heartbeat_interval_secs: u64,
     pub tier_b_top_n_constraints: usize,  // 0 = no limit
+
+    // Circuit breaker (C1)
+    pub cb_enabled: bool,
+    pub cb_max_drawdown_pct: f64,
+    pub cb_max_consecutive_errors: u32,
+    pub cb_error_window_seconds: f64,
+    pub cb_api_timeout_seconds: f64,
 }
 
 impl OrchestratorConfig {
@@ -276,6 +284,20 @@ impl OrchestratorConfig {
                 .and_then(|v| v.as_u64()).unwrap_or(10),
             tier_b_top_n_constraints: ws_cfg.get("tier_b_top_n_constraints")
                 .and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+
+            // Circuit breaker (C1)
+            cb_enabled: {
+                let cb = yaml.pointer("/safety/circuit_breaker");
+                cb.and_then(|v| v.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(true)
+            },
+            cb_max_drawdown_pct: yaml.pointer("/safety/circuit_breaker/max_drawdown_pct")
+                .and_then(|v| v.as_f64()).unwrap_or(0.10),
+            cb_max_consecutive_errors: yaml.pointer("/safety/circuit_breaker/max_consecutive_errors")
+                .and_then(|v| v.as_u64()).unwrap_or(3) as u32,
+            cb_error_window_seconds: yaml.pointer("/safety/circuit_breaker/error_window_seconds")
+                .and_then(|v| v.as_f64()).unwrap_or(300.0),
+            cb_api_timeout_seconds: yaml.pointer("/safety/circuit_breaker/api_timeout_seconds")
+                .and_then(|v| v.as_f64()).unwrap_or(60.0),
         }
     }
 }
@@ -319,8 +341,11 @@ pub struct Orchestrator {
     // Background disk save thread handle
     disk_save_handle: Option<std::thread::JoinHandle<()>>,
 
-    // WhatsApp notifier (C3)
+    // Telegram notifier (C3)
     notifier: Arc<Notifier>,
+
+    // Circuit breaker (C1)
+    circuit_breaker: CircuitBreaker,
 
     // P1: Cached held IDs (invalidated on position entry/exit/resolution)
     held_ids_cache: Option<(HashSet<String>, HashSet<String>)>,
@@ -445,6 +470,19 @@ impl Orchestrator {
         };
         let notifier = Arc::new(Notifier::new(notify_cfg));
 
+        // Build circuit breaker before moving cfg into Self
+        let circuit_breaker = CircuitBreaker::new(
+            CircuitBreakerConfig {
+                enabled: cfg.cb_enabled,
+                max_drawdown_pct: cfg.cb_max_drawdown_pct,
+                max_consecutive_errors: cfg.cb_max_consecutive_errors,
+                error_window_seconds: cfg.cb_error_window_seconds,
+                api_timeout_seconds: cfg.cb_api_timeout_seconds,
+            },
+            0.0, // peak set after state load
+            now_secs(),
+        );
+
         Ok(Self {
             cfg, engine,
             scanner: Arc::new(scanner),
@@ -468,6 +506,7 @@ impl Orchestrator {
             p95_table, p95_default,
             disk_save_handle: None,
             notifier,
+            circuit_breaker,
             held_ids_cache: None,
             last_constraint_to_assets: HashMap::new(),
         })
@@ -571,6 +610,7 @@ impl Orchestrator {
 
             if let Err(e) = self.tick(now) {
                 tracing::error!("[iter {}] Error: {}", self.iteration, e);
+                self.circuit_breaker.record_error(now);
             }
 
             // Wait up to 50ms for urgent work — wakes instantly on EFP drift
@@ -636,6 +676,17 @@ impl Orchestrator {
             }
         }
 
+        // --- Circuit breaker check (C1) ---
+        if let Some(reason) = self.circuit_breaker.check(self.engine.total_value(), now) {
+            tracing::error!("CIRCUIT BREAKER TRIPPED: {}", reason);
+            let _ = self.notifier.send(&NotifyEvent::CircuitBreaker { reason });
+        }
+        if !self.circuit_breaker.is_trading_allowed() {
+            // Skip trading but continue housekeeping (state save, WS, reconciliation, etc.)
+            self.do_periodic_tasks(now);
+            return Ok(());
+        }
+
         // --- Evaluate batch ---
         // P1: Use cached held IDs (rebuilt only when positions change)
         if self.held_ids_cache.is_none() {
@@ -689,6 +740,14 @@ impl Orchestrator {
             self.last_monitor = now;
         }
 
+        // --- Periodic tasks (run even when circuit breaker is tripped) ---
+        self.do_periodic_tasks(now);
+
+        Ok(())
+    }
+
+    /// Periodic housekeeping tasks. Run every tick regardless of circuit breaker state.
+    fn do_periodic_tasks(&mut self, now: f64) {
         // --- Postponement check ---
         if (now - self.last_postponement_check) >= self.cfg.postponement_check_interval {
             if self.engine.pm_open_count() > 0 && self.postponement_detector.is_some() {
@@ -699,22 +758,24 @@ impl Orchestrator {
 
         // --- Constraint rebuild ---
         if (now - self.last_constraint_rebuild) >= self.cfg.constraint_rebuild_interval {
-            // Refresh markets in background, then rebuild constraints
             match self.scanner.scan() {
                 Ok(result) => {
+                    self.circuit_breaker.record_api_success(now);
                     self.ingest_scan_result(&result);
                     let (all_assets, constraint_to_assets) = self.detect_constraints();
                     if !all_assets.is_empty() {
                         if self.cfg.use_tiered_ws {
-                            // Tiered WS: incremental update — no connection churn!
                             self.engine.update_tier_b(constraint_to_assets.clone());
                             self.last_constraint_to_assets = constraint_to_assets;
                         } else {
-                            self.engine.start(all_assets, 0, &self.cfg.dashboard_bind); // port=0 skips dashboard restart
+                            self.engine.start(all_assets, 0, &self.cfg.dashboard_bind);
                         }
                     }
                 }
-                Err(e) => tracing::warn!("Constraint rebuild scan failed: {}", e),
+                Err(e) => {
+                    self.circuit_breaker.record_error(now);
+                    tracing::warn!("Constraint rebuild scan failed: {}", e);
+                }
             }
             self.last_constraint_rebuild = now;
         }
@@ -736,23 +797,18 @@ impl Orchestrator {
 
         // --- Tiered WS: flush new markets + periodic maintenance ---
         if self.cfg.use_tiered_ws {
-            // Flush new market bursts from Tier C buffer
             let bursts = self.engine.tiered_flush_new_markets();
             for burst in &bursts {
                 tracing::info!("New market burst: event='{}' ({} markets)",
                     burst.event_title, burst.markets.len());
-                // Collect all asset IDs from the burst for Tier B subscription
                 let all_burst_assets: Vec<String> = burst.markets.iter()
                     .flat_map(|m| m.asset_ids.iter().cloned())
                     .collect();
                 if !all_burst_assets.is_empty() {
-                    // Use event_id as a synthetic constraint_id for new market tracking
                     let synthetic_cid = format!("newmkt_{}", &burst.event_id[..burst.event_id.len().min(32)]);
                     self.engine.tiered_add_new_market_constraint(synthetic_cid, all_burst_assets);
                 }
             }
-
-            // Periodic maintenance (hourly consolidation)
             self.engine.tiered_periodic_maintenance();
         }
 
@@ -762,6 +818,7 @@ impl Orchestrator {
                 let results = self.engine.check_api_resolutions();
                 if !results.is_empty() {
                     self.held_ids_cache = None;
+                    self.circuit_breaker.record_api_success(now);
                     for r in &results {
                         tracing::info!("API RESOLUTION: {} → winner={}, profit=${:.4}",
                             r.position_id, r.winning_market_id, r.profit);
@@ -771,7 +828,13 @@ impl Orchestrator {
                             method: format!("api_resolution({})", r.winning_market_id),
                         });
                     }
+                } else {
+                    // No resolutions but API was reachable
+                    self.circuit_breaker.record_api_success(now);
                 }
+            } else {
+                // No positions to check, but mark API as reachable
+                self.circuit_breaker.record_api_success(now);
             }
             self.last_api_resolution_check = now;
         }
@@ -803,8 +866,6 @@ impl Orchestrator {
             self.log_stats();
             self.last_stats_log = now;
         }
-
-        Ok(())
     }
 
     // --- Market loading ---
@@ -956,10 +1017,22 @@ impl Orchestrator {
         self.engine.init_positions(initial, fee_rate);
         self.engine.import_positions(&open_jsons, &closed_jsons, capital, initial);
 
-        tracing::info!("State loaded: ${:.2} capital, {} open, {} closed",
+        // Restore circuit breaker peak from persistence
+        let total_value = self.engine.total_value();
+        if let Some(peak) = self.state_db.get_scalar("cb_peak_total_value") {
+            // Use whichever is higher: persisted peak or current value
+            self.circuit_breaker.set_peak(peak.max(total_value));
+        } else {
+            self.circuit_breaker.set_peak(total_value);
+        }
+        // Reset API success timestamp so we don't false-trip on startup
+        self.circuit_breaker.record_api_success(now_secs());
+
+        tracing::info!("State loaded: ${:.2} capital, {} open, {} closed (CB peak=${:.2})",
             self.engine.current_capital(),
             self.engine.pm_open_count(),
-            self.engine.pm_closed_count());
+            self.engine.pm_closed_count(),
+            self.circuit_breaker.peak_total_value());
     }
 
     fn save_state(&mut self) {
@@ -972,6 +1045,7 @@ impl Orchestrator {
         self.state_db.set_scalars(&[
             ("current_capital".to_string(), cap),
             ("initial_capital".to_string(), init_cap),
+            ("cb_peak_total_value".to_string(), self.circuit_breaker.peak_total_value()),
         ]);
         for key in &["total_trades", "winning_trades", "losing_trades",
                      "total_actual_profit", "total_expected_profit"] {
@@ -1556,12 +1630,18 @@ impl Orchestrator {
         }
 
         // Update dashboard metrics
+        let engine_status = if self.circuit_breaker.is_tripped() { "CIRCUIT_BREAKER" } else { "running" };
         self.engine.update_dashboard_metrics(
             self.iteration,
             lat_p50 as u64, lat_p95 as u64, lat_max as u64,
             "running", &chrono::Utc::now().format("%d/%m/%Y %H:%M:%S").to_string(),
-            "running", &chrono::Utc::now().format("%d/%m/%Y %H:%M:%S").to_string(),
+            engine_status, &chrono::Utc::now().format("%d/%m/%Y %H:%M:%S").to_string(),
         );
+
+        // Log circuit breaker state if tripped
+        if let Some((reason, ts)) = self.circuit_breaker.trip_info() {
+            tracing::warn!("Circuit breaker TRIPPED at {:.0}: {}", ts, reason);
+        }
     }
 }
 

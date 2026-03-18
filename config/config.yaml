@@ -186,6 +186,13 @@ ollama:
   context_window: 128000
   max_tokens: 8192
   model: lfm2.5-thinking:1.2b
+safety:
+  circuit_breaker:
+    enabled: true
+    max_drawdown_pct: 0.10              # 10% drawdown from peak triggers halt
+    max_consecutive_errors: 3           # 3 errors within window triggers halt
+    error_window_seconds: 300           # 5-minute sliding window for errors
+    api_timeout_seconds: 60             # API unreachable for 60s triggers halt
 dashboard:
   port: 5558
   bind_addr: '127.0.0.1'

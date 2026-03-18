@@ -11,7 +11,8 @@
 /// - Market scanner (Gamma API + SQLite cache)
 /// - AI resolution validator (Anthropic API)
 /// - AI postponement detector (Anthropic API + web search)
-/// - WhatsApp notifications (C3)
+/// - Telegram notifications (C3)
+/// - Circuit breaker (C1)
 
 pub mod types;
 pub mod cached_db;
@@ -39,6 +40,7 @@ pub mod instrument;
 pub mod rate_limiter;
 pub mod executor;
 pub mod reconciliation;
+pub mod circuit_breaker;
 
 use std::collections::HashMap;
 use std::sync::Arc;
