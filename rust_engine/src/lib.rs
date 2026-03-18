@@ -767,6 +767,7 @@ impl TradingEngine {
         lat_p50: u64, lat_p95: u64, lat_max: u64,
         scanner_status: &str, scanner_ts: &str,
         engine_status: &str, engine_ts: &str,
+        pol_balance: Option<f64>,
     ) {
         let mut m = self.engine_metrics.lock();
         m.iteration = iteration;
@@ -791,6 +792,7 @@ impl TradingEngine {
             m.ws_live_books = ws.live_books;
             m.ws_connections = 0;
         }
+        m.pol_balance = pol_balance;
     }
 
     pub fn set_recent_opps(&self, opps_json: &[String]) {

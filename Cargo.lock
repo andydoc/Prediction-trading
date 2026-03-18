@@ -2402,7 +2402,7 @@ dependencies = [
 
 [[package]]
 name = "prediction-trader"
-version = "0.14.4"
+version = "0.14.5"
 dependencies = [
  "chrono",
  "clap",
@@ -2822,7 +2822,7 @@ dependencies = [
 
 [[package]]
 name = "rust_engine"
-version = "0.14.4"
+version = "0.14.5"
 dependencies = [
  "alloy-primitives",
  "alloy-signer",

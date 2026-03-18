@@ -1773,6 +1773,7 @@ impl Orchestrator {
             lat_p50 as u64, lat_p95 as u64, lat_max as u64,
             "running", &chrono::Utc::now().format("%d/%m/%Y %H:%M:%S").to_string(),
             engine_status, &chrono::Utc::now().format("%d/%m/%Y %H:%M:%S").to_string(),
+            self.gas_monitor.last_balance(),
         );
 
         // Log circuit breaker state if tripped

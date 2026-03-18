@@ -65,6 +65,8 @@ pub struct EngineMetrics {
     pub ws_total_msgs: u64,
     pub ws_live_books: u64,
     pub ws_connections: u32,
+    // Gas monitor (C1.1)
+    pub pol_balance: Option<f64>,
 }
 
 /// Static HTML — loaded at compile time from the extracted template.
@@ -887,6 +889,15 @@ fn build_monitor(s: &DashboardState, full: bool) -> Value {
     if let Value::Object(ref mut map) = result {
         map.insert("financial".to_string(), financial);
     }
+
+    // Add POL gas balance (C1.1)
+    let m = s.engine_metrics.lock();
+    if let Some(bal) = m.pol_balance {
+        if let Value::Object(ref mut map) = result {
+            map.insert("pol_balance".to_string(), json!(bal));
+        }
+    }
+    drop(m);
 
     // Add latency breakdown (migrated from system section)
     let lat_snap = s.latency.snapshot();

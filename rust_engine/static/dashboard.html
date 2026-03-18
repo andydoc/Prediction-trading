@@ -980,6 +980,11 @@ function renderMonitor(d) {
       var holdStr = ah < 1 ? (ah*60).toFixed(0)+'m' : ah < 24 ? ah.toFixed(1)+'h' : (ah/24).toFixed(1)+'d';
       fh += fst('Avg Hold', holdStr);
     }
+    if (d.pol_balance !== undefined) {
+      var pb = d.pol_balance;
+      var pcls = pb < 0.1 ? 'bad' : pb < 1.0 ? '' : 'good';
+      fh += fst('POL Gas', pb.toFixed(4)+' POL', pcls);
+    }
     fel.innerHTML = fh;
   }
 
