@@ -7,6 +7,26 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.14.4] — 2026-03-18 — C1: Circuit Breaker
+
+### Added
+- **Circuit breaker module** (`circuit_breaker.rs`): Auto-pauses trading on 3 conditions — portfolio drawdown from peak, error burst in sliding window, API unreachable timeout.
+- Peak total value persisted to SQLite; tripped state clears on restart (resume = restart).
+- Housekeeping (state save, WS, reconciliation, stats) continues when tripped.
+- Telegram notification on circuit breaker trip.
+- 13 unit tests covering all trip conditions, expiry, disabled state, persistence.
+- Dashboard `engine_status` shows `CIRCUIT_BREAKER` when tripped.
+- Config section `safety.circuit_breaker` with 5 params: `enabled`, `max_drawdown_pct`, `max_consecutive_errors`, `error_window_seconds`, `api_timeout_seconds`.
+
+### Fixed
+- Circuit breaker API timeout 60s → 600s — original value was shorter than the 300s API resolution interval, causing false trips between periodic tasks.
+- Startup `scanner.scan()` now records API success on the circuit breaker for extra safety margin.
+
+### Changed
+- Dashboard footer: brighter text color, added version number and copyright.
+
+---
+
 ## [0.14.3] — 2026-03-18 — Telegram Notifications + Hostname Prefix
 
 ### Added

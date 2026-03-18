@@ -280,10 +280,10 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | Trade confirmation timeout | new (B2.1) | 120 s | `live_trading.trade_confirmation_timeout_seconds` |
 | Order aggression (tick offset) | new (B3.1) | `at_market` | `live_trading.order_aggression` (`passive`/`at_market`/`aggressive`) |
 | **Safety** | | | |
-| Circuit breaker drawdown | designed (Phase C1) | 10% | `safety.circuit_breaker.max_drawdown_pct` |
-| Circuit breaker error count | designed (Phase C1) | 3 | `safety.circuit_breaker.max_consecutive_errors` |
-| Circuit breaker error window | designed (Phase C1) | 5 min | `safety.circuit_breaker.error_window_seconds` |
-| Circuit breaker API timeout | designed (Phase C1) | 60 s | `safety.circuit_breaker.api_timeout_seconds` |
+| Circuit breaker drawdown | ✅ C1 | 10% | `safety.circuit_breaker.max_drawdown_pct` |
+| Circuit breaker error count | ✅ C1 | 3 | `safety.circuit_breaker.max_consecutive_errors` |
+| Circuit breaker error window | ✅ C1 | 5 min | `safety.circuit_breaker.error_window_seconds` |
+| Circuit breaker API timeout | ✅ C1 | 600 s | `safety.circuit_breaker.api_timeout_seconds` |
 | Gas check interval | new (C1.1) | 3600 s | `safety.gas_check_interval_seconds` |
 | Min POL balance (warning) | new (C1.1) | 1.0 | `safety.min_pol_balance` |
 | Critical POL balance (circuit breaker) | new (C1.1) | 0.1 | `safety.critical_pol_balance` |
@@ -366,7 +366,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| ⬚ **C1: Circuit breaker** | Auto-pause trading if: (a) portfolio drawdown exceeds `safety.circuit_breaker.max_drawdown_pct` from peak, (b) `max_consecutive_errors` errors in `error_window_seconds`, (c) CLOB API unreachable for `api_timeout_seconds`. Log the trigger. Resume requires manual intervention (config change + restart). |
+| ✅ **C1: Circuit breaker** | Auto-pause trading if: (a) portfolio drawdown exceeds `safety.circuit_breaker.max_drawdown_pct` from peak, (b) `max_consecutive_errors` errors in `error_window_seconds`, (c) CLOB API unreachable for `api_timeout_seconds`. Implemented in `circuit_breaker.rs`. Peak persisted to SQLite; tripped state clears on restart. Housekeeping (state save, WS, reconciliation) continues when tripped. Telegram notification on trip. 13 unit tests. |
 | ⬚ **C1.1: POL gas balance monitoring** | On startup and every `safety.gas_check_interval_seconds`: query Polygon RPC (`eth_getBalance`) for wallet POL balance. If < `safety.min_pol_balance` (default 1.0): Telegram alert. If < `safety.critical_pol_balance` (default 0.1): trigger circuit breaker. Dashboard shows POL balance in System section. Uses `reqwest` — no web3 library needed. |
 | ⬚ **C2: Kill switch** | `kill.sh --emergency` and dashboard button that: (a) cancels all open CLOB orders, (b) sets mode to shadow, (c) sends Telegram notification. Idempotent. |
 | ✅ **C3: Notifications (Telegram)** | Implemented in `notify.rs`. Telegram backend auto-detected from webhook URL; bot token from `secrets.yaml`, chat_id from config. Generic webhook fallback for WhatsApp/ntfy/Discord. Rate limiting (10s), exponential backoff (5 failures → 5min cooldown), per-event toggles. All messages prefixed with `[hostname/instance]`. Events: startup, entry, resolution, proactive exit, error, circuit breaker, daily summary. |
