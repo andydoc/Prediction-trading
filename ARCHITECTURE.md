@@ -238,7 +238,7 @@ All parameterised values in `config/config.yaml`:
 | `use_tiered_ws` | `true` | Enable Tier B + C (replaces flat sharding) |
 | `max_assets_per_connection` | `490` | Hard limit per WS connection (~500 Polymarket limit) |
 | `stagger_ms` | `150` | Delay between connection startups |
-| `tier_b_max_connections` | `16` | Max Tier B connections |
+| `tier_b_max_connections` | `17` | Max Tier B connections |
 | `tier_b_hysteresis_scans` | `3` | Scans before unsubscribing cold constraint |
 | `tier_b_consolidation_threshold` | `300` | Assets/conn below which hourly consolidation triggers |
 | `tier_b_top_n_constraints` | `500` | Only subscribe top N constraints (0 = no limit) |

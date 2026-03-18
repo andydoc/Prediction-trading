@@ -261,7 +261,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | WS tiered mode enabled | orchestrator | false | `websocket.use_tiered_ws` |
 | WS max assets per connection | orchestrator | 450 | `websocket.max_assets_per_connection` |
 | WS connection stagger | orchestrator | 150 ms | `websocket.stagger_ms` |
-| Tier B max connections | orchestrator | 16 | `websocket.tier_b_max_connections` |
+| Tier B max connections | orchestrator | 17 | `websocket.tier_b_max_connections` |
 | Tier B hysteresis scans | orchestrator | 3 | `websocket.tier_b_hysteresis_scans` |
 | Tier B consolidation threshold | orchestrator | 300 | `websocket.tier_b_consolidation_threshold` |
 | Tier B top N constraints | orchestrator | 0 (no limit) | `websocket.tier_b_top_n_constraints` |

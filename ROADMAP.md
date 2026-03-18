@@ -16,7 +16,7 @@ All core modules ported: WebSocket, order book mirror, arb math, position manage
 
 ---
 
-## Milestone B: Build Execution Infrastructure — 🔧 In Progress
+## Milestone B: Build Execution Infrastructure — ✅ Complete
 
 **Goal**: Code-complete execution path — all modules built, unit-tested, and shadow-testable. No funded account required.
 
@@ -43,7 +43,7 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 
 ---
 
-## Milestone C: Safety Infrastructure — ⬚ Not Started
+## Milestone C: Safety Infrastructure — 🔧 In Progress
 
 **Goal**: System can protect capital automatically and alert the operator. No funded account required.
 
@@ -74,7 +74,7 @@ Tasks: deposit test funds, smoke tests (place/cancel, real fill, negRisk, multi-
 
 ---
 
-## Milestone E: Shadow Validation (14-Day Gate) — ⬚ Not Started
+## Milestone E: Shadow Validation (14-Day Gate) — 🔧 In Progress
 
 **Goal**: Prove complete system works without real money. Determine optimal parameters via 6 parallel shadow instances.
 
@@ -126,8 +126,8 @@ Tasks: deposit funds, configure winning parameters, switch to live mode, supervi
 |-----------|-------|--------|
 | A: Rust Port | 13/13 | ✅ Complete |
 | B: Execution Infrastructure | 27/27 | ✅ Complete |
-| C: Safety | 2/7 | ⬚ Next |
+| C: Safety | 2/7 | 🔧 In Progress |
 | D: CLOB Integration Test | 0/8 | ⬚ Planned |
-| E: Shadow Validation | 1/10 | ⬚ Planned |
+| E: Shadow Validation | 1/10 | 🔧 In Progress |
 | F: Go Live | 0/6 | ⬚ Planned |
 | G: Scale | 0/4 | ⬚ Future |
