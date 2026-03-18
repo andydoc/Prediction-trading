@@ -1110,6 +1110,18 @@ impl Orchestrator {
         };
 
         let db_open_ids: HashSet<String> = self.state_db.get_open_position_ids().into_iter().collect();
+
+        // Safety guard: refuse to wipe all positions if DB had some but runtime has none.
+        // This prevents accidental state loss from a bad restart or missed load_state.
+        if live_ids.is_empty() && !db_open_ids.is_empty() {
+            tracing::error!(
+                "STATE GUARD: refusing to delete {} open positions (runtime has 0). \
+                 Skipping save to prevent state loss. Check load_state or .db.bak backup.",
+                db_open_ids.len()
+            );
+            return;
+        }
+
         for stale_id in db_open_ids.difference(&live_ids) {
             self.state_db.delete_position(stale_id);
         }

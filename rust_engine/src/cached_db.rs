@@ -71,10 +71,20 @@ impl CachedSqliteDB {
     }
 
     /// Restore in-memory DB from disk. Returns elapsed milliseconds.
+    ///
+    /// Creates a `.bak` copy of the disk file before loading, so state
+    /// can be recovered if the in-memory DB is later saved in a bad state.
     pub fn load_from_disk(&self) -> Result<f64, String> {
         if !self.disk_path.exists() {
             return Err("Disk DB file not found".into());
         }
+
+        // Safety: backup disk file before overwriting in-memory state
+        let bak_path = self.disk_path.with_extension("db.bak");
+        if let Err(e) = std::fs::copy(&self.disk_path, &bak_path) {
+            tracing::warn!("Failed to create state backup {}: {}", bak_path.display(), e);
+        }
+
         let t0 = Instant::now();
         let disk_db = Connection::open(&self.disk_path)
             .map_err(|e| format!("Failed to open disk DB: {}", e))?;
