@@ -49,11 +49,11 @@ impl RoundingConfig {
 
     /// Derive from tick_size as f64.
     pub fn from_tick_size_f64(tick_size: f64) -> Self {
-        if (tick_size - 0.1).abs() < 1e-9 {
+        if (tick_size - 0.1).abs() < 1e-6 {
             Self::from_tick_size("0.1")
-        } else if (tick_size - 0.001).abs() < 1e-9 {
+        } else if (tick_size - 0.001).abs() < 1e-6 {
             Self::from_tick_size("0.001")
-        } else if (tick_size - 0.0001).abs() < 1e-9 {
+        } else if (tick_size - 0.0001).abs() < 1e-6 {
             Self::from_tick_size("0.0001")
         } else {
             // Default: 0.01 (most common)

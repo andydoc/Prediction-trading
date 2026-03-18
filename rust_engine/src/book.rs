@@ -128,10 +128,11 @@ impl BookMirror {
             .unwrap_or(0.0)
     }
 
-    /// Get ask depth in USD for an asset (with haircut).
-    pub fn get_ask_depth_usd(&self, asset_id: &str, haircut: f64) -> f64 {
+    /// Get ask depth in USD for an asset.
+    /// `haircut_factor` is a 0.0..=1.0 multiplier to discount phantom/stale depth.
+    pub fn get_ask_depth_usd(&self, asset_id: &str, haircut_factor: f64) -> f64 {
         self.books.get(asset_id)
-            .map(|b| b.ask_depth_usd(haircut))
+            .map(|b| b.ask_depth_usd(haircut_factor))
             .unwrap_or(0.0)
     }
 

@@ -270,11 +270,7 @@ async fn connect_and_run(
                     Some(Ok(WsMessage::Text(text))) => {
                         total_msgs.fetch_add(1, Ordering::Relaxed);
                         // Track PONG responses to our text PING
-                        let trimmed = text.trim();
-                        if trimmed == "PONG"
-                            || trimmed.starts_with("{\"type\":\"pong\"")
-                            || trimmed.starts_with("[{\"type\":\"pong\"")
-                        {
+                        if is_pong(&text) {
                             last_pong = std::time::Instant::now();
                             continue;
                         }
@@ -317,6 +313,14 @@ async fn connect_and_run(
     }
 }
 
+/// ST1: Shared pong detection — used by both WsManager and ConnectionPool.
+pub fn is_pong(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed == "PONG"
+        || trimmed.starts_with("{\"type\":\"pong\"")
+        || trimmed.starts_with("[{\"type\":\"pong\"")
+}
+
 /// Parse and dispatch a single WS message (shared between WsManager and ConnectionPool).
 pub fn handle_message_shared(
     label: &str,
@@ -329,18 +333,25 @@ pub fn handle_message_shared(
     instruments: Option<&Arc<crate::instrument::InstrumentStore>>,
 ) {
     // Debug: log first 200 chars of every message for diagnosis
-    tracing::trace!("{} raw msg: {}", label, &text[..text.len().min(200)]);
+    #[cfg(debug_assertions)]
+    tracing::trace!("{} raw msg: {}", label, text.get(..200).unwrap_or(text));
 
     // Polymarket sends arrays of events
     let messages: Vec<Value> = if text.starts_with('[') {
         match serde_json::from_str(text) {
             Ok(arr) => arr,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!("{} failed to parse WS array: {}", label, e);
+                return;
+            }
         }
     } else {
         match serde_json::from_str::<Value>(text) {
             Ok(v) => vec![v],
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!("{} failed to parse WS message: {}", label, e);
+                return;
+            }
         }
     };
 

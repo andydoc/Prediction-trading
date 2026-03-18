@@ -101,6 +101,10 @@ pub fn check_mutex_arb(
 }
 
 /// Build valid outcome scenarios for a constraint type.
+/// Build valid outcome scenarios for a constraint type.
+/// P12: String-based dispatch is acceptable at current scale — the set of constraint
+/// types is small and stable. Converting to an enum would be invasive with no
+/// meaningful performance benefit.
 fn build_scenarios(n: usize, constraint_type: &str, implications: &[(usize, usize)]) -> Vec<Vec<f64>> {
     match constraint_type {
         "mutual_exclusivity" | "mutex" => {
@@ -147,6 +151,10 @@ pub fn polytope_arb(
 
     let price_sum: f64 = yes_prices.iter().sum();
     let ct = constraint_type;
+    // B20: Threshold logic — these ranges are intentionally overlapping:
+    //   - mutex: price_sum must be >= 0.90 (tighter filter for the common case)
+    //   - all types: price_sum must be in [0.30, 1.40] (rejects garbage data)
+    //   - 2-market: additional floor at 0.80 (2-market arbs need stronger signal)
     if (ct == "mutual_exclusivity" || ct == "mutex") && price_sum < 0.90 { return None; }
     if price_sum < 0.30 || price_sum > 1.40 { return None; }
     if n == 2 && price_sum < 0.80 { return None; }
@@ -198,6 +206,9 @@ pub fn polytope_arb(
     let gross_profit = guaranteed - capital;
     let net_profit = gross_profit - fees;
     let profit_pct = net_profit / capital;
+
+    // B13: Guard against NaN/Inf propagation from degenerate price inputs
+    if !profit_pct.is_finite() { return None; }
 
     if profit_pct < min_profit || profit_pct > max_profit { return None; }
 

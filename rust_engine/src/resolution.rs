@@ -187,7 +187,12 @@ fn call_anthropic(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
-        tracing::error!("[rust_rv] Anthropic API returned {}: {}", status, &text[..text.len().min(500)]);
+        let snippet = text.get(..500).unwrap_or(&text);
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            tracing::warn!("[rust_rv] Anthropic API rate-limited (429): {}", snippet);
+        } else {
+            tracing::error!("[rust_rv] Anthropic API returned {}: {}", status, snippet);
+        }
         return None;
     }
 
@@ -216,9 +221,9 @@ fn call_anthropic(
     // Strip markdown code fences
     if text.starts_with("```") {
         if let Some(idx) = text.find('\n') {
-            text = text[idx + 1..].to_string();
+            text = text.get(idx + 1..).unwrap_or_default().to_string();
         } else {
-            text = text[3..].to_string();
+            text = text.get(3..).unwrap_or_default().to_string();
         }
         if text.ends_with("```") {
             text = text[..text.len() - 3].to_string();
@@ -231,7 +236,7 @@ fn call_anthropic(
         Err(e) => {
             tracing::error!(
                 "[rust_rv] JSON parse failed: {}, text={}",
-                e, &text[..text.len().min(200)]
+                e, text.get(..200).unwrap_or(&text)
             );
             None
         }
@@ -392,6 +397,8 @@ impl ResolutionValidator {
         };
 
         // 3. Format prompt
+        // S1: expose_secret() returns &str; .to_string() creates a heap copy because
+        // the MutexGuard lifetime prevents passing &str directly across the lock boundary.
         let api_key = self.api_key.lock().expose_secret().to_string();
         let prompt = format_prompt(&self.prompt_template, &question, &description, &end_date);
 

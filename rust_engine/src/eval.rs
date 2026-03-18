@@ -140,11 +140,12 @@ pub fn evaluate_batch(
         .as_secs_f64();
 
     // Segment 3: queue wait — time from push to drain
+    const MAX_SANE_LATENCY_US: f64 = 60_000_000.0; // 60 seconds — sanity cap for queue wait
     if latency.is_enabled() {
         for entry in &entries {
             if entry.queued_at > 0.0 {
                 let wait_us = (now_ts - entry.queued_at) * 1_000_000.0;
-                if wait_us > 0.0 && wait_us < 60_000_000.0 { // sanity: < 60s
+                if wait_us > 0.0 && wait_us < MAX_SANE_LATENCY_US {
                     latency.record_queue_wait(wait_us);
                 }
             }
@@ -222,6 +223,9 @@ pub fn evaluate_batch(
         }
 
         if let Some(arb) = result {
+            // P2: These HashMap clones are acceptable at current scale — evaluate_batch
+            // processes at most a few dozen constraints per tick, so the allocation
+            // overhead is negligible vs. the WS/arb math cost.
             let mut current_prices = HashMap::new();
             let mut current_no_prices = HashMap::new();
             let mut optimal_bets = HashMap::new();

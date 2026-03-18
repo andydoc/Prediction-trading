@@ -112,7 +112,8 @@ impl GasMonitor {
         };
 
         // Convert wei to POL (18 decimals)
-        let balance_pol = balance_wei as f64 / 1e18;
+        const WEI_PER_POL: f64 = 1e18;
+        let balance_pol = balance_wei as f64 / WEI_PER_POL;
         self.last_balance = Some(balance_pol);
 
         if balance_pol < self.config.critical_pol_balance {

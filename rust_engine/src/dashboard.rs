@@ -248,16 +248,6 @@ fn fmt_ts_sec(ts: f64) -> String {
         .unwrap_or_else(|| "?".into())
 }
 
-/// Parse entry_timestamp which can be ISO string, Unix float string, or raw f64.
-#[allow(dead_code)]
-fn parse_entry_ts(val: &Value) -> f64 {
-    if let Some(s) = val.as_str() {
-        parse_entry_ts_str(s)
-    } else {
-        val.as_f64().unwrap_or(0.0)
-    }
-}
-
 /// Parse entry_timestamp from a string (ISO or Unix float).
 fn parse_entry_ts_str(s: &str) -> f64 {
     // Try ISO first
@@ -278,30 +268,39 @@ fn fmt_strategy(strategy: &str, method: &str) -> String {
 }
 
 fn build_stats(s: &DashboardState) -> Value {
-    let pm = s.positions.lock();
-    let cap = pm.current_capital();
-    let init_cap = pm.initial_capital();
-    let perf = pm.get_performance_metrics();
-    let open_count = pm.open_count();
-    let closed_count = pm.closed_count();
+    // Lock scope: extract all needed data from PositionManager in one locked section,
+    // then drop the lock before doing any further computation or accessing other locks.
+    let (cap, init_cap, perf, open_count, closed_count, total_fees,
+         open_snapshot, first_entry_ts, total_realized) = {
+        let pm = s.positions.lock();
+        let cap = pm.current_capital();
+        let init_cap = pm.initial_capital();
+        let perf = pm.get_performance_metrics();
+        let open_count = pm.open_count();
+        let closed_count = pm.closed_count();
+        let total_fees = pm.total_fees();
+        let open_snapshot: Vec<crate::position::Position> = pm.open_positions().values().cloned().collect();
 
-    // Calculate deployed capital and fees from open positions
+        let mut first_entry_ts = f64::MAX;
+        for p in &open_snapshot {
+            let ts = parse_entry_ts_str(&p.entry_timestamp);
+            if ts > 0.0 && ts < first_entry_ts { first_entry_ts = ts; }
+        }
+        for p in pm.closed_positions() {
+            let ts = parse_entry_ts_str(&p.entry_timestamp);
+            if ts > 0.0 && ts < first_entry_ts { first_entry_ts = ts; }
+        }
+        let total_realized = perf.get("total_actual_profit").copied().unwrap_or(0.0);
+
+        (cap, init_cap, perf, open_count, closed_count, total_fees,
+         open_snapshot, first_entry_ts, total_realized)
+    }; // pm lock dropped here
+
+    // Calculate deployed capital from snapshot (no lock held)
     let mut deployed = 0.0f64;
-    let total_fees = pm.total_fees();
-    let mut first_entry_ts = f64::MAX;
-    let open_snapshot: Vec<crate::position::Position> = pm.open_positions().values().cloned().collect();
     for p in &open_snapshot {
         deployed += p.total_capital;
-        let ts = parse_entry_ts_str(&p.entry_timestamp);
-        if ts > 0.0 && ts < first_entry_ts { first_entry_ts = ts; }
     }
-    // Also check closed for first trade
-    for p in pm.closed_positions() {
-        let ts = parse_entry_ts_str(&p.entry_timestamp);
-        if ts > 0.0 && ts < first_entry_ts { first_entry_ts = ts; }
-    }
-    let total_realized = perf.get("total_actual_profit").copied().unwrap_or(0.0);
-    drop(pm); // Release lock — no more position reads needed
 
     // B4.4: Total unrealized P&L (mark-to-market across all open positions)
     let mut total_unrealized = 0.0f64;
@@ -574,22 +573,25 @@ fn build_positions(s: &DashboardState) -> Value {
         }));
     }
     // Sort open positions by score descending, then re-number
-    positions.sort_by(|a, b| b["score"].as_f64().unwrap_or(0.0)
-        .partial_cmp(&a["score"].as_f64().unwrap_or(0.0)).unwrap());
+    positions.sort_by(|a, b| {
+        let sb = b["score"].as_f64().unwrap_or(0.0);
+        let sa = a["score"].as_f64().unwrap_or(0.0);
+        sb.total_cmp(&sa)
+    });
     for (i, pos) in positions.iter_mut().enumerate() {
         pos["idx"] = serde_json::Value::from(i + 1);
     }
     // Build aggregates: group all legs across positions by market name
-    let mut agg_map: std::collections::HashMap<String, (String, f64, f64, f64, usize)> = std::collections::HashMap::new();
+    let mut agg_map: std::collections::HashMap<&str, (&str, f64, f64, f64, usize)> = std::collections::HashMap::new();
     for (pidx, pos) in positions.iter().enumerate() {
         if let Some(legs) = pos["legs"].as_array() {
             for leg in legs {
-                let name = leg["name"].as_str().unwrap_or("?").to_string();
-                let side = leg["side"].as_str().unwrap_or("?").to_string();
+                let name = leg["name"].as_str().unwrap_or("?");
+                let side = leg["side"].as_str().unwrap_or("?");
                 let bet = leg["bet"].as_f64().unwrap_or(0.0);
                 let price = leg["price"].as_f64().unwrap_or(0.0);
                 let payout = leg["payout"].as_f64().unwrap_or(0.0);
-                let entry = agg_map.entry(name.clone()).or_insert((side, 0.0, 0.0, 0.0, pidx + 1));
+                let entry = agg_map.entry(name).or_insert((side, 0.0, 0.0, 0.0, pidx + 1));
                 entry.1 += bet;
                 entry.2 = price; // last price (simplification)
                 entry.3 += payout;
@@ -785,8 +787,11 @@ fn build_closed(s: &DashboardState) -> Value {
 
     // Sort each category by close time descending
     for cat in [&mut resolved, &mut proactive_exit, &mut replaced_profit, &mut replaced_loss, &mut replaced_even] {
-        cat.sort_by(|a, b| b["_sort_ts"].as_f64().unwrap_or(0.0)
-            .partial_cmp(&a["_sort_ts"].as_f64().unwrap_or(0.0)).unwrap());
+        cat.sort_by(|a, b| {
+            let tb = b["_sort_ts"].as_f64().unwrap_or(0.0);
+            let ta = a["_sort_ts"].as_f64().unwrap_or(0.0);
+            tb.total_cmp(&ta)
+        });
     }
 
     let total = resolved.len() + proactive_exit.len() + replaced_profit.len() + replaced_loss.len() + replaced_even.len();

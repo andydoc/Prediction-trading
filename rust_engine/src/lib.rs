@@ -406,6 +406,8 @@ impl TradingEngine {
         self.positions.lock().set_asset_index(result.asset_to_market.clone());
 
         // Ensure open position assets stay in subscription list
+        // P10: HashSet rebuild on each constraint detection is acceptable — runs once
+        // every few minutes at most, and the set is typically < 1000 elements.
         let open_pos_assets = self.positions.lock().get_open_position_asset_ids();
         let mut all_asset_ids = result.all_asset_ids.clone();
         if !open_pos_assets.is_empty() {
@@ -661,6 +663,7 @@ impl TradingEngine {
                             let prices_raw = &mdata["outcomePrices"];
                             let prices: Vec<f64> = if let Some(s) = prices_raw.as_str() {
                                 serde_json::from_str::<Vec<serde_json::Value>>(s)
+                                    .inspect_err(|e| tracing::warn!("outcomePrices parse fail: {e}"))
                                     .unwrap_or_default()
                                     .iter()
                                     .filter_map(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))

@@ -68,21 +68,21 @@ impl EvalQueue {
             origin_ts,
         };
 
-        let mut q = self.inner.lock();
+        let mut queue = self.inner.lock();
         if urgent {
-            if q.urgent_set.insert(constraint_id.to_string()) {
-                q.urgent.push(entry);
+            if queue.urgent_set.insert(constraint_id.to_string()) {
+                queue.urgent.push(entry);
             }
-            q.bg_set.remove(constraint_id);
+            queue.bg_set.remove(constraint_id);
             // Wake the orchestrator immediately for urgent work
-            drop(q);
+            drop(queue);
             let mut flag = self.wake_flag.lock();
             *flag = true;
             self.wake_cond.notify_one();
         } else {
-            if !q.urgent_set.contains(constraint_id) {
-                if q.bg_set.insert(constraint_id.to_string()) {
-                    q.background.push(entry);
+            if !queue.urgent_set.contains(constraint_id) {
+                if queue.bg_set.insert(constraint_id.to_string()) {
+                    queue.background.push(entry);
                 }
             }
         }
@@ -105,14 +105,14 @@ impl EvalQueue {
 
     /// Drain up to `max` entries, urgent first then background.
     pub fn drain(&self, max: usize) -> Vec<DrainResult> {
-        let mut q = self.inner.lock();
+        let mut queue = self.inner.lock();
         let mut results = Vec::with_capacity(max);
 
         // Drain urgent first
-        let take = q.urgent.len().min(max);
-        let urgent_entries: Vec<QueueEntry> = q.urgent.drain(..take).collect();
+        let take = queue.urgent.len().min(max);
+        let urgent_entries: Vec<QueueEntry> = queue.urgent.drain(..take).collect();
         for entry in urgent_entries {
-            q.urgent_set.remove(&entry.constraint_id);
+            queue.urgent_set.remove(&entry.constraint_id);
             results.push(DrainResult {
                 constraint_id: entry.constraint_id,
                 urgent: true,
@@ -124,10 +124,10 @@ impl EvalQueue {
         // Fill remainder from background
         let remaining = max.saturating_sub(results.len());
         if remaining > 0 {
-            let take = q.background.len().min(remaining);
-            let bg_entries: Vec<QueueEntry> = q.background.drain(..take).collect();
+            let take = queue.background.len().min(remaining);
+            let bg_entries: Vec<QueueEntry> = queue.background.drain(..take).collect();
             for entry in bg_entries {
-                q.bg_set.remove(&entry.constraint_id);
+                queue.bg_set.remove(&entry.constraint_id);
                 results.push(DrainResult {
                     constraint_id: entry.constraint_id,
                     urgent: false,
@@ -142,17 +142,17 @@ impl EvalQueue {
 
     /// Queue depths for monitoring.
     pub fn depths(&self) -> (usize, usize) {
-        let q = self.inner.lock();
-        (q.urgent.len(), q.background.len())
+        let queue = self.inner.lock();
+        (queue.urgent.len(), queue.background.len())
     }
 
     /// Clear all queues.
     pub fn clear(&self) {
-        let mut q = self.inner.lock();
-        q.urgent.clear();
-        q.background.clear();
-        q.urgent_set.clear();
-        q.bg_set.clear();
+        let mut queue = self.inner.lock();
+        queue.urgent.clear();
+        queue.background.clear();
+        queue.urgent_set.clear();
+        queue.bg_set.clear();
     }
 }
 

@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::Mutex;
 
-const MAX_SAMPLES: usize = 500;
+const MAX_SAMPLES: usize = 500; // ~83 min at 10s sampling interval
 
 /// Per-segment percentile snapshot.
 #[derive(Debug, Clone, Default)]

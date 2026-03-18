@@ -155,7 +155,7 @@ pub fn compare_positions(
                 if diff < 0.01 {
                     report.positions_matched += 1;
                 } else {
-                    let severity = if diff * 1.0 > escalation_threshold {
+                    let severity = if diff > escalation_threshold {
                         Severity::Critical
                     } else {
                         Severity::Warning

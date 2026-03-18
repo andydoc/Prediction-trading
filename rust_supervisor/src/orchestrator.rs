@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use rust_engine::detect::{DetectableMarket, DetectionConfig};
@@ -46,13 +46,18 @@ fn deep_merge(base: &mut serde_json::Value, overlay: &serde_json::Value) {
 // Delay model (ported from Python trading_engine.py)
 // ---------------------------------------------------------------------------
 
-const FALLBACK_P95: &[(&str, f64)] = &[
+const FALLBACK_P95_DATA: &[(&str, f64)] = &[
     ("football", 14.8), ("us_sports", 33.6), ("esports", 20.0), ("tennis", 20.8),
     ("mma_boxing", 50.3), ("cricket", 21.8), ("rugby", 23.3), ("politics", 350.2),
     ("gov_policy", 44.3), ("crypto", 3.4), ("crypto_price", 0.05), ("sports_props", 6.5),
     ("other", 33.5),
 ];
 const FALLBACK_DEFAULT: f64 = 33.5;
+
+/// P1: Pre-computed fallback table — avoids String allocations on every call.
+static FALLBACK_P95: LazyLock<HashMap<String, f64>> = LazyLock::new(|| {
+    FALLBACK_P95_DATA.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+});
 
 /// Maximum latency samples to retain for percentile calculation.
 const MAX_LATENCY_SAMPLES: usize = 200;
@@ -477,9 +482,7 @@ impl Orchestrator {
             let default = table.get("other").copied().unwrap_or(FALLBACK_DEFAULT);
             (table, default)
         } else {
-            let table: HashMap<String, f64> = FALLBACK_P95.iter()
-                .map(|(k, v)| (k.to_string(), *v))
-                .collect();
+            let table: HashMap<String, f64> = FALLBACK_P95.clone();
             (table, FALLBACK_DEFAULT)
         };
 
@@ -635,6 +638,7 @@ impl Orchestrator {
         let (all_assets, constraint_to_assets) = self.detect_constraints();
 
         // 3. Load delay table into engine
+        // P3: clone is required — engine API takes Vec<(String, f64)>, table is borrowed here
         self.engine.set_delay_table(
             self.p95_table.iter().map(|(k, v)| (k.clone(), *v)).collect()
         );
@@ -1049,7 +1053,7 @@ impl Orchestrator {
         if (now - self.last_stale_sweep) >= self.cfg.stale_sweep_interval {
             let stale = self.engine.get_stale_assets(self.cfg.stale_asset_threshold);
             if !stale.is_empty() {
-                tracing::debug!("Stale assets: {} > {:.0}s old", stale.len(), self.cfg.stale_asset_threshold);
+                tracing::trace!("Stale assets: {} > {:.0}s old", stale.len(), self.cfg.stale_asset_threshold);
             }
             self.last_stale_sweep = now;
         }
@@ -1179,7 +1183,9 @@ impl Orchestrator {
     }
 
     fn ingest_scan_result(&mut self, result: &rust_engine::scanner::ScanResult) {
+        // P5: clear+rebuild is correct; pre-allocate to avoid rehashing
         self.market_lookup.clear();
+        self.market_lookup.reserve(result.markets.len());
         for m in &result.markets {
             if let Some(mid) = m.get("market_id").and_then(|v| v.as_str()) {
                 self.market_lookup.insert(mid.to_string(), m.clone());
@@ -1270,6 +1276,7 @@ impl Orchestrator {
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
 
+            // P6: Full sort is acceptable — runs only every ~600s at constraint rebuild
             let mut ranked: Vec<_> = constraint_to_assets.keys().cloned().collect();
             ranked.sort_by(|a, b| {
                 let score = |cid: &str| -> f64 {
@@ -1590,7 +1597,7 @@ impl Orchestrator {
                             };
                             let rem_score = (remaining_upside / total_cap.max(0.01)) / hours_rem.max(0.01);
 
-                            if worst.is_none() || rem_score < worst.as_ref().unwrap().1 {
+                            if worst.as_ref().map_or(true, |w| rem_score < w.1) {
                                 if eval.worth_replacing {
                                     worst_bids = bids;
                                     worst = Some((pid.clone(), rem_score));
@@ -1906,7 +1913,7 @@ impl Orchestrator {
             let mut lats: Vec<f64> = self.recent_latencies.iter().copied().collect();
             lats.sort_by(|a, b| a.total_cmp(b));
             let p50 = lats[lats.len() / 2];
-            let p95 = lats[(lats.len() as f64 * 0.95) as usize];
+            let p95 = lats[((lats.len() as f64 * 0.95).ceil() as usize).saturating_sub(1).min(lats.len() - 1)];
             let max = *lats.last().unwrap_or(&0.0);
             (p50, p95, max)
         } else {

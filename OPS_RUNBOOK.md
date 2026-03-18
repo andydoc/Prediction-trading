@@ -12,16 +12,16 @@
 |------|-------|
 | Provider | ZAP-Hosting (Germany) |
 | IP | `193.23.127.99` |
-| SSH | `ssh root@193.23.127.99` |
+| SSH | `ssh vps-ubuntu` (ubuntu user) or `ssh vps` (root) |
 | Specs | 4 vCPU, 8 GB RAM, 25 GB NVMe, Ubuntu 24.04 |
-| Workspace | `/root/prediction-trader` |
-| Binary | `/root/prediction-trader/target/release/prediction-trader` |
+| Workspace | `/home/ubuntu/prediction-trader` |
+| Binary | `/home/ubuntu/prediction-trader/target/release/prediction-trader` |
 
 **SSH quick commands:**
 ```bash
-ssh root@193.23.127.99                          # Shell
-ssh root@193.23.127.99 'systemctl status prediction-trader'
-ssh root@193.23.127.99 'tail -50 /root/prediction-trader/logs/supervisor-*.log'
+ssh vps-ubuntu                                  # Shell (ubuntu user)
+ssh vps-ubuntu 'systemctl status prediction-trader'
+ssh vps-ubuntu 'tail -50 /home/ubuntu/prediction-trader/logs/supervisor-*.log'
 ```
 
 **ZAP-Hosting login reminder**: Set a calendar reminder every 3 months to log in to the ZAP dashboard and verify account/billing status.
@@ -30,7 +30,7 @@ ssh root@193.23.127.99 'tail -50 /root/prediction-trader/logs/supervisor-*.log'
 
 ## 2. Scripts
 
-All scripts are in `scripts/`. Set `TRADER_WORKSPACE` env var or they default to `/home/andydoc/prediction-trader` (dev) or `/root/prediction-trader` (VPS).
+All scripts are in `scripts/`. Set `TRADER_WORKSPACE` env var or they default to `/home/andydoc/prediction-trader` (dev) or `/home/ubuntu/prediction-trader` (VPS).
 
 ### start.sh — Start the system
 ```bash
@@ -91,10 +91,11 @@ All numeric values are bounds-checked (e.g., `capital_per_trade_pct` max 0.5, `m
 | shadow-c | 5562 | `http://localhost:5562` |
 | shadow-d | 5563 | `http://localhost:5563` |
 | shadow-e | 5564 | `http://localhost:5564` |
+| shadow-f | 5565 | `http://localhost:5565` |
 
 **Remote access via SSH tunnel:**
 ```bash
-ssh -L 5558:127.0.0.1:5558 root@193.23.127.99
+ssh -L 5558:127.0.0.1:5558 vps-ubuntu
 # Then open http://localhost:5558 in browser
 ```
 
@@ -287,8 +288,8 @@ cp -p data/state_rust.db data/state_rust.db.pre-maintenance-$(date +%s)
 - Daily P&L summary at midnight UTC: entries, exits, fees, net P&L, capital utilisation, drawdown
 
 **Weekly**:
-- Check VPS disk usage: `ssh root@193.23.127.99 'df -h /'`
-- Check VPS memory: `ssh root@193.23.127.99 'free -h'`
+- Check VPS disk usage: `ssh vps-ubuntu 'df -h /'`
+- Check VPS memory: `ssh vps-ubuntu 'free -h'`
 - Review log retention (30-day auto-cleanup)
 
 **Monthly**:

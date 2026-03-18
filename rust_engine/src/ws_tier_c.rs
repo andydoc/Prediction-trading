@@ -163,11 +163,19 @@ impl TierC {
         let mut start = self.buffer_start.lock();
 
         if start.is_none() {
+            // B22: SystemTime precision (~100ns on modern OS) is more than adequate
+            // for the 2.5s buffer timeout used here. No high-resolution clock needed.
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs_f64();
             *start = Some(now);
+        }
+
+        // S4: Cap buffer size to prevent unbounded memory growth from event floods
+        if buf.len() >= 10_000 {
+            buf.clear();
+            tracing::warn!("Event buffer overflow — flushed");
         }
 
         tracing::info!("Tier C: new market event: {} (event: {})",
@@ -316,6 +324,9 @@ pub fn parse_new_market_event(msg: &Value) -> Option<NewMarketEvent> {
         .unwrap_or("")
         .to_string();
 
+    // PY3: Empty asset_ids check is the primary validation gate — we intentionally
+    // allow empty strings for question/event_id/etc. since those are informational
+    // fields that may legitimately be absent in some event formats.
     if asset_ids.is_empty() {
         return None;
     }
@@ -361,7 +372,10 @@ pub fn parse_market_resolved_event(msg: &Value) -> Option<ResolvedEvent> {
             msg.get("asset_id").and_then(|v| v.as_str()).unwrap_or("")
         });
 
+    // B15: If both identifiers are missing, we cannot match this event to any position.
+    // Log a warning so resolution data loss is visible in logs.
     if market_cid.is_empty() && asset_id.is_empty() {
+        tracing::warn!("market_resolved event missing both market_cid and asset_id — dropping");
         return None;
     }
 

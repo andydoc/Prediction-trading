@@ -153,6 +153,8 @@ impl MonitorState {
         self.sys.refresh_memory();
 
         // CPU — average across all cores
+        // P8: Iterating all cores is O(n_cores) but this runs only every ~10s,
+        // so the overhead is minimal even on high-core-count machines.
         let cpus = self.sys.cpus();
         let cpu = if cpus.is_empty() {
             0.0

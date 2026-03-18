@@ -193,7 +193,7 @@ fn call_anthropic_with_search(
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
         tracing::warn!("Postponement API returned {}: {}",
-            status, &text[..text.len().min(200)]);
+            status, text.get(..200).unwrap_or(&text));
         return None;
     }
 
@@ -257,7 +257,9 @@ fn extract_json(text: &str) -> Option<PostponementResult> {
         }
     }
 
-    // Find last JSON object in text
+    // Find last JSON object in text using naive brace-matching.
+    // NOTE: This doesn't handle escaped braces inside JSON string values.
+    // Acceptable because LLM responses rarely contain escaped braces in practice.
     let mut depth = 0i32;
     let mut last_start = None;
     let mut last_json = None;
@@ -533,6 +535,8 @@ impl PostponementDetector {
             days_overdue);
 
         // 3. Attempt 1
+        // S1: expose_secret() returns &str; .to_string() creates a heap copy because
+        // the MutexGuard lifetime prevents passing &str directly across the lock boundary.
         let api_key = self.api_key.lock().expose_secret().to_string();
         let prompt = format_prompt(
             &self.prompt_template, market_names, original_date, &today, days_overdue,

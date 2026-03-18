@@ -294,6 +294,9 @@ impl PositionManager {
 
         let method = position.metadata.get("method")
             .and_then(|v| v.as_str()).unwrap_or("");
+        // Intentional string matching: method values like "mutex_sell_all" are free-form
+        // strings from arb detection, not an enum. String matching provides flexibility
+        // for new method names without requiring enum conversion.
         let is_sell = method.contains("sell");
 
         let payout = if is_sell {
@@ -331,7 +334,7 @@ impl PositionManager {
         position.actual_profit = profit;
         position.actual_profit_pct = profit_pct;
         position.profit_delta = profit - position.expected_profit;
-        position.profit_accuracy = if position.expected_profit != 0.0 {
+        position.profit_accuracy = if position.expected_profit.abs() > f64::EPSILON {
             profit / position.expected_profit
         } else { 0.0 };
         position.metadata.insert("close_reason".into(),
@@ -622,7 +625,7 @@ impl PositionManager {
         let mut pruned = 0;
         for pos in self.closed_positions.iter_mut() {
             let close_ts = pos.close_timestamp.unwrap_or(0.0);
-            if close_ts > 0.0 && close_ts < cutoff_ts {
+            if close_ts > 0.0 && close_ts <= cutoff_ts {
                 // Strip bulky fields but keep audit-essential metadata
                 let keep_keys = ["constraint_id", "strategy", "method", "close_reason",
                                  "chain_id", "chain_generation", "parent_position_id"];

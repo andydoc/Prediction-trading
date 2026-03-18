@@ -187,9 +187,8 @@ impl TierB {
 
         // 4. Apply subscription changes
         if !to_subscribe.is_empty() {
-            tracing::info!("Tier B: subscribing {} assets from {} new hot constraints",
-                to_subscribe.len(),
-                current_hot.len().saturating_sub(existing_ids.len()));
+            tracing::info!("Tier B: subscribing {} assets (current_hot={}, existing={})",
+                to_subscribe.len(), current_hot.len(), existing_ids.len());
             self.pool.subscribe(to_subscribe);
         }
         if !to_unsubscribe.is_empty() {
@@ -219,6 +218,9 @@ impl TierB {
 
     /// Demote assets from Tier C back to B (position resolved, constraint still hot).
     pub fn demote_from_c(&self, asset_ids: &[String], constraint_id: &str) {
+        // B19: TOCTOU between this check and the subscribe below is benign —
+        // worst case is a redundant subscribe that will be cleaned up on the
+        // next update_hot_constraints() cycle.
         let is_still_hot = self.hot_constraints.lock().contains_key(constraint_id);
 
         {

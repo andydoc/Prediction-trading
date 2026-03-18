@@ -69,7 +69,7 @@ pub struct PoolConfig {
 struct ManagedConnection {
     _handle: JoinHandle<()>,
     subscribed: Arc<Mutex<HashSet<String>>>,
-    cmd_tx: mpsc::UnboundedSender<SubCommand>,
+    cmd_tx: mpsc::Sender<SubCommand>,
 }
 
 /// Stats exposed by the pool.
@@ -200,7 +200,9 @@ impl ConnectionPool {
                 }
 
                 // Send subscribe command to the connection task
-                let _ = conn.cmd_tx.send(SubCommand::Subscribe(batch));
+                if let Err(e) = conn.cmd_tx.try_send(SubCommand::Subscribe(batch)) {
+                    tracing::warn!("SubCommand channel full or closed: {}", e);
+                }
             }
         } // Drop conns lock
 
@@ -266,7 +268,9 @@ impl ConnectionPool {
                     sub.remove(id);
                 }
             }
-            let _ = conns[idx].cmd_tx.send(SubCommand::Unsubscribe(ids));
+            if let Err(e) = conns[idx].cmd_tx.try_send(SubCommand::Unsubscribe(ids)) {
+                    tracing::warn!("SubCommand channel full or closed: {}", e);
+                }
         }
 
         // Update stats
@@ -359,7 +363,9 @@ impl ConnectionPool {
             }
             let assets: Vec<String> = conn.subscribed.lock().drain().collect();
             if !assets.is_empty() {
-                let _ = conn.cmd_tx.send(SubCommand::Unsubscribe(assets));
+                if let Err(e) = conn.cmd_tx.try_send(SubCommand::Unsubscribe(assets)) {
+                        tracing::warn!("SubCommand channel full or closed: {}", e);
+                    }
             }
         }
 
@@ -384,14 +390,18 @@ impl ConnectionPool {
                     let mut sub = conns[idx].subscribed.lock();
                     for id in &to_remove { sub.remove(id); }
                 }
-                let _ = conns[idx].cmd_tx.send(SubCommand::Unsubscribe(to_remove));
+                if let Err(e) = conns[idx].cmd_tx.try_send(SubCommand::Unsubscribe(to_remove)) {
+                        tracing::warn!("SubCommand channel full or closed: {}", e);
+                    }
             }
             if !to_add.is_empty() {
                 {
                     let mut sub = conns[idx].subscribed.lock();
                     for id in &to_add { sub.insert(id.clone()); }
                 }
-                let _ = conns[idx].cmd_tx.send(SubCommand::Subscribe(to_add));
+                if let Err(e) = conns[idx].cmd_tx.try_send(SubCommand::Subscribe(to_add)) {
+                        tracing::warn!("SubCommand channel full or closed: {}", e);
+                    }
             }
         }
 
@@ -411,7 +421,7 @@ impl ConnectionPool {
 
     /// Spawn a single managed connection task.
     fn spawn_connection(&self, idx: usize, initial_assets: Vec<String>, rt: &tokio::runtime::Handle) {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let subscribed = Arc::new(Mutex::new(initial_assets.iter().cloned().collect::<HashSet<_>>()));
 
         let tier = self.tier;
@@ -451,7 +461,7 @@ async fn connection_loop(
     tier: WsTier,
     idx: usize,
     config: PoolConfig,
-    mut cmd_rx: mpsc::UnboundedReceiver<SubCommand>,
+    mut cmd_rx: mpsc::Receiver<SubCommand>,
     subscribed: Arc<Mutex<HashSet<String>>>,
     book: Arc<BookMirror>,
     eval_queue: Arc<EvalQueue>,
@@ -540,7 +550,7 @@ async fn connection_loop(
 async fn connection_session(
     label: &str,
     config: &PoolConfig,
-    cmd_rx: &mut mpsc::UnboundedReceiver<SubCommand>,
+    cmd_rx: &mut mpsc::Receiver<SubCommand>,
     subscribed: &Arc<Mutex<HashSet<String>>>,
     book: &Arc<BookMirror>,
     eval_queue: &Arc<EvalQueue>,
@@ -613,11 +623,7 @@ async fn connection_session(
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         stats.msgs_received.fetch_add(1, Ordering::Relaxed);
-                        let trimmed = text.trim();
-                        if trimmed == "PONG"
-                            || trimmed.starts_with("{\"type\":\"pong\"")
-                            || trimmed.starts_with("[{\"type\":\"pong\"")
-                        {
+                        if crate::ws::is_pong(&text) {
                             last_pong = std::time::Instant::now();
                             continue;
                         }

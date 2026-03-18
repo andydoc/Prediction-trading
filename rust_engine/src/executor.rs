@@ -356,7 +356,7 @@ pub fn evaluate_partial_fills(
 
     // If only BUY legs filled (no revenue yet), we can't compute profit.
     // This is a one-sided fill — needs unwind unless the arb is still executable.
-    if total_cost > 0.0 && total_revenue == 0.0 {
+    if total_cost > 0.0 && total_revenue.abs() < 1e-9 {
         // One-sided fill: we bought but didn't sell. Need to unwind.
         let filled_ids: Vec<String> = filled_legs.iter()
             .map(|o| o.trade_id.clone())
@@ -368,7 +368,7 @@ pub fn evaluate_partial_fills(
         };
     }
 
-    if total_revenue > 0.0 && total_cost == 0.0 {
+    if total_revenue > 0.0 && total_cost.abs() < 1e-9 {
         // Only SELL legs filled — unusual but possible. Revenue without cost = profit.
         return PartialFillAction::AcceptPartial {
             filled_pct,
@@ -441,6 +441,9 @@ impl Default for ExecutorConfig {
     }
 }
 
+/// HTTP client timeout in seconds.
+const HTTP_TIMEOUT_SECS: u64 = 30;
+
 /// The live order executor. Constructs, signs, and submits orders to Polymarket CLOB.
 pub struct Executor {
     config: ExecutorConfig,
@@ -459,18 +462,19 @@ impl Executor {
         signer: OrderSigner,
         instruments: Arc<InstrumentStore>,
         rate_limiter: Arc<RateLimiter>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        let http_client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+        Ok(Self {
             config,
             signer,
             instruments,
             rate_limiter,
-            http_client: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("Failed to build HTTP client"),
+            http_client,
             tracked: parking_lot::Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     /// Execute all legs of an arb opportunity.
@@ -500,11 +504,11 @@ impl Executor {
         // Log summary
         let accepted = results.iter().filter(|r| matches!(r, OrderResult::Accepted(_))).count();
         let rejected = results.len() - accepted;
-        let mode = if self.config.dry_run { "DRY-RUN" } else { "LIVE" };
+        let mode = if self.config.dry_run { "SEQ DRY-RUN" } else { "SEQ LIVE" };
 
         if all_accepted {
             tracing::info!(
-                "[{}] Arb {} executed: {}/{} legs accepted",
+                "[{}] Arb {} submitted: {}/{} legs accepted",
                 mode, position_id, accepted, results.len()
             );
         } else {
@@ -611,14 +615,14 @@ impl Executor {
         // 6. Log order details
         let side_str = if side == Side::Buy { "BUY" } else { "SELL" };
         let mode = if self.config.dry_run { "DRY-RUN" } else { "LIVE" };
-        tracing::info!(
+        tracing::debug!(
             "[{}] {} {} {} shares @ {:.4} (${:.2}) token={} neg_risk={} sig={}...{}",
             mode, side_str, self.config.order_type.as_str(),
             quantity, rounded_price, size_usd,
-            &token_id[..token_id.len().min(8)],
+            token_id.get(..8).unwrap_or(token_id),
             instrument.neg_risk,
-            &signed.signature[..10],
-            &signed.signature[signed.signature.len()-6..],
+            signed.signature.get(..10).unwrap_or(&signed.signature),
+            signed.signature.get(signed.signature.len().saturating_sub(6)..).unwrap_or(&signed.signature),
         );
 
         // 7. Submit to CLOB (or skip in dry-run mode)
@@ -710,7 +714,9 @@ impl Executor {
             .send()
             .map_err(|e| {
                 if e.is_timeout() {
-                    ExecutionError::Timeout { elapsed_secs: 30.0 }
+                    ExecutionError::Timeout {
+                        elapsed_secs: HTTP_TIMEOUT_SECS as f64,
+                    }
                 } else {
                     ExecutionError::NetworkFailure { message: e.to_string() }
                 }
@@ -743,11 +749,20 @@ impl Executor {
         }
 
         // Extract order ID from response
-        let order_id = body.get("orderID")
-            .or_else(|| body.get("order_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let order_id_value = body.get("orderID").or_else(|| body.get("order_id"));
+        let order_id = match order_id_value {
+            Some(v) => match v.as_str() {
+                Some(s) => s.to_string(),
+                None => {
+                    tracing::warn!("Malformed order response: orderID field is not a string: {:?}", v);
+                    String::new()
+                }
+            },
+            None => {
+                tracing::warn!("Malformed order response: no orderID field in response body");
+                String::new()
+            }
+        };
 
         tracing::info!("CLOB order accepted: order_id={}", order_id);
 
@@ -816,7 +831,7 @@ impl Executor {
         let timeout = self.config.confirmation_timeout_secs;
         self.tracked.lock().values()
             .filter(|o| !o.status.is_terminal()
-                && (now - o.submitted_at) > timeout)
+                && (now - o.submitted_at) >= timeout)
             .cloned()
             .collect()
     }
@@ -1075,10 +1090,11 @@ impl Executor {
                 tracing::info!(
                     "[DRY-RUN BATCH] {} {} shares @ {:.4} token={}",
                     side_str, tracked.quantity, tracked.price,
-                    &tracked.token_id[..tracked.token_id.len().min(8)],
+                    tracked.token_id.get(..8).unwrap_or(&tracked.token_id),
                 );
-                self.tracked.lock().insert(tracked.trade_id.clone(), tracked.clone());
-                results.push(OrderResult::Accepted(tracked));
+                let result = OrderResult::Accepted(tracked.clone());
+                self.tracked.lock().insert(tracked.trade_id.clone(), tracked);
+                results.push(result);
             }
             return ArbExecutionResult {
                 legs: results,
@@ -1173,8 +1189,9 @@ impl Executor {
 
                         if success && !order_id.is_empty() {
                             tracked.order_id = order_id.to_string();
-                            self.tracked.lock().insert(tracked.trade_id.clone(), tracked.clone());
-                            results.push(OrderResult::Accepted(tracked));
+                            let result = OrderResult::Accepted(tracked.clone());
+                            self.tracked.lock().insert(tracked.trade_id.clone(), tracked);
+                            results.push(result);
                         } else {
                             all_accepted = false;
                             let error_msg = entry

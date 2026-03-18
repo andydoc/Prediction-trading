@@ -60,6 +60,11 @@ pub enum NotifyEvent {
 ///
 /// For Telegram: set `webhook_url` to `https://api.telegram.org/bot<TOKEN>/sendMessage`
 /// and `phone_number` to your chat ID (get it from @userinfobot or /getUpdates).
+///
+/// S2: `webhook_url` (which contains the Telegram bot token) is stored as a plain
+/// String. Ideally this would be `SecretString` to avoid leaking into logs/debug
+/// output, but the change is too invasive for the current notification architecture.
+/// TODO: Wrap in SecretString when the notification system is refactored.
 #[derive(Clone, Debug)]
 pub struct NotifyConfig {
     pub enabled: bool,

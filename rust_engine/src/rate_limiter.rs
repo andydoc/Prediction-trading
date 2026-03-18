@@ -129,7 +129,9 @@ impl RateLimiter {
         if !self.global.lock().try_consume() {
             let wait = self.global.lock().wait_time();
             tracing::warn!("Rate limited (global): wait {:.2}s", wait);
-            // Refund the category token since we can't proceed
+            // Refund the category token since we can't proceed — the category
+            // bucket already consumed a token above, but the global bucket rejected
+            // the request, so we must restore the category token to avoid double-counting.
             match category {
                 RateCategory::Trading => self.trading.lock().tokens += 1.0,
                 RateCategory::Public => self.public.lock().tokens += 1.0,

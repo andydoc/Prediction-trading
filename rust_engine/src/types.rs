@@ -90,11 +90,13 @@ impl OrderBook {
     }
 
     /// Total ask depth in USD (with optional haircut for phantom orders).
-    pub fn ask_depth_usd(&self, haircut: f64) -> f64 {
+    /// `haircut_factor` is a multiplier in 0.0..=1.0 (e.g. 0.5 = keep 50% of depth).
+    pub fn ask_depth_usd(&self, haircut_factor: f64) -> f64 {
+        debug_assert!((0.0..=1.0).contains(&haircut_factor), "haircut_factor out of range: {}", haircut_factor);
         let raw: f64 = self.asks.iter()
             .map(|(OrderedFloat(p), &s)| p * s)
             .sum();
-        raw * haircut
+        raw * haircut_factor
     }
 
     /// Apply a full book snapshot (replaces all asks/bids).

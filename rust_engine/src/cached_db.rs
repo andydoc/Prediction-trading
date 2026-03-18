@@ -47,7 +47,9 @@ impl CachedSqliteDB {
         let db = self.mem.lock();
 
         if let Some(parent) = self.disk_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!("Failed to create directory {}: {}", parent.display(), e);
+            }
         }
 
         match Connection::open(&self.disk_path) {

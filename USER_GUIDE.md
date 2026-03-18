@@ -130,7 +130,7 @@ bash scripts/restart.sh --clean                  # Also purge stale cache
 
 Access at `http://localhost:5558` (default port). For VPS, use an SSH tunnel:
 ```bash
-ssh -L 5558:127.0.0.1:5558 root@<VPS_IP>
+ssh -L 5558:127.0.0.1:5558 vps-ubuntu
 ```
 
 ### Tabs
@@ -191,6 +191,9 @@ Each instance auto-isolates: separate database, logs, PID file, and dashboard po
 | shadow-c | Moderate | 15 | 15% |
 | shadow-d | Conservative | 10 | 20% |
 | shadow-e | Concentrated | 8 | 50% |
+| shadow-f | Fast markets (5-15 min crypto) | 50 | 5% |
+
+**Shadow-F** targets short-lived crypto price prediction markets (5-15 minute resolution). It uses aggressive timing parameters: 60s constraint rebuild interval, 60s minimum resolution time, 10s replacement cooldown, and 6-minute replacement protection. See PRODUCT_SPEC_v2.md for full parameter grid.
 
 ---
 
