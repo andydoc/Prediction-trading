@@ -147,8 +147,8 @@ The following inconsistencies were identified. These will be addressed by the do
 ```
 ✅ Milestone A: Complete Rust Port + parameterise config + docs (CHANGELOG, INCIDENT_LOG)
     |
-🔧 Milestone B: Build Execution Infrastructure + docs (ARCHITECTURE, ROADMAP)
-    |                Code-complete. All testable in shadow / dry-run / unit tests.
+✅ Milestone B: Build Execution Infrastructure + docs (ARCHITECTURE, ROADMAP)
+    |                Complete. 27/27 tasks. 44/44 tests. Shadow-verified on VPS.
     |                No funded account required.
     |
 ⬚ Milestone C: Safety Infrastructure + docs (OPS_RUNBOOK, USER_GUIDE) + retire PROGRESS_ROADMAP
@@ -292,9 +292,9 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 ---
 
-### 🔧 Milestone B: Build Execution Infrastructure
+### ✅ Milestone B: Build Execution Infrastructure
 
-**Status**: All code tasks (B2–B4) complete. B5 documentation (ARCHITECTURE.md, ROADMAP.md) remaining. 44/44 unit tests pass. Shadow mode verified on VPS (reconciliation, P&L tracking, dashboard).
+**Status**: **COMPLETE** — All 27/27 tasks done (B1–B5). 44/44 unit tests pass. Shadow mode verified on VPS. ARCHITECTURE.md and ROADMAP.md written.
 
 **Goal**: Code-complete execution path — all modules built, unit-tested, and shadow-testable. **No funded account required.** Everything in this milestone can be verified against shadow data, dry-run mode, or unit tests comparing output against known-good reference values.
 
@@ -353,8 +353,8 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| ⬚ **B5.0: Create ARCHITECTURE.md** | Post-Rust-port architecture, data flow, component descriptions, file structure (verified against repo), config reference (all parameterised values), signing design decision (type 0 EOA), instrument model, WS tier design, glossary. Current state only — not historical. |
-| ⬚ **B5.1: Create ROADMAP.md** | Phases renumbered by actual priority. Each phase: goal, status, items. Cross-references ARCHITECTURE.md. No version history or incident detail. Accurately reflects A+B as complete, C–G as remaining. |
+| ✅ **B5.0: Create ARCHITECTURE.md** | Post-Rust-port architecture, data flow, component descriptions, file structure (verified against repo), config reference (all parameterised values), signing design decision (type 0 EOA), instrument model, WS tier design, glossary. Current state only — not historical. |
+| ✅ **B5.1: Create ROADMAP.md** | Phases renumbered by actual priority. Each phase: goal, status, items. Cross-references ARCHITECTURE.md. No version history or incident detail. Accurately reflects A+B as complete, C–G as remaining. |
 
 **Verification** (as of v0.14.1): All code builds and passes 44/44 unit tests. Dry-run mode constructs, signs, and logs full order details for every "would-execute" event in shadow mode. Signature output matches py-clob-client for identical inputs. Rate limiter correctly throttles burst requests. Instrument model correctly encodes all 4 tick-size precision tiers. Reconciliation runs cleanly in shadow mode (no false alarms). Dashboard P&L charts and stats bar verified on VPS. Tier B WS connections stable at 16 with jitter v2 + biased heartbeat.
 

@@ -7,11 +7,15 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
-## [0.14.2] — 2026-03-18 — Tier B 16 Connections + Milestone B Documentation
+## [0.14.2] — 2026-03-18 — Milestone B Complete + Tier B 16 Connections
+
+### Added
+- **B5.0: ARCHITECTURE.md** — Post-Rust-port architecture: data flow diagram, component descriptions, file structure, full config reference, WS tier design, EIP-712 signing design decision, instrument model rounding table, glossary.
+- **B5.1: ROADMAP.md** — All milestones (A–G) with goal, status, and task completion counts. Cross-references ARCHITECTURE.md.
 
 ### Changed
+- **Milestone B marked COMPLETE** — all 27/27 tasks done (B1–B5). PRODUCT_SPEC_v2.md updated throughout.
 - Tier B `max_connections` increased to 16 (jitter v2 + biased heartbeat provides sufficient spread at this level).
-- PRODUCT_SPEC_v2.md: Milestone B status updated to reflect all code tasks (B2–B4) complete, 44/44 tests passing, shadow mode verified on VPS. B5 (ARCHITECTURE.md, ROADMAP.md) remaining.
 - PRODUCT_SPEC_v2.md: B4.0 documents shadow mode skip behaviour. B4.4 documents full chart/stats bar spec. WS connection budget updated for 16-conn default.
 
 ---
