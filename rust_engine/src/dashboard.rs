@@ -285,7 +285,8 @@ fn parse_entry_ts_str(s: &str) -> f64 {
     s.parse::<f64>().unwrap_or(0.0)
 }
 
-/// Format strategy for display
+/// Format strategy for display.
+/// Legacy fallback on method string — remove after all pre-v3 positions have resolved.
 fn fmt_strategy(strategy: &str, method: &str) -> String {
     if method.contains("sell") { "Mutex Sell All".into() }
     else if method.contains("buy") { "Mutex Buy All".into() }
@@ -500,7 +501,7 @@ fn build_positions(s: &DashboardState) -> Value {
             for name in &full_names {
                 if let Some(pos) = name.find("202") {
                     if name.len() >= pos + 10 {
-                        let date_str = &name[pos..pos+10];
+                        let date_str = name.get(pos..pos+10).unwrap_or("");
                         if let Ok(dt) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
                             end_date_ts = dt.and_hms_opt(23, 59, 59)
                                 .map(|ndt| ndt.and_utc().timestamp() as f64)
