@@ -38,6 +38,7 @@ pub mod signing;
 pub mod instrument;
 pub mod rate_limiter;
 pub mod executor;
+pub mod reconciliation;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -720,6 +721,39 @@ impl TradingEngine {
         }
 
         results
+    }
+
+    // === Reconciliation (B4.0/B4.1/B4.2) ===
+
+    /// Extract open position data for reconciliation comparison.
+    /// Returns Vec<(position_id, market_id, shares)> — one entry per leg.
+    fn extract_position_data(&self) -> Vec<(String, String, f64)> {
+        let pm = self.positions.lock();
+        let mut data = Vec::new();
+        for p in pm.open_positions().values() {
+            for (market_id, leg) in &p.markets {
+                data.push((p.position_id.clone(), market_id.clone(), leg.shares));
+            }
+        }
+        data
+    }
+
+    /// Run startup reconciliation (B4.1).
+    /// Called once after state is loaded from SQLite.
+    pub fn reconcile_startup(&self, escalation_threshold: f64) -> reconciliation::ReconciliationReport {
+        let positions = self.extract_position_data();
+        reconciliation::reconcile_startup(
+            &positions, &self.http_client, "https://clob.polymarket.com", escalation_threshold,
+        )
+    }
+
+    /// Run periodic reconciliation (B4.0).
+    /// Called on interval from the orchestrator tick loop.
+    pub fn reconcile_periodic(&self, escalation_threshold: f64) -> reconciliation::ReconciliationReport {
+        let positions = self.extract_position_data();
+        reconciliation::reconcile_periodic(
+            &positions, &self.http_client, "https://clob.polymarket.com", escalation_threshold,
+        )
     }
 
     // === Dashboard helpers ===

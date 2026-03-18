@@ -268,7 +268,8 @@ fn build_stats(s: &DashboardState) -> Value {
     let mut deployed = 0.0f64;
     let total_fees = pm.total_fees();
     let mut first_entry_ts = f64::MAX;
-    for p in pm.open_positions().values() {
+    let open_snapshot: Vec<crate::position::Position> = pm.open_positions().values().cloned().collect();
+    for p in &open_snapshot {
         deployed += p.total_capital;
         let ts = parse_entry_ts_str(&p.entry_timestamp);
         if ts > 0.0 && ts < first_entry_ts { first_entry_ts = ts; }
@@ -280,6 +281,25 @@ fn build_stats(s: &DashboardState) -> Value {
     }
     let total_realized = perf.get("total_actual_profit").copied().unwrap_or(0.0);
     drop(pm); // Release lock — no more position reads needed
+
+    // B4.4: Total unrealized P&L (mark-to-market across all open positions)
+    let mut total_unrealized = 0.0f64;
+    for p in &open_snapshot {
+        let cid = p.metadata.get("constraint_id").and_then(|v| v.as_str()).unwrap_or("");
+        let constraint = s.constraints.get(cid);
+        let mut sale_proceeds = 0.0f64;
+        for (mid, leg) in &p.markets {
+            let live_bid = constraint.as_ref().and_then(|c| {
+                c.markets.iter().find(|mref| mref.market_id == *mid).and_then(|mref| {
+                    let asset_id = if leg.outcome == "no" { &mref.no_asset_id } else { &mref.yes_asset_id };
+                    let bid = s.book.get_best_bid(asset_id);
+                    if bid > 0.0 { Some(bid) } else { None }
+                })
+            });
+            sale_proceeds += leg.shares * live_bid.unwrap_or(leg.entry_price);
+        }
+        total_unrealized += sale_proceeds - p.total_capital;
+    }
 
     let total_value = cap + deployed;
     let ret_pct = if init_cap > 0.0 { (total_value - init_cap) / init_cap * 100.0 } else { 0.0 };
@@ -336,6 +356,7 @@ fn build_stats(s: &DashboardState) -> Value {
         "init_cap": init_cap, "fees": total_fees, "ret_pct": ret_pct,
         "trades": trades, "open_count": open_count, "closed_count": closed_count,
         "realized": total_realized,
+        "unrealized": (total_unrealized * 100.0).round() / 100.0,
         "annualized": annualized_str, "annualized_ret": annualized_ret,
         "mode_label": s.mode.to_uppercase(), "mode_class": format!("mode-{}", s.mode),
         "first_trade": first_trade_str, "start_time": start_str,
@@ -472,6 +493,29 @@ fn build_positions(s: &DashboardState) -> Value {
             Some(json!({ "status": pp_status, "reason": pp_reason, "date": pp_date }))
         } else { None };
 
+        // B4.4: Unrealized P&L (mark-to-market) — value position at current best bids
+        let unrealized_pnl = {
+            let constraint = s.constraints.get(cid);
+            let mut sale_proceeds = 0.0f64;
+            for (mid, leg) in &p.markets {
+                let shares = leg.shares;
+                let live_bid = constraint.as_ref().and_then(|c| {
+                    c.markets.iter().find(|mref| mref.market_id == *mid).and_then(|mref| {
+                        let asset_id = if leg.outcome == "no" {
+                            &mref.no_asset_id
+                        } else {
+                            &mref.yes_asset_id
+                        };
+                        let bid = s.book.get_best_bid(asset_id);
+                        if bid > 0.0 { Some(bid) } else { None }
+                    })
+                });
+                let bid = live_bid.unwrap_or(leg.entry_price);
+                sale_proceeds += shares * bid;
+            }
+            sale_proceeds - total_cap
+        };
+
         // Guaranteed payout: compute from legs (minimum scenario payout)
         let guaranteed = if is_sell && legs.len() > 1 {
             // Sell-all: when outcome i wins YES, NO_i loses, all others pay $1/share
@@ -504,6 +548,7 @@ fn build_positions(s: &DashboardState) -> Value {
             "status": status, "postpone": postpone,
             "entry_ts": entry_ts_fmt, "legs": legs,
             "guaranteed": (guaranteed * 100.0).round() / 100.0,
+            "unrealized_pnl": (unrealized_pnl * 100.0).round() / 100.0,
             "scenarios": [],  // TODO: compute sell-arb scenarios
         }));
     }

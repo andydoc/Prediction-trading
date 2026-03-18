@@ -308,6 +308,7 @@ pub struct Orchestrator {
     last_postponement_check: f64,
     last_api_resolution_check: f64,
     last_retention_prune: f64,
+    last_reconciliation: f64,
     iteration: u64,
     recent_latencies: std::collections::VecDeque<f64>,
 
@@ -428,6 +429,7 @@ impl Orchestrator {
             last_postponement_check: 0.0,
             last_api_resolution_check: 0.0,
             last_retention_prune: 0.0,
+            last_reconciliation: 0.0,
             iteration: 0,
             recent_latencies: std::collections::VecDeque::with_capacity(MAX_LATENCY_SAMPLES),
             p95_table, p95_default,
@@ -498,6 +500,15 @@ impl Orchestrator {
 
         // 5. Load state from SQLite
         self.load_state();
+
+        // 5b. B4.1: Startup reconciliation — compare loaded positions against venue
+        if self.engine.pm_open_count() > 0 {
+            let report = self.engine.reconcile_startup(self.cfg.min_trade_size);
+            if !report.passed {
+                tracing::warn!("B4.1 startup reconciliation found {} critical discrepancies",
+                    report.critical_count());
+            }
+        }
 
         // 6. Check API for missed resolutions
         if self.cfg.shadow_only {
@@ -723,6 +734,18 @@ impl Orchestrator {
                 }
             }
             self.last_api_resolution_check = now;
+        }
+
+        // --- B4.0: Periodic reconciliation (every 5 min) ---
+        if (now - self.last_reconciliation) >= 300.0 {
+            if self.engine.pm_open_count() > 0 {
+                let report = self.engine.reconcile_periodic(self.cfg.min_trade_size);
+                if !report.passed {
+                    tracing::warn!("B4.0 reconciliation: {} critical, {} warnings",
+                        report.critical_count(), report.warning_count());
+                }
+            }
+            self.last_reconciliation = now;
         }
 
         // --- Record retention pruning (B1.2) — daily ---

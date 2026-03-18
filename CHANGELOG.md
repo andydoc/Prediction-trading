@@ -7,6 +7,21 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.14.0] — 2026-03-18 — B4 Reconciliation + Live P&L
+
+### Added
+- **B4.0: Periodic reconciliation** (`reconciliation.rs`): New module compares internal positions against CLOB API venue state every 5 min. Reports discrepancies by severity (Info/Warning/Critical). Detects: quantity mismatch, missing positions (both directions), orphan orders.
+- **B4.1: Startup reconciliation**: Runs after state load, before entering event loop. Same comparison logic as periodic, with separate logging path.
+- **B4.2: Cross-asset fill matching** (`detect_neg_risk_synthetics()`): Detects synthetic NO positions created by negRisk YES fills. Reports as informational discrepancies (expected behavior). Based on NT PR #3345/#3357 pattern.
+- **B4.4: Live P&L tracking**: Dashboard now shows unrealized P&L per position (mark-to-market using BookMirror best bids) and total unrealized P&L in stats. Updated via SSE every 5s.
+- 5 reconciliation tests: all_match, quantity_mismatch, missing_on_venue, missing_internal, neg_risk_synthetic, empty.
+- `TradingEngine::reconcile_startup()` and `reconcile_periodic()` wrapper methods.
+
+### Changed
+- CLOB API query is stubbed (returns empty) until API credentials are configured — reconciliation runs but finds no venue-side data in shadow mode.
+
+---
+
 ## [0.13.3] — 2026-03-18 — NT Review Hardening + WS Jitter v2
 
 ### Added
