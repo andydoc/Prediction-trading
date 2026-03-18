@@ -46,6 +46,7 @@ pub mod gas_monitor;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use book::BookMirror;
 use queue::EvalQueue;
@@ -90,6 +91,8 @@ pub struct TradingEngine {
     resolved_events: Arc<parking_lot::Mutex<Vec<ws::ResolvedEvent>>>,
     /// Instrument store — token_id → Instrument (tick_size, rounding, neg_risk, etc.)
     pub instruments: Arc<InstrumentStore>,
+    /// C2: Kill switch flag — shared with dashboard, read by orchestrator.
+    pub kill_switch: Arc<AtomicBool>,
 }
 
 impl TradingEngine {
@@ -202,6 +205,7 @@ impl TradingEngine {
 
         let resolved_events = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let instruments = Arc::new(InstrumentStore::new());
+        let kill_switch = Arc::new(AtomicBool::new(false));
 
         Ok(Self {
             book, eval_queue, ws, constraints, instruments,
@@ -218,6 +222,7 @@ impl TradingEngine {
             monitor,
             log_ring,
             resolved_events,
+            kill_switch,
         })
     }
 
@@ -254,6 +259,7 @@ impl TradingEngine {
                 latency: Arc::clone(&self.latency),
                 monitor: Arc::clone(&self.monitor),
                 log_ring: Arc::clone(&self.log_ring),
+                kill_switch: Arc::clone(&self.kill_switch),
             };
             let bind_addr = dashboard_bind.to_string();
             self.runtime.spawn(async move {

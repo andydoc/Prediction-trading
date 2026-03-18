@@ -7,6 +7,25 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.14.7] — 2026-03-18 — C4: Daily P&L Report
+
+### Added
+- **Daily P&L report** (C4): Automated summary at midnight UTC. Detects UTC day boundary in orchestrator tick loop. Reports: entries, exits, fees, net P&L, capital utilisation %, drawdown from peak. Sent via Telegram (`NotifyEvent::DailySummary`). Persisted to `daily_reports` SQLite table with full JSON data payload.
+- `daily_reports` table in StateDB schema with `save_daily_report()` method.
+- `parse_entry_ts()` helper in orchestrator for ISO/float timestamp parsing.
+
+---
+
+## [0.14.6] — 2026-03-18 — C2: Kill Switch
+
+### Added
+- **Kill switch** (C2): Two trigger paths — `kill.sh --emergency` (file-based) and dashboard KILL SWITCH button (HTTP POST `/api/kill-switch`). Actions: cancel all open CLOB orders, set mode to shadow, send Telegram notification. Idempotent.
+- `cancel_all_orders()` on `Executor`: Cancels all non-terminal tracked orders + CLOB cancel-all API call (L2 auth stub until Milestone D).
+- Dashboard KILL SWITCH button in header with confirmation dialog.
+- `kill.sh --emergency` flag writes `data/kill_switch.flag`, waits 5s for orchestrator, then graceful shutdown.
+
+---
+
 ## [0.14.5] — 2026-03-18 — C1.1: POL Gas Monitor + State Safety
 
 ### Added

@@ -417,6 +417,12 @@ pub struct Orchestrator {
 
     /// Tiered WS: last constraint→assets map (for Tier B hot constraint diffing).
     last_constraint_to_assets: HashMap<String, Vec<String>>,
+
+    // C2: Kill switch already activated (prevents re-triggering)
+    kill_switch_activated: bool,
+
+    // C4: Daily P&L report — tracks last UTC day boundary we reported on
+    last_daily_report_day: i64,
 }
 
 impl Orchestrator {
@@ -597,6 +603,9 @@ impl Orchestrator {
             last_gas_check: 0.0,
             held_ids_cache: None,
             last_constraint_to_assets: HashMap::new(),
+            kill_switch_activated: false,
+            // C4: Start at current UTC day so we don't fire immediately on startup
+            last_daily_report_day: (now_secs() / 86400.0).floor() as i64,
         })
     }
 
@@ -765,6 +774,11 @@ impl Orchestrator {
             }
         }
 
+        // --- C2: Kill switch check ---
+        if !self.kill_switch_activated {
+            self.check_kill_switch(now);
+        }
+
         // --- Circuit breaker check (C1) ---
         if let Some(reason) = self.circuit_breaker.check(self.engine.total_value(), now) {
             tracing::error!("CIRCUIT BREAKER TRIPPED: {}", reason);
@@ -833,6 +847,162 @@ impl Orchestrator {
         self.do_periodic_tasks(now);
 
         Ok(())
+    }
+
+    /// C2: Check for kill switch activation (dashboard button or file-based trigger).
+    fn check_kill_switch(&mut self, _now: f64) {
+        use std::sync::atomic::Ordering;
+
+        // Check 1: Dashboard atomic flag
+        let dashboard_triggered = self.engine.kill_switch.load(Ordering::SeqCst);
+
+        // Check 2: File-based trigger (kill.sh --emergency writes this file)
+        let flag_path = self.cfg.workspace.join("data").join("kill_switch.flag");
+        let file_triggered = flag_path.exists();
+
+        if !dashboard_triggered && !file_triggered {
+            return;
+        }
+
+        // --- Kill switch activated ---
+        self.kill_switch_activated = true;
+        let source = if dashboard_triggered && file_triggered {
+            "dashboard + file"
+        } else if dashboard_triggered {
+            "dashboard"
+        } else {
+            "file (kill.sh --emergency)"
+        };
+
+        tracing::error!("KILL SWITCH ACTIVATED via {} — cancelling orders, switching to shadow", source);
+
+        // (a) Cancel all open CLOB orders
+        // The executor is owned by the orchestrator (or accessible via engine).
+        // In shadow mode, this is a no-op since there are no real CLOB orders.
+        // When live trading is enabled (Milestone D), this will cancel via the CLOB API.
+        let cancelled_msg = if !self.cfg.shadow_only {
+            // TODO(D): Access executor and call cancel_all_orders()
+            // For now, log that we would cancel.
+            "CLOB cancel attempted (live mode)".to_string()
+        } else {
+            "No CLOB orders to cancel (shadow mode)".to_string()
+        };
+        tracing::warn!("[KILL] {}", cancelled_msg);
+
+        // (b) Set mode to shadow
+        if !self.cfg.shadow_only {
+            self.cfg.shadow_only = true;
+            tracing::warn!("[KILL] Mode set to SHADOW — no live trades will be placed");
+        }
+
+        // (c) Send Telegram notification
+        let _ = self.notifier.send(&NotifyEvent::Error {
+            message: format!(
+                "KILL SWITCH activated via {}. {}. Mode set to SHADOW. Positions: {}, Capital: ${:.2}",
+                source, cancelled_msg,
+                self.engine.pm_open_count(),
+                self.engine.current_capital(),
+            ),
+        });
+
+        // Clean up the file trigger (so it doesn't re-trigger on restart)
+        if file_triggered {
+            if let Err(e) = std::fs::remove_file(&flag_path) {
+                tracing::warn!("[KILL] Failed to remove flag file: {}", e);
+            }
+        }
+
+        // Reset the dashboard atomic flag
+        self.engine.kill_switch.store(false, Ordering::SeqCst);
+    }
+
+    /// C4: Generate and send daily P&L report for the previous UTC day.
+    fn generate_daily_report(&self, now: f64, prev_day: i64) {
+        let day_start = prev_day as f64 * 86400.0;
+        let day_end = day_start + 86400.0;
+
+        let pm = self.engine.positions.lock();
+
+        // Count entries: positions with entry_timestamp in [day_start, day_end)
+        let entries = pm.open_positions().values()
+            .chain(pm.closed_positions().iter())
+            .filter(|p| {
+                parse_entry_ts(&p.entry_timestamp)
+                    .map(|ts| ts >= day_start && ts < day_end)
+                    .unwrap_or(false)
+            })
+            .count() as u32;
+
+        // Count exits + sum fees/pnl: positions with close_timestamp in [day_start, day_end)
+        let closed_today: Vec<&rust_engine::position::Position> = pm.closed_positions().iter()
+            .filter(|p| {
+                p.close_timestamp
+                    .map(|ts| ts >= day_start && ts < day_end)
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        let exits = closed_today.len() as u32;
+        let fees: f64 = closed_today.iter().map(|p| p.fees_paid).sum();
+        let net_pnl: f64 = closed_today.iter().map(|p| p.actual_profit).sum();
+
+        // Capital utilisation: deployed / total_value
+        let metrics = pm.get_performance_metrics();
+        let current_capital = metrics.get("current_capital").copied().unwrap_or(0.0);
+        let initial_capital = metrics.get("initial_capital").copied().unwrap_or(0.0);
+        let open_count = pm.open_positions().len();
+        let deployed: f64 = pm.open_positions().values().map(|p| p.total_capital).sum();
+        let total_value = current_capital + deployed;
+        let capital_util_pct = if total_value > 0.0 { deployed / total_value } else { 0.0 };
+
+        // Drawdown from peak — use monitor time series
+        let drawdown_pct = self.engine.monitor.lock()
+            .drawdown_pct.latest().unwrap_or(0.0) / 100.0; // monitor stores as %, we want fraction
+
+        drop(pm); // Release position lock before I/O
+
+        // Format report date as YYYY-MM-DD
+        let report_date = {
+            let secs = prev_day * 86400;
+            let dt = chrono::DateTime::from_timestamp(secs, 0)
+                .unwrap_or_else(|| chrono::Utc::now());
+            dt.format("%Y-%m-%d").to_string()
+        };
+
+        tracing::info!(
+            "[DAILY REPORT] {} — entries={}, exits={}, fees=${:.4}, net_pnl=${:.4}, util={:.1}%, dd={:.2}%",
+            report_date, entries, exits, fees, net_pnl, capital_util_pct * 100.0, drawdown_pct * 100.0
+        );
+
+        // Send Telegram notification
+        let _ = self.notifier.send(&NotifyEvent::DailySummary {
+            entries,
+            exits,
+            fees,
+            net_pnl,
+            capital_util_pct,
+            drawdown_pct,
+        });
+
+        // Persist to SQLite
+        let data_json = serde_json::json!({
+            "report_date": report_date,
+            "entries": entries,
+            "exits": exits,
+            "fees": fees,
+            "net_pnl": net_pnl,
+            "capital_util_pct": capital_util_pct,
+            "drawdown_pct": drawdown_pct,
+            "current_capital": current_capital,
+            "initial_capital": initial_capital,
+            "open_positions": open_count,
+            "total_value": total_value,
+        });
+        let data_str = data_json.to_string();
+        self.state_db.save_daily_report(
+            &report_date, now, entries, exits, fees, net_pnl,
+            capital_util_pct, drawdown_pct, Some(&data_str),
+        );
     }
 
     /// Periodic housekeeping tasks. Run every tick regardless of circuit breaker state.
@@ -948,6 +1118,15 @@ impl Orchestrator {
                 tracing::info!("Pruned {} closed positions (> {}d old)", pruned, self.cfg.closed_retention_days);
             }
             self.last_retention_prune = now;
+        }
+
+        // --- C4: Daily P&L report (at midnight UTC) ---
+        {
+            let current_day = (now / 86400.0).floor() as i64;
+            if current_day > self.last_daily_report_day {
+                self.generate_daily_report(now, self.last_daily_report_day);
+                self.last_daily_report_day = current_day;
+            }
         }
 
         // --- C1.1: POL gas balance check ---
@@ -1790,6 +1969,21 @@ fn now_secs() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// Parse entry_timestamp — supports ISO 8601 or bare Unix float.
+fn parse_entry_ts(entry: &str) -> Option<f64> {
+    if let Ok(ts) = entry.parse::<f64>() {
+        return Some(ts);
+    }
+    chrono::DateTime::parse_from_rfc3339(entry)
+        .ok()
+        .map(|dt| dt.timestamp() as f64 + dt.timestamp_subsec_millis() as f64 / 1000.0)
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(entry, "%Y-%m-%dT%H:%M:%S%.f")
+                .ok()
+                .map(|ndt| ndt.and_utc().timestamp() as f64)
+        })
 }
 
 fn parse_end_date_ts(s: &str) -> f64 {

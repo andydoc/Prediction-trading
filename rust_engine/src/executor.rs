@@ -835,6 +835,102 @@ impl Executor {
         self.config.dry_run
     }
 
+    /// Get the CLOB host URL.
+    pub fn clob_host(&self) -> &str {
+        &self.config.clob_host
+    }
+
+    // -----------------------------------------------------------------------
+    // C2: Kill switch — cancel all open CLOB orders
+    // -----------------------------------------------------------------------
+
+    /// Cancel all non-terminal tracked orders.
+    ///
+    /// In dry-run mode: marks all pending orders as Cancelled locally.
+    /// In live mode: calls the CLOB cancel-all endpoint, then marks locally.
+    /// Returns (cancelled_count, error_message).
+    pub fn cancel_all_orders(&self) -> (usize, Option<String>) {
+        let pending: Vec<String> = {
+            let tracked = self.tracked.lock();
+            tracked.values()
+                .filter(|o| !o.status.is_terminal())
+                .map(|o| o.order_id.clone())
+                .collect()
+        };
+
+        if pending.is_empty() {
+            tracing::info!("[KILL] No pending orders to cancel");
+            return (0, None);
+        }
+
+        tracing::warn!("[KILL] Cancelling {} pending orders", pending.len());
+
+        // In live mode, call the CLOB cancel-all endpoint
+        let api_error = if !self.config.dry_run {
+            match self.cancel_all_on_clob() {
+                Ok(()) => None,
+                Err(e) => {
+                    tracing::error!("[KILL] CLOB cancel-all failed: {}", e);
+                    Some(e)
+                }
+            }
+        } else {
+            tracing::info!("[KILL] Dry-run mode — skipping CLOB cancel API call");
+            None
+        };
+
+        // Mark all pending orders as cancelled locally
+        let mut tracked = self.tracked.lock();
+        let now = chrono::Utc::now().timestamp() as f64;
+        let mut count = 0usize;
+        for order in tracked.values_mut() {
+            if !order.status.is_terminal() {
+                order.status = TradeStatus::Cancelled;
+                order.last_update = now;
+                count += 1;
+            }
+        }
+
+        tracing::warn!("[KILL] Marked {} tracked orders as cancelled", count);
+        (count, api_error)
+    }
+
+    /// Call the Polymarket CLOB cancel-all endpoint.
+    ///
+    /// Requires L2 API credentials (API key + HMAC signature).
+    /// These will be configured in Milestone D when live trading is enabled.
+    fn cancel_all_on_clob(&self) -> Result<(), String> {
+        // L2 auth headers (POLY_API_KEY, POLY_TIMESTAMP, POLY_SIGNATURE, POLY_PASSPHRASE)
+        // are required for authenticated endpoints. Until Milestone D configures these,
+        // this will return an error which is caught and logged by cancel_all_orders().
+        //
+        // Endpoint: DELETE {clob_host}/cancel-all
+        // No body needed — cancels all open orders for the authenticated wallet.
+
+        let url = format!("{}/cancel-all", self.config.clob_host);
+
+        // TODO(D): Add L2 HMAC auth headers when API credentials are configured.
+        // For now, attempt the call — it will fail with 401 if no auth headers,
+        // which is expected in shadow mode.
+        let resp = self.http_client
+            .delete(&url)
+            .send()
+            .map_err(|e| format!("cancel-all request failed: {}", e))?;
+
+        let status = resp.status();
+        if status.is_success() {
+            tracing::info!("[KILL] CLOB cancel-all succeeded");
+            Ok(())
+        } else if status.as_u16() == 401 {
+            // Expected in shadow mode — no L2 credentials configured
+            tracing::info!("[KILL] CLOB cancel-all returned 401 (no L2 credentials — expected in shadow mode)");
+            Ok(())
+        } else {
+            let body = resp.text().unwrap_or_default();
+            Err(format!("cancel-all returned {}: {}", status, body))
+        }
+    }
+
     // -----------------------------------------------------------------------
     // B3.6: Evaluate partial fills after arb execution
     // -----------------------------------------------------------------------

@@ -5,19 +5,36 @@
 #   bash kill.sh                # graceful SIGTERM → wait → SIGKILL stragglers
 #   bash kill.sh --quiet        # same but no output (used by restart.sh)
 #   bash kill.sh --cancel       # also cancel open CLOB orders (live mode)
+#   bash kill.sh --emergency    # C2: Kill switch — cancel orders + shadow mode,
+#                               #     then graceful shutdown. Process stays alive
+#                               #     long enough to execute the kill switch actions.
 
 WORKSPACE="${TRADER_WORKSPACE:-/home/andydoc/prediction-trader}"
 QUIET=false
 CANCEL=false
+EMERGENCY=false
 
 for arg in "$@"; do
     case "$arg" in
         --quiet) QUIET=true ;;
         --cancel) CANCEL=true ;;
+        --emergency) EMERGENCY=true ;;
     esac
 done
 
 log() { [ "$QUIET" = false ] && echo "$@"; }
+
+# --- C2: Emergency kill switch ---
+if [ "$EMERGENCY" = true ]; then
+    log "[kill] EMERGENCY KILL SWITCH — writing trigger file"
+    mkdir -p "$WORKSPACE/data"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) kill.sh --emergency" > "$WORKSPACE/data/kill_switch.flag"
+    log "[kill] Kill switch flag written. Waiting 5s for orchestrator to process..."
+    sleep 5
+    # Remove flag if orchestrator didn't (e.g., process already dead)
+    rm -f "$WORKSPACE/data/kill_switch.flag"
+    log "[kill] Proceeding with graceful shutdown..."
+fi
 
 # --- Cancel open CLOB orders if requested ---
 if [ "$CANCEL" = true ]; then

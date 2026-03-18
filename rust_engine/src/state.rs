@@ -32,6 +32,17 @@ const STATE_SCHEMA: &str = "
         pct_over_24h REAL NOT NULL DEFAULT 0,
         updated_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS daily_reports (
+        report_date TEXT PRIMARY KEY,
+        timestamp REAL NOT NULL,
+        entries INTEGER NOT NULL DEFAULT 0,
+        exits INTEGER NOT NULL DEFAULT 0,
+        fees REAL NOT NULL DEFAULT 0,
+        net_pnl REAL NOT NULL DEFAULT 0,
+        capital_util_pct REAL NOT NULL DEFAULT 0,
+        drawdown_pct REAL NOT NULL DEFAULT 0,
+        data TEXT
+    );
 ";
 
 pub struct StateDB {
@@ -248,6 +259,31 @@ impl StateDB {
         }
     }
 
+    // --- Daily reports (C4) ---
+
+    /// Save a daily report. Upserts by report_date (YYYY-MM-DD).
+    pub fn save_daily_report(
+        &self,
+        report_date: &str,
+        timestamp: f64,
+        entries: u32,
+        exits: u32,
+        fees: f64,
+        net_pnl: f64,
+        capital_util_pct: f64,
+        drawdown_pct: f64,
+        data_json: Option<&str>,
+    ) {
+        let db = self.db.conn();
+        let _ = db.execute(
+            "INSERT OR REPLACE INTO daily_reports \
+             (report_date, timestamp, entries, exits, fees, net_pnl, capital_util_pct, drawdown_pct, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![report_date, timestamp, entries, exits, fees, net_pnl, capital_util_pct, drawdown_pct, data_json],
+        );
+        *self.dirty_count.lock() += 1;
+    }
+
     // --- Disk persistence ---
 
     /// Atomic backup of in-memory DB to disk. Returns elapsed ms.
@@ -272,6 +308,17 @@ impl StateDB {
                 p75_hours REAL NOT NULL DEFAULT 0,
                 pct_over_24h REAL NOT NULL DEFAULT 0,
                 updated_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS daily_reports (
+                report_date TEXT PRIMARY KEY,
+                timestamp REAL NOT NULL,
+                entries INTEGER NOT NULL DEFAULT 0,
+                exits INTEGER NOT NULL DEFAULT 0,
+                fees REAL NOT NULL DEFAULT 0,
+                net_pnl REAL NOT NULL DEFAULT 0,
+                capital_util_pct REAL NOT NULL DEFAULT 0,
+                drawdown_pct REAL NOT NULL DEFAULT 0,
+                data TEXT
             );
         ");
 

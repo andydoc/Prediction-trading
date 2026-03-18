@@ -9,6 +9,7 @@
 ///                   system(10s), closed(60s)
 ///   GET /state    → JSON snapshot of full execution state
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use axum::{Router, Json, response::{Html, Sse, sse}};
 use axum::extract::State;
@@ -47,6 +48,8 @@ pub struct DashboardState {
     pub monitor: Arc<Mutex<MonitorState>>,
     /// Separate log ring buffer (avoids monitor lock contention)
     pub log_ring: Arc<Mutex<crate::monitor::LogRing>>,
+    /// C2: Kill switch flag — set by POST /api/kill-switch, read by orchestrator
+    pub kill_switch: Arc<AtomicBool>,
 }
 
 /// Metrics updated by the Rust orchestrator each stats cycle.
@@ -79,6 +82,7 @@ pub async fn start(state: DashboardState, port: u16, bind_addr: &str) {
         .route("/", axum::routing::get(handle_html))
         .route("/stream", axum::routing::get(handle_sse))
         .route("/state", axum::routing::get(handle_state))
+        .route("/api/kill-switch", axum::routing::post(handle_kill_switch))
         .with_state(Arc::new(state));
 
     let addr = format!("{}:{}", bind_addr, port);
@@ -109,6 +113,20 @@ async fn handle_html(State(s): State<Arc<DashboardState>>) -> Html<String> {
 
 async fn handle_state(State(s): State<Arc<DashboardState>>) -> Json<Value> {
     Json(build_state_snapshot(&s))
+}
+
+/// C2: Kill switch endpoint — POST /api/kill-switch
+/// Sets the atomic flag that the orchestrator checks each tick.
+/// Idempotent: returns success even if already triggered.
+async fn handle_kill_switch(State(s): State<Arc<DashboardState>>) -> Json<Value> {
+    let was_set = s.kill_switch.swap(true, Ordering::SeqCst);
+    if was_set {
+        tracing::warn!("[KILL] Kill switch triggered via dashboard (already active)");
+        Json(json!({"status": "ok", "message": "Kill switch already active"}))
+    } else {
+        tracing::error!("[KILL] Kill switch triggered via dashboard");
+        Json(json!({"status": "ok", "message": "Kill switch activated"}))
+    }
 }
 
 async fn handle_sse(
