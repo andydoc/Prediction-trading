@@ -9,7 +9,7 @@
 /// The pool distributes assets across connections, keeping each under max_assets_per_connection.
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -69,6 +69,8 @@ pub struct PoolConfig {
 struct ManagedConnection {
     _handle: JoinHandle<()>,
     subscribed: Arc<Mutex<HashSet<String>>>,
+    /// Atomic mirror of subscribed.len() — used for stats to avoid locking subscribed.
+    subscribed_count: Arc<AtomicUsize>,
     cmd_tx: mpsc::Sender<SubCommand>,
 }
 
@@ -197,6 +199,7 @@ impl ConnectionPool {
                     for id in &batch {
                         sub.insert(id.clone());
                     }
+                    conn.subscribed_count.store(sub.len(), Ordering::Relaxed);
                 }
 
                 // Send subscribe command to the connection task
@@ -233,9 +236,9 @@ impl ConnectionPool {
             }
         }
 
-        // Update stats
+        // Update stats using atomic counters (avoids nested lock on subscribed)
         let total: u64 = self.connections.lock().iter()
-            .map(|c| c.subscribed.lock().len() as u64)
+            .map(|c| c.subscribed_count.load(Ordering::Relaxed) as u64)
             .sum();
         self.stats.assets_subscribed.store(total, Ordering::Relaxed);
     }
@@ -267,15 +270,16 @@ impl ConnectionPool {
                 for id in &ids {
                     sub.remove(id);
                 }
+                conns[idx].subscribed_count.store(sub.len(), Ordering::Relaxed);
             }
             if let Err(e) = conns[idx].cmd_tx.try_send(SubCommand::Unsubscribe(ids)) {
                     tracing::warn!("SubCommand channel full or closed: {}", e);
                 }
         }
 
-        // Update stats
+        // Update stats using atomic counters (avoids nested lock on subscribed)
         let total: u64 = conns.iter()
-            .map(|c| c.subscribed.lock().len() as u64)
+            .map(|c| c.subscribed_count.load(Ordering::Relaxed) as u64)
             .sum();
         self.stats.assets_subscribed.store(total, Ordering::Relaxed);
     }
@@ -423,6 +427,7 @@ impl ConnectionPool {
     fn spawn_connection(&self, idx: usize, initial_assets: Vec<String>, rt: &tokio::runtime::Handle) {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let subscribed = Arc::new(Mutex::new(initial_assets.iter().cloned().collect::<HashSet<_>>()));
+        let subscribed_count = Arc::new(AtomicUsize::new(initial_assets.len()));
 
         let tier = self.tier;
         let config = self.config.clone();
@@ -450,6 +455,7 @@ impl ConnectionPool {
         self.connections.lock().push(ManagedConnection {
             _handle: handle,
             subscribed,
+            subscribed_count,
             cmd_tx,
         });
     }

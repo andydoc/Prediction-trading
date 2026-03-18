@@ -1,6 +1,33 @@
 /// Pure Rust arb math — extracted from rust_arb, no PyO3 dependencies.
 /// Used by evaluate_batch() to run the entire hot path in Rust.
 
+/// Constraint type enum — replaces string-based dispatch for type safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintType {
+    Mutex,
+    Complementary,
+    LogicalImplication,
+}
+
+impl ConstraintType {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "mutual_exclusivity" | "mutex" => Some(Self::Mutex),
+            "complementary" => Some(Self::Complementary),
+            "logical_implication" => Some(Self::LogicalImplication),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mutex => "mutex",
+            Self::Complementary => "complementary",
+            Self::LogicalImplication => "logical_implication",
+        }
+    }
+}
+
 /// Minimum price sum to consider mutex arb (filters garbage data).
 const MIN_PRICE_SUM_THRESHOLD: f64 = 0.899;
 /// Maximum markets for polytope optimization.
@@ -101,21 +128,17 @@ pub fn check_mutex_arb(
 }
 
 /// Build valid outcome scenarios for a constraint type.
-/// Build valid outcome scenarios for a constraint type.
-/// P12: String-based dispatch is acceptable at current scale — the set of constraint
-/// types is small and stable. Converting to an enum would be invasive with no
-/// meaningful performance benefit.
-fn build_scenarios(n: usize, constraint_type: &str, implications: &[(usize, usize)]) -> Vec<Vec<f64>> {
+fn build_scenarios(n: usize, constraint_type: ConstraintType, implications: &[(usize, usize)]) -> Vec<Vec<f64>> {
     match constraint_type {
-        "mutual_exclusivity" | "mutex" => {
+        ConstraintType::Mutex => {
             (0..n).map(|i| { let mut r = vec![0.0; n]; r[i] = 1.0; r }).collect()
         }
-        "complementary" => {
+        ConstraintType::Complementary => {
             let mut s: Vec<Vec<f64>> = (0..n).map(|i| { let mut r = vec![0.0; n]; r[i] = 1.0; r }).collect();
             if n > 2 { s.push(vec![0.0; n]); }
             s
         }
-        "logical_implication" => {
+        ConstraintType::LogicalImplication => {
             let total = 1usize << n;
             let mut scenarios = Vec::new();
             for mask in 0..total {
@@ -125,10 +148,6 @@ fn build_scenarios(n: usize, constraint_type: &str, implications: &[(usize, usiz
             }
             scenarios
         }
-        _ => {
-            let total = 1usize << n;
-            (0..total).map(|mask| (0..n).map(|bit| if mask & (1 << bit) != 0 { 1.0 } else { 0.0 }).collect()).collect()
-        }
     }
 }
 
@@ -136,7 +155,7 @@ fn build_scenarios(n: usize, constraint_type: &str, implications: &[(usize, usiz
 pub fn polytope_arb(
     market_ids: &[String],
     yes_prices: &[f64],
-    constraint_type: &str,
+    constraint_type: ConstraintType,
     capital: f64,
     fee_rate: f64,
     min_profit: f64,
@@ -155,7 +174,7 @@ pub fn polytope_arb(
     //   - mutex: price_sum must be >= 0.90 (tighter filter for the common case)
     //   - all types: price_sum must be in [0.30, 1.40] (rejects garbage data)
     //   - 2-market: additional floor at 0.80 (2-market arbs need stronger signal)
-    if (ct == "mutual_exclusivity" || ct == "mutex") && price_sum < 0.90 { return None; }
+    if ct == ConstraintType::Mutex && price_sum < 0.90 { return None; }
     if price_sum < 0.30 || price_sum > 1.40 { return None; }
     if n == 2 && price_sum < 0.80 { return None; }
 
@@ -221,7 +240,7 @@ pub fn polytope_arb(
         profit_pct, net_profit, gross_profit, fees, price_sum,
         neg_risk: false, bets,
         no_price_sum: None, collateral_per_unit: None, capital_efficiency: None,
-        constraint_type: Some(constraint_type.to_string()),
+        constraint_type: Some(constraint_type.as_str().to_string()),
         n_scenarios: Some(scenarios.len()),
     })
 }

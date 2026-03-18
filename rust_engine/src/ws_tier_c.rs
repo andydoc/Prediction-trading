@@ -159,6 +159,8 @@ impl TierC {
     /// Buffer a new market event. Call this from the message handler
     /// when `event_type == "new_market"` is received.
     pub fn buffer_new_market(&self, event: NewMarketEvent) {
+        // Lock ordering: always acquire new_market_buffer before buffer_start.
+        // This is the only acquisition site for both locks, so no deadlock risk.
         let mut buf = self.new_market_buffer.lock();
         let mut start = self.buffer_start.lock();
 
@@ -172,10 +174,11 @@ impl TierC {
             *start = Some(now);
         }
 
-        // S4: Cap buffer size to prevent unbounded memory growth from event floods
+        // S4: Cap buffer size to prevent unbounded memory growth from event floods.
+        // Reject new events at capacity rather than clearing (which would drop unprocessed events).
         if buf.len() >= 10_000 {
-            buf.clear();
-            tracing::warn!("Event buffer overflow — flushed");
+            tracing::warn!("Event buffer at capacity (10,000) — dropping new event: {}", event.question);
+            return;
         }
 
         tracing::info!("Tier C: new market event: {} (event: {})",
@@ -359,22 +362,21 @@ pub fn parse_new_market_event(msg: &Value) -> Option<NewMarketEvent> {
 /// }
 /// ```
 pub fn parse_market_resolved_event(msg: &Value) -> Option<ResolvedEvent> {
-    let market_cid = msg.get("id")
-        .or_else(|| msg.get("market"))
-        .or_else(|| msg.get("condition_id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    // Helper: extract non-empty string or None (avoids empty-string sentinels)
+    fn non_empty(v: Option<&Value>) -> Option<&str> {
+        v.and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+    }
 
-    let asset_id = msg.get("winning_asset_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_else(|| {
-            // Fallback to old format
-            msg.get("asset_id").and_then(|v| v.as_str()).unwrap_or("")
-        });
+    let market_cid = non_empty(msg.get("id"))
+        .or_else(|| non_empty(msg.get("market")))
+        .or_else(|| non_empty(msg.get("condition_id")));
+
+    let asset_id = non_empty(msg.get("winning_asset_id"))
+        .or_else(|| non_empty(msg.get("asset_id")));
 
     // B15: If both identifiers are missing, we cannot match this event to any position.
     // Log a warning so resolution data loss is visible in logs.
-    if market_cid.is_empty() && asset_id.is_empty() {
+    if market_cid.is_none() && asset_id.is_none() {
         tracing::warn!("market_resolved event missing both market_cid and asset_id — dropping");
         return None;
     }
@@ -384,9 +386,12 @@ pub fn parse_market_resolved_event(msg: &Value) -> Option<ResolvedEvent> {
         .unwrap_or_default()
         .as_secs_f64();
 
+    // Note: ResolvedEvent uses String (not Option<String>) for market_cid/asset_id
+    // because the struct is widely referenced. Empty string still means "not present"
+    // but the None guard above ensures at least one is populated.
     Some(ResolvedEvent {
-        market_cid: market_cid.to_string(),
-        asset_id: asset_id.to_string(),
+        market_cid: market_cid.unwrap_or("").to_string(),
+        asset_id: asset_id.unwrap_or("").to_string(),
         timestamp: ts,
     })
 }

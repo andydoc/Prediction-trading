@@ -213,9 +213,10 @@ pub fn evaluate_batch(
         );
 
         // If no direct arb, try polytope (catches partial hedges)
-        if result.is_none() && constraint.constraint_type == "mutex" {
+        let ct = arb::ConstraintType::from_str(&constraint.constraint_type);
+        if result.is_none() && ct == Some(arb::ConstraintType::Mutex) {
             result = arb::polytope_arb(
-                &market_ids, &yes_prices, &constraint.constraint_type,
+                &market_ids, &yes_prices, ct.unwrap(),
                 config.capital, config.fee_rate,
                 config.min_profit_threshold, config.max_profit_threshold,
                 &constraint.implications, config.max_fw_iter,
@@ -223,12 +224,9 @@ pub fn evaluate_batch(
         }
 
         if let Some(arb) = result {
-            // P2: These HashMap clones are acceptable at current scale — evaluate_batch
-            // processes at most a few dozen constraints per tick, so the allocation
-            // overhead is negligible vs. the WS/arb math cost.
-            let mut current_prices = HashMap::new();
-            let mut current_no_prices = HashMap::new();
-            let mut optimal_bets = HashMap::new();
+            let mut current_prices = HashMap::with_capacity(market_ids.len());
+            let mut current_no_prices = HashMap::with_capacity(market_ids.len());
+            let mut optimal_bets = HashMap::with_capacity(arb.bets.len());
             for (mid, bet) in &arb.bets {
                 optimal_bets.insert(mid.clone(), *bet);
             }

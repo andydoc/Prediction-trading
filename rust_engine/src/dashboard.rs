@@ -234,6 +234,27 @@ fn build_state_snapshot(s: &DashboardState) -> Value {
     })
 }
 
+/// Compute guaranteed (minimum-scenario) payout from leg payouts.
+/// For sell-all: when outcome i wins, leg i is lost, all others pay out.
+/// For buy-all: each leg pays if it wins, guaranteed = min across legs.
+fn compute_guaranteed_payout(legs: &[Value], is_sell: bool, fallback: f64) -> f64 {
+    if is_sell && legs.len() > 1 {
+        let share_vals: Vec<f64> = legs.iter()
+            .map(|l| l["payout"].as_f64().unwrap_or(0.0))
+            .collect();
+        let total_shares: f64 = share_vals.iter().sum();
+        share_vals.iter()
+            .map(|s| total_shares - s)
+            .fold(f64::MAX, f64::min)
+    } else if !is_sell && !legs.is_empty() {
+        legs.iter()
+            .map(|l| l["payout"].as_f64().unwrap_or(0.0))
+            .fold(f64::MAX, f64::min)
+    } else {
+        fallback
+    }
+}
+
 fn fmt_ts(ts: f64) -> String {
     if ts <= 0.0 { return "?".into(); }
     chrono::DateTime::from_timestamp(ts as i64, 0)
@@ -249,12 +270,18 @@ fn fmt_ts_sec(ts: f64) -> String {
 }
 
 /// Parse entry_timestamp from a string (ISO or Unix float).
+///
+/// Two formats exist because legacy positions (imported from Python-era state) store
+/// entry_timestamp as a Unix float (e.g. "1773397067.088904"), while newer positions
+/// created by the Rust engine use ISO 8601 / RFC 3339 (e.g. "2026-03-17T12:00:00Z").
+/// Both must be supported to correctly display positions across engine upgrades.
+/// Returns 0.0 if the string is unparseable.
 fn parse_entry_ts_str(s: &str) -> f64 {
-    // Try ISO first
+    // Try ISO first (newer format)
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return dt.timestamp() as f64;
     }
-    // Try Unix float string like "1773397067.088904"
+    // Fallback: Unix float string (legacy format)
     s.parse::<f64>().unwrap_or(0.0)
 }
 
@@ -362,8 +389,8 @@ fn build_stats(s: &DashboardState) -> Value {
                 format!("{}{:.1}% <span style=\"font-size:0.7em\">({} data)</span>", sign, abs_val, period_label)
             } else {
                 let sign = if annualized_ret < 0.0 { "-" } else { "+" };
-                let exp = abs_val.log10().floor() as i32;
-                let mantissa = abs_val / 10f64.powi(exp);
+                let exp = if abs_val > 0.0 { abs_val.log10().floor() as i32 } else { 0 };
+                let mantissa = if exp != 0 { abs_val / 10f64.powi(exp) } else { 0.0 };
                 format!("{}{:.2}e{}% <span style=\"font-size:0.7em\">({} data)</span>", sign, mantissa, exp, period_label)
             }
         }
@@ -537,24 +564,7 @@ fn build_positions(s: &DashboardState) -> Value {
         };
 
         // Guaranteed payout: compute from legs (minimum scenario payout)
-        let guaranteed = if is_sell && legs.len() > 1 {
-            // Sell-all: when outcome i wins YES, NO_i loses, all others pay $1/share
-            let share_vals: Vec<f64> = legs.iter()
-                .map(|l| l["payout"].as_f64().unwrap_or(0.0))
-                .collect();
-            let total_shares: f64 = share_vals.iter().sum();
-            let min_scenario = share_vals.iter()
-                .map(|s| total_shares - s)  // lose this leg, keep all others
-                .fold(f64::MAX, f64::min);
-            min_scenario
-        } else if !is_sell && legs.len() > 0 {
-            // Buy-all: each leg pays shares if it wins, guaranteed = min(shares)
-            legs.iter()
-                .map(|l| l["payout"].as_f64().unwrap_or(0.0))
-                .fold(f64::MAX, f64::min)
-        } else {
-            total_cap + exp_profit
-        };
+        let guaranteed = compute_guaranteed_payout(&legs, is_sell, total_cap + exp_profit);
 
         positions.push(json!({
             "idx": idx + 1, "short_name": short_name, "full_names": full_names,
@@ -682,16 +692,7 @@ fn build_opportunities(s: &DashboardState) -> Value {
         let fees = opp["fees_estimated"].as_f64().unwrap_or(0.0);
 
         // Guaranteed payout from legs (same logic as positions)
-        let guaranteed_payout = if is_sell && legs.len() > 1 {
-            let share_vals: Vec<f64> = legs.iter()
-                .map(|l| l["payout"].as_f64().unwrap_or(0.0)).collect();
-            let total_shares: f64 = share_vals.iter().sum();
-            share_vals.iter().map(|s| total_shares - s).fold(f64::MAX, f64::min)
-        } else if !is_sell && legs.len() > 0 {
-            legs.iter().map(|l| l["payout"].as_f64().unwrap_or(0.0)).fold(f64::MAX, f64::min)
-        } else {
-            total_cap + net_profit
-        };
+        let guaranteed_payout = compute_guaranteed_payout(&legs, is_sell, total_cap + net_profit);
 
         // Score = profit_pct / hours × 1000
         let score_val = if hours > 0.01 {

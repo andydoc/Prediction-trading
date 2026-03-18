@@ -156,27 +156,12 @@ fn fetch_market_description(
     Some((question, description, end_date))
 }
 
-fn call_anthropic(
-    client: &reqwest::blocking::Client,
-    config: &ValidatorConfig,
-    api_key: &str,
-    prompt: &str,
+/// Send a pre-built Anthropic API request and parse the response.
+/// Used by validate() which builds the request under the API key lock scope.
+fn send_anthropic_request(
+    request: reqwest::blocking::RequestBuilder,
 ) -> Option<ValidationResult> {
-    let body = serde_json::json!({
-        "model": config.model,
-        "max_tokens": config.max_tokens,
-        "messages": [{"role": "user", "content": prompt}]
-    });
-
-    let resp = match client
-        .post(&config.api_url)
-        .header("Content-Type", "application/json")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", &config.api_version)
-        .timeout(Duration::from_secs(30))
-        .json(&body)
-        .send()
-    {
+    let resp = match request.send() {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("[rust_rv] Anthropic API request failed: {}", e);
@@ -226,7 +211,7 @@ fn call_anthropic(
             text = text.get(3..).unwrap_or_default().to_string();
         }
         if text.ends_with("```") {
-            text = text[..text.len() - 3].to_string();
+            text = text.get(..text.len().saturating_sub(3)).unwrap_or_default().to_string();
         }
         text = text.trim().to_string();
     }
@@ -397,13 +382,26 @@ impl ResolutionValidator {
         };
 
         // 3. Format prompt
-        // S1: expose_secret() returns &str; .to_string() creates a heap copy because
-        // the MutexGuard lifetime prevents passing &str directly across the lock boundary.
-        let api_key = self.api_key.lock().expose_secret().to_string();
         let prompt = format_prompt(&self.prompt_template, &question, &description, &end_date);
 
-        // 4. Call Anthropic API
-        match call_anthropic(&self.client, &self.config, &api_key, &prompt) {
+        // 4. Call Anthropic API — build request under lock to avoid heap-copying the secret key
+        let request = {
+            let key = self.api_key.lock();
+            let body = serde_json::json!({
+                "model": self.config.model,
+                "max_tokens": self.config.max_tokens,
+                "messages": [{"role": "user", "content": prompt}]
+            });
+            self.client
+                .post(&self.config.api_url)
+                .header("Content-Type", "application/json")
+                .header("x-api-key", key.expose_secret())
+                .header("anthropic-version", &self.config.api_version)
+                .timeout(Duration::from_secs(30))
+                .json(&body)
+        };
+        // Lock dropped here, request is built
+        match send_anthropic_request(request) {
             Some(vr) => {
                 self.cache.save(group_id, &vr);
                 Some(vr)

@@ -61,11 +61,9 @@ pub enum NotifyEvent {
 /// For Telegram: set `webhook_url` to `https://api.telegram.org/bot<TOKEN>/sendMessage`
 /// and `phone_number` to your chat ID (get it from @userinfobot or /getUpdates).
 ///
-/// S2: `webhook_url` (which contains the Telegram bot token) is stored as a plain
-/// String. Ideally this would be `SecretString` to avoid leaking into logs/debug
-/// output, but the change is too invasive for the current notification architecture.
-/// TODO: Wrap in SecretString when the notification system is refactored.
-#[derive(Clone, Debug)]
+/// S2: `webhook_url` contains the Telegram bot token and `api_key` may contain
+/// secrets. A custom Debug impl redacts both fields to prevent leaking into logs.
+#[derive(Clone)]
 pub struct NotifyConfig {
     pub enabled: bool,
     pub webhook_url: String,
@@ -82,6 +80,25 @@ pub struct NotifyConfig {
     pub hostname: String,
     /// Instance name (e.g. "shadow-a") — prepended when set.
     pub instance: String,
+}
+
+impl std::fmt::Debug for NotifyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotifyConfig")
+            .field("enabled", &self.enabled)
+            .field("webhook_url", &"[REDACTED]")
+            .field("api_key", &"[REDACTED]")
+            .field("phone_number", &self.phone_number)
+            .field("on_entry", &self.on_entry)
+            .field("on_resolution", &self.on_resolution)
+            .field("on_error", &self.on_error)
+            .field("on_circuit_breaker", &self.on_circuit_breaker)
+            .field("on_daily_summary", &self.on_daily_summary)
+            .field("rate_limit_seconds", &self.rate_limit_seconds)
+            .field("hostname", &self.hostname)
+            .field("instance", &self.instance)
+            .finish()
+    }
 }
 
 impl Default for NotifyConfig {
@@ -358,7 +375,7 @@ impl Notifier {
             Ok(resp) => {
                 if resp.status().is_success() {
                     self.consecutive_failures.store(0, Ordering::Relaxed);
-                    tracing::debug!("Notification sent: {}", &message[..message.len().min(60)]);
+                    tracing::debug!("Notification sent: {}", message.get(..60).unwrap_or(message));
                     Ok(())
                 } else {
                     let status = resp.status();

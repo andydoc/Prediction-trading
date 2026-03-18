@@ -156,10 +156,11 @@ impl MonitorState {
         // P8: Iterating all cores is O(n_cores) but this runs only every ~10s,
         // so the overhead is minimal even on high-core-count machines.
         let cpus = self.sys.cpus();
-        let cpu = if cpus.is_empty() {
-            0.0
+        let n_cpus = cpus.len() as f64;
+        let cpu = if n_cpus > 0.0 {
+            cpus.iter().map(|c| c.cpu_usage() as f64).sum::<f64>() / n_cpus
         } else {
-            cpus.iter().map(|c| c.cpu_usage() as f64).sum::<f64>() / cpus.len() as f64
+            0.0
         };
         self.cpu_pct.push(ts, cpu);
 

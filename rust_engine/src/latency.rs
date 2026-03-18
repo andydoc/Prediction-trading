@@ -147,7 +147,7 @@ fn percentiles(buf: &Mutex<VecDeque<f64>>) -> SegmentStats {
     let n = sorted.len();
     SegmentStats {
         p50: sorted[n / 2],
-        p95: sorted[((n as f64 * 0.95) as usize).min(n - 1)],
+        p95: sorted[((n as f64 * 0.95).ceil() as usize).saturating_sub(1).min(n - 1)],
         max: sorted[n - 1],
         count: n,
     }

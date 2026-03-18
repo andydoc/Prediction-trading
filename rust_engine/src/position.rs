@@ -13,6 +13,17 @@ fn now_ts() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
 }
 
+/// Trade side derived from method string.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TradeSide { Buy, Sell }
+
+fn parse_trade_side(method: &str) -> TradeSide {
+    if method.contains("sell") { TradeSide::Sell } else { TradeSide::Buy }
+}
+
+/// Minimum absolute profit to classify as win/loss (below this = break-even).
+const WIN_LOSS_THRESHOLD: f64 = 0.001;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketLeg {
     pub name: String,
@@ -212,7 +223,8 @@ impl PositionManager {
             // Compute shares using the correct price for the side we're buying
             let shares = if is_sell {
                 let no_price = current_no_prices.get(mid).copied()
-                    .unwrap_or_else(|| (1.0 - price).max(0.001));
+                    .unwrap_or_else(|| (1.0 - price).max(0.001))
+                    .max(0.001); // B18: Ensure no division by zero even if map contains 0.0
                 bet / no_price
             } else {
                 if price > 0.0 { bet / price } else { 0.0 }
@@ -225,7 +237,7 @@ impl PositionManager {
         }
 
         let ts = now_ts();
-        let ts_iso = format!("{:.6}", ts);  // Will be formatted properly by dashboard
+        let ts_iso = format!("{:.6}", ts);  // Unix float string — dashboard parses both ISO and float formats
         let pid = format!("paper_{}_{}", ts, opportunity_id);
 
         let mut meta = HashMap::new();
@@ -294,10 +306,7 @@ impl PositionManager {
 
         let method = position.metadata.get("method")
             .and_then(|v| v.as_str()).unwrap_or("");
-        // Intentional string matching: method values like "mutex_sell_all" are free-form
-        // strings from arb detection, not an enum. String matching provides flexibility
-        // for new method names without requiring enum conversion.
-        let is_sell = method.contains("sell");
+        let is_sell = parse_trade_side(method) == TradeSide::Sell;
 
         let payout = if is_sell {
             // SELL arb: bought NO on all markets. Winner's NO loses, rest pay $1/share.
@@ -334,7 +343,7 @@ impl PositionManager {
         position.actual_profit = profit;
         position.actual_profit_pct = profit_pct;
         position.profit_delta = profit - position.expected_profit;
-        position.profit_accuracy = if position.expected_profit.abs() > f64::EPSILON {
+        position.profit_accuracy = if profit.is_finite() && position.expected_profit.abs() > f64::EPSILON {
             profit / position.expected_profit
         } else { 0.0 };
         position.metadata.insert("close_reason".into(),
@@ -343,8 +352,8 @@ impl PositionManager {
         // Update capital + stats
         self.current_capital += payout;
         self.total_actual_profit += profit;
-        if profit > 0.001 { self.winning_trades += 1; }
-        else if profit < -0.001 { self.losing_trades += 1; }
+        if profit > WIN_LOSS_THRESHOLD { self.winning_trades += 1; }
+        else if profit < -WIN_LOSS_THRESHOLD { self.losing_trades += 1; }
 
         let event = ResolutionEvent {
             position_id: position.position_id.clone(),
@@ -371,7 +380,7 @@ impl PositionManager {
 
         let method = position.metadata.get("method")
             .and_then(|v| v.as_str()).unwrap_or("");
-        let is_sell = method.contains("sell");
+        let is_sell = parse_trade_side(method) == TradeSide::Sell;
 
         // Calculate shares held and what they sell for at current bids
         let mut sale_proceeds = 0.0;
@@ -495,8 +504,8 @@ impl PositionManager {
 
         self.current_capital += liq.net_proceeds;
         self.total_actual_profit += liq.profit;
-        if liq.profit > 0.001 { self.winning_trades += 1; }
-        else if liq.profit < -0.001 { self.losing_trades += 1; }
+        if liq.profit > WIN_LOSS_THRESHOLD { self.winning_trades += 1; }
+        else if liq.profit < -WIN_LOSS_THRESHOLD { self.losing_trades += 1; }
 
         self.closed_positions.push(position);
 
@@ -754,9 +763,9 @@ impl PositionManager {
         self.total_actual_profit = self.closed_positions.iter()
             .map(|p| p.actual_profit).sum();
         self.winning_trades = self.closed_positions.iter()
-            .filter(|p| p.actual_profit > 0.001).count() as u64;
+            .filter(|p| p.actual_profit > WIN_LOSS_THRESHOLD).count() as u64;
         self.losing_trades = self.closed_positions.iter()
-            .filter(|p| p.actual_profit < -0.001).count() as u64;
+            .filter(|p| p.actual_profit < -WIN_LOSS_THRESHOLD).count() as u64;
         self.total_expected_profit = self.open_positions.values()
             .chain(self.closed_positions.iter())
             .map(|p| p.expected_profit).sum();

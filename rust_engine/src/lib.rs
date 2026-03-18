@@ -662,17 +662,27 @@ impl TradingEngine {
                             // Market is definitively resolved — read outcome from prices
                             let prices_raw = &mdata["outcomePrices"];
                             let prices: Vec<f64> = if let Some(s) = prices_raw.as_str() {
-                                serde_json::from_str::<Vec<serde_json::Value>>(s)
-                                    .inspect_err(|e| tracing::warn!("outcomePrices parse fail: {e}"))
-                                    .unwrap_or_default()
-                                    .iter()
-                                    .filter_map(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-                                    .collect()
+                                match serde_json::from_str::<Vec<serde_json::Value>>(s) {
+                                    Ok(vals) => vals.iter()
+                                        .filter_map(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                                        .collect(),
+                                    Err(e) => {
+                                        tracing::warn!("outcomePrices parse fail for market {}: {e}", mid);
+                                        all_resolved = false;
+                                        continue;
+                                    }
+                                }
                             } else if let Some(arr) = prices_raw.as_array() {
                                 arr.iter().filter_map(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).collect()
                             } else {
                                 Vec::new()
                             };
+
+                            if prices.is_empty() {
+                                tracing::warn!("Market {} has empty/unparseable outcomePrices — skipping", mid);
+                                all_resolved = false;
+                                continue;
+                            }
 
                             if prices.len() >= 2 {
                                 if prices[0] >= 0.99 && prices[1] <= 0.01 {
@@ -710,22 +720,31 @@ impl TradingEngine {
                 }
             };
 
-            if let Some(event) = self.positions.lock()
-                .close_on_resolution(pid, &winning_mid)
-            {
-                tracing::info!(
-                    "API resolution: {} → winner={}, payout={:.2}, profit={:.4}",
-                    pid, winning_mid, event.payout, event.profit
-                );
-                results.push(ApiResolution {
-                    position_id: pid.to_string(),
-                    winning_market_id: winning_mid,
-                    payout: event.payout,
-                    profit: event.profit,
-                });
+            results.push((pid.clone(), winning_mid));
+        }
+
+        // Apply all resolutions in a single lock acquisition (P12: batch to avoid
+        // re-acquiring the positions lock per resolved position)
+        let mut final_results = Vec::new();
+        if !results.is_empty() {
+            let mut pm = self.positions.lock();
+            for (pid, winning_mid) in &results {
+                if let Some(event) = pm.close_on_resolution(pid, winning_mid) {
+                    tracing::info!(
+                        "API resolution: {} → winner={}, payout={:.2}, profit={:.4}",
+                        pid, winning_mid, event.payout, event.profit
+                    );
+                    final_results.push(ApiResolution {
+                        position_id: pid.to_string(),
+                        winning_market_id: winning_mid.clone(),
+                        payout: event.payout,
+                        profit: event.profit,
+                    });
+                }
             }
         }
 
+        let results = final_results;
         let count = results.len();
         if count > 0 {
             tracing::info!("API resolution check: resolved {} positions", count);

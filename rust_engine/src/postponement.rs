@@ -146,42 +146,25 @@ impl PostponementCache {
 // ---------------------------------------------------------------------------
 
 fn call_anthropic_with_search(
-    client: &reqwest::blocking::Client,
-    config: &PostponementConfig,
-    api_key: &str,
-    prompt: &str,
+    request: reqwest::blocking::RequestBuilder,
     last_api_call: &Mutex<Instant>,
+    rate_limit_secs: f64,
 ) -> Option<PostponementResult> {
     // Rate limiting
     {
         let last = last_api_call.lock();
         let elapsed = last.elapsed().as_secs_f64();
-        if elapsed < config.rate_limit_secs {
-            let wait = config.rate_limit_secs - elapsed;
+        if elapsed < rate_limit_secs {
+            let wait = rate_limit_secs - elapsed;
             tracing::debug!("Rate limit: waiting {:.0}s before postponement API call", wait);
             std::thread::sleep(Duration::from_secs_f64(wait));
         }
     }
 
-    let body = serde_json::json!({
-        "model": config.model,
-        "max_tokens": config.max_tokens,
-        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-        "messages": [{"role": "user", "content": prompt}]
-    });
-
     // Update last call time before sending
     *last_api_call.lock() = Instant::now();
 
-    let resp = match client
-        .post(&config.api_url)
-        .header("Content-Type", "application/json")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", &config.api_version)
-        .timeout(Duration::from_secs(90))
-        .json(&body)
-        .send()
-    {
+    let resp = match request.send() {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("Postponement API request failed: {}", e);
@@ -245,10 +228,10 @@ fn extract_json(text: &str) -> Option<PostponementResult> {
 
     // Try markdown code block
     if let Some(start) = text.find("```") {
-        let after_fence = &text[start + 3..];
+        let after_fence = text.get(start + 3..).unwrap_or_default();
         // Skip language tag (e.g., ```json)
         let content_start = after_fence.find('\n').map(|i| i + 1).unwrap_or(0);
-        let content = &after_fence[content_start..];
+        let content = after_fence.get(content_start..).unwrap_or_default();
         if let Some(end) = content.find("```") {
             let json_str = content[..end].trim();
             if let Ok(r) = serde_json::from_str::<PostponementResult>(json_str) {
@@ -257,14 +240,26 @@ fn extract_json(text: &str) -> Option<PostponementResult> {
         }
     }
 
-    // Find last JSON object in text using naive brace-matching.
-    // NOTE: This doesn't handle escaped braces inside JSON string values.
-    // Acceptable because LLM responses rarely contain escaped braces in practice.
+    // Find last JSON object in text using brace-matching.
+    // Skips braces inside string literals to avoid miscounting.
     let mut depth = 0i32;
     let mut last_start = None;
     let mut last_json = None;
+    let mut in_string = false;
+    let mut prev_backslash = false;
     for (i, ch) in text.char_indices() {
+        if in_string {
+            if ch == '"' && !prev_backslash {
+                in_string = false;
+            }
+            prev_backslash = ch == '\\' && !prev_backslash;
+            continue;
+        }
         match ch {
+            '"' => {
+                in_string = true;
+                prev_backslash = false;
+            }
             '{' => {
                 if depth == 0 {
                     last_start = Some(i);
@@ -531,18 +526,16 @@ impl PostponementDetector {
         };
 
         tracing::info!("Postponement check: {}... (overdue {}d)",
-            market_names.first().map(|n| &n[..n.len().min(50)]).unwrap_or("?"),
+            market_names.first().map(|n| n.get(..50).unwrap_or(n)).unwrap_or("?"),
             days_overdue);
 
-        // 3. Attempt 1
-        // S1: expose_secret() returns &str; .to_string() creates a heap copy because
-        // the MutexGuard lifetime prevents passing &str directly across the lock boundary.
-        let api_key = self.api_key.lock().expose_secret().to_string();
+        // 3. Attempt 1 — build request under lock to avoid heap-copying the secret key
         let prompt = format_prompt(
             &self.prompt_template, market_names, original_date, &today, days_overdue,
         );
+        let request = self.build_request(&prompt);
         let mut result = call_anthropic_with_search(
-            &self.client, &self.config, &api_key, &prompt, &self.last_api_call,
+            request, &self.last_api_call, self.config.rate_limit_secs,
         )?;
 
         // Attempt 2: if postponed but no date found
@@ -555,8 +548,9 @@ impl PostponementDetector {
             let retry_prompt = format_retry_prompt(
                 &self.retry_prompt_template, &result, market_names, original_date, &today,
             );
+            let retry_request = self.build_request(&retry_prompt);
             if let Some(result2) = call_anthropic_with_search(
-                &self.client, &self.config, &api_key, &retry_prompt, &self.last_api_call,
+                retry_request, &self.last_api_call, self.config.rate_limit_secs,
             ) {
                 if result2.new_date.is_some() {
                     tracing::info!("  Attempt 2 found date: {}",
@@ -631,5 +625,24 @@ impl PostponementDetector {
     /// Update API key at runtime.
     pub fn set_api_key(&self, api_key: &str) {
         *self.api_key.lock() = SecretString::from(api_key.to_string());
+    }
+
+    /// Build an Anthropic API request under the API key lock scope.
+    /// Returns a RequestBuilder with headers set — lock is dropped after this returns.
+    fn build_request(&self, prompt: &str) -> reqwest::blocking::RequestBuilder {
+        let key = self.api_key.lock();
+        let body = serde_json::json!({
+            "model": self.config.model,
+            "max_tokens": self.config.max_tokens,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "messages": [{"role": "user", "content": prompt}]
+        });
+        self.client
+            .post(&self.config.api_url)
+            .header("Content-Type", "application/json")
+            .header("x-api-key", key.expose_secret())
+            .header("anthropic-version", &self.config.api_version)
+            .timeout(Duration::from_secs(90))
+            .json(&body)
     }
 }

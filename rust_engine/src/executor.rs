@@ -525,6 +525,20 @@ impl Executor {
         }
     }
 
+    /// Validate that an instrument exists and is accepting orders.
+    fn validate_instrument(&self, token_id: &str, market_id: &str) -> Result<Instrument, OrderResult> {
+        let inst = self.instruments.get(token_id)
+            .ok_or_else(|| OrderResult::Rejected(ExecutionError::InstrumentError {
+                message: format!("Unknown token_id: {}", token_id),
+            }))?;
+        if !inst.accepting_orders {
+            return Err(OrderResult::Rejected(ExecutionError::InstrumentError {
+                message: format!("Market {} not accepting orders", market_id),
+            }));
+        }
+        Ok(inst)
+    }
+
     /// Execute a single leg of an arb.
     fn execute_single_leg(
         &self,
@@ -536,20 +550,11 @@ impl Executor {
         size_usd: f64,
         now: f64,
     ) -> OrderResult {
-        // 1. Look up instrument
-        let instrument = match self.instruments.get(token_id) {
-            Some(inst) => inst,
-            None => return OrderResult::Rejected(ExecutionError::InstrumentError {
-                message: format!("Unknown token_id: {}", token_id),
-            }),
+        // 1. Look up and validate instrument
+        let instrument = match self.validate_instrument(token_id, market_id) {
+            Ok(inst) => inst,
+            Err(result) => return result,
         };
-
-        // Validate instrument state
-        if !instrument.accepting_orders {
-            return OrderResult::Rejected(ExecutionError::InstrumentError {
-                message: format!("Market {} not accepting orders", market_id),
-            });
-        }
 
         // 2. B3.0: Quantity guard
         let (quantity, _qty_type) = match compute_order_quantity(
@@ -733,20 +738,26 @@ impl Executor {
             return Err(ExecutionError::RateLimited { retry_after_secs: retry_after });
         }
 
+        if !status.is_success() {
+            let text = response.text().unwrap_or_default();
+            let (code, message) = if let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) {
+                let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("UNKNOWN").to_string();
+                let msg = body.get("message")
+                    .or_else(|| body.get("error"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown error")
+                    .to_string();
+                (code, msg)
+            } else {
+                ("UNKNOWN".to_string(), format!("HTTP {}: {}", status.as_u16(), text))
+            };
+            return Err(ExecutionError::ClobRejection { code, message });
+        }
+
         let body: serde_json::Value = response.json()
             .map_err(|e| ExecutionError::NetworkFailure {
                 message: format!("Failed to parse response: {}", e),
             })?;
-
-        if !status.is_success() {
-            let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("UNKNOWN").to_string();
-            let message = body.get("message")
-                .or_else(|| body.get("error"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown error")
-                .to_string();
-            return Err(ExecutionError::ClobRejection { code, message });
-        }
 
         // Extract order ID from response
         let order_id_value = body.get("orderID").or_else(|| body.get("order_id"));
@@ -763,6 +774,13 @@ impl Executor {
                 String::new()
             }
         };
+
+        if order_id.is_empty() {
+            return Err(ExecutionError::ClobRejection {
+                code: "EMPTY_ORDER_ID".to_string(),
+                message: "CLOB returned empty/missing order ID".to_string(),
+            });
+        }
 
         tracing::info!("CLOB order accepted: order_id={}", order_id);
 
@@ -795,6 +813,10 @@ impl Executor {
             order.last_update = chrono::Utc::now().timestamp() as f64;
 
             if let Some(qty) = filled_qty {
+                // Anomalous fill on zero-quantity order
+                if order.quantity == 0.0 && qty > 0.0 {
+                    tracing::error!("Anomalous fill: {} shares on zero-quantity order {}", qty, trade_id);
+                }
                 // B4.3: Overfill detection — clamp to order quantity, track excess
                 if qty > order.quantity && order.quantity > 0.0 {
                     let excess = qty - order.quantity;
@@ -982,23 +1004,14 @@ impl Executor {
         let mut results: Vec<OrderResult> = Vec::new();
 
         for (market_id, token_id, side, price, size_usd) in legs {
-            // Look up instrument
-            let instrument = match self.instruments.get(token_id) {
-                Some(inst) => inst,
-                None => {
-                    results.push(OrderResult::Rejected(ExecutionError::InstrumentError {
-                        message: format!("Unknown token_id: {}", token_id),
-                    }));
+            // Look up and validate instrument
+            let instrument = match self.validate_instrument(token_id, market_id) {
+                Ok(inst) => inst,
+                Err(result) => {
+                    results.push(result);
                     continue;
                 }
             };
-
-            if !instrument.accepting_orders {
-                results.push(OrderResult::Rejected(ExecutionError::InstrumentError {
-                    message: format!("Market {} not accepting orders", market_id),
-                }));
-                continue;
-            }
 
             // B3.0: Quantity guard
             let (quantity, _) = match compute_order_quantity(

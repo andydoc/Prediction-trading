@@ -326,9 +326,10 @@ impl MarketScanner {
         }
 
         // Store in SQLite (needs lock, quick operation)
-        let db_pairs: Vec<(String, String)> = markets.iter()
-            .map(|(mid, val)| (mid.clone(), serde_json::to_string(val).unwrap_or_default()))
-            .collect();
+        let mut db_pairs: Vec<(String, String)> = Vec::with_capacity(markets.len());
+        for (mid, val) in &markets {
+            db_pairs.push((mid.clone(), serde_json::to_string(val).unwrap_or_default()));
+        }
         self.db.save_markets(&db_pairs);
         let mirror_ms = self.db.mirror_to_disk();
         tracing::info!("[scanner] {} markets stored, {} skipped, disk backup {:.1}ms",
@@ -350,7 +351,9 @@ impl MarketScanner {
     pub fn load_cached(&self) -> ScanResult {
         // Try loading from disk if in-memory is empty
         if self.db.count() == 0 && self.db.db.disk_exists() {
-            let _ = self.db.load_from_disk();
+            if let Err(e) = self.db.load_from_disk() {
+                tracing::warn!("Failed to load cached markets from disk: {}", e);
+            }
         }
 
         let json_strings = self.db.load_all();

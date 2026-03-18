@@ -108,7 +108,14 @@ impl RateLimiter {
     /// Check if a request of the given category is allowed.
     /// Returns Ok(()) if allowed, Err(wait_secs) if throttled.
     pub fn check(&self, category: RateCategory) -> Result<(), f64> {
-        // Check category-specific bucket first
+        // Check global bucket first (avoids needing to refund category token)
+        if !self.global.lock().try_consume() {
+            let wait = self.global.lock().wait_time();
+            tracing::warn!("Rate limited (global): wait {:.2}s", wait);
+            return Err(wait);
+        }
+
+        // Then check category-specific bucket
         let category_ok = match category {
             RateCategory::Trading => self.trading.lock().try_consume(),
             RateCategory::Public => self.public.lock().try_consume(),
@@ -122,21 +129,6 @@ impl RateLimiter {
                 RateCategory::Auth => self.auth.lock().wait_time(),
             };
             tracing::warn!("Rate limited ({:?}): wait {:.2}s", category, wait);
-            return Err(wait);
-        }
-
-        // Check global bucket
-        if !self.global.lock().try_consume() {
-            let wait = self.global.lock().wait_time();
-            tracing::warn!("Rate limited (global): wait {:.2}s", wait);
-            // Refund the category token since we can't proceed — the category
-            // bucket already consumed a token above, but the global bucket rejected
-            // the request, so we must restore the category token to avoid double-counting.
-            match category {
-                RateCategory::Trading => self.trading.lock().tokens += 1.0,
-                RateCategory::Public => self.public.lock().tokens += 1.0,
-                RateCategory::Auth => self.auth.lock().tokens += 1.0,
-            }
             return Err(wait);
         }
 

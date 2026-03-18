@@ -401,10 +401,15 @@ pub fn handle_message_shared(
             }
             "last_trade_price" | "pong" | "" => {} // ignore
             _ => {
-                tracing::trace!("Unknown event_type: '{}' in: {}", event_type, &text[..text.len().min(150)]);
+                tracing::trace!("Unknown event_type: '{}' in: {}", event_type, text.get(..150).unwrap_or(text));
             }
         }
     }
+}
+
+/// Parse a book level value that may be a JSON string or number.
+fn parse_level_value(v: &Value) -> Option<f64> {
+    v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_f64())
 }
 
 /// Handle full book snapshot.
@@ -422,20 +427,8 @@ fn handle_book(
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter().filter_map(|level| {
-                    let price = level.get("price")
-                        .and_then(|v| v.as_str().or_else(|| v.as_f64().map(|_| "")))?;
-                    let size = level.get("size")
-                        .and_then(|v| v.as_str().or_else(|| v.as_f64().map(|_| "")))?;
-                    let p = if price.is_empty() {
-                        level.get("price").and_then(|v| v.as_f64())?
-                    } else {
-                        price.parse::<f64>().ok()?
-                    };
-                    let s = if size.is_empty() {
-                        level.get("size").and_then(|v| v.as_f64())?
-                    } else {
-                        size.parse::<f64>().ok()?
-                    };
+                    let p = parse_level_value(level.get("price")?)?;
+                    let s = parse_level_value(level.get("size")?)?;
                     Some(BookLevel { price: p, size: s })
                 }).collect()
             })
@@ -576,7 +569,7 @@ fn handle_resolved(
         if let Some(res) = pm.close_on_resolution(pid, winning_mid) {
             tracing::info!(
                 "RESOLVED {}: payout=${:.2} profit=${:.2}",
-                &pid[..pid.len().min(40)], res.payout, res.profit
+                pid.get(..40).unwrap_or(pid), res.payout, res.profit
             );
         }
     }

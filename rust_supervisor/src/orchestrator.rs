@@ -27,6 +27,11 @@ use rust_engine::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use rust_engine::gas_monitor::{GasMonitor, GasMonitorConfig, GasCheckResult};
 use rust_engine::TradingEngine;
 
+/// Safely truncate a string to at most `n` bytes at a char boundary.
+fn truncate(s: &str, n: usize) -> &str {
+    s.get(..n).unwrap_or(s)
+}
+
 // ---------------------------------------------------------------------------
 // Config overlay: deep-merge config.local.yaml on top of config.yaml
 // ---------------------------------------------------------------------------
@@ -902,6 +907,7 @@ impl Orchestrator {
                 pm.open_positions().values()
                     .map(|p| {
                         let cid = p.metadata.get("constraint_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        // P2: clone required — assets outlive the position lock
                         let assets: Vec<String> = p.markets.keys().cloned().collect();
                         (p.position_id.clone(), cid, assets)
                     })
@@ -952,7 +958,9 @@ impl Orchestrator {
         if self.held_ids_cache.is_none() {
             self.held_ids_cache = Some(self.engine.get_held_ids());
         }
-        let (held_cids, held_mids) = self.held_ids_cache.clone().unwrap();
+        // P3: Clone the cache contents so we don't hold an immutable borrow on self
+        // while try_enter_or_replace needs &mut self.
+        let (held_cids, held_mids) = self.held_ids_cache.as_ref().unwrap().clone();
 
         let t0 = Instant::now();
         let result = self.engine.evaluate_batch(
@@ -1221,7 +1229,7 @@ impl Orchestrator {
                     .flat_map(|m| m.asset_ids.iter().cloned())
                     .collect();
                 if !all_burst_assets.is_empty() {
-                    let synthetic_cid = format!("newmkt_{}", &burst.event_id[..burst.event_id.len().min(32)]);
+                    let synthetic_cid = format!("newmkt_{}", truncate(&burst.event_id, 32));
                     self.engine.tiered_add_new_market_constraint(synthetic_cid, all_burst_assets);
                 }
             }
@@ -1413,15 +1421,13 @@ impl Orchestrator {
         tracing::info!("Constraints: {} detected, {} assets (capital=${:.2})",
             result.constraints.len(), result.all_asset_ids.len(), cap);
 
-        let mut constraint_to_assets = result.constraint_to_assets.clone();
-
         // Filter to top N constraints by composite score for Tier B.
         // Score = spread / time_factor  (lower = better).
         // spread = |price_sum - 1.0|  (tighter = better)
         // time_factor = max(hours_to_resolution, 1.0)  (sooner = better, divides score down)
         // So constraints with tight spreads resolving soon rank highest.
         let top_n = self.cfg.tier_b_top_n_constraints;
-        if top_n > 0 && constraint_to_assets.len() > top_n {
+        let constraint_to_assets = if top_n > 0 && result.constraint_to_assets.len() > top_n {
             let spread = &result.constraint_spread;
             let end_ts = &result.constraint_end_ts;
             let now_ts = std::time::SystemTime::now()
@@ -1429,8 +1435,8 @@ impl Orchestrator {
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
 
-            // P6: Full sort is acceptable — runs only every ~600s at constraint rebuild
-            let mut ranked: Vec<_> = constraint_to_assets.keys().cloned().collect();
+            // P7: Sort references, clone only the top N keys we keep
+            let mut ranked: Vec<&String> = result.constraint_to_assets.keys().collect();
             ranked.sort_by(|a, b| {
                 let score = |cid: &str| -> f64 {
                     let s = spread.get(cid).copied().unwrap_or(1.0);
@@ -1441,13 +1447,23 @@ impl Orchestrator {
                 };
                 score(a).total_cmp(&score(b))
             });
-            let keep: std::collections::HashSet<String> = ranked.into_iter().take(top_n).collect();
-            let removed = constraint_to_assets.len() - keep.len();
-            constraint_to_assets.retain(|k, _| keep.contains(k));
-            let hot_assets: usize = constraint_to_assets.values().map(|v| v.len()).sum();
+            // P6: Build filtered map directly from references — no full clone
+            let total = result.constraint_to_assets.len();
+            let filtered: HashMap<String, Vec<String>> = ranked.into_iter()
+                .take(top_n)
+                .filter_map(|k| {
+                    result.constraint_to_assets.get(k)
+                        .map(|v| (k.clone(), v.clone()))
+                })
+                .collect();
+            let removed = total - filtered.len();
+            let hot_assets: usize = filtered.values().map(|v| v.len()).sum();
             tracing::info!("Tier B filter: top {} constraints ({} assets), {} demoted to Tier A (scored by spread/time_to_resolve)",
                 top_n, hot_assets, removed);
-        }
+            filtered
+        } else {
+            result.constraint_to_assets.clone()
+        };
 
         (result.all_asset_ids, constraint_to_assets)
     }
@@ -1518,6 +1534,7 @@ impl Orchestrator {
         // Sync open positions — extract typed data + JSON under one lock
         let (live_ids, open_rows, n_closed_total, closed_rows_data) = {
             let pm = self.engine.positions.lock();
+            // P2: clone required — live_ids outlive the position lock for set difference below
             let live_ids: HashSet<String> = pm.open_positions().keys().cloned().collect();
             let open_rows: Vec<(String, String, String, Option<String>, Option<String>)> =
                 pm.open_positions().values()
@@ -1688,7 +1705,7 @@ impl Orchestrator {
                         }
                     }
                     tracing::info!("ENTER: {}... | ${:.2} | exp ${:.2} | {:.1}h | score={:.6} | depth=${:.0}",
-                        &opp.constraint_id[..opp.constraint_id.len().min(30)],
+                        truncate(&opp.constraint_id, 30),
                         cap, scaled_profit, hours, score, opp.min_leg_depth_usd);
                     let _ = self.notifier.send(&NotifyEvent::PositionEntry {
                         position_id: pos.position_id.clone(),
@@ -1774,6 +1791,7 @@ impl Orchestrator {
                                 pm.get_position(&worst_pid).map(|p| {
                                     let cid = p.metadata.get("constraint_id")
                                         .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    // P2: clone required — assets outlive the position lock
                                     let assets: Vec<String> = p.markets.keys().cloned().collect();
                                     (cid, assets)
                                 })
@@ -1792,7 +1810,7 @@ impl Orchestrator {
                             }
                             self.held_ids_cache = None;
                             tracing::info!("REPLACE: liquidated {} → freed ${:.2}, profit=${:+.2}",
-                                &worst_pid[..worst_pid.len().min(30)], net, profit);
+                                truncate(&worst_pid, 30), net, profit);
 
                             // Enter replacement with chain tracking
                             let cap = dynamic_capital(self.engine.total_value(), self.cfg.capital_pct);
@@ -1818,7 +1836,7 @@ impl Orchestrator {
 
                             self.last_replacement = now;
                             tracing::info!("  WITH: {}... | score={:.6} | {:.1}h | chain_gen={}",
-                                &best_opp.constraint_id[..best_opp.constraint_id.len().min(30)],
+                                truncate(&best_opp.constraint_id, 30),
                                 best_score, best_hours,
                                 chain_info_owned.as_ref().map(|(_, g, _)| *g).unwrap_or(0));
                         }
@@ -1837,7 +1855,7 @@ impl Orchestrator {
         // B1.0: Depth gating — skip if any leg has insufficient depth
         if self.cfg.min_depth_per_leg > 0.0 && opp.min_leg_depth_usd < self.cfg.min_depth_per_leg {
             tracing::debug!("SKIP (depth): {}... min_depth=${:.2} < ${:.2}",
-                &opp.constraint_id[..opp.constraint_id.len().min(30)],
+                truncate(&opp.constraint_id, 30),
                 opp.min_leg_depth_usd, self.cfg.min_depth_per_leg);
             return false;
         }
@@ -1852,12 +1870,12 @@ impl Orchestrator {
                     if age > self.cfg.max_book_staleness_secs {
                         if age == f64::MAX {
                             tracing::debug!("SKIP (no book): {}... asset {} has no book data",
-                                &opp.constraint_id[..opp.constraint_id.len().min(30)],
-                                &asset_id[..asset_id.len().min(16)]);
+                                truncate(&opp.constraint_id, 30),
+                                truncate(asset_id, 16));
                         } else {
                             tracing::debug!("SKIP (stale book): {}... asset {} is {:.1}s old",
-                                &opp.constraint_id[..opp.constraint_id.len().min(30)],
-                                &asset_id[..asset_id.len().min(16)], age);
+                                truncate(&opp.constraint_id, 30),
+                                truncate(asset_id, 16), age);
                         }
                         return false;
                     }
@@ -1873,7 +1891,7 @@ impl Orchestrator {
 
             if let Some(validation) = rv.validate(&opp.constraint_id, mid) {
                 if validation.has_unrepresented_outcome {
-                    tracing::info!("SKIP (unrepresented outcome): {}...", &opp.constraint_id[..opp.constraint_id.len().min(30)]);
+                    tracing::info!("SKIP (unrepresented outcome): {}...", truncate(&opp.constraint_id, 30));
                     return false;
                 }
                 if let Ok(vd) = chrono::NaiveDate::parse_from_str(&validation.latest_resolution_date, "%Y-%m-%d") {
@@ -1881,7 +1899,7 @@ impl Orchestrator {
                     let days = (vd - today).num_days();
                     if days > self.cfg.max_days_entry as i64 {
                         tracing::debug!("SKIP (AI date): {} resolves in {}d > {}d",
-                            &opp.constraint_id[..opp.constraint_id.len().min(30)],
+                            truncate(&opp.constraint_id, 30),
                             days, self.cfg.max_days_entry);
                         return false;
                     }
@@ -1933,13 +1951,14 @@ impl Orchestrator {
         let exits = self.engine.check_proactive_exits(&all_bids, PROACTIVE_EXIT_MULTIPLIER);
         for exit in &exits {
             tracing::info!("PROACTIVE EXIT: {}... ratio={:.3}",
-                &exit.position_id[..exit.position_id.len().min(40)], exit.ratio);
+                truncate(&exit.position_id, 40), exit.ratio);
 
             // Capture tiered WS exit info before liquidation
             let exit_info = if self.cfg.use_tiered_ws {
                 let pm = self.engine.positions.lock();
                 pm.get_position(&exit.position_id).map(|p| {
                     let cid = p.metadata.get("constraint_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    // P2: clone required — assets outlive the position lock
                     let assets: Vec<String> = p.markets.keys().cloned().collect();
                     (cid, assets)
                 })
@@ -1997,6 +2016,7 @@ impl Orchestrator {
             let pm = self.engine.positions.lock();
             pm.open_positions().values().map(|pos| {
                 let pid = pos.position_id.clone();
+                // P2: clone required — market_ids outlive the position lock
                 let market_ids: Vec<String> = pos.markets.keys().cloned().collect();
                 let market_names: Vec<String> = pos.markets.values()
                     .map(|leg| leg.name.clone())
@@ -2037,7 +2057,7 @@ impl Orchestrator {
             if let Some(result) = pd.check(pid, market_names, &expected_date) {
                 if result.effective_resolution_date.is_some() {
                     let display_name = market_names.first()
-                        .map(|n| &n[..n.len().min(40)])
+                        .map(|n| truncate(n, 40))
                         .unwrap_or("?");
                     tracing::info!("Postponement detected: {}... → {}",
                         display_name,
