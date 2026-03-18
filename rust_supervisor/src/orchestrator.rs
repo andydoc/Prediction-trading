@@ -1065,7 +1065,7 @@ impl Orchestrator {
             message: format!(
                 "KILL SWITCH activated via {}. {}. Mode set to SHADOW. Positions: {}, Capital: ${:.2}",
                 source, cancelled_msg,
-                self.engine.pm_open_count(),
+                self.engine.pm_open_count(),  // single-value calls acceptable here (error path)
                 self.engine.current_capital(),
             ),
         });
@@ -1505,23 +1505,21 @@ impl Orchestrator {
         // Reset API success timestamp so we don't false-trip on startup
         self.circuit_breaker.record_api_success(now_secs());
 
+        let snap = self.engine.dashboard_snapshot();
         tracing::info!("State loaded: ${:.2} capital, {} open, {} closed (CB peak=${:.2})",
-            self.engine.current_capital(),
-            self.engine.pm_open_count(),
-            self.engine.pm_closed_count(),
+            snap.current_capital, snap.open_count, snap.closed_count,
             self.circuit_breaker.peak_total_value());
     }
 
     fn save_state(&mut self) {
         let t0 = Instant::now();
 
-        let cap = self.engine.current_capital();
-        let init_cap = self.engine.initial_capital();
+        let snap = self.engine.dashboard_snapshot();
         let perf = self.engine.get_performance_metrics();
 
         self.state_db.set_scalars(&[
-            ("current_capital".to_string(), cap),
-            ("initial_capital".to_string(), init_cap),
+            ("current_capital".to_string(), snap.current_capital),
+            ("initial_capital".to_string(), snap.initial_capital),
             ("cb_peak_total_value".to_string(), self.circuit_breaker.peak_total_value()),
         ]);
         for key in &["total_trades", "winning_trades", "losing_trades",
@@ -1651,7 +1649,7 @@ impl Orchestrator {
 
             // B3: negRisk capital efficiency — for sell arbs on negRisk markets,
             // collateral = $1.00/unit instead of sum(NO prices), so we can size larger
-            let is_sell = opp.method.to_lowercase().contains("sell");
+            let is_sell = opp.is_sell;
 
             // Scale to dynamic capital
             let old_cap = opp.optimal_bets.values().sum::<f64>();
@@ -1819,7 +1817,7 @@ impl Orchestrator {
                             let scaled_bets: HashMap<String, f64> = best_opp.optimal_bets.iter()
                                 .map(|(k, v)| (k.clone(), v * scale))
                                 .collect();
-                            let is_sell = best_opp.method.to_lowercase().contains("sell");
+                            let is_sell = best_opp.is_sell;
 
                             let chain_ref = chain_info_owned.as_ref()
                                 .map(|(cid, gen, ppid)| (cid.as_str(), *gen, ppid.as_str()));
@@ -1864,8 +1862,7 @@ impl Orchestrator {
         if self.cfg.max_book_staleness_secs > 0.0 {
             if let Some(constraint) = self.engine.constraints.get(&opp.constraint_id) {
                 for mref in &constraint.markets {
-                    let is_sell = opp.method.to_lowercase().contains("sell");
-                    let asset_id = if is_sell { &mref.no_asset_id } else { &mref.yes_asset_id };
+                    let asset_id = if opp.is_sell { &mref.no_asset_id } else { &mref.yes_asset_id };
                     let age = self.engine.book.get_book_age_secs(asset_id);
                     if age > self.cfg.max_book_staleness_secs {
                         if age == f64::MAX {
@@ -2034,7 +2031,7 @@ impl Orchestrator {
                 if let Some(m) = self.market_lookup.get(mid) {
                     if let Some(ed) = m.pointer("/metadata/end_date").and_then(|v| v.as_str()) {
                         if ed.len() >= 10 {
-                            expected_date = Some(ed[..10].to_string());
+                            expected_date = Some(truncate(ed, 10).to_string());
                             break;
                         }
                     }
@@ -2076,8 +2073,9 @@ impl Orchestrator {
 
     fn log_stats(&self) {
         let (q_urg, q_bg) = self.engine.queue_depths();
-        let cap = self.engine.current_capital();
-        let npos = self.engine.pm_open_count();
+        let snap = self.engine.dashboard_snapshot();
+        let cap = snap.current_capital;
+        let npos = snap.open_count;
         let gas_str = self.gas_monitor.last_balance()
             .map(|b| format!(" POL={:.4}", b))
             .unwrap_or_default();

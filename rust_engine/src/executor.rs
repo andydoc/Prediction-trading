@@ -1105,9 +1105,9 @@ impl Executor {
                     side_str, tracked.quantity, tracked.price,
                     tracked.token_id.get(..8).unwrap_or(&tracked.token_id),
                 );
-                let result = OrderResult::Accepted(tracked.clone());
-                self.tracked.lock().insert(tracked.trade_id.clone(), tracked);
-                results.push(result);
+                let tracking_copy = tracked.clone();
+                results.push(OrderResult::Accepted(tracked));
+                self.tracked.lock().insert(tracking_copy.trade_id.clone(), tracking_copy);
             }
             return ArbExecutionResult {
                 legs: results,
@@ -1202,9 +1202,9 @@ impl Executor {
 
                         if success && !order_id.is_empty() {
                             tracked.order_id = order_id.to_string();
-                            let result = OrderResult::Accepted(tracked.clone());
-                            self.tracked.lock().insert(tracked.trade_id.clone(), tracked);
-                            results.push(result);
+                            let tracking_copy = tracked.clone();
+                            results.push(OrderResult::Accepted(tracked));
+                            self.tracked.lock().insert(tracking_copy.trade_id.clone(), tracking_copy);
                         } else {
                             all_accepted = false;
                             let error_msg = entry

@@ -36,7 +36,8 @@ const MAX_POLYTOPE_MARKETS: usize = 12;
 /// Result of a mutex arb check.
 #[derive(Debug, Clone)]
 pub struct ArbResult {
-    pub method: String,        // "mutex_buy_all" or "mutex_sell_all"
+    pub method: String,        // "mutex_buy_all", "mutex_sell_all", or "polytope_fw"
+    pub is_sell: bool,         // true for sell strategies (no substring matching needed)
     pub profitable: bool,
     pub profit_pct: f64,
     pub net_profit: f64,
@@ -89,7 +90,7 @@ pub fn check_mutex_arb(
                 .map(|(i, mid)| (mid.clone(), capital * yes_prices[i] / price_sum))
                 .collect();
             return Some(ArbResult {
-                method: "mutex_buy_all".into(), profitable: true,
+                method: "mutex_buy_all".into(), is_sell: false, profitable: true,
                 profit_pct, net_profit, gross_profit, fees, price_sum,
                 neg_risk: is_neg_risk, bets,
                 no_price_sum: None, collateral_per_unit: None,
@@ -116,7 +117,7 @@ pub fn check_mutex_arb(
                 .map(|(i, mid)| (mid.clone(), capital * no_prices[i] / no_cost))
                 .collect();
             return Some(ArbResult {
-                method: "mutex_sell_all".into(), profitable: true,
+                method: "mutex_sell_all".into(), is_sell: true, profitable: true,
                 profit_pct, net_profit, gross_profit, fees, price_sum,
                 neg_risk: is_neg_risk, bets,
                 no_price_sum: Some(no_cost), collateral_per_unit: Some(collateral),
@@ -236,7 +237,7 @@ pub fn polytope_arb(
         .collect();
 
     Some(ArbResult {
-        method: "polytope_fw".into(), profitable: true,
+        method: "polytope_fw".into(), is_sell: false, profitable: true,
         profit_pct, net_profit, gross_profit, fees, price_sum,
         neg_risk: false, bets,
         no_price_sum: None, collateral_per_unit: None, capital_efficiency: None,

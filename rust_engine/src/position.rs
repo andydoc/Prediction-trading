@@ -244,6 +244,7 @@ impl PositionManager {
         meta.insert("constraint_id".into(), serde_json::Value::String(constraint_id.to_string()));
         meta.insert("strategy".into(), serde_json::Value::String(strategy.to_string()));
         meta.insert("method".into(), serde_json::Value::String(method.to_string()));
+        meta.insert("is_sell".into(), serde_json::Value::Bool(is_sell));
         if end_date_ts > 0.0 {
             meta.insert("end_date_ts".into(), serde_json::json!(end_date_ts));
         }

@@ -86,6 +86,7 @@ pub struct Opportunity {
     pub market_ids: Vec<String>,
     pub market_names: Vec<String>,
     pub method: String,
+    pub is_sell: bool,
     pub expected_profit_pct: f64,
     pub expected_profit: f64,
     pub fees_estimated: f64,
@@ -224,22 +225,20 @@ pub fn evaluate_batch(
         }
 
         if let Some(arb) = result {
+            // Build price/bet maps. We clone market_id strings into price maps
+            // and consume arb.bets (moved, no clone needed for bet keys).
             let mut current_prices = HashMap::with_capacity(market_ids.len());
             let mut current_no_prices = HashMap::with_capacity(market_ids.len());
-            let mut optimal_bets = HashMap::with_capacity(arb.bets.len());
-            for (mid, bet) in &arb.bets {
-                optimal_bets.insert(mid.clone(), *bet);
-            }
             for (i, mid) in market_ids.iter().enumerate() {
                 current_prices.insert(mid.clone(), yes_prices[i]);
                 current_no_prices.insert(mid.clone(), no_prices[i]);
             }
+            let optimal_bets: HashMap<String, f64> = arb.bets.into_iter().collect();
 
             // Compute minimum ask depth across all legs (B1.0)
             let min_leg_depth_usd = constraint.markets.iter()
                 .map(|mref| {
-                    let is_sell = arb.method.contains("sell");
-                    let asset_id = if is_sell { &mref.no_asset_id } else { &mref.yes_asset_id };
+                    let asset_id = if arb.is_sell { &mref.no_asset_id } else { &mref.yes_asset_id };
                     book.get_ask_depth_usd(asset_id, depth_haircut)
                 })
                 .fold(f64::INFINITY, f64::min);
@@ -256,9 +255,10 @@ pub fn evaluate_batch(
 
             opportunities.push(Opportunity {
                 constraint_id: constraint.constraint_id.clone(),
-                market_ids: market_ids.clone(),
+                market_ids,  // moved, not cloned
                 market_names,
-                method: arb.method.clone(),
+                method: arb.method,  // moved, not cloned
+                is_sell: arb.is_sell,
                 expected_profit_pct: arb.profit_pct,
                 expected_profit: arb.net_profit,
                 fees_estimated: arb.fees,

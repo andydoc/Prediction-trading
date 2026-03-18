@@ -471,7 +471,9 @@ fn build_positions(s: &DashboardState) -> Value {
         let method = p.metadata.get("method")
             .and_then(|v| v.as_str()).unwrap_or("");
         let strategy_fmt = fmt_strategy(strategy, method);
-        let is_sell = method.to_lowercase().contains("sell");
+        let is_sell = p.metadata.get("is_sell")
+            .and_then(|v| v.as_bool())
+            .unwrap_or_else(|| method.to_lowercase().contains("sell"));
 
         // Entry timestamp
         let entry_epoch = parse_entry_ts_str(&p.entry_timestamp);
@@ -629,7 +631,8 @@ fn build_opportunities(s: &DashboardState) -> Value {
         let meta = &opp["metadata"];
         let method = meta["method"].as_str().unwrap_or("");
         let strategy = fmt_strategy("", method);
-        let is_sell = method.to_lowercase().contains("sell");
+        let is_sell = meta["is_sell"].as_bool()
+            .unwrap_or_else(|| method.to_lowercase().contains("sell"));
 
         let constraint_id = opp["constraint_id"].as_str().unwrap_or("");
         let is_held = held_cids.contains(constraint_id);
@@ -735,7 +738,9 @@ fn build_closed(s: &DashboardState) -> Value {
             .and_then(|v| v.as_str()).unwrap_or("?");
         let method = p.metadata.get("method")
             .and_then(|v| v.as_str()).unwrap_or("");
-        let is_sell = method.to_lowercase().contains("sell");
+        let is_sell = p.metadata.get("is_sell")
+            .and_then(|v| v.as_bool())
+            .unwrap_or_else(|| method.to_lowercase().contains("sell"));
 
         let mkt_vals: Vec<&crate::position::MarketLeg> = p.markets.values().collect();
         let short_name = mkt_vals.first()

@@ -61,6 +61,16 @@ use dashboard::{DashboardState, EngineMetrics};
 use latency::LatencyTracker;
 use monitor::MonitorState;
 
+/// Snapshot of position stats captured under a single lock.
+#[derive(Debug, Clone, Copy)]
+pub struct DashboardSnapshot {
+    pub current_capital: f64,
+    pub total_value: f64,
+    pub initial_capital: f64,
+    pub open_count: usize,
+    pub closed_count: usize,
+}
+
 /// The core trading engine. Owns all hot-path state:
 /// WS connections, order books, eval queue, positions, dashboard.
 ///
@@ -524,6 +534,18 @@ impl TradingEngine {
     pub fn initial_capital(&self) -> f64 { self.positions.lock().initial_capital() }
     pub fn pm_open_count(&self) -> usize { self.positions.lock().open_count() }
     pub fn pm_closed_count(&self) -> usize { self.positions.lock().closed_count() }
+
+    /// Snapshot of dashboard-relevant position stats under a single lock acquisition.
+    pub fn dashboard_snapshot(&self) -> DashboardSnapshot {
+        let pm = self.positions.lock();
+        DashboardSnapshot {
+            current_capital: pm.current_capital(),
+            total_value: pm.total_value(),
+            initial_capital: pm.initial_capital(),
+            open_count: pm.open_count(),
+            closed_count: pm.closed_count(),
+        }
+    }
 
     pub fn enter_position(
         &self,

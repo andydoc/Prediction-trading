@@ -8,6 +8,9 @@
 
 use reqwest::blocking::Client;
 
+/// Wei-to-POL conversion factor (18 decimals).
+const WEI_PER_POL: f64 = 1e18;
+
 /// Gas monitor configuration.
 #[derive(Clone, Debug)]
 pub struct GasMonitorConfig {
@@ -111,8 +114,6 @@ impl GasMonitor {
             Err(e) => return GasCheckResult::Error(format!("Balance parse failed: {}", e)),
         };
 
-        // Convert wei to POL (18 decimals)
-        const WEI_PER_POL: f64 = 1e18;
         let balance_pol = balance_wei as f64 / WEI_PER_POL;
         self.last_balance = Some(balance_pol);
 
@@ -166,7 +167,7 @@ mod tests {
         // 1 POL = 1e18 wei = 0xDE0B6B3A7640000
         let hex = "0xde0b6b3a7640000";
         let wei = u128::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap();
-        let pol = wei as f64 / 1e18;
+        let pol = wei as f64 / WEI_PER_POL;
         assert!((pol - 1.0).abs() < 0.001);
     }
 
@@ -175,7 +176,7 @@ mod tests {
         // 5 POL = 5e18 wei = 0x4563918244F40000
         let hex = "0x4563918244f40000";
         let wei = u128::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap();
-        let pol = wei as f64 / 1e18;
+        let pol = wei as f64 / WEI_PER_POL;
         assert!((pol - 5.0).abs() < 0.001);
     }
 }
