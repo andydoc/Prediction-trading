@@ -193,6 +193,12 @@ safety:
     max_consecutive_errors: 3           # 3 errors within window triggers halt
     error_window_seconds: 300           # 5-minute sliding window for errors
     api_timeout_seconds: 600            # API unreachable for 10min triggers halt (must exceed 300s API resolution interval)
+  gas_monitor:
+    enabled: true
+    rpc_url: 'https://polygon-rpc.com'
+    check_interval_seconds: 3600       # Check every hour
+    min_pol_balance: 1.0               # Warning threshold (Telegram alert)
+    critical_pol_balance: 0.1          # Critical threshold (trips circuit breaker)
 dashboard:
   port: 5558
   bind_addr: '127.0.0.1'

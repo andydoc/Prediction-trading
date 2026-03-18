@@ -24,6 +24,7 @@ use rust_engine::scanner::MarketScanner;
 use rust_engine::state::StateDB;
 use rust_engine::ws_tiered::TieredWsConfig;
 use rust_engine::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use rust_engine::gas_monitor::{GasMonitor, GasMonitorConfig, GasCheckResult};
 use rust_engine::TradingEngine;
 
 // ---------------------------------------------------------------------------
@@ -171,6 +172,14 @@ pub struct OrchestratorConfig {
     pub cb_max_consecutive_errors: u32,
     pub cb_error_window_seconds: f64,
     pub cb_api_timeout_seconds: f64,
+
+    // Gas monitor (C1.1)
+    pub gas_enabled: bool,
+    pub gas_rpc_url: String,
+    pub gas_wallet_address: String,
+    pub gas_check_interval_seconds: f64,
+    pub gas_min_pol_balance: f64,
+    pub gas_critical_pol_balance: f64,
 }
 
 impl OrchestratorConfig {
@@ -322,6 +331,34 @@ impl OrchestratorConfig {
                 .and_then(|v| v.as_f64()).unwrap_or(300.0),
             cb_api_timeout_seconds: yaml.pointer("/safety/circuit_breaker/api_timeout_seconds")
                 .and_then(|v| v.as_f64()).unwrap_or(60.0),
+
+            // Gas monitor (C1.1)
+            gas_enabled: yaml.pointer("/safety/gas_monitor/enabled")
+                .and_then(|v| v.as_bool()).unwrap_or(false),
+            gas_rpc_url: yaml.pointer("/safety/gas_monitor/rpc_url")
+                .and_then(|v| v.as_str()).unwrap_or("https://polygon-rpc.com").to_string(),
+            gas_wallet_address: {
+                // Derive wallet address from private key in secrets
+                let pk = secrets.pointer("/polymarket/private_key")
+                    .and_then(|v| v.as_str()).unwrap_or("");
+                if pk.is_empty() {
+                    String::new()
+                } else {
+                    match rust_engine::signing::OrderSigner::new(pk) {
+                        Ok(signer) => format!("{:#x}", signer.address()),
+                        Err(e) => {
+                            tracing::warn!("Failed to derive wallet address for gas monitor: {}", e);
+                            String::new()
+                        }
+                    }
+                }
+            },
+            gas_check_interval_seconds: yaml.pointer("/safety/gas_monitor/check_interval_seconds")
+                .and_then(|v| v.as_f64()).unwrap_or(3600.0),
+            gas_min_pol_balance: yaml.pointer("/safety/gas_monitor/min_pol_balance")
+                .and_then(|v| v.as_f64()).unwrap_or(1.0),
+            gas_critical_pol_balance: yaml.pointer("/safety/gas_monitor/critical_pol_balance")
+                .and_then(|v| v.as_f64()).unwrap_or(0.1),
         }
     }
 }
@@ -370,6 +407,10 @@ pub struct Orchestrator {
 
     // Circuit breaker (C1)
     circuit_breaker: CircuitBreaker,
+
+    // Gas monitor (C1.1)
+    gas_monitor: GasMonitor,
+    last_gas_check: f64,
 
     // P1: Cached held IDs (invalidated on position entry/exit/resolution)
     held_ids_cache: Option<(HashSet<String>, HashSet<String>)>,
@@ -513,6 +554,21 @@ impl Orchestrator {
             now_secs(),
         );
 
+        // Build gas monitor (C1.1)
+        let gas_monitor = GasMonitor::new(GasMonitorConfig {
+            enabled: cfg.gas_enabled,
+            rpc_url: cfg.gas_rpc_url.clone(),
+            wallet_address: cfg.gas_wallet_address.clone(),
+            check_interval_seconds: cfg.gas_check_interval_seconds,
+            min_pol_balance: cfg.gas_min_pol_balance,
+            critical_pol_balance: cfg.gas_critical_pol_balance,
+        });
+
+        if gas_monitor.is_enabled() {
+            tracing::info!("Gas monitor enabled: wallet={}, warn<{} POL, critical<{} POL",
+                cfg.gas_wallet_address, cfg.gas_min_pol_balance, cfg.gas_critical_pol_balance);
+        }
+
         Ok(Self {
             cfg, engine,
             scanner: Arc::new(scanner),
@@ -537,6 +593,8 @@ impl Orchestrator {
             disk_save_handle: None,
             notifier,
             circuit_breaker,
+            gas_monitor,
+            last_gas_check: 0.0,
             held_ids_cache: None,
             last_constraint_to_assets: HashMap::new(),
         })
@@ -890,6 +948,39 @@ impl Orchestrator {
                 tracing::info!("Pruned {} closed positions (> {}d old)", pruned, self.cfg.closed_retention_days);
             }
             self.last_retention_prune = now;
+        }
+
+        // --- C1.1: POL gas balance check ---
+        if self.gas_monitor.is_enabled()
+            && (now - self.last_gas_check) >= self.gas_monitor.check_interval()
+        {
+            match self.gas_monitor.check_balance(&self.engine.http_client) {
+                GasCheckResult::Ok(bal) => {
+                    tracing::info!("POL gas balance: {:.4} POL (healthy)", bal);
+                }
+                GasCheckResult::Warning(bal) => {
+                    tracing::warn!("POL gas balance LOW: {:.4} POL (threshold {:.1})",
+                        bal, self.gas_monitor.min_balance());
+                    let _ = self.notifier.send(&NotifyEvent::Error {
+                        message: format!("⚠️ POL gas balance low: {:.4} POL (warn < {:.1})",
+                            bal, self.gas_monitor.min_balance()),
+                    });
+                }
+                GasCheckResult::Critical(bal) => {
+                    tracing::error!("POL gas balance CRITICAL: {:.4} POL (threshold {:.2})",
+                        bal, self.gas_monitor.critical_balance());
+                    let reason = format!("POL gas critically low: {:.4} POL (critical < {:.2})",
+                        bal, self.gas_monitor.critical_balance());
+                    if let Some(trip_msg) = self.circuit_breaker.check_gas_critical(&reason, now) {
+                        tracing::error!("CIRCUIT BREAKER TRIPPED: {}", trip_msg);
+                        let _ = self.notifier.send(&NotifyEvent::CircuitBreaker { reason: trip_msg });
+                    }
+                }
+                GasCheckResult::Error(e) => {
+                    tracing::warn!("Gas balance check failed: {}", e);
+                }
+            }
+            self.last_gas_check = now;
         }
 
         // --- Stats ---
@@ -1628,6 +1719,9 @@ impl Orchestrator {
         let (q_urg, q_bg) = self.engine.queue_depths();
         let cap = self.engine.current_capital();
         let npos = self.engine.pm_open_count();
+        let gas_str = self.gas_monitor.last_balance()
+            .map(|b| format!(" POL={:.4}", b))
+            .unwrap_or_default();
 
         let (lat_p50, lat_p95, lat_max) = if !self.recent_latencies.is_empty() {
             let mut lats: Vec<f64> = self.recent_latencies.iter().copied().collect();
@@ -1642,8 +1736,8 @@ impl Orchestrator {
 
         if let Some(ts) = self.engine.tiered_stats() {
             tracing::info!(
-                "[iter {}] Capital=${:.2} positions={} | TieredWS: B={} conns/{} assets/{} hot, C={} conns/{} assets/{} pos | msgs={} urg={} bg={} lat_μs p50={:.0} p95={:.0} max={:.0}",
-                self.iteration, cap, npos,
+                "[iter {}] Capital=${:.2} positions={}{} | TieredWS: B={} conns/{} assets/{} hot, C={} conns/{} assets/{} pos | msgs={} urg={} bg={} lat_μs p50={:.0} p95={:.0} max={:.0}",
+                self.iteration, cap, npos, gas_str,
                 ts.tier_b_connections, ts.tier_b_assets, ts.tier_b_hot_constraints,
                 ts.tier_c_connections, ts.tier_c_assets, ts.tier_c_position_assets,
                 ts.total_msgs, q_urg, q_bg, lat_p50, lat_p95, lat_max,
@@ -1651,8 +1745,8 @@ impl Orchestrator {
         } else {
             let ws = self.engine.stats();
             tracing::info!(
-                "[iter {}] Capital=${:.2} positions={} | WS: subs={} msgs={} live={} urgent={} bg={} lat_μs p50={:.0} p95={:.0} max={:.0}",
-                self.iteration, cap, npos,
+                "[iter {}] Capital=${:.2} positions={}{} | WS: subs={} msgs={} live={} urgent={} bg={} lat_μs p50={:.0} p95={:.0} max={:.0}",
+                self.iteration, cap, npos, gas_str,
                 ws.subscribed, ws.total_msgs, ws.live_books,
                 q_urg, q_bg, lat_p50, lat_p95, lat_max,
             );

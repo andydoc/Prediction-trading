@@ -13,6 +13,7 @@
 /// - AI postponement detector (Anthropic API + web search)
 /// - Telegram notifications (C3)
 /// - Circuit breaker (C1)
+/// - POL gas balance monitoring (C1.1)
 
 pub mod types;
 pub mod cached_db;
@@ -41,6 +42,7 @@ pub mod rate_limiter;
 pub mod executor;
 pub mod reconciliation;
 pub mod circuit_breaker;
+pub mod gas_monitor;
 
 use std::collections::HashMap;
 use std::sync::Arc;

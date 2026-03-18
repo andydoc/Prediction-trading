@@ -367,7 +367,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | Task | Acceptance Criteria |
 |------|-------------------|
 | ✅ **C1: Circuit breaker** | Auto-pause trading if: (a) portfolio drawdown exceeds `safety.circuit_breaker.max_drawdown_pct` from peak, (b) `max_consecutive_errors` errors in `error_window_seconds`, (c) CLOB API unreachable for `api_timeout_seconds`. Implemented in `circuit_breaker.rs`. Peak persisted to SQLite; tripped state clears on restart. Housekeeping (state save, WS, reconciliation) continues when tripped. Telegram notification on trip. 13 unit tests. |
-| ⬚ **C1.1: POL gas balance monitoring** | On startup and every `safety.gas_check_interval_seconds`: query Polygon RPC (`eth_getBalance`) for wallet POL balance. If < `safety.min_pol_balance` (default 1.0): Telegram alert. If < `safety.critical_pol_balance` (default 0.1): trigger circuit breaker. Dashboard shows POL balance in System section. Uses `reqwest` — no web3 library needed. |
+| ✅ **C1.1: POL gas balance monitoring** | Implemented in `gas_monitor.rs`. Queries Polygon RPC (`eth_getBalance`) every `safety.gas_monitor.check_interval_seconds` (default 3600s). Wallet address auto-derived from private key. If < `min_pol_balance` (1.0): Telegram warning. If < `critical_pol_balance` (0.1): trips circuit breaker via `GasCritical` trip reason. Balance shown in stats log line (`POL=X.XXXX`). 3 unit tests. Config under `safety.gas_monitor.*`. |
 | ⬚ **C2: Kill switch** | `kill.sh --emergency` and dashboard button that: (a) cancels all open CLOB orders, (b) sets mode to shadow, (c) sends Telegram notification. Idempotent. |
 | ✅ **C3: Notifications (Telegram)** | Implemented in `notify.rs`. Telegram backend auto-detected from webhook URL; bot token from `secrets.yaml`, chat_id from config. Generic webhook fallback for WhatsApp/ntfy/Discord. Rate limiting (10s), exponential backoff (5 failures → 5min cooldown), per-event toggles. All messages prefixed with `[hostname/instance]`. Events: startup, entry, resolution, proactive exit, error, circuit breaker, daily summary. |
 | ⬚ **C4: Daily P&L report** | Automated daily summary at midnight UTC: entries, exits, fees, net P&L, capital utilisation %, drawdown from peak. Sent via Telegram. Persisted to SQLite. |
@@ -528,6 +528,7 @@ Not blocking go-live. Prioritise based on operational experience.
 | Task | Priority |
 |------|----------|
 | Increase capital allocation (per E9 findings) | Medium — after 30 days profitable |
+| Automated POL gas bridge top-up | Medium — auto-bridge USDC→POL when balance < threshold, eliminating manual top-ups |
 | Historical performance dashboard | Medium — needed for commercial pitch |
 | Dashboard control panel (mode switch, config edit) | Low — CLI is fine for single operator |
 | Multi-exchange support (Kalshi) | Low — separate product decision |

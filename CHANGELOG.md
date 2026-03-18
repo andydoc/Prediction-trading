@@ -7,6 +7,18 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.14.5] — 2026-03-18 — C1.1: POL Gas Monitor + State Safety
+
+### Added
+- **POL gas balance monitor** (`gas_monitor.rs`): Queries Polygon RPC `eth_getBalance` every hour. Wallet address auto-derived from private key. Warning < 1.0 POL → Telegram alert. Critical < 0.1 POL → trips circuit breaker. 3 unit tests.
+- **State safety guards**: `.db.bak` backup created before every `load_from_disk()`. Save guard refuses to wipe positions if DB has some but runtime has 0.
+- `GasCritical` circuit breaker trip reason for external gas-related trips.
+- POL balance shown in stats log line (`POL=X.XXXX`).
+- Config section `safety.gas_monitor` with 5 params.
+- Automated POL bridge top-up added to Milestone G roadmap.
+
+---
+
 ## [0.14.4] — 2026-03-18 — C1: Circuit Breaker
 
 ### Added

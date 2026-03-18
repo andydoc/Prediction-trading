@@ -49,6 +49,9 @@ pub enum TripReason {
         elapsed_secs: f64,
         threshold_secs: f64,
     },
+    GasCritical {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for TripReason {
@@ -63,6 +66,9 @@ impl std::fmt::Display for TripReason {
             }
             TripReason::ApiUnreachable { elapsed_secs, threshold_secs } => {
                 write!(f, "API unreachable for {:.0}s (threshold {:.0}s)", elapsed_secs, threshold_secs)
+            }
+            TripReason::GasCritical { message } => {
+                write!(f, "{}", message)
             }
         }
     }
@@ -183,6 +189,19 @@ impl CircuitBreaker {
         self.trip_reason.as_ref().map(|r| {
             (r.to_string(), self.trip_timestamp.unwrap_or(0.0))
         })
+    }
+
+    /// Trip the circuit breaker from an external condition (e.g., gas balance critical).
+    /// Returns the trip message if it just tripped, None if already tripped or disabled.
+    pub fn check_gas_critical(&mut self, reason: &str, now: f64) -> Option<String> {
+        if !self.config.enabled || self.tripped {
+            return None;
+        }
+        self.tripped = true;
+        let msg = reason.to_string();
+        self.trip_reason = Some(TripReason::GasCritical { message: msg.clone() });
+        self.trip_timestamp = Some(now);
+        Some(msg)
     }
 
     /// Current drawdown from peak as a fraction (0.0 = no drawdown).
