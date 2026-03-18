@@ -1251,8 +1251,19 @@ document.addEventListener('DOMContentLoaded', function() { splashStatus('connect
     es.addEventListener('stats', function(e) {
       try { renderStats(JSON.parse(e.data)); markDataReceived('stats'); } catch(ex) { console.warn('stats parse error', ex); }
     });
+    // C4.1: Buffer positions render until closed arrives, so closing positions
+    // transition seamlessly (closed table updates before open table removes them).
+    var _posBuf = null;
+    var _posBufTimer = null;
     es.addEventListener('positions', function(e) {
-      try { renderPositions(JSON.parse(e.data)); markDataReceived('positions'); } catch(ex) { console.warn('positions parse error', ex); }
+      try {
+        _posBuf = JSON.parse(e.data);
+        // Fallback: render after 150ms if closed event doesn't arrive
+        if (_posBufTimer) clearTimeout(_posBufTimer);
+        _posBufTimer = setTimeout(function() {
+          if (_posBuf) { renderPositions(_posBuf); markDataReceived('positions'); _posBuf = null; }
+        }, 150);
+      } catch(ex) { console.warn('positions parse error', ex); }
     });
     es.addEventListener('opportunities', function(e) {
       try { renderOpportunities(JSON.parse(e.data)); markDataReceived('opportunities'); } catch(ex) { console.warn('opp parse error', ex); }
@@ -1261,7 +1272,14 @@ document.addEventListener('DOMContentLoaded', function() { splashStatus('connect
       try { renderSystem(JSON.parse(e.data)); markDataReceived('system'); } catch(ex) { console.warn('system parse error', ex); }
     });
     es.addEventListener('closed', function(e) {
-      try { renderClosed(JSON.parse(e.data)); } catch(ex) { console.warn('closed parse error', ex); }
+      try {
+        renderClosed(JSON.parse(e.data));
+        // Flush buffered positions render now that closed is up to date
+        if (_posBuf) {
+          if (_posBufTimer) { clearTimeout(_posBufTimer); _posBufTimer = null; }
+          renderPositions(_posBuf); markDataReceived('positions'); _posBuf = null;
+        }
+      } catch(ex) { console.warn('closed parse error', ex); }
     });
     es.addEventListener('shadow', function(e) {
       try { renderShadow(JSON.parse(e.data)); } catch(ex) { console.warn('shadow parse error', ex); }

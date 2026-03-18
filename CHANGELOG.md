@@ -7,12 +7,15 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
-## [0.14.7] — 2026-03-18 — C4: Daily P&L Report
+## [0.14.7] — 2026-03-18 — C4: Daily P&L Report + C4.1: Seamless Close
 
 ### Added
 - **Daily P&L report** (C4): Automated summary at midnight UTC. Detects UTC day boundary in orchestrator tick loop. Reports: entries, exits, fees, net P&L, capital utilisation %, drawdown from peak. Sent via Telegram (`NotifyEvent::DailySummary`). Persisted to `daily_reports` SQLite table with full JSON data payload.
 - `daily_reports` table in StateDB schema with `save_daily_report()` method.
 - `parse_entry_ts()` helper in orchestrator for ISO/float timestamp parsing.
+
+### Fixed
+- **Seamless position close transition** (C4.1): Client-side buffer ensures closed table updates before open table removes transitioning positions. Eliminates visual gap on resolve/exit. 150ms fallback timeout.
 
 ---
 

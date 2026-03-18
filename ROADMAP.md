@@ -49,12 +49,12 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 
 | Status | Count |
 |--------|-------|
-| ✅ Complete | 6/10 |
-| ⬚ Remaining | 4/10 |
+| ✅ Complete | 7/10 |
+| ⬚ Remaining | 3/10 |
 
-**Done**: Circuit breaker (C1), POL gas balance monitoring (C1.1), kill switch (C2), Telegram notifications (C3), daily P&L report (C4), proactive near-resolution exit (C4.2).
+**Done**: Circuit breaker (C1), POL gas balance monitoring (C1.1), kill switch (C2), Telegram notifications (C3), daily P&L report (C4), seamless close transition (C4.1), proactive near-resolution exit (C4.2).
 
-**Remaining**: Seamless position close transition (C4.1), OPS_RUNBOOK.md (C5), USER_GUIDE.md (C6), retire PROGRESS_ROADMAP.md (C7).
+**Remaining**: OPS_RUNBOOK.md (C5), USER_GUIDE.md (C6), retire PROGRESS_ROADMAP.md (C7).
 
 ---
 
