@@ -151,8 +151,8 @@ The following inconsistencies were identified. These will be addressed by the do
     |                Complete. 27/27 tasks. 44/44 tests. Shadow-verified on VPS.
     |                No funded account required.
     |
-🔧 Milestone C: Safety Infrastructure + docs (OPS_RUNBOOK, USER_GUIDE) + retire PROGRESS_ROADMAP
-    |                No funded account required.
+✅ Milestone C: Safety Infrastructure + docs (OPS_RUNBOOK, USER_GUIDE) + retire PROGRESS_ROADMAP
+    |                Complete. 10/10 tasks. No funded account required.
     |
 ⬚ Milestone D: CLOB Integration Test (small deposit: ~$50 USDC + POL gas)
     |                Prove the execution path works against the real CLOB.
@@ -360,7 +360,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 ---
 
-### 🔧 Milestone C: Safety Infrastructure
+### ✅ Milestone C: Safety Infrastructure
 
 **Goal**: The system can protect capital automatically and alert the operator. **No funded account required.**
 
