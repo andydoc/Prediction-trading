@@ -1,6 +1,6 @@
 [package]
 name = "rust_engine"
-version = "0.13.0"
+version = "0.14.4"
 edition = "2021"
 description = "Core trading engine: WS, book mirror, arb math, positions, dashboard"
 

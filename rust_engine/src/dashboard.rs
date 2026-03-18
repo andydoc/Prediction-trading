@@ -100,7 +100,8 @@ pub async fn start(state: DashboardState, port: u16, bind_addr: &str) {
 async fn handle_html(State(s): State<Arc<DashboardState>>) -> Html<String> {
     let html = DASHBOARD_HTML
         .replace("{{MODE_LABEL}}", &s.mode.to_uppercase())
-        .replace("{{MODE_CLASS}}", &format!("mode-{}", s.mode));
+        .replace("{{MODE_CLASS}}", &format!("mode-{}", s.mode))
+        .replace("{{VERSION}}", &format!("v{}", env!("CARGO_PKG_VERSION")));
     Html(html)
 }
 
