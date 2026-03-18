@@ -9,6 +9,7 @@ env/
 
 # Secrets & runtime data
 config/secrets.yaml
+config/config.local.yaml
 secrets.yaml
 data/
 logs/

@@ -27,6 +27,21 @@ use rust_engine::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use rust_engine::TradingEngine;
 
 // ---------------------------------------------------------------------------
+// Config overlay: deep-merge config.local.yaml on top of config.yaml
+// ---------------------------------------------------------------------------
+
+fn deep_merge(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(overlay_map)) => {
+            for (k, v) in overlay_map {
+                deep_merge(base_map.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+            }
+        }
+        (base, overlay) => *base = overlay.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Delay model (ported from Python trading_engine.py)
 // ---------------------------------------------------------------------------
 
@@ -159,15 +174,24 @@ pub struct OrchestratorConfig {
 }
 
 impl OrchestratorConfig {
-    /// Load from config.yaml + secrets.yaml at workspace path.
+    /// Load from config.yaml + config.local.yaml (overlay) + secrets.yaml at workspace path.
     pub fn load(workspace: &Path) -> Self {
         let config_path = workspace.join("config").join("config.yaml");
+        let local_path = workspace.join("config").join("config.local.yaml");
         let secrets_path = workspace.join("config").join("secrets.yaml");
 
-        let yaml: serde_json::Value = std::fs::read_to_string(&config_path)
+        let mut yaml: serde_json::Value = std::fs::read_to_string(&config_path)
             .ok()
             .and_then(|s| serde_yaml_ng::from_str(&s).ok())
             .unwrap_or_default();
+
+        // Merge config.local.yaml on top (not tracked by git — for per-machine overrides)
+        if let Ok(local_str) = std::fs::read_to_string(&local_path) {
+            if let Ok(local_val) = serde_yaml_ng::from_str::<serde_json::Value>(&local_str) {
+                deep_merge(&mut yaml, &local_val);
+                tracing::info!("Applied config.local.yaml overrides");
+            }
+        }
 
         let secrets: serde_json::Value = std::fs::read_to_string(&secrets_path)
             .ok()
@@ -412,12 +436,18 @@ impl Orchestrator {
             (table, FALLBACK_DEFAULT)
         };
 
-        // Cache parsed config.yaml at startup
+        // Cache parsed config.yaml + local overlay at startup
         let config_path = cfg.workspace.join("config").join("config.yaml");
-        let cached_yaml: serde_json::Value = std::fs::read_to_string(&config_path)
+        let mut cached_yaml: serde_json::Value = std::fs::read_to_string(&config_path)
             .ok()
             .and_then(|s| serde_yaml_ng::from_str(&s).ok())
             .unwrap_or_default();
+        let local_path = cfg.workspace.join("config").join("config.local.yaml");
+        if let Ok(local_str) = std::fs::read_to_string(&local_path) {
+            if let Ok(local_val) = serde_yaml_ng::from_str::<serde_json::Value>(&local_str) {
+                deep_merge(&mut cached_yaml, &local_val);
+            }
+        }
 
         // Load notification config (C3)
         // Telegram bot token loaded from secrets.yaml; chat_id from config.yaml phone_number field
