@@ -23,7 +23,7 @@ impl Default for GasMonitorConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            rpc_url: "https://polygon-rpc.com".to_string(),
+            rpc_url: "https://polygon-bor-rpc.publicnode.com".to_string(),
             wallet_address: String::new(),
             check_interval_seconds: 3600.0,
             min_pol_balance: 1.0,

@@ -195,10 +195,10 @@ safety:
     api_timeout_seconds: 600            # API unreachable for 10min triggers halt (must exceed 300s API resolution interval)
   gas_monitor:
     enabled: true
-    rpc_url: 'https://polygon-rpc.com'
+    rpc_url: 'https://polygon-bor-rpc.publicnode.com'
     check_interval_seconds: 3600       # Check every hour
     min_pol_balance: 1.0               # Warning threshold (Telegram alert)
-    critical_pol_balance: 0.1          # Critical threshold (trips circuit breaker)
+    critical_pol_balance: 0.0          # Critical threshold (trips circuit breaker) — set to 0 until POL deposited for Milestone D
 dashboard:
   port: 5558
   bind_addr: '127.0.0.1'
