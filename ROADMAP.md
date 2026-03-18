@@ -43,18 +43,15 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 
 ---
 
-## Milestone C: Safety Infrastructure — 🔧 In Progress
+## Milestone C: Safety Infrastructure — ✅ Complete
 
 **Goal**: System can protect capital automatically and alert the operator. No funded account required.
 
 | Status | Count |
 |--------|-------|
-| ✅ Complete | 7/10 |
-| ⬚ Remaining | 3/10 |
+| ✅ Complete | 10/10 |
 
-**Done**: Circuit breaker (C1), POL gas balance monitoring (C1.1), kill switch (C2), Telegram notifications (C3), daily P&L report (C4), seamless close transition (C4.1), proactive near-resolution exit (C4.2).
-
-**Remaining**: OPS_RUNBOOK.md (C5), USER_GUIDE.md (C6), retire PROGRESS_ROADMAP.md (C7).
+**Done**: Circuit breaker (C1), POL gas balance monitoring (C1.1), kill switch (C2), Telegram notifications (C3), daily P&L report (C4), seamless close transition (C4.1), proactive near-resolution exit (C4.2), OPS_RUNBOOK.md (C5), USER_GUIDE.md (C6), retire PROGRESS_ROADMAP.md (C7).
 
 ---
 

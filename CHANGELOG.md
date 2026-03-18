@@ -17,6 +17,11 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 ### Fixed
 - **Seamless position close transition** (C4.1): Client-side buffer ensures closed table updates before open table removes transitioning positions. Eliminates visual gap on resolve/exit. 150ms fallback timeout.
 
+### Documentation
+- **OPS_RUNBOOK.md** (C5): 12-section operations runbook — VPS, scripts, CLI, dashboard, logs, circuit breaker, kill switch, Telegram, POL gas, backups, config, monitoring checklist.
+- **USER_GUIDE.md** (C6): 11-section user guide — overview, setup, operation, dashboard, modes, multi-instance, recovery, safety, go-live checklist, glossary.
+- **PROGRESS_ROADMAP.md retired** (C7): Replaced 1,270-line monolith with brief note pointing to 7 replacement documents.
+
 ---
 
 ## [0.14.6] — 2026-03-18 — C2: Kill Switch
