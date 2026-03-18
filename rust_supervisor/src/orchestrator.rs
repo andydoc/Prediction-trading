@@ -109,7 +109,222 @@ fn rank_opportunities(
 }
 
 // ---------------------------------------------------------------------------
-// Config
+// Config — YAML-mirrored serde structs (PY1)
+// ---------------------------------------------------------------------------
+
+/// Intermediate structs for serde deserialization from config.yaml.
+/// Each struct mirrors a YAML section and provides defaults via `#[serde(default)]`.
+
+#[derive(serde::Deserialize, Default)]
+struct ArbitrageYaml {
+    #[serde(default = "default_20u64")]
+    max_concurrent_positions: u64,
+    #[serde(default = "default_60u64")]
+    max_days_to_resolution: u64,
+    #[serde(default = "default_30u64")]
+    max_days_to_replacement: u64,
+    #[serde(default = "default_010")]
+    capital_per_trade_pct: f64,
+    #[serde(default = "default_10f")]
+    min_trade_size: f64,
+    #[serde(default = "default_300f")]
+    min_resolution_time_secs: f64,
+    #[serde(default = "default_60f")]
+    replacement_cooldown_seconds: f64,
+    #[serde(default)]
+    resolution_validation: ResolutionValidationYaml,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ResolutionValidationYaml {
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct EngineYaml {
+    #[serde(default = "default_30f")]
+    state_save_interval_seconds: f64,
+    #[serde(default = "default_30f")]
+    monitor_interval_seconds: f64,
+    #[serde(default = "default_600f")]
+    constraint_rebuild_interval_seconds: f64,
+    #[serde(default = "default_500u64")]
+    max_evals_per_batch: u64,
+    #[serde(default = "default_30f")]
+    stats_log_interval_seconds: f64,
+    #[serde(default = "default_60f")]
+    stale_sweep_interval_seconds: f64,
+    #[serde(default = "default_30f")]
+    stale_asset_threshold_seconds: f64,
+    #[serde(default = "default_300f")]
+    api_resolution_interval_seconds: f64,
+    #[serde(default = "default_30f")]
+    max_book_staleness_secs: f64,
+    #[serde(default = "default_90u64")]
+    closed_position_retention_days: u64,
+    #[serde(default)]
+    latency_instrumentation: bool,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct LiveTradingYaml {
+    #[serde(default = "default_true")]
+    shadow_only: bool,
+    #[serde(default)]
+    min_depth_per_leg: f64,
+    #[serde(default = "default_080")]
+    depth_haircut: f64,
+    #[serde(default = "default_070")]
+    min_profit_ratio: f64,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct DashboardYaml {
+    #[serde(default = "default_5556u64")]
+    port: u64,
+    #[serde(default = "default_localhost")]
+    bind_addr: String,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct WebsocketYaml {
+    #[serde(default)]
+    use_tiered_ws: bool,
+    #[serde(default = "default_ws_url")]
+    market_channel_url: String,
+    #[serde(default = "default_10u64")]
+    tier_b_max_connections: u64,
+    #[serde(default = "default_3u64")]
+    tier_b_hysteresis_scans: u64,
+    #[serde(default = "default_300u64")]
+    tier_b_consolidation_threshold: u64,
+    #[serde(default = "default_25f")]
+    tier_c_new_market_buffer_secs: f64,
+    #[serde(default = "default_150u64")]
+    stagger_ms: u64,
+    #[serde(default = "default_450u64")]
+    max_assets_per_connection: u64,
+    #[serde(default = "default_10u64")]
+    heartbeat_interval: u64,
+    #[serde(default)]
+    tier_b_top_n_constraints: u64,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct SafetyYaml {
+    #[serde(default)]
+    circuit_breaker: CircuitBreakerYaml,
+    #[serde(default)]
+    gas_monitor: GasMonitorYaml,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct CircuitBreakerYaml {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_010")]
+    max_drawdown_pct: f64,
+    #[serde(default = "default_3u64")]
+    max_consecutive_errors: u64,
+    #[serde(default = "default_300f")]
+    error_window_seconds: f64,
+    #[serde(default = "default_60f")]
+    api_timeout_seconds: f64,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct GasMonitorYaml {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_rpc_url")]
+    rpc_url: String,
+    #[serde(default = "default_3600f")]
+    check_interval_seconds: f64,
+    #[serde(default = "default_1f")]
+    min_pol_balance: f64,
+    #[serde(default = "default_01f")]
+    critical_pol_balance: f64,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct AiYaml {
+    #[serde(default)]
+    postponement: PostponementYaml,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct PostponementYaml {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_24f")]
+    check_interval_hours: f64,
+    #[serde(default = "default_14u64")]
+    postponement_rescore_days: u64,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct StateYaml {
+    #[serde(default)]
+    db_path: Option<String>,
+}
+
+/// Top-level config YAML layout.
+#[derive(serde::Deserialize, Default)]
+struct ConfigYaml {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    arbitrage: ArbitrageYaml,
+    #[serde(default)]
+    engine: EngineYaml,
+    #[serde(default)]
+    live_trading: LiveTradingYaml,
+    #[serde(default)]
+    dashboard: DashboardYaml,
+    #[serde(default)]
+    websocket: WebsocketYaml,
+    #[serde(default)]
+    safety: SafetyYaml,
+    #[serde(default)]
+    ai: AiYaml,
+    #[serde(default)]
+    state: StateYaml,
+}
+
+// Default value functions for serde
+fn default_true() -> bool { true }
+fn default_010() -> f64 { 0.10 }
+fn default_070() -> f64 { 0.70 }
+fn default_080() -> f64 { 0.80 }
+fn default_01f() -> f64 { 0.1 }
+fn default_1f() -> f64 { 1.0 }
+fn default_10f() -> f64 { 10.0 }
+fn default_24f() -> f64 { 24.0 }
+fn default_25f() -> f64 { 2.5 }
+fn default_30f() -> f64 { 30.0 }
+fn default_60f() -> f64 { 60.0 }
+fn default_300f() -> f64 { 300.0 }
+fn default_600f() -> f64 { 600.0 }
+fn default_3600f() -> f64 { 3600.0 }
+fn default_3u64() -> u64 { 3 }
+fn default_10u64() -> u64 { 10 }
+fn default_14u64() -> u64 { 14 }
+fn default_20u64() -> u64 { 20 }
+fn default_30u64() -> u64 { 30 }
+fn default_60u64() -> u64 { 60 }
+fn default_90u64() -> u64 { 90 }
+fn default_150u64() -> u64 { 150 }
+fn default_300u64() -> u64 { 300 }
+fn default_450u64() -> u64 { 450 }
+fn default_500u64() -> u64 { 500 }
+fn default_5556u64() -> u64 { 5556 }
+fn default_localhost() -> String { "127.0.0.1".into() }
+fn default_ws_url() -> String { "wss://ws-subscriptions-clob.polymarket.com/ws/market".into() }
+fn default_rpc_url() -> String { "https://polygon-rpc.com".into() }
+
+// ---------------------------------------------------------------------------
+// Config — public struct
 // ---------------------------------------------------------------------------
 
 /// Orchestrator config (extracted from config.yaml).
@@ -212,158 +427,96 @@ impl OrchestratorConfig {
             .and_then(|s| serde_yaml_ng::from_str(&s).ok())
             .unwrap_or_default();
 
-        let arb = yaml.get("arbitrage").cloned().unwrap_or_default();
-        let eng = yaml.get("engine").cloned().unwrap_or_default();
-        let live_cfg = yaml.get("live_trading").cloned().unwrap_or_default();
-        let ai = yaml.get("ai").cloned().unwrap_or_default();
-        let ws_cfg = yaml.get("websocket").cloned().unwrap_or_default();
+        // Deserialize each YAML section via serde (PY1: replaces ~130 lines of .and_then().unwrap_or())
+        let cfg: ConfigYaml = serde_json::from_value(yaml.clone()).unwrap_or_default();
 
-        let shadow_only = live_cfg.get("shadow_only").and_then(|v| v.as_bool()).unwrap_or(true);
-        let mode_str = yaml.get("mode").and_then(|v| v.as_str()).unwrap_or("dual");
-
-        // API key: secrets > config > env
+        // API key: secrets > env
         let api_key = secrets.pointer("/resolution_validation/anthropic_api_key")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
             .unwrap_or_default();
 
-        let rv_cfg = arb.get("resolution_validation").cloned().unwrap_or_default();
-        let pp_cfg = ai.get("postponement").cloned().unwrap_or_default();
+        // Derive wallet address from private key in secrets
+        let gas_wallet_address = {
+            let pk = secrets.pointer("/polymarket/private_key")
+                .and_then(|v| v.as_str()).unwrap_or("");
+            if pk.is_empty() {
+                String::new()
+            } else {
+                match rust_engine::signing::OrderSigner::new(pk) {
+                    Ok(signer) => format!("{:#x}", signer.address()),
+                    Err(e) => {
+                        tracing::warn!("Failed to derive wallet address for gas monitor: {}", e);
+                        String::new()
+                    }
+                }
+            }
+        };
 
         Self {
             workspace: workspace.to_path_buf(),
-            mode: mode_str.to_string(),
-            shadow_only,
-            dashboard_port: yaml.pointer("/dashboard/port")
-                .and_then(|v| v.as_u64()).unwrap_or(5556) as u16,
-            dashboard_bind: yaml.pointer("/dashboard/bind_addr")
-                .and_then(|v| v.as_str()).unwrap_or("127.0.0.1").to_string(),
+            mode: cfg.mode.unwrap_or_else(|| "dual".into()),
+            shadow_only: cfg.live_trading.shadow_only,
+            dashboard_port: cfg.dashboard.port as u16,
+            dashboard_bind: cfg.dashboard.bind_addr,
 
-            max_positions: arb.get("max_concurrent_positions")
-                .and_then(|v| v.as_u64()).unwrap_or(20) as usize,
-            max_days_entry: arb.get("max_days_to_resolution")
-                .and_then(|v| v.as_u64()).unwrap_or(60) as u32,
-            max_days_replace: arb.get("max_days_to_replacement")
-                .and_then(|v| v.as_u64()).unwrap_or(30) as u32,
-            capital_pct: arb.get("capital_per_trade_pct")
-                .and_then(|v| v.as_f64()).unwrap_or(0.10),
-            min_trade_size: arb.get("min_trade_size")
-                .and_then(|v| v.as_f64()).unwrap_or(10.0),
-            min_resolution_secs: arb.get("min_resolution_time_secs")
-                .and_then(|v| v.as_f64()).unwrap_or(300.0),
-            replacement_cooldown_secs: arb.get("replacement_cooldown_seconds")
-                .and_then(|v| v.as_f64()).unwrap_or(60.0),
+            max_positions: cfg.arbitrage.max_concurrent_positions as usize,
+            max_days_entry: cfg.arbitrage.max_days_to_resolution as u32,
+            max_days_replace: cfg.arbitrage.max_days_to_replacement as u32,
+            capital_pct: cfg.arbitrage.capital_per_trade_pct,
+            min_trade_size: cfg.arbitrage.min_trade_size,
+            min_resolution_secs: cfg.arbitrage.min_resolution_time_secs,
+            replacement_cooldown_secs: cfg.arbitrage.replacement_cooldown_seconds,
 
-            state_save_interval: eng.get("state_save_interval_seconds")
-                .and_then(|v| v.as_f64()).unwrap_or(30.0),
-            monitor_interval: eng.get("monitor_interval_seconds")
-                .and_then(|v| v.as_f64()).unwrap_or(30.0),
-            constraint_rebuild_interval: eng.get("constraint_rebuild_interval_seconds")
-                .and_then(|v| v.as_f64()).unwrap_or(600.0),
-            max_evals_per_batch: eng.get("max_evals_per_batch")
-                .and_then(|v| v.as_u64()).unwrap_or(500) as usize,
-            stats_log_interval: eng.get("stats_log_interval_seconds")
-                .and_then(|v| v.as_f64()).unwrap_or(30.0),
-            stale_sweep_interval: eng.get("stale_sweep_interval_seconds")
-                .and_then(|v| v.as_f64()).unwrap_or(60.0),
-            stale_asset_threshold: eng.get("stale_asset_threshold_seconds")
-                .and_then(|v| v.as_f64()).unwrap_or(30.0),
-            api_resolution_interval: eng.get("api_resolution_interval_seconds")
-                .and_then(|v| v.as_f64()).unwrap_or(300.0),
+            state_save_interval: cfg.engine.state_save_interval_seconds,
+            monitor_interval: cfg.engine.monitor_interval_seconds,
+            constraint_rebuild_interval: cfg.engine.constraint_rebuild_interval_seconds,
+            max_evals_per_batch: cfg.engine.max_evals_per_batch as usize,
+            stats_log_interval: cfg.engine.stats_log_interval_seconds,
+            stale_sweep_interval: cfg.engine.stale_sweep_interval_seconds,
+            stale_asset_threshold: cfg.engine.stale_asset_threshold_seconds,
+            api_resolution_interval: cfg.engine.api_resolution_interval_seconds,
 
-            min_depth_per_leg: live_cfg.get("min_depth_per_leg")
-                .and_then(|v| v.as_f64()).unwrap_or(0.0),
-            depth_haircut: live_cfg.get("depth_haircut")
-                .and_then(|v| v.as_f64()).unwrap_or(0.80),
-            max_book_staleness_secs: eng.get("max_book_staleness_secs")
-                .and_then(|v| v.as_f64()).unwrap_or(30.0),
-            min_profit_ratio: live_cfg.get("min_profit_ratio")
-                .and_then(|v| v.as_f64()).unwrap_or(0.70),
-            closed_retention_days: eng.get("closed_position_retention_days")
-                .and_then(|v| v.as_u64()).unwrap_or(90) as u32,
+            min_depth_per_leg: cfg.live_trading.min_depth_per_leg,
+            depth_haircut: cfg.live_trading.depth_haircut,
+            max_book_staleness_secs: cfg.engine.max_book_staleness_secs,
+            min_profit_ratio: cfg.live_trading.min_profit_ratio,
+            closed_retention_days: cfg.engine.closed_position_retention_days as u32,
 
-            resolution_validation_enabled: rv_cfg.get("enabled")
-                .and_then(|v| v.as_bool()).unwrap_or(true),
+            resolution_validation_enabled: cfg.arbitrage.resolution_validation.enabled,
             anthropic_api_key: api_key,
-            postponement_enabled: pp_cfg.get("enabled")
-                .and_then(|v| v.as_bool()).unwrap_or(false),
-            postponement_check_interval: pp_cfg.get("check_interval_hours")
-                .and_then(|v| v.as_f64()).unwrap_or(24.0) * 3600.0,
-            postponement_rescore_days: pp_cfg.get("postponement_rescore_days")
-                .and_then(|v| v.as_u64()).unwrap_or(14) as u32,
-            state_db_path: yaml.pointer("/state/db_path")
-                .and_then(|v| v.as_str())
+            postponement_enabled: cfg.ai.postponement.enabled,
+            postponement_check_interval: cfg.ai.postponement.check_interval_hours * 3600.0,
+            postponement_rescore_days: cfg.ai.postponement.postponement_rescore_days as u32,
+            state_db_path: cfg.state.db_path
                 .map(|s| workspace.join(s))
                 .unwrap_or_else(|| workspace.join("data").join("system_state").join("execution_state.db")),
-            latency_instrumentation: eng.get("latency_instrumentation")
-                .and_then(|v| v.as_bool()).unwrap_or(false),
+            latency_instrumentation: cfg.engine.latency_instrumentation,
 
-            // Tiered WS config
-            use_tiered_ws: ws_cfg.get("use_tiered_ws")
-                .and_then(|v| v.as_bool()).unwrap_or(false),
-            tiered_ws_url: ws_cfg.get("market_channel_url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("wss://ws-subscriptions-clob.polymarket.com/ws/market")
-                .to_string(),
-            tier_b_max_connections: ws_cfg.get("tier_b_max_connections")
-                .and_then(|v| v.as_u64()).unwrap_or(10) as usize,
-            tier_b_hysteresis_scans: ws_cfg.get("tier_b_hysteresis_scans")
-                .and_then(|v| v.as_u64()).unwrap_or(3) as u32,
-            tier_b_consolidation_threshold: ws_cfg.get("tier_b_consolidation_threshold")
-                .and_then(|v| v.as_u64()).unwrap_or(300) as usize,
-            tier_c_new_market_buffer_secs: ws_cfg.get("tier_c_new_market_buffer_secs")
-                .and_then(|v| v.as_f64()).unwrap_or(2.5),
-            ws_stagger_ms: ws_cfg.get("stagger_ms")
-                .and_then(|v| v.as_u64()).unwrap_or(150),
-            ws_max_assets_per_connection: ws_cfg.get("max_assets_per_connection")
-                .and_then(|v| v.as_u64()).unwrap_or(450) as usize,
-            ws_heartbeat_interval_secs: ws_cfg.get("heartbeat_interval")
-                .and_then(|v| v.as_u64()).unwrap_or(10),
-            tier_b_top_n_constraints: ws_cfg.get("tier_b_top_n_constraints")
-                .and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            use_tiered_ws: cfg.websocket.use_tiered_ws,
+            tiered_ws_url: cfg.websocket.market_channel_url,
+            tier_b_max_connections: cfg.websocket.tier_b_max_connections as usize,
+            tier_b_hysteresis_scans: cfg.websocket.tier_b_hysteresis_scans as u32,
+            tier_b_consolidation_threshold: cfg.websocket.tier_b_consolidation_threshold as usize,
+            tier_c_new_market_buffer_secs: cfg.websocket.tier_c_new_market_buffer_secs,
+            ws_stagger_ms: cfg.websocket.stagger_ms,
+            ws_max_assets_per_connection: cfg.websocket.max_assets_per_connection as usize,
+            ws_heartbeat_interval_secs: cfg.websocket.heartbeat_interval,
+            tier_b_top_n_constraints: cfg.websocket.tier_b_top_n_constraints as usize,
 
-            // Circuit breaker (C1)
-            cb_enabled: {
-                let cb = yaml.pointer("/safety/circuit_breaker");
-                cb.and_then(|v| v.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(true)
-            },
-            cb_max_drawdown_pct: yaml.pointer("/safety/circuit_breaker/max_drawdown_pct")
-                .and_then(|v| v.as_f64()).unwrap_or(0.10),
-            cb_max_consecutive_errors: yaml.pointer("/safety/circuit_breaker/max_consecutive_errors")
-                .and_then(|v| v.as_u64()).unwrap_or(3) as u32,
-            cb_error_window_seconds: yaml.pointer("/safety/circuit_breaker/error_window_seconds")
-                .and_then(|v| v.as_f64()).unwrap_or(300.0),
-            cb_api_timeout_seconds: yaml.pointer("/safety/circuit_breaker/api_timeout_seconds")
-                .and_then(|v| v.as_f64()).unwrap_or(60.0),
+            cb_enabled: cfg.safety.circuit_breaker.enabled,
+            cb_max_drawdown_pct: cfg.safety.circuit_breaker.max_drawdown_pct,
+            cb_max_consecutive_errors: cfg.safety.circuit_breaker.max_consecutive_errors as u32,
+            cb_error_window_seconds: cfg.safety.circuit_breaker.error_window_seconds,
+            cb_api_timeout_seconds: cfg.safety.circuit_breaker.api_timeout_seconds,
 
-            // Gas monitor (C1.1)
-            gas_enabled: yaml.pointer("/safety/gas_monitor/enabled")
-                .and_then(|v| v.as_bool()).unwrap_or(false),
-            gas_rpc_url: yaml.pointer("/safety/gas_monitor/rpc_url")
-                .and_then(|v| v.as_str()).unwrap_or("https://polygon-rpc.com").to_string(),
-            gas_wallet_address: {
-                // Derive wallet address from private key in secrets
-                let pk = secrets.pointer("/polymarket/private_key")
-                    .and_then(|v| v.as_str()).unwrap_or("");
-                if pk.is_empty() {
-                    String::new()
-                } else {
-                    match rust_engine::signing::OrderSigner::new(pk) {
-                        Ok(signer) => format!("{:#x}", signer.address()),
-                        Err(e) => {
-                            tracing::warn!("Failed to derive wallet address for gas monitor: {}", e);
-                            String::new()
-                        }
-                    }
-                }
-            },
-            gas_check_interval_seconds: yaml.pointer("/safety/gas_monitor/check_interval_seconds")
-                .and_then(|v| v.as_f64()).unwrap_or(3600.0),
-            gas_min_pol_balance: yaml.pointer("/safety/gas_monitor/min_pol_balance")
-                .and_then(|v| v.as_f64()).unwrap_or(1.0),
-            gas_critical_pol_balance: yaml.pointer("/safety/gas_monitor/critical_pol_balance")
-                .and_then(|v| v.as_f64()).unwrap_or(0.1),
+            gas_enabled: cfg.safety.gas_monitor.enabled,
+            gas_rpc_url: cfg.safety.gas_monitor.rpc_url,
+            gas_wallet_address,
+            gas_check_interval_seconds: cfg.safety.gas_monitor.check_interval_seconds,
+            gas_min_pol_balance: cfg.safety.gas_monitor.min_pol_balance,
+            gas_critical_pol_balance: cfg.safety.gas_monitor.critical_pol_balance,
         }
     }
 }
