@@ -261,7 +261,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | WS tiered mode enabled | orchestrator | false | `websocket.use_tiered_ws` |
 | WS max assets per connection | orchestrator | 450 | `websocket.max_assets_per_connection` |
 | WS connection stagger | orchestrator | 150 ms | `websocket.stagger_ms` |
-| Tier B max connections | orchestrator | 15 | `websocket.tier_b_max_connections` |
+| Tier B max connections | orchestrator | 16 | `websocket.tier_b_max_connections` |
 | Tier B hysteresis scans | orchestrator | 3 | `websocket.tier_b_hysteresis_scans` |
 | Tier B consolidation threshold | orchestrator | 300 | `websocket.tier_b_consolidation_threshold` |
 | Tier B top N constraints | orchestrator | 0 (no limit) | `websocket.tier_b_top_n_constraints` |
@@ -294,6 +294,8 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 ### 🔧 Milestone B: Build Execution Infrastructure
 
+**Status**: All code tasks (B2–B4) complete. B5 documentation (ARCHITECTURE.md, ROADMAP.md) remaining. 44/44 unit tests pass. Shadow mode verified on VPS (reconciliation, P&L tracking, dashboard).
+
 **Goal**: Code-complete execution path — all modules built, unit-tested, and shadow-testable. **No funded account required.** Everything in this milestone can be verified against shadow data, dry-run mode, or unit tests comparing output against known-good reference values.
 
 **Critical files** (all Rust after Milestone A):
@@ -303,6 +305,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 - New: `signing.rs` — EIP-712 order signing
 - New: `instrument.rs` — formal instrument model
 - New: `reconciliation.rs` — venue-side state comparison
+- New: `monitor.rs` — system/financial metrics collection + SSE streaming
 - New: `rate_limiter.rs` — token bucket for CLOB API
 
 #### B-Part 1: Foundations (already complete)
@@ -353,7 +356,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | ⬚ **B5.0: Create ARCHITECTURE.md** | Post-Rust-port architecture, data flow, component descriptions, file structure (verified against repo), config reference (all parameterised values), signing design decision (type 0 EOA), instrument model, WS tier design, glossary. Current state only — not historical. |
 | ⬚ **B5.1: Create ROADMAP.md** | Phases renumbered by actual priority. Each phase: goal, status, items. Cross-references ARCHITECTURE.md. No version history or incident detail. Accurately reflects A+B as complete, C–G as remaining. |
 
-**Verification**: All code builds and passes unit tests. Dry-run mode constructs, signs, and logs full order details for every "would-execute" event in shadow mode. Signature output matches py-clob-client for identical inputs. Rate limiter correctly throttles burst requests. Instrument model correctly encodes all 4 tick-size precision tiers.
+**Verification** (as of v0.14.1): All code builds and passes 44/44 unit tests. Dry-run mode constructs, signs, and logs full order details for every "would-execute" event in shadow mode. Signature output matches py-clob-client for identical inputs. Rate limiter correctly throttles burst requests. Instrument model correctly encodes all 4 tick-size precision tiers. Reconciliation runs cleanly in shadow mode (no false alarms). Dashboard P&L charts and stats bar verified on VPS. Tier B WS connections stable at 16 with jitter v2 + biased heartbeat.
 
 ---
 
@@ -453,7 +456,7 @@ Shadow-A tests whether wider entry gates (lowered to 120s min resolution) and fa
 
 Each instance runs independently with its own SQLite database and log files. Dashboard shows a comparison view of all 5.
 
-**WebSocket connection budget**: With 6 instances sharing one IP, total Tier B connections must stay within Polymarket's per-IP limit (~20-30, per INC-011). Shadow-A–E set `websocket.tier_b_max_connections: 2`; Shadow-F sets `websocket.tier_b_max_connections: 1` (crypto price is a smaller market subset). Total: 5×2 + 1×1 = 11 Tier B + 6 Tier C = 17 total, safely within budget. Stagger instance startup by 30s to avoid connection burst.
+**WebSocket connection budget**: Single-instance default is `tier_b_max_connections: 16` (raised from 15 — jitter v2 + biased heartbeat provides sufficient spread). With 6 instances sharing one IP, total Tier B connections must stay within Polymarket's per-IP limit (~20-30, per INC-011). Shadow-A–E set `websocket.tier_b_max_connections: 2`; Shadow-F sets `websocket.tier_b_max_connections: 1` (crypto price is a smaller market subset). Total: 5×2 + 1×1 = 11 Tier B + 6 Tier C = 17 total, safely within budget. Stagger instance startup by 30s to avoid connection burst.
 
 **Extensibility**: The multi-instance system is not limited to 6 instances. Adding more requires only: (1) a new `config/instances/{name}.yaml` overlay file, (2) `systemctl start prediction-trader@{name}`. Any config key can be overridden per-instance.
 

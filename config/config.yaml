@@ -115,7 +115,7 @@ websocket:
   use_tiered_ws: true               # Tiered WS enabled (replaces flat sharding)
   max_assets_per_connection: 490    # Hard limit per connection (Polymarket max ~500)
   stagger_ms: 150                   # Delay between connection starts
-  tier_b_max_connections: 15        # Max Tier B connections (15 — pushing limit with jitter v2)
+  tier_b_max_connections: 16        # Max Tier B connections (16 — jitter v2 + biased heartbeat provides sufficient spread)
   tier_b_hysteresis_scans: 3        # Scans a constraint must be cold before unsubscribing
   tier_b_consolidation_threshold: 300  # Assets/conn below which hourly consolidation triggers
   tier_b_top_n_constraints: 500        # Only subscribe to top N constraints by spread/time_to_resolve (0 = no limit)

@@ -7,6 +7,15 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.14.2] — 2026-03-18 — Tier B 16 Connections + Milestone B Documentation
+
+### Changed
+- Tier B `max_connections` increased to 16 (jitter v2 + biased heartbeat provides sufficient spread at this level).
+- PRODUCT_SPEC_v2.md: Milestone B status updated to reflect all code tasks (B2–B4) complete, 44/44 tests passing, shadow mode verified on VPS. B5 (ARCHITECTURE.md, ROADMAP.md) remaining.
+- PRODUCT_SPEC_v2.md: B4.0 documents shadow mode skip behaviour. B4.4 documents full chart/stats bar spec. WS connection budget updated for 16-conn default.
+
+---
+
 ## [0.14.1] — 2026-03-18 — Shadow Reconciliation Fix + Dashboard P&L Charts
 
 ### Fixed
