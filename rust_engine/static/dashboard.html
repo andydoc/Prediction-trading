@@ -970,7 +970,7 @@ function renderMonitor(d) {
     fh += fst('Total Value', '$'+tv.toFixed(2), tv>=0?'good':'bad');
     fh += fst('Deployed %', dp.toFixed(1)+'%');
     if (fin.win_rate !== undefined) fh += fst('Win %', ((fin.win_rate||0)*100).toFixed(1)+'%');
-    fh += fst('Drawdown', dd.toFixed(2)+'% / '+maxDD.toFixed(2)+'%', dd>5?'bad':'good');
+    fh += fst('Drawdown (cur/max)', dd.toFixed(2)+'% / '+maxDD.toFixed(2)+'%', dd>5?'bad':'good');
     if (fin.profit_factor !== undefined) fh += fst('Profit Factor', (fin.profit_factor||0).toFixed(2));
     if (fin.recovery_ratio !== undefined) fh += fst('Recovery', (fin.recovery_ratio||0).toFixed(2));
     if (fin.sharpe !== undefined) fh += fst('Sharpe', (fin.sharpe||0).toFixed(2));

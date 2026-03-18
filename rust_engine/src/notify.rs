@@ -1,7 +1,10 @@
-/// WhatsApp notification module (C3).
+/// Notification module (C3).
 ///
-/// Sends alerts via a generic HTTP webhook (compatible with WhatsApp Cloud API,
-/// Twilio, CallMeBot, or any service accepting JSON POST with phone + message).
+/// Sends alerts via HTTP webhook. Supports multiple backends:
+/// - **Telegram**: auto-detected when webhook_url contains `api.telegram.org`.
+///   Uses `chat_id` (from `phone_number` config field) + `text` JSON body.
+/// - **Generic webhook**: JSON POST with `{"phone": "...", "message": "..."}`.
+///   Compatible with WhatsApp Cloud API, Twilio, ntfy.sh, Discord, etc.
 ///
 /// Design principles:
 /// - Never panics or blocks trading — all errors are logged via tracing::warn
@@ -13,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use parking_lot::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Events that can trigger a WhatsApp notification.
+/// Events that can trigger a notification.
 pub enum NotifyEvent {
     PositionEntry {
         position_id: String,
@@ -47,13 +50,17 @@ pub enum NotifyEvent {
     },
 }
 
-/// Configuration for WhatsApp notifications.
+/// Configuration for notifications.
 /// Loaded from config.yaml `notifications` section.
+///
+/// For Telegram: set `webhook_url` to `https://api.telegram.org/bot<TOKEN>/sendMessage`
+/// and `phone_number` to your chat ID (get it from @userinfobot or /getUpdates).
 #[derive(Clone, Debug)]
 pub struct NotifyConfig {
     pub enabled: bool,
     pub webhook_url: String,
     pub api_key: String,
+    /// Phone number (generic webhook) or Telegram chat_id.
     pub phone_number: String,
     pub on_entry: bool,
     pub on_resolution: bool,
@@ -61,6 +68,10 @@ pub struct NotifyConfig {
     pub on_circuit_breaker: bool,
     pub on_daily_summary: bool,
     pub rate_limit_seconds: f64,
+    /// Machine hostname — prepended to all messages.
+    pub hostname: String,
+    /// Instance name (e.g. "shadow-a") — prepended when set.
+    pub instance: String,
 }
 
 impl Default for NotifyConfig {
@@ -76,11 +87,13 @@ impl Default for NotifyConfig {
             on_circuit_breaker: true,
             on_daily_summary: true,
             rate_limit_seconds: 10.0,
+            hostname: String::new(),
+            instance: String::new(),
         }
     }
 }
 
-/// WhatsApp notifier. Thread-safe; designed to be wrapped in Arc and shared.
+/// Notifier. Thread-safe; designed to be wrapped in Arc and shared.
 pub struct Notifier {
     config: NotifyConfig,
     client: Option<reqwest::blocking::Client>,
@@ -104,8 +117,14 @@ impl Notifier {
                 .build()
             {
                 Ok(c) => {
+                    let backend = if config.webhook_url.contains("api.telegram.org") {
+                        "Telegram"
+                    } else {
+                        "webhook"
+                    };
                     tracing::info!(
-                        "WhatsApp notifier enabled: phone={}, url={}",
+                        "Notifier enabled ({}): recipient={}, url={}",
+                        backend,
                         config.phone_number,
                         config.webhook_url
                     );
@@ -118,7 +137,7 @@ impl Notifier {
             }
         } else {
             if config.enabled {
-                tracing::warn!("Notifications enabled but webhook_url is empty — running in noop mode");
+                tracing::warn!("Notifications enabled but webhook_url is empty - running in noop mode");
             }
             None
         };
@@ -211,8 +230,24 @@ impl Notifier {
         }
     }
 
+    /// Build the prefix line: "[hostname/instance] " or "[hostname] ".
+    fn prefix(&self) -> String {
+        let h = &self.config.hostname;
+        let i = &self.config.instance;
+        if !h.is_empty() && !i.is_empty() {
+            format!("[{}/{}] ", h, i)
+        } else if !h.is_empty() {
+            format!("[{}] ", h)
+        } else if !i.is_empty() {
+            format!("[{}] ", i)
+        } else {
+            String::new()
+        }
+    }
+
     /// Format a human-readable message for the given event.
     fn format_message(&self, event: &NotifyEvent) -> String {
+        let pfx = self.prefix();
         match event {
             NotifyEvent::PositionEntry {
                 position_id,
@@ -221,8 +256,8 @@ impl Notifier {
                 profit_pct,
             } => {
                 format!(
-                    "[ENTRY] New position {}\nStrategy: {}\nCapital: ${:.2}\nExpected profit: {:.2}%",
-                    position_id, strategy, capital, profit_pct * 100.0
+                    "{}[ENTRY] New position {}\nStrategy: {}\nCapital: ${:.2}\nExpected profit: {:.2}%",
+                    pfx, position_id, strategy, capital, profit_pct * 100.0
                 )
             }
             NotifyEvent::PositionResolved {
@@ -232,8 +267,8 @@ impl Notifier {
             } => {
                 let icon = if *profit >= 0.0 { "[WIN]" } else { "[LOSS]" };
                 format!(
-                    "{} Position {} resolved\nMethod: {}\nProfit: ${:.4}",
-                    icon, position_id, method, profit
+                    "{}{} Position {} resolved\nMethod: {}\nProfit: ${:.4}",
+                    pfx, icon, position_id, method, profit
                 )
             }
             NotifyEvent::ProactiveExit {
@@ -242,15 +277,15 @@ impl Notifier {
                 ratio,
             } => {
                 format!(
-                    "[EXIT] Proactive exit {}\nProfit: ${:.4}\nRatio: {:.2}x",
-                    position_id, profit, ratio
+                    "{}[EXIT] Proactive exit {}\nProfit: ${:.4}\nRatio: {:.2}x",
+                    pfx, position_id, profit, ratio
                 )
             }
             NotifyEvent::Error { message } => {
-                format!("[ERROR] {}", message)
+                format!("{}[ERROR] {}", pfx, message)
             }
             NotifyEvent::CircuitBreaker { reason } => {
-                format!("[CIRCUIT BREAKER] Trading halted: {}", reason)
+                format!("{}[CIRCUIT BREAKER] Trading halted: {}", pfx, reason)
             }
             NotifyEvent::DailySummary {
                 entries,
@@ -261,11 +296,16 @@ impl Notifier {
                 drawdown_pct,
             } => {
                 format!(
-                    "[DAILY SUMMARY]\nEntries: {}\nExits: {}\nFees: ${:.4}\nNet P&L: ${:.4}\nCapital util: {:.1}%\nDrawdown: {:.2}%",
-                    entries, exits, fees, net_pnl, capital_util_pct * 100.0, drawdown_pct * 100.0
+                    "{}[DAILY SUMMARY]\nEntries: {}\nExits: {}\nFees: ${:.4}\nNet P&L: ${:.4}\nCapital util: {:.1}%\nDrawdown: {:.2}%",
+                    pfx, entries, exits, fees, net_pnl, capital_util_pct * 100.0, drawdown_pct * 100.0
                 )
             }
         }
+    }
+
+    /// Returns true if the webhook URL points to the Telegram Bot API.
+    fn is_telegram(&self) -> bool {
+        self.config.webhook_url.contains("api.telegram.org")
     }
 
     /// Actually POST the message to the webhook URL.
@@ -275,17 +315,25 @@ impl Notifier {
             None => return Ok(()),
         };
 
-        let body = serde_json::json!({
-            "phone": self.config.phone_number,
-            "message": message,
-        });
+        let body = if self.is_telegram() {
+            serde_json::json!({
+                "chat_id": self.config.phone_number,
+                "text": message,
+                "parse_mode": "HTML",
+            })
+        } else {
+            serde_json::json!({
+                "phone": self.config.phone_number,
+                "message": message,
+            })
+        };
 
         let mut request = client
             .post(&self.config.webhook_url)
             .header("Content-Type", "application/json");
 
-        // Add API key as Bearer token if provided
-        if !self.config.api_key.is_empty() {
+        // Add API key as Bearer token if provided (not needed for Telegram)
+        if !self.config.api_key.is_empty() && !self.is_telegram() {
             request = request.header("Authorization", format!("Bearer {}", self.config.api_key));
         }
 
@@ -293,20 +341,20 @@ impl Notifier {
             Ok(resp) => {
                 if resp.status().is_success() {
                     self.consecutive_failures.store(0, Ordering::Relaxed);
-                    tracing::debug!("WhatsApp notification sent: {}", &message[..message.len().min(60)]);
+                    tracing::debug!("Notification sent: {}", &message[..message.len().min(60)]);
                     Ok(())
                 } else {
                     let status = resp.status();
                     let body_text = resp.text().unwrap_or_default();
                     self.record_failure();
-                    let err = format!("WhatsApp webhook returned {}: {}", status, body_text);
+                    let err = format!("Notification webhook returned {}: {}", status, body_text);
                     tracing::warn!("{}", err);
                     Err(err)
                 }
             }
             Err(e) => {
                 self.record_failure();
-                let err = format!("WhatsApp webhook request failed: {}", e);
+                let err = format!("Notification webhook request failed: {}", e);
                 tracing::warn!("{}", err);
                 Err(err)
             }
@@ -323,7 +371,7 @@ impl Notifier {
                 *bo = until;
             }
             tracing::warn!(
-                "WhatsApp notifier: {} consecutive failures, backing off for {}s",
+                "Notifier: {} consecutive failures, backing off for {}s",
                 count,
                 BACKOFF_SECONDS
             );

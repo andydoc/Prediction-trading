@@ -7,6 +7,19 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.14.3] — 2026-03-18 — Telegram Notifications + Hostname Prefix
+
+### Added
+- **Telegram backend for notifications**: Auto-detected when webhook URL contains `api.telegram.org`. Sends `chat_id` + `text` JSON body. Bot token loaded from `secrets.yaml` (`telegram_bot_token`), chat ID from `config.yaml` (`phone_number`).
+- **Hostname + instance prefix**: All notification messages prepended with `[hostname]` or `[hostname/instance]`. Hostname auto-detected from `/etc/hostname`, instance from `notifications.instance_name` config or `PT_INSTANCE` env var.
+
+### Changed
+- Notifier module renamed from "WhatsApp" to generic "Notification" — supports Telegram, WhatsApp, ntfy.sh, Discord, etc.
+- Dashboard stats bar: "Drawdown" label changed to "Drawdown (cur/max)" for clarity.
+- Notifications enabled by default in config.yaml with chat_id `688371419`.
+
+---
+
 ## [0.14.2] — 2026-03-18 — Milestone B Complete + Tier B 16 Connections
 
 ### Added

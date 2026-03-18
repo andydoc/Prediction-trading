@@ -395,11 +395,42 @@ impl Orchestrator {
             .unwrap_or_default();
 
         // Load notification config (C3)
+        // Telegram bot token loaded from secrets.yaml; chat_id from config.yaml phone_number field
         let notify_cfg = {
             let n = cached_yaml.get("notifications").cloned().unwrap_or_default();
+            let secrets_path = cfg.workspace.join("config").join("secrets.yaml");
+            let secrets: serde_json::Value = std::fs::read_to_string(&secrets_path)
+                .ok()
+                .and_then(|s| serde_yaml_ng::from_str(&s).ok())
+                .unwrap_or_default();
+
+            // Build webhook URL: secrets telegram_bot_token takes precedence over config webhook_url
+            let cfg_url = n.get("webhook_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let webhook_url = secrets.get("telegram_bot_token")
+                .and_then(|v| v.as_str())
+                .filter(|t| !t.is_empty())
+                .map(|token| format!("https://api.telegram.org/bot{}/sendMessage", token))
+                .unwrap_or(cfg_url);
+
+            // Hostname: auto-detect via sysinfo, config override available
+            let hostname = n.get("hostname").and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    std::fs::read_to_string("/etc/hostname")
+                        .unwrap_or_default().trim().to_string()
+                });
+
+            // Instance: from notifications config or --instance CLI (via env)
+            let instance = n.get("instance_name").and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| std::env::var("PT_INSTANCE").ok())
+                .unwrap_or_default();
+
             NotifyConfig {
                 enabled: n.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
-                webhook_url: n.get("webhook_url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                webhook_url,
                 api_key: n.get("api_key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 phone_number: n.get("phone_number").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 on_entry: n.get("on_entry").and_then(|v| v.as_bool()).unwrap_or(true),
@@ -408,6 +439,8 @@ impl Orchestrator {
                 on_circuit_breaker: n.get("on_circuit_breaker").and_then(|v| v.as_bool()).unwrap_or(true),
                 on_daily_summary: n.get("on_daily_summary").and_then(|v| v.as_bool()).unwrap_or(true),
                 rate_limit_seconds: n.get("rate_limit_seconds").and_then(|v| v.as_f64()).unwrap_or(10.0),
+                hostname,
+                instance,
             }
         };
         let notifier = Arc::new(Notifier::new(notify_cfg));

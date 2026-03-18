@@ -190,10 +190,10 @@ dashboard:
   port: 5558
   bind_addr: '127.0.0.1'
 notifications:
-  enabled: false
-  webhook_url: ''
+  enabled: true
+  webhook_url: ''                       # Auto-built from secrets.yaml telegram_bot_token
   api_key: ''
-  phone_number: ''
+  phone_number: '688371419'             # Telegram chat_id
   rate_limit_seconds: 10
   on_entry: true
   on_resolution: true
