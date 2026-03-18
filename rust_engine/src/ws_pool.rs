@@ -494,6 +494,8 @@ async fn connection_loop(
             }
         }
 
+        let lived_secs = connect_time.elapsed().as_secs();
+
         stats.connections_active.fetch_sub(1, Ordering::Relaxed);
 
         if !running.load(Ordering::Relaxed) {
@@ -510,10 +512,17 @@ async fn connection_loop(
         }
 
         // Jitter: spread reconnects to avoid stampede when Polymarket mass-disconnects
+        // When a healthy connection drops (lived > 30s), add extra 0-3s random spread
+        // so that mass-disconnect events don't cause all connections to reconnect together
+        let mass_jitter_ms = if lived_secs > 30 {
+            (3000.0 * rand::random::<f64>()) as u64
+        } else {
+            0
+        };
         let jitter_ms = {
             let base_jitter = (backoff_ms as f64 * 0.5 * rand::random::<f64>()) as u64;
             let stagger = idx as u64 * config.stagger_ms;
-            base_jitter + stagger
+            base_jitter + stagger + mass_jitter_ms
         };
         let delay_ms = backoff_ms + jitter_ms;
         tokio::select! {

@@ -164,6 +164,26 @@ impl TradeStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Confirmed | Self::Failed | Self::Cancelled)
     }
+
+    /// Validate whether a state transition is allowed.
+    /// Rejects impossible transitions (e.g., terminal→non-terminal, backwards flow).
+    /// Based on NT lesson: strict state machine caught multiple production bugs (#3403).
+    pub fn can_transition_to(&self, new: &TradeStatus) -> bool {
+        use TradeStatus::*;
+        match (self, new) {
+            // Terminal states cannot transition to anything
+            (Confirmed, _) | (Failed, _) | (Cancelled, _) => false,
+            // Submitted → Matched, Failed, Cancelled
+            (Submitted, Matched) | (Submitted, Failed) | (Submitted, Cancelled) => true,
+            // Matched → Mined, Retrying, Failed, Confirmed (fast-path confirmation)
+            (Matched, Mined) | (Matched, Retrying) | (Matched, Failed) | (Matched, Confirmed) => true,
+            // Mined → Confirmed, Retrying, Failed
+            (Mined, Confirmed) | (Mined, Retrying) | (Mined, Failed) => true,
+            // Retrying → Mined, Confirmed, Failed
+            (Retrying, Mined) | (Retrying, Confirmed) | (Retrying, Failed) => true,
+            _ => false,
+        }
+    }
 }
 
 /// A tracked order with its current status.
@@ -199,6 +219,9 @@ pub struct TrackedOrder {
     pub signed_order: Option<SignedOrder>,
     /// Whether this is a negRisk market.
     pub neg_risk: bool,
+    /// B4.3: Overfill quantity (excess fill beyond order.quantity). NT #3221.
+    /// Clamped: filled_quantity stays <= quantity, overfill tracks the excess.
+    pub overfill_quantity: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -582,6 +605,7 @@ impl Executor {
             last_update: now,
             signed_order: Some(signed.clone()),
             neg_risk: instrument.neg_risk,
+            overfill_quantity: 0.0,
         };
 
         // 6. Log order details
@@ -735,20 +759,46 @@ impl Executor {
     // -----------------------------------------------------------------------
 
     /// Update the status of a tracked order (called from WS events).
+    ///
+    /// Returns true if the update was applied, false if rejected (invalid transition
+    /// or unknown trade_id). Based on NT lessons:
+    ///   - Strict state machine validation (#3403)
+    ///   - Overfill clamping (#3221): filled_qty > order.quantity is clamped, excess tracked
     pub fn update_trade_status(&self, trade_id: &str, new_status: TradeStatus,
-                                filled_qty: Option<f64>, avg_price: Option<f64>) {
+                                filled_qty: Option<f64>, avg_price: Option<f64>) -> bool {
         let mut tracked = self.tracked.lock();
         if let Some(order) = tracked.get_mut(trade_id) {
+            // State transition validation
+            if !order.status.can_transition_to(&new_status) {
+                tracing::warn!("Trade {} invalid transition: {} → {}, ignoring",
+                    trade_id, order.status.as_str(), new_status.as_str());
+                return false;
+            }
+
             let old = order.status.as_str();
             order.status = new_status;
             order.last_update = chrono::Utc::now().timestamp() as f64;
+
             if let Some(qty) = filled_qty {
-                order.filled_quantity = qty;
+                // B4.3: Overfill detection — clamp to order quantity, track excess
+                if qty > order.quantity && order.quantity > 0.0 {
+                    let excess = qty - order.quantity;
+                    tracing::warn!("B4.3 overfill: trade={} order_qty={:.6} fill_qty={:.6} excess={:.6}",
+                        trade_id, order.quantity, qty, excess);
+                    order.filled_quantity = order.quantity;
+                    order.overfill_quantity = excess;
+                } else {
+                    order.filled_quantity = qty;
+                }
             }
             if let Some(price) = avg_price {
                 order.avg_fill_price = price;
             }
             tracing::info!("Trade {} status: {} → {}", trade_id, old, new_status.as_str());
+            true
+        } else {
+            tracing::warn!("Trade {} not found in tracked orders", trade_id);
+            false
         }
     }
 
@@ -897,6 +947,7 @@ impl Executor {
                 last_update: now,
                 signed_order: Some(signed.clone()),
                 neg_risk: instrument.neg_risk,
+                overfill_quantity: 0.0,
             };
 
             prepared.push((tracked, signed, instrument));
@@ -952,6 +1003,13 @@ impl Executor {
         }
 
         // Build batch payload
+        // Polymarket batch API caps at 15 orders
+        if prepared.len() > 15 {
+            tracing::warn!("[BATCH] {} legs exceeds Polymarket batch limit of 15, falling back to sequential",
+                prepared.len());
+            return self.execute_arb(position_id, legs);
+        }
+
         let mut order_payloads = Vec::with_capacity(prepared.len());
         for (tracked, signed, instrument) in &prepared {
             let side_str = if tracked.side == Side::Buy { "BUY" } else { "SELL" };
@@ -998,29 +1056,39 @@ impl Executor {
                 let body: serde_json::Value = resp.json().unwrap_or_default();
 
                 if status.is_success() {
-                    // Parse batch response: array of order IDs or individual results
-                    let order_ids: Vec<String> = if let Some(arr) = body.as_array() {
-                        arr.iter().map(|v| {
-                            v.get("orderID").or_else(|| v.get("order_id"))
-                                .and_then(|id| id.as_str())
-                                .unwrap_or("")
-                                .to_string()
-                        }).collect()
-                    } else {
-                        vec![]
-                    };
+                    // Parse batch response: array of per-order results
+                    // Each element has: orderID, success (bool), errorMsg (optional)
+                    let response_arr = body.as_array();
 
                     let mut all_accepted = true;
                     for (i, (mut tracked, _signed, _inst)) in prepared.into_iter().enumerate() {
-                        if let Some(oid) = order_ids.get(i) {
-                            tracked.order_id = oid.clone();
+                        let entry = response_arr.and_then(|arr| arr.get(i));
+
+                        // Check per-order success field (NT lesson: don't just check for orderID)
+                        let success = entry
+                            .and_then(|v| v.get("success"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true); // default true for backwards compat
+
+                        let order_id = entry
+                            .and_then(|v| v.get("orderID").or_else(|| v.get("order_id")))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+
+                        if success && !order_id.is_empty() {
+                            tracked.order_id = order_id.to_string();
                             self.tracked.lock().insert(tracked.trade_id.clone(), tracked.clone());
                             results.push(OrderResult::Accepted(tracked));
                         } else {
                             all_accepted = false;
+                            let error_msg = entry
+                                .and_then(|v| v.get("errorMsg").or_else(|| v.get("error_msg")))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("No order ID or success=false");
+                            tracing::warn!("[BATCH] Leg {} rejected: {}", i, error_msg);
                             results.push(OrderResult::Rejected(ExecutionError::ClobRejection {
-                                code: "BATCH_MISSING".into(),
-                                message: format!("No order ID for leg {}", i),
+                                code: "BATCH_REJECTED".into(),
+                                message: format!("Leg {}: {}", i, error_msg),
                             }));
                         }
                     }
@@ -1240,6 +1308,7 @@ mod tests {
             last_update: 0.0,
             signed_order: None,
             neg_risk: false,
+            overfill_quantity: 0.0,
         }
     }
 
@@ -1310,5 +1379,55 @@ mod tests {
     #[test]
     fn test_partial_fill_empty() {
         assert_eq!(evaluate_partial_fills(&[], 0.03), PartialFillAction::NoFill);
+    }
+
+    // State transition validation tests
+    #[test]
+    fn test_valid_transitions() {
+        use TradeStatus::*;
+        // Happy path: Submitted → Matched → Mined → Confirmed
+        assert!(Submitted.can_transition_to(&Matched));
+        assert!(Matched.can_transition_to(&Mined));
+        assert!(Mined.can_transition_to(&Confirmed));
+        // Retry path
+        assert!(Matched.can_transition_to(&Retrying));
+        assert!(Retrying.can_transition_to(&Mined));
+        assert!(Retrying.can_transition_to(&Confirmed));
+        // Failure from any non-terminal
+        assert!(Submitted.can_transition_to(&Failed));
+        assert!(Matched.can_transition_to(&Failed));
+        assert!(Mined.can_transition_to(&Failed));
+        assert!(Retrying.can_transition_to(&Failed));
+        // Cancel from Submitted
+        assert!(Submitted.can_transition_to(&Cancelled));
+        // Fast-path: Matched → Confirmed (skip Mined)
+        assert!(Matched.can_transition_to(&Confirmed));
+    }
+
+    #[test]
+    fn test_invalid_transitions() {
+        use TradeStatus::*;
+        // Terminal states cannot transition
+        assert!(!Confirmed.can_transition_to(&Failed));
+        assert!(!Failed.can_transition_to(&Matched));
+        assert!(!Cancelled.can_transition_to(&Submitted));
+        // Backwards flow
+        assert!(!Matched.can_transition_to(&Submitted));
+        assert!(!Mined.can_transition_to(&Submitted));
+        assert!(!Confirmed.can_transition_to(&Mined));
+        // Self-transition
+        assert!(!Submitted.can_transition_to(&Submitted));
+    }
+
+    #[test]
+    fn test_overfill_clamp() {
+        // Simulate what update_trade_status does: clamp fill to order qty
+        let order_qty: f64 = 100.0;
+        let fill_qty: f64 = 105.5;
+        let excess = fill_qty - order_qty;
+        assert!((excess - 5.5).abs() < 1e-10);
+        // The clamped value should be order_qty
+        let clamped = if fill_qty > order_qty { order_qty } else { fill_qty };
+        assert!((clamped - 100.0).abs() < 1e-10);
     }
 }

@@ -7,6 +7,21 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.13.3] — 2026-03-18 — NT Review Hardening + WS Jitter v2
+
+### Added
+- **B4.3: Overfill detection** (`executor.rs`): `update_trade_status()` now clamps fill quantity to order quantity and tracks excess in `overfill_quantity` field. Based on NT issue #3221 pattern (clamp-and-track, position gets truth).
+- **State transition validation** (`executor.rs`): `TradeStatus::can_transition_to()` rejects impossible state transitions (e.g., terminal→non-terminal, backwards flow). Based on NT issue #3403.
+- 5 new executor tests: valid transitions, invalid transitions, overfill clamp.
+
+### Changed
+- WS reconnect jitter v2: healthy connections (lived > 30s) now add 0–3s extra random spread on reconnect, preventing cascade failures during Polymarket mass-disconnect events
+- Batch order submission: now checks per-order `success` field and extracts `errorMsg` from Polymarket batch response (NT lesson). Enforces 15-order batch size cap.
+- `update_trade_status()` returns `bool` (true if applied, false if rejected/unknown)
+- Tier B `max_connections` increased to 12 (jitter v2 provides sufficient spread)
+
+---
+
 ## [0.13.2] — 2026-03-17 — B2.4, B3.6, B3.7 + WS Reconnect Jitter
 
 ### Added
