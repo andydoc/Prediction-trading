@@ -12,6 +12,7 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 ### Added
 - **Telegram backend for notifications**: Auto-detected when webhook URL contains `api.telegram.org`. Sends `chat_id` + `text` JSON body. Bot token loaded from `secrets.yaml` (`telegram_bot_token`), chat ID from `config.yaml` (`phone_number`).
 - **Hostname + instance prefix**: All notification messages prepended with `[hostname]` or `[hostname/instance]`. Hostname auto-detected from `/etc/hostname`, instance from `notifications.instance_name` config or `PT_INSTANCE` env var.
+- **Startup notification**: `[STARTUP]` message sent on engine start with mode, open position count, and capital. Always sent (not toggleable).
 
 ### Changed
 - Notifier module renamed from "WhatsApp" to generic "Notification" — supports Telegram, WhatsApp, ntfy.sh, Discord, etc.
@@ -251,7 +252,7 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 ## [0.11.0] — 2026-03-16 — Notifications, Multi-Instance, Python Retirement
 
 ### Added
-- **C3**: WhatsApp notification module (`notify.rs`) — rate-limited (10s), exponential backoff (5 failures → 5min cooldown), per-event toggles, generic HTTP webhook POST
+- **C3**: Notification module (`notify.rs`) — Telegram + generic webhook, rate-limited (10s), exponential backoff (5 failures → 5min cooldown), per-event toggles, hostname/instance prefix
 - **C3**: Notifier wired into orchestrator for entry, WS resolution, API resolution, and proactive exit events
 - **C4.2**: Proactive exit — sells position when liquidation value > 1.2× expected resolution payout
 - **D1**: Multi-instance support — `--instance <name>` auto-configures DB, logs, PID file, and dashboard port

@@ -48,6 +48,11 @@ pub enum NotifyEvent {
         capital_util_pct: f64,
         drawdown_pct: f64,
     },
+    Startup {
+        mode: String,
+        positions: usize,
+        capital: f64,
+    },
 }
 
 /// Configuration for notifications.
@@ -227,6 +232,7 @@ impl Notifier {
             NotifyEvent::Error { .. } => self.config.on_error,
             NotifyEvent::CircuitBreaker { .. } => self.config.on_circuit_breaker,
             NotifyEvent::DailySummary { .. } => self.config.on_daily_summary,
+            NotifyEvent::Startup { .. } => true, // always send
         }
     }
 
@@ -298,6 +304,12 @@ impl Notifier {
                 format!(
                     "{}[DAILY SUMMARY]\nEntries: {}\nExits: {}\nFees: ${:.4}\nNet P&L: ${:.4}\nCapital util: {:.1}%\nDrawdown: {:.2}%",
                     pfx, entries, exits, fees, net_pnl, capital_util_pct * 100.0, drawdown_pct * 100.0
+                )
+            }
+            NotifyEvent::Startup { mode, positions, capital } => {
+                format!(
+                    "{}[STARTUP] Engine started\nMode: {}\nOpen positions: {}\nCapital: ${:.2}",
+                    pfx, mode, positions, capital
                 )
             }
         }

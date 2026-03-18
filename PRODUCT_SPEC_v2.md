@@ -22,7 +22,7 @@ A senior developer built an automated prediction market arbitrage system under p
 - **Timeline**: No rush. Get it right. Shadow mode runs indefinitely until solid.
 - **Production target**: VPS only (ZAP-Hosting, Germany, always-on, 4 vCPU, **8 GB RAM**, 25 GB NVMe). Laptop is dev-only.
 - **Rust port**: Complete before go-live. Single compiled binary is the target state before real money flows.
-- **Notifications**: WhatsApp (not OpenClaw, not email).
+- **Notifications**: Telegram (primary), with generic webhook fallback (WhatsApp, ntfy.sh, Discord). Not email.
 - **Shadow strategy**: Run 6 parallel shadow accounts with different parameter combinations (including a fast-market instance for 5-15 min crypto price predictions) to optimise strategy before committing real money.
 
 ---
@@ -57,7 +57,7 @@ Automated detection and execution of guaranteed-profit arbitrage on Polymarket p
 
 **Pure Rust system** (single compiled binary since v0.10.0):
 - `rust_supervisor` crate: orchestrator, CLI, config loading, systemd integration
-- `rust_engine` crate: WebSocket (3-tier), order book mirror (DashMap), EFP queue (parking_lot), arb math, position manager, state persistence (rusqlite), constraint detection, market scanner, resolution validator (Anthropic API), postponement detector (Anthropic API + web search), dashboard (Axum HTTP + SSE), notifications (WhatsApp webhook)
+- `rust_engine` crate: WebSocket (3-tier), order book mirror (DashMap), EFP queue (parking_lot), arb math, position manager, state persistence (rusqlite), constraint detection, market scanner, resolution validator (Anthropic API), postponement detector (Anthropic API + web search), dashboard (Axum HTTP + SSE), notifications (Telegram / webhook)
 
 **Target state (pre go-live)**: Add LiveExecutor with Rust EIP-712 signing (Milestone B). No Python runtime dependency.
 
@@ -110,7 +110,7 @@ The following inconsistencies were identified. These will be addressed by the do
 - AI resolution validator (Anthropic API, 1-week cache)
 - AI postponement detector (web search for rescheduled events)
 - Shadow mode validation (paper trades cross-checked against live books)
-- WhatsApp notifications (rate-limited, per-event toggles, exponential backoff)
+- Telegram/webhook notifications (rate-limited, per-event toggles, exponential backoff, hostname/instance prefix)
 - Multi-instance support (6 shadow configs incl. fast-market, systemd template)
 - Proactive exit (liquidation value > 1.2× resolution payout)
 
@@ -186,7 +186,7 @@ Each document is produced at the point in the milestone sequence when its conten
 | **INCIDENT_LOG.md** | End of Milestone A | All incidents are historical and fully resolved. No dependency on later milestones. |
 | **ARCHITECTURE.md** | End of Milestone B | By this point the Rust port is complete (A) and the execution infrastructure is built (B). The architecture is in its final state. Writing it earlier would require rewriting after B. |
 | **ROADMAP.md** | End of Milestone B | With A and B complete, the roadmap can accurately reflect what's done vs remaining (C–G). |
-| **OPS_RUNBOOK.md** | End of Milestone C | Safety infrastructure (circuit breaker, kill switch, WhatsApp, scripts) must exist before the runbook can document how to operate them. |
+| **OPS_RUNBOOK.md** | End of Milestone C | Safety infrastructure (circuit breaker, kill switch, Telegram, scripts) must exist before the runbook can document how to operate them. |
 | **USER_GUIDE.md** | End of Milestone C | Depends on: rationalised scripts (A9), execution infrastructure (B), safety features (C). This is the last document because it must describe the complete operational system. |
 | **Retire PROGRESS_ROADMAP.md** | End of Milestone C | All 6 replacement documents exist. Replace contents with a pointer to the new docs. |
 
@@ -332,7 +332,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 |------|-------------------|
 | ✅ **B3.0: Market BUY quantity guard** | Enforced at executor boundary: (a) Market BUY → quantity = USDC notional (quote). (b) Market SELL → quantity = token count (base). (c) Limit/FAK → quantity = token count (base). (d) Base-denominated market BUY rejected with error log, never submitted. Prevents oversized fills. Unit test covers all 4 cases. |
 | ✅ **B3.1: Wire LiveExecutor (dry-run)** | CLOB `create_order()` calls for all legs of an arb. Uses B2.0 signing, B2.3 instrument model, B3.0 quantity guard. Passes `neg_risk: true` for negRisk markets. Uses FAK (Fill And Kill) order type. In `--dry-run` mode: constructs and signs orders, logs full details, but does not submit to CLOB. Handles: success, partial fill, rejection, timeout as state transitions. **Design decision**: signature type 0 (EOA). Document in ARCHITECTURE.md. **Fast-market note**: For short-lived markets (Shadow-F), FAK limit orders placed 1 tick into the book provide the best fill-rate vs price tradeoff. Market orders guarantee fill but sacrifice spread; passive limit orders risk non-fill on a 5-min market. Config key `live_trading.order_aggression` (values: `passive`, `at_market`, `aggressive`) controls tick offset per instance. |
-| ✅ **B3.2: Trade status pipeline** | After MATCHED, track status via Tier C WebSocket: MATCHED → MINED → CONFIRMED → RETRYING → FAILED. (a) CONFIRMED: finalise position entry. (b) RETRYING: log warning, hold in "pending" state, exclude from replacement queue. (c) FAILED: roll back entry, restore capital, WhatsApp alert. (d) No update within `live_trading.trade_confirmation_timeout_seconds` (default 120s): query CLOB API, reconcile. Position not "open" until CONFIRMED. Dedup on `trade_id`. |
+| ✅ **B3.2: Trade status pipeline** | After MATCHED, track status via Tier C WebSocket: MATCHED → MINED → CONFIRMED → RETRYING → FAILED. (a) CONFIRMED: finalise position entry. (b) RETRYING: log warning, hold in "pending" state, exclude from replacement queue. (c) FAILED: roll back entry, restore capital, Telegram alert. (d) No update within `live_trading.trade_confirmation_timeout_seconds` (default 120s): query CLOB API, reconcile. Position not "open" until CONFIRMED. Dedup on `trade_id`. |
 | ✅ **B3.3: Execution rate limiting** | Token-bucket rate limiter: 60 orders/min trading, 100 req/min public, 300 req/min auth, 3,000 req/10min global. Logs when throttled. Prevents 429 bans. **Pre-req**: study NT rate limit implementation and Polymarket API docs for current limits. |
 | ✅ **B3.4: Timestamp normalisation** | Robust parsing across all API responses: ISO8601 with/without timezone, Unix seconds vs milliseconds, missing/null timestamps. Single `parse_polymarket_timestamp()` function used everywhere. **Pre-req**: study NT issue #3273 and fix for edge cases. |
 | ✅ **B3.5: Error handling matrix** | Defined behaviour for: CLOB API timeout (retry once, then abort + unwind), CLOB rejection (log + skip), network failure (pause trading, alert, retry connection), insufficient balance (pause trading, alert), rate limit 429 (back off per token bucket). |
@@ -343,7 +343,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| ✅ **B4.0: Position reconciliation (periodic)** | Every `live_trading.reconciliation_interval_seconds`: query CLOB for actual positions. Compare with internal record. Alert on discrepancy. Log results. Source of truth: CLOB API contract balances (same as NT Gamma API approach). On-chain `balanceOf` query as escalation when CLOB/internal differ by > `live_trading.reconciliation_escalation_threshold` (default $1.00). If `umaResolutionStatus == "disputed"` on a market: flag position as `disputed`, exclude from replacement queue, WhatsApp alert. Resume normal lifecycle when dispute resolves. **Shadow mode**: when no venue credentials are configured, reconciliation skips CLOB comparison and reports positions as checked (no false alarms). |
+| ✅ **B4.0: Position reconciliation (periodic)** | Every `live_trading.reconciliation_interval_seconds`: query CLOB for actual positions. Compare with internal record. Alert on discrepancy. Log results. Source of truth: CLOB API contract balances (same as NT Gamma API approach). On-chain `balanceOf` query as escalation when CLOB/internal differ by > `live_trading.reconciliation_escalation_threshold` (default $1.00). If `umaResolutionStatus == "disputed"` on a market: flag position as `disputed`, exclude from replacement queue, Telegram alert. Resume normal lifecycle when dispute resolves. **Shadow mode**: when no venue credentials are configured, reconciliation skips CLOB comparison and reports positions as checked (no false alarms). |
 | ✅ **B4.1: Venue-side reconciliation on startup** | On every startup: query CLOB for contract balances and open orders. Compare against SQLite state. Report discrepancies before resuming trading. **Pre-req**: study NT `generate_order_status_reports` pattern. |
 | ✅ **B4.2: Cross-asset fill matching** | When a YES fill executes on a negRisk market, Polymarket implicitly creates corresponding NO positions on complementary outcomes. Detect and reconcile these synthetic fills against internal position state. **Pre-req**: study NT PR #3345/#3357 source. |
 | ✅ **B4.3: FOK/FAK overfill handling** | Detect when FAK limit orders receive more fill than expected. Adjust internal position state, log discrepancy. **Pre-req**: study NT issue #3221 and fix. |
@@ -367,17 +367,17 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | Task | Acceptance Criteria |
 |------|-------------------|
 | ⬚ **C1: Circuit breaker** | Auto-pause trading if: (a) portfolio drawdown exceeds `safety.circuit_breaker.max_drawdown_pct` from peak, (b) `max_consecutive_errors` errors in `error_window_seconds`, (c) CLOB API unreachable for `api_timeout_seconds`. Log the trigger. Resume requires manual intervention (config change + restart). |
-| ⬚ **C1.1: POL gas balance monitoring** | On startup and every `safety.gas_check_interval_seconds`: query Polygon RPC (`eth_getBalance`) for wallet POL balance. If < `safety.min_pol_balance` (default 1.0): WhatsApp alert. If < `safety.critical_pol_balance` (default 0.1): trigger circuit breaker. Dashboard shows POL balance in System section. Uses `reqwest` — no web3 library needed. |
-| ⬚ **C2: Kill switch** | `kill.sh --emergency` and dashboard button that: (a) cancels all open CLOB orders, (b) sets mode to shadow, (c) sends WhatsApp notification. Idempotent. |
-| ✅ **C3: WhatsApp notifications** | Implemented in `notify.rs`. Rate limiting (10s), exponential backoff (5 failures → 5min cooldown), per-event toggles. Wired into entry, resolution, proactive exit, and API resolution events. |
-| ⬚ **C4: Daily P&L report** | Automated daily summary at midnight UTC: entries, exits, fees, net P&L, capital utilisation %, drawdown from peak. Sent via WhatsApp. Persisted to SQLite. |
+| ⬚ **C1.1: POL gas balance monitoring** | On startup and every `safety.gas_check_interval_seconds`: query Polygon RPC (`eth_getBalance`) for wallet POL balance. If < `safety.min_pol_balance` (default 1.0): Telegram alert. If < `safety.critical_pol_balance` (default 0.1): trigger circuit breaker. Dashboard shows POL balance in System section. Uses `reqwest` — no web3 library needed. |
+| ⬚ **C2: Kill switch** | `kill.sh --emergency` and dashboard button that: (a) cancels all open CLOB orders, (b) sets mode to shadow, (c) sends Telegram notification. Idempotent. |
+| ✅ **C3: Notifications (Telegram)** | Implemented in `notify.rs`. Telegram backend auto-detected from webhook URL; bot token from `secrets.yaml`, chat_id from config. Generic webhook fallback for WhatsApp/ntfy/Discord. Rate limiting (10s), exponential backoff (5 failures → 5min cooldown), per-event toggles. All messages prefixed with `[hostname/instance]`. Events: startup, entry, resolution, proactive exit, error, circuit breaker, daily summary. |
+| ⬚ **C4: Daily P&L report** | Automated daily summary at midnight UTC: entries, exits, fees, net P&L, capital utilisation %, drawdown from peak. Sent via Telegram. Persisted to SQLite. |
 | ⬚ **C4.1: Seamless position close transition** | Eliminate 5s visual gap where a closing position disappears from open before appearing in closed. Buffer removal client-side until closed entry arrives in next SSE push. |
-| ✅ **C4.2: Proactive near-resolution exit** | Implemented in `orchestrator::check_proactive_exits()` using `PROACTIVE_EXIT_MULTIPLIER = 1.2`. WhatsApp notification on each exit. |
-| ⬚ **C5: Create OPS_RUNBOOK.md** | VPS details, SSH access, systemd commands, log locations, dashboard URLs, monitoring commands, backup procedures, the 3 rationalised scripts and their usage, circuit breaker recovery procedure, kill switch procedure, WhatsApp setup, POL gas top-up procedure, ZAP-Hosting 3-month login reminder. |
+| ✅ **C4.2: Proactive near-resolution exit** | Implemented in `orchestrator::check_proactive_exits()` using `PROACTIVE_EXIT_MULTIPLIER = 1.2`. Telegram notification on each exit. |
+| ⬚ **C5: Create OPS_RUNBOOK.md** | VPS details, SSH access, systemd commands, log locations, dashboard URLs, monitoring commands, backup procedures, the 3 rationalised scripts and their usage, circuit breaker recovery procedure, kill switch procedure, Telegram bot setup, POL gas top-up procedure, ZAP-Hosting 3-month login reminder. |
 | ⬚ **C6: Create USER_GUIDE.md** | Product overview, prerequisites, setup from scratch, starting/stopping (rationalised scripts), monitoring (dashboard), mode switching, recovery after crash, go-live checklist, glossary. Includes all supervisor CLI flags. Written so a new operator can run the system without having built it. |
 | ⬚ **C7: Retire PROGRESS_ROADMAP.md** | Copy to Archive then replace live version contents with a brief note listing the 6 replacement documents and their purposes. Do not delete (preserves git history). |
 
-**Verification**: Simulate circuit breaker triggers (inject fake errors, simulate drawdown). Verify kill switch cancels test orders. Verify WhatsApp messages arrive within 60s of trigger. Verify POL balance check runs and alerts correctly. All 6 documents reviewed for accuracy and internal consistency.
+**Verification**: Simulate circuit breaker triggers (inject fake errors, simulate drawdown). Verify kill switch cancels test orders. Verify Telegram messages arrive within 60s of trigger. Verify POL balance check runs and alerts correctly. All 6 documents reviewed for accuracy and internal consistency.
 
 ---
 
@@ -397,7 +397,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | ⬚ **D4: Test negRisk fill** | Execute a micro-fill on a negRisk market. Verify: (a) `neg_risk: true` passed correctly, (b) cross-asset fill matching (B4.2) detects any synthetic NO positions, (c) reconciliation passes. |
 | ⬚ **D5: Test multi-leg arb execution** | Execute a real 2-leg arb at minimum size. Verify: (a) batch submission (B3.7) or sequential submission succeeds on all legs, (b) partial fill handling (B3.6) functions if one leg partially fills, (c) position tracks all legs correctly. This is the first real arb. |
 | ⬚ **D6: Test reconciliation cold-start** | With open test positions: restart the binary. Verify: (a) venue-side reconciliation on startup (B4.1) detects all positions, (b) internal state matches CLOB, (c) trading resumes correctly. |
-| ⬚ **D7: Test circuit breaker + kill switch** | (a) Trigger circuit breaker via config override (set drawdown to 0.01%). Verify: trading pauses, WhatsApp fires, dashboard shows breaker state. (b) Execute kill switch. Verify: all test CLOB orders cancelled, mode set to shadow. |
+| ⬚ **D7: Test circuit breaker + kill switch** | (a) Trigger circuit breaker via config override (set drawdown to 0.01%). Verify: trading pauses, Telegram fires, dashboard shows breaker state. (b) Execute kill switch. Verify: all test CLOB orders cancelled, mode set to shadow. |
 | ⬚ **D8: Resolve or sell test positions** | Clean up: sell all test positions or let them resolve. Reconcile final state. Verify capital accounting is correct (initial deposit minus fees = remaining balance ± P&L). |
 
 **Exit criteria**: All 8 tasks pass. Zero unexplained discrepancies between internal state and CLOB. All funds accounted for. Ready to proceed to 14-day shadow validation.
@@ -516,7 +516,7 @@ Before building the comparison dashboard, stress-test the engine to determine ac
 | ⬚ **F2: Configure winning parameters** | Apply the parameter set selected in E9 to the live instance. |
 | ⬚ **F3: Switch to live mode** | Config change: `shadow_only: false`. System begins placing real orders. |
 | ⬚ **F4: Supervised first trades** | Operator monitors first 3–5 live trades in real time. Verifies: orders placed correctly, fills match expectations, P&L tracking accurate, trade status pipeline confirms all fills. |
-| ⬚ **F5: 48h supervised period** | Operator checks dashboard and WhatsApp notifications every 2–4 hours for first 48h. No intervention needed = success. |
+| ⬚ **F5: 48h supervised period** | Operator checks dashboard and Telegram notifications every 2–4 hours for first 48h. No intervention needed = success. |
 | ⬚ **F6: Steady state** | System runs autonomously. Operator checks daily summary. Intervenes only on alerts. |
 
 ---
@@ -580,7 +580,7 @@ The system is production-ready when ALL of these are true:
 4. CLOB integration test passed with real micro-orders — zero unexplained discrepancies (Milestone D)
 5. 14 consecutive days of 6-way shadow trading at $1,000 capital with zero unhandled errors (Milestone E)
 6. Optimal parameters selected from shadow comparison (capital_per_trade_pct, max_concurrent_positions)
-7. Circuit breaker, kill switch, POL gas monitoring, and WhatsApp notifications all tested and working
+7. Circuit breaker, kill switch, POL gas monitoring, and Telegram notifications all tested and working
 8. Position reconciliation passes every check for 14 days across all instances
 9. Execution price validation shows 95%+ of trades would fill at > 70% of expected profit
 10. CTO has reviewed comparison results and given written sign-off
@@ -598,5 +598,5 @@ The following are explicitly NOT part of this plan:
 - Mobile app or mobile-friendly dashboard
 - Backtesting framework (Polymarket does not expose historical book depth; PT's EFP-dependent strategy cannot be meaningfully backtested against trade-only data; small-capital live validation via Milestones D+E is the correct approach)
 - Market-making (we only take arb opportunities, never provide liquidity)
-- Email notifications (WhatsApp only per CTO decision)
+- Email notifications (Telegram only per CTO decision)
 - OpenClaw integration (not wanted)

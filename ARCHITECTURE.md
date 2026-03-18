@@ -131,7 +131,7 @@ Order execution: dry-run signing, live submission, trade status pipeline (MATCHE
 Token bucket: 60 orders/min trading, 100 req/min public, 300 req/min auth, 3,000 req/10min global.
 
 ### Notifications (`notify.rs`)
-WhatsApp webhook notifications with rate limiting (10s) and exponential backoff (5 failures → 5min cooldown). Wired into entry, resolution, proactive exit, and API resolution events.
+Telegram (auto-detected) or generic webhook notifications. Bot token from `secrets.yaml`, chat_id from config. Rate limiting (10s), exponential backoff (5 failures → 5min cooldown). All messages prefixed with `[hostname/instance]`. Events: startup, entry, resolution, proactive exit, error, circuit breaker, daily summary.
 
 ---
 
@@ -165,7 +165,7 @@ rust_engine/src/
 ├── postponement.rs     # Postponement detector (Anthropic API)
 ├── rate_limiter.rs     # Token bucket rate limiter
 ├── latency.rs          # Latency percentile tracking
-└── notify.rs           # WhatsApp notifications
+└── notify.rs           # Telegram / webhook notifications
 
 rust_supervisor/src/
 ├── main.rs             # Binary entry: PID lock, signal handling

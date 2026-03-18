@@ -557,6 +557,13 @@ impl Orchestrator {
         let mode_str = if self.cfg.shadow_only { "SHADOW" } else { "LIVE" };
         tracing::info!("Orchestrator ready [{}] — entering event loop", mode_str);
 
+        // Send startup notification
+        let _ = self.notifier.send(&NotifyEvent::Startup {
+            mode: mode_str.to_string(),
+            positions: self.engine.pm_open_count(),
+            capital: self.engine.current_capital(),
+        });
+
         // 7. Event loop
         while running.load(Ordering::Relaxed) {
             self.iteration += 1;
