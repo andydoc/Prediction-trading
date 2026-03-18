@@ -192,7 +192,7 @@ safety:
     max_drawdown_pct: 0.10              # 10% drawdown from peak triggers halt
     max_consecutive_errors: 3           # 3 errors within window triggers halt
     error_window_seconds: 300           # 5-minute sliding window for errors
-    api_timeout_seconds: 60             # API unreachable for 60s triggers halt
+    api_timeout_seconds: 600            # API unreachable for 10min triggers halt (must exceed 300s API resolution interval)
 dashboard:
   port: 5558
   bind_addr: '127.0.0.1'

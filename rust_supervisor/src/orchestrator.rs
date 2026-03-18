@@ -527,6 +527,7 @@ impl Orchestrator {
         // Background refresh
         match self.scanner.scan() {
             Ok(result) => {
+                self.circuit_breaker.record_api_success(now_secs());
                 self.ingest_scan_result(&result);
                 tracing::info!("Scanner refresh: {} markets", result.count);
             }

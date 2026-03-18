@@ -27,7 +27,7 @@ impl Default for CircuitBreakerConfig {
             max_drawdown_pct: 0.10,
             max_consecutive_errors: 3,
             error_window_seconds: 300.0,
-            api_timeout_seconds: 60.0,
+            api_timeout_seconds: 600.0,
         }
     }
 }
@@ -222,7 +222,7 @@ mod tests {
             max_drawdown_pct: 0.10,
             max_consecutive_errors: 3,
             error_window_seconds: 300.0,
-            api_timeout_seconds: 60.0,
+            api_timeout_seconds: 600.0,
         }
     }
 
@@ -304,8 +304,8 @@ mod tests {
     #[test]
     fn trip_on_api_timeout() {
         let mut cb = CircuitBreaker::new(default_config(), 1000.0, 0.0);
-        // Last success at t=0, check at t=60
-        let result = cb.check(1000.0, 60.0);
+        // Last success at t=0, check at t=600
+        let result = cb.check(1000.0, 600.0);
         assert!(result.is_some());
         assert!(result.unwrap().contains("API unreachable"));
     }
@@ -313,9 +313,9 @@ mod tests {
     #[test]
     fn api_success_resets_timeout() {
         let mut cb = CircuitBreaker::new(default_config(), 1000.0, 0.0);
-        cb.record_api_success(50.0);
-        // Check at t=60 — only 10s since last success
-        assert!(cb.check(1000.0, 60.0).is_none());
+        cb.record_api_success(550.0);
+        // Check at t=600 — only 50s since last success
+        assert!(cb.check(1000.0, 600.0).is_none());
     }
 
     #[test]
