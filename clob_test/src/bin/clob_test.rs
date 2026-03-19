@@ -44,6 +44,10 @@ struct Cli {
     /// Timeout in minutes (default: 720 = 12 hours).
     #[arg(long, default_value = "720")]
     timeout_minutes: u64,
+
+    /// Dry-run mode: simulate orders without submitting to CLOB.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 fn main() {
@@ -121,7 +125,7 @@ fn main() {
     let executor = Executor::new(
         ExecutorConfig {
             clob_host: clob_host.clone(),
-            dry_run: false,  // Real trades!
+            dry_run: cli.dry_run,
             order_type: OrderType::Fak,
             aggression: OrderAggression::AtMarket,
             fee_rate_bps: 0,
