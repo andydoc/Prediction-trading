@@ -43,6 +43,30 @@ const STATE_SCHEMA: &str = "
         drawdown_pct REAL NOT NULL DEFAULT 0,
         data TEXT
     );
+    CREATE TABLE IF NOT EXISTS strategy_portfolios (
+        name TEXT PRIMARY KEY,
+        current_capital REAL NOT NULL,
+        total_entered INTEGER NOT NULL DEFAULT 0,
+        total_wins INTEGER NOT NULL DEFAULT 0,
+        total_losses INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS strategy_open_positions (
+        strategy_name TEXT NOT NULL,
+        constraint_id TEXT NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (strategy_name, constraint_id)
+    );
+    CREATE TABLE IF NOT EXISTS strategy_closed_positions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        strategy_name TEXT NOT NULL,
+        capital_deployed REAL NOT NULL,
+        actual_profit REAL NOT NULL,
+        actual_profit_pct REAL NOT NULL,
+        entry_ts REAL NOT NULL,
+        close_ts REAL NOT NULL,
+        is_win INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_strat_closed_ts ON strategy_closed_positions(close_ts);
 ";
 
 pub struct StateDB {
@@ -284,6 +308,113 @@ impl StateDB {
         *self.dirty_count.lock() += 1;
     }
 
+    // --- Strategy virtual portfolios ---
+
+    /// Save a strategy portfolio summary row (upsert).
+    pub fn save_strategy_portfolio(&self, name: &str, capital: f64, entered: u64, wins: u64, losses: u64) {
+        let db = self.db.conn();
+        let _ = db.execute(
+            "INSERT OR REPLACE INTO strategy_portfolios (name, current_capital, total_entered, total_wins, total_losses) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, capital, entered as i64, wins as i64, losses as i64],
+        );
+    }
+
+    /// Load all strategy portfolio summaries.
+    pub fn load_strategy_portfolios(&self) -> Vec<(String, f64, i64, i64, i64)> {
+        let db = self.db.conn();
+        let mut stmt = match db.prepare(
+            "SELECT name, current_capital, total_entered, total_wins, total_losses FROM strategy_portfolios"
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?,
+                row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?))
+        });
+        match rows {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Replace all open positions for a strategy.
+    pub fn save_strategy_open_positions(&self, strategy_name: &str, positions: &[(String, String)]) {
+        let db = self.db.conn();
+        let _ = db.execute(
+            "DELETE FROM strategy_open_positions WHERE strategy_name = ?1",
+            params![strategy_name],
+        );
+        for (cid, data_json) in positions {
+            let _ = db.execute(
+                "INSERT INTO strategy_open_positions (strategy_name, constraint_id, data) VALUES (?1, ?2, ?3)",
+                params![strategy_name, cid, data_json],
+            );
+        }
+    }
+
+    /// Load all open positions for a strategy.
+    pub fn load_strategy_open_positions(&self, strategy_name: &str) -> Vec<(String, String)> {
+        let db = self.db.conn();
+        let mut stmt = match db.prepare(
+            "SELECT constraint_id, data FROM strategy_open_positions WHERE strategy_name = ?1"
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![strategy_name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        });
+        match rows {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Insert a closed virtual position.
+    pub fn save_strategy_closed_position(
+        &self, strategy_name: &str, capital: f64, profit: f64, profit_pct: f64,
+        entry_ts: f64, close_ts: f64, is_win: bool,
+    ) {
+        let db = self.db.conn();
+        let _ = db.execute(
+            "INSERT INTO strategy_closed_positions \
+             (strategy_name, capital_deployed, actual_profit, actual_profit_pct, entry_ts, close_ts, is_win) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![strategy_name, capital, profit, profit_pct, entry_ts, close_ts, is_win as i32],
+        );
+    }
+
+    /// Load closed virtual positions for a strategy within a time window.
+    pub fn load_strategy_closed_positions(&self, strategy_name: &str, since_ts: f64) -> Vec<(f64, f64, f64, f64, f64, bool)> {
+        let db = self.db.conn();
+        let mut stmt = match db.prepare(
+            "SELECT capital_deployed, actual_profit, actual_profit_pct, entry_ts, close_ts, is_win \
+             FROM strategy_closed_positions WHERE strategy_name = ?1 AND close_ts >= ?2 ORDER BY close_ts"
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![strategy_name, since_ts], |row| {
+            Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?, row.get::<_, f64>(2)?,
+                row.get::<_, f64>(3)?, row.get::<_, f64>(4)?, row.get::<_, i32>(5)? != 0))
+        });
+        match rows {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Prune closed virtual positions older than cutoff_ts.
+    pub fn prune_strategy_closed_positions(&self, cutoff_ts: f64) {
+        let db = self.db.conn();
+        let _ = db.execute(
+            "DELETE FROM strategy_closed_positions WHERE close_ts < ?1",
+            params![cutoff_ts],
+        );
+    }
+
     // --- Disk persistence ---
 
     /// Atomic backup of in-memory DB to disk. Returns elapsed ms.
@@ -320,6 +451,30 @@ impl StateDB {
                 drawdown_pct REAL NOT NULL DEFAULT 0,
                 data TEXT
             );
+            CREATE TABLE IF NOT EXISTS strategy_portfolios (
+                name TEXT PRIMARY KEY,
+                current_capital REAL NOT NULL,
+                total_entered INTEGER NOT NULL DEFAULT 0,
+                total_wins INTEGER NOT NULL DEFAULT 0,
+                total_losses INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS strategy_open_positions (
+                strategy_name TEXT NOT NULL,
+                constraint_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                PRIMARY KEY (strategy_name, constraint_id)
+            );
+            CREATE TABLE IF NOT EXISTS strategy_closed_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy_name TEXT NOT NULL,
+                capital_deployed REAL NOT NULL,
+                actual_profit REAL NOT NULL,
+                actual_profit_pct REAL NOT NULL,
+                entry_ts REAL NOT NULL,
+                close_ts REAL NOT NULL,
+                is_win INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_strat_closed_ts ON strategy_closed_positions(close_ts);
         ");
 
         Ok(ms)

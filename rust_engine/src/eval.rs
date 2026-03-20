@@ -61,6 +61,11 @@ impl ConstraintStore {
     pub fn len(&self) -> usize {
         self.constraints.len()
     }
+
+    /// Return all constraints (for strategy tracker iteration).
+    pub fn all(&self) -> Vec<Constraint> {
+        self.constraints.iter().map(|r| r.value().clone()).collect()
+    }
 }
 
 impl Default for ConstraintStore {

@@ -156,7 +156,7 @@
 <div class="tab-bar">
   <div class="tab-btn active" data-tab="positions" onclick="switchTab('positions')">Positions <span id="tab-ann-paper" class="tab-annualized"></span></div>
   <div class="tab-btn" data-tab="monitor" onclick="switchTab('monitor')">Monitor</div>
-  <div class="tab-btn" data-tab="shadow" onclick="switchTab('shadow')">Shadow</div>
+  <div class="tab-btn" data-tab="strategies" onclick="switchTab('strategies')">Strategies</div>
   <div class="tab-btn" data-tab="live" onclick="switchTab('live')">Live</div>
 </div>
 
@@ -283,7 +283,7 @@
   </div>
 </div>
 
-<div id="tab-shadow" class="tab-content"></div>
+<div id="tab-strategies" class="tab-content"></div>
 <div id="tab-live" class="tab-content"></div>
 
 <div class="footer" style="color:#999;font-size:11px;margin-top:20px;">
@@ -697,32 +697,89 @@ function renderClosed(d) {
   restoreExpanded('closed-container', expanded, 'cl');
 }
 
-// === Shadow tab renderer ===
-function renderShadow(d) {
-  var el = document.getElementById('tab-shadow');
+// === Strategies tab renderer ===
+var _stratExpanded = {};
+function renderStrategies(d) {
+  var el = document.getElementById('tab-strategies');
   if (!el) return;
-  if (d.error) { el.innerHTML = '<p class="color-red">Error: '+esc(d.error)+'</p>'; return; }
-  var h = '<div class="stats">';
-  h += '<div class="stat"><div class="label">WOULD TRADE</div><div class="value good">'+(d.would_trade||0)+'</div></div>';
-  h += '<div class="stat"><div class="label">REJECTED</div><div class="value">'+(d.rejected||0)+'</div></div>';
-  h += '<div class="stat"><div class="label">TOTAL CHECKED</div><div class="value">'+(d.total||0)+'</div></div>';
-  h += '</div>';
-  // Rejection reasons
-  if (d.reject_reasons && Object.keys(d.reject_reasons).length > 0) {
-    h += '<h3 style="color:#fa0;margin:15px 0 5px">Rejection Reasons</h3><table><tr><th>Reason</th><th>Count</th></tr>';
-    Object.entries(d.reject_reasons).forEach(function(e) { h += '<tr><td>'+esc(e[0])+'</td><td>'+e[1]+'</td></tr>'; });
-    h += '</table>';
+  if (!d || !d.strategies || d.strategies.length === 0) {
+    el.innerHTML = '<p class="color-muted">No strategy configs found. Place shadow-a.yaml through shadow-f.yaml in config/instances/.</p>';
+    return;
   }
-  // Recent trades
-  h += '<h3 style="color:#0f0;margin:15px 0 5px">Recent Would-Trade Signals</h3>';
-  if (d.recent_trades && d.recent_trades.length > 0) {
-    h += '<table><tr><th>Time</th><th>Opportunity</th></tr>';
-    d.recent_trades.forEach(function(t) { h += '<tr><td>'+esc(t.ts)+'</td><td class="color-green">'+esc(t.msg)+'</td></tr>'; });
-    h += '</table>';
-  } else {
-    h += '<p class="color-muted">No would-trade signals yet.</p>';
-  }
+  // Find best 28d P&L for highlighting
+  var best28 = -Infinity;
+  d.strategies.forEach(function(s) { if (s.pnl_28d > best28) best28 = s.pnl_28d; });
+
+  var h = '<h2 style="color:#0af;margin:0 0 10px">Virtual Portfolio Comparison</h2>';
+  h += '<table style="width:100%;border-collapse:collapse">';
+  h += '<tr style="border-bottom:2px solid #333">';
+  h += '<th style="text-align:left;padding:6px 8px">Strategy</th>';
+  h += '<th style="text-align:right;padding:6px 8px">Capital</th>';
+  h += '<th style="text-align:right;padding:6px 8px">Open</th>';
+  h += '<th style="text-align:right;padding:6px 8px">7d P&L%</th>';
+  h += '<th style="text-align:right;padding:6px 8px">14d P&L%</th>';
+  h += '<th style="text-align:right;padding:6px 8px">28d P&L%</th>';
+  h += '<th style="text-align:right;padding:6px 8px">Win%</th>';
+  h += '<th style="text-align:right;padding:6px 8px">Avg Hold</th>';
+  h += '<th style="text-align:right;padding:6px 8px">Sharpe</th>';
+  h += '<th style="text-align:right;padding:6px 8px">Trades</th>';
+  h += '</tr>';
+
+  d.strategies.forEach(function(s, idx) {
+    var isBest = s.pnl_28d === best28 && best28 > 0;
+    var rowStyle = isBest ? 'border-left:3px solid #0f0;background:#0a1a0a' : '';
+    h += '<tr style="border-bottom:1px solid #222;cursor:pointer;'+rowStyle+'" onclick="toggleStratRow('+idx+')">';
+    h += '<td style="padding:6px 8px"><span style="color:#0af;font-weight:bold">'+esc(s.name)+'</span>';
+    h += ' <span style="color:#666;font-size:11px">'+esc(s.label)+'</span></td>';
+    h += '<td style="text-align:right;padding:6px 8px;color:#ccc">$'+s.capital.toFixed(0)+'</td>';
+    h += '<td style="text-align:right;padding:6px 8px;color:#aaa">'+s.open_count+'/'+s.max_positions+'</td>';
+    h += '<td style="text-align:right;padding:6px 8px;'+pnlColor(s.pnl_7d)+'">'+fmtPnl(s.pnl_7d)+'</td>';
+    h += '<td style="text-align:right;padding:6px 8px;'+pnlColor(s.pnl_14d)+'">'+fmtPnl(s.pnl_14d)+'</td>';
+    h += '<td style="text-align:right;padding:6px 8px;'+pnlColor(s.pnl_28d)+'">'+fmtPnl(s.pnl_28d)+'</td>';
+    h += '<td style="text-align:right;padding:6px 8px;color:#aaa">'+s.win_rate.toFixed(0)+'%</td>';
+    h += '<td style="text-align:right;padding:6px 8px;color:#aaa">'+fmtHold(s.avg_hold_hours)+'</td>';
+    h += '<td style="text-align:right;padding:6px 8px;color:#aaa">'+s.sharpe_28d.toFixed(2)+'</td>';
+    h += '<td style="text-align:right;padding:6px 8px;color:#666">'+s.total_entered+'</td>';
+    h += '</tr>';
+
+    // Expandable position details
+    var show = _stratExpanded[idx] ? '' : 'display:none;';
+    h += '<tr id="strat-detail-'+idx+'" style="'+show+'">';
+    h += '<td colspan="10" style="padding:4px 20px 10px;background:#0a0a0a">';
+    if (s.positions && s.positions.length > 0) {
+      h += '<table style="width:100%;font-size:12px"><tr style="color:#666">';
+      h += '<th style="text-align:left">Market</th><th style="text-align:right">Capital</th>';
+      h += '<th style="text-align:right">Exp. Profit%</th><th style="text-align:right">Hours Left</th></tr>';
+      s.positions.forEach(function(p) {
+        h += '<tr style="border-bottom:1px solid #1a1a1a">';
+        h += '<td style="padding:3px 4px;color:#ccc">'+esc(p.name)+'</td>';
+        h += '<td style="text-align:right;padding:3px 4px;color:#aaa">$'+p.capital.toFixed(0)+'</td>';
+        h += '<td style="text-align:right;padding:3px 4px;color:#0f0">'+p.profit_pct.toFixed(1)+'%</td>';
+        h += '<td style="text-align:right;padding:3px 4px;color:#888">'+p.hours_left.toFixed(0)+'h</td>';
+        h += '</tr>';
+      });
+      h += '</table>';
+    } else {
+      h += '<span style="color:#666;font-size:12px">No open virtual positions</span>';
+    }
+    h += '</td></tr>';
+  });
+
+  h += '</table>';
+  h += '<p style="color:#444;font-size:11px;margin-top:10px">Virtual portfolios — $1,000 initial capital each. Click row to expand positions.</p>';
   el.innerHTML = h;
+}
+function toggleStratRow(idx) {
+  _stratExpanded[idx] = !_stratExpanded[idx];
+  var el = document.getElementById('strat-detail-'+idx);
+  if (el) el.style.display = _stratExpanded[idx] ? '' : 'none';
+}
+function pnlColor(v) { return v > 0 ? 'color:#0f0' : v < 0 ? 'color:#f44' : 'color:#666'; }
+function fmtPnl(v) { return (v >= 0 ? '+' : '') + v.toFixed(2) + '%'; }
+function fmtHold(h) {
+  if (h < 1) return (h*60).toFixed(0)+'m';
+  if (h < 48) return h.toFixed(0)+'h';
+  return (h/24).toFixed(1)+'d';
 }
 
 // === Live tab renderer ===
@@ -1281,8 +1338,8 @@ document.addEventListener('DOMContentLoaded', function() { splashStatus('connect
         }
       } catch(ex) { console.warn('closed parse error', ex); }
     });
-    es.addEventListener('shadow', function(e) {
-      try { renderShadow(JSON.parse(e.data)); } catch(ex) { console.warn('shadow parse error', ex); }
+    es.addEventListener('strategies', function(e) {
+      try { renderStrategies(JSON.parse(e.data)); } catch(ex) { console.warn('strategies parse error', ex); }
     });
     es.addEventListener('live', function(e) {
       try { renderLive(JSON.parse(e.data)); } catch(ex) { console.warn('live parse error', ex); }

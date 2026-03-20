@@ -232,6 +232,11 @@ impl InstrumentStore {
         tracing::info!("InstrumentStore loaded {} instruments from {} markets", count, markets.len());
     }
 
+    /// Insert a single instrument by token_id.
+    pub fn insert_instrument(&self, inst: Instrument) {
+        self.instruments.write().insert(inst.token_id.clone(), inst);
+    }
+
     /// Get an instrument by token_id.
     pub fn get(&self, token_id: &str) -> Option<Instrument> {
         self.instruments.read().get(token_id).cloned()

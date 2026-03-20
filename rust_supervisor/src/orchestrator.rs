@@ -25,6 +25,7 @@ use rust_engine::state::StateDB;
 use rust_engine::ws_tiered::TieredWsConfig;
 use rust_engine::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use rust_engine::gas_monitor::{GasMonitor, GasMonitorConfig, GasCheckResult};
+use rust_engine::strategy_tracker::{self, StrategyTracker};
 use rust_engine::TradingEngine;
 
 /// Safely truncate a string to at most `n` bytes at a char boundary.
@@ -586,6 +587,9 @@ pub struct Orchestrator {
 
     // C4: Daily P&L report — tracks last UTC day boundary we reported on
     last_daily_report_day: i64,
+
+    /// Strategy tracker for virtual portfolios (Shadow A-F).
+    strategy_tracker: Option<StrategyTracker>,
 }
 
 impl Orchestrator {
@@ -767,6 +771,7 @@ impl Orchestrator {
             kill_switch_activated: false,
             // C4: Start at current UTC day so we don't fire immediately on startup
             last_daily_report_day: (now_secs() / 86400.0).floor() as i64,
+            strategy_tracker: None,
         })
     }
 
@@ -853,6 +858,20 @@ impl Orchestrator {
             }
         }
 
+        // 6b. Load strategy tracker for virtual portfolios (Shadow A-F)
+        let strategy_configs = strategy_tracker::load_strategy_configs(&self.cfg.workspace);
+        if !strategy_configs.is_empty() {
+            let tracker = StrategyTracker::load_or_new(&self.state_db, strategy_configs);
+            // Widen eval gates so all strategy opportunities are visible
+            let mut ec = self.engine.eval_config.lock().clone();
+            tracker.apply_widest_gates(&mut ec);
+            *self.engine.eval_config.lock() = ec;
+            tracing::info!("Strategy tracker: {} virtual portfolios loaded", tracker.len());
+            // Initial summary for dashboard
+            *self.engine.strategy_summary.lock() = tracker.build_summary();
+            self.strategy_tracker = Some(tracker);
+        }
+
         let mode_str = if self.cfg.shadow_only { "SHADOW" } else { "LIVE" };
         tracing::info!("Orchestrator ready [{}] — entering event loop", mode_str);
 
@@ -901,8 +920,8 @@ impl Orchestrator {
                 .map(|r| (r.market_cid.clone(), r.asset_id.clone()))
                 .collect();
 
-            // Before resolving, capture constraint info for tiered WS exit hooks
-            let pre_resolve_info: Vec<(String, String, Vec<String>)> = if self.cfg.use_tiered_ws {
+            // Before resolving, capture constraint info for tiered WS exit hooks + strategy tracker
+            let pre_resolve_info: Vec<(String, String, Vec<String>)> = {
                 let pm = self.engine.positions.lock();
                 pm.open_positions().values()
                     .map(|p| {
@@ -912,14 +931,21 @@ impl Orchestrator {
                         (p.position_id.clone(), cid, assets)
                     })
                     .collect()
-            } else {
-                Vec::new()
             };
 
             let closed = self.engine.resolve_by_ws_events(&events);
             if !closed.is_empty() { self.held_ids_cache = None; }
             for (pid, winner) in &closed {
                 tracing::info!("WS RESOLUTION: {} → winner={}", pid, winner);
+
+                // Forward to strategy tracker (resolve virtual positions)
+                if let Some((_, cid, _)) = pre_resolve_info.iter().find(|(p, _, _)| p == pid) {
+                    if !cid.is_empty() {
+                        if let Some(ref mut tracker) = self.strategy_tracker {
+                            tracker.resolve_with_db(cid, winner, &self.state_db);
+                        }
+                    }
+                }
 
                 // Tiered WS: migrate resolved position assets from Tier C → possibly Tier B
                 if self.cfg.use_tiered_ws {
@@ -962,12 +988,25 @@ impl Orchestrator {
         // while try_enter_or_replace needs &mut self.
         let (held_cids, held_mids) = self.held_ids_cache.as_ref().unwrap().clone();
 
+        // When strategy tracker is active, eval with EMPTY held sets so virtual
+        // portfolios see ALL opportunities (including markets the main trader holds).
+        // The main trader's held filter is applied later in try_enter_or_replace.
         let t0 = Instant::now();
-        let result = self.engine.evaluate_batch(
-            self.cfg.max_evals_per_batch,
-            &held_cids, &held_mids, 20,
-            self.cfg.depth_haircut,
-        );
+        let result = if self.strategy_tracker.is_some() {
+            let empty_cids = HashSet::new();
+            let empty_mids = HashSet::new();
+            self.engine.evaluate_batch(
+                self.cfg.max_evals_per_batch,
+                &empty_cids, &empty_mids, 20,
+                self.cfg.depth_haircut,
+            )
+        } else {
+            self.engine.evaluate_batch(
+                self.cfg.max_evals_per_batch,
+                &held_cids, &held_mids, 20,
+                self.cfg.depth_haircut,
+            )
+        };
         let batch_us = t0.elapsed().as_micros() as f64;
 
         if result.n_evaluated > 0 {
@@ -979,9 +1018,29 @@ impl Orchestrator {
             self.engine.latency.record_eval_batch(batch_us);
         }
 
-        if !result.opportunities.is_empty() {
+        // Feed ALL opportunities to strategy tracker (unfiltered by held)
+        if let Some(ref mut tracker) = self.strategy_tracker {
+            if !result.opportunities.is_empty() {
+                let fee_rate = self.engine.eval_config.lock().fee_rate;
+                tracker.process_opportunities(&result.opportunities, fee_rate);
+                *self.engine.strategy_summary.lock() = tracker.build_summary();
+            }
+        }
+
+        // Filter to non-held opportunities for the main trader
+        let main_opps: Vec<Opportunity> = if self.strategy_tracker.is_some() {
+            result.opportunities.iter()
+                .filter(|o| !held_cids.contains(&o.constraint_id)
+                    && !o.market_ids.iter().any(|m| held_mids.contains(m)))
+                .cloned()
+                .collect()
+        } else {
+            result.opportunities.clone()
+        };
+
+        if !main_opps.is_empty() {
             let entry_t0 = Instant::now();
-            self.try_enter_or_replace(&result.opportunities, &held_cids, &held_mids);
+            self.try_enter_or_replace(&main_opps, &held_cids, &held_mids);
             // Segment 5: eval → entry decision
             let entry_us = entry_t0.elapsed().as_micros() as f64;
             self.engine.latency.record_eval_to_entry(entry_us);
@@ -989,7 +1048,7 @@ impl Orchestrator {
             // Segment 6 (e2e): origin_ts → now for each opportunity that had an entry attempt
             if self.engine.latency.is_enabled() {
                 let now = now_secs();
-                for opp in &result.opportunities {
+                for opp in &main_opps {
                     if opp.origin_ts > 0.0 {
                         let e2e_us = (now - opp.origin_ts) * 1_000_000.0;
                         if e2e_us > 0.0 && e2e_us < 60_000_000.0 {
@@ -1239,6 +1298,18 @@ impl Orchestrator {
         // --- API resolution poll (safety net for missed WS events) ---
         if (now - self.last_api_resolution_check) >= self.cfg.api_resolution_interval {
             if self.engine.pm_open_count() > 0 {
+                // Capture pid→constraint_id before API resolves them
+                let pid_to_cid: HashMap<String, String> = if self.strategy_tracker.is_some() {
+                    let pm = self.engine.positions.lock();
+                    pm.open_positions().values()
+                        .map(|p| {
+                            let cid = p.metadata.get("constraint_id")
+                                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            (p.position_id.clone(), cid)
+                        })
+                        .collect()
+                } else { HashMap::new() };
+
                 let results = self.engine.check_api_resolutions();
                 if !results.is_empty() {
                     self.held_ids_cache = None;
@@ -1246,6 +1317,16 @@ impl Orchestrator {
                     for r in &results {
                         tracing::info!("API RESOLUTION: {} → winner={}, profit=${:.4}",
                             r.position_id, r.winning_market_id, r.profit);
+
+                        // Forward to strategy tracker
+                        if let Some(cid) = pid_to_cid.get(&r.position_id) {
+                            if !cid.is_empty() {
+                                if let Some(ref mut tracker) = self.strategy_tracker {
+                                    tracker.resolve_with_db(cid, &r.winning_market_id, &self.state_db);
+                                }
+                            }
+                        }
+
                         let _ = self.notifier.send(&NotifyEvent::PositionResolved {
                             position_id: r.position_id.clone(),
                             profit: r.profit,
@@ -1600,6 +1681,13 @@ impl Orchestrator {
             if !new_rows.is_empty() {
                 self.state_db.save_positions_bulk(&new_rows);
             }
+        }
+
+        // Save strategy tracker state + update dashboard summary
+        if let Some(ref mut tracker) = self.strategy_tracker {
+            tracker.prune_old_closed_with_db(&self.state_db);
+            tracker.save_state(&self.state_db);
+            *self.engine.strategy_summary.lock() = tracker.build_summary();
         }
 
         // Disk mirrors run in a background thread to avoid blocking the tick loop.

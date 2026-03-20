@@ -1,0 +1,16 @@
+# Shadow-F: Fast-market scalper (crypto price predictions, 5-15 min)
+arbitrage:
+  capital_per_trade_pct: 0.05
+  max_concurrent_positions: 50
+  max_position_size: 200
+  min_profit_threshold: 0.01
+  max_profit_threshold: 0.30
+  min_resolution_time_secs: 60
+  max_days_to_resolution: 1
+  replacement_cooldown_seconds: 10
+  max_days_to_replacement: 1
+  max_exposure_per_market: 100
+engine:
+  constraint_rebuild_interval_seconds: 60
+dashboard:
+  port: 5565

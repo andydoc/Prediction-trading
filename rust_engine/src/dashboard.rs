@@ -50,6 +50,8 @@ pub struct DashboardState {
     pub log_ring: Arc<Mutex<crate::monitor::LogRing>>,
     /// C2: Kill switch flag — set by POST /api/kill-switch, read by orchestrator
     pub kill_switch: Arc<AtomicBool>,
+    /// Strategy tracker summary JSON — updated by orchestrator
+    pub strategy_summary: Arc<Mutex<Value>>,
 }
 
 /// Metrics updated by the Rust orchestrator each stats cycle.
@@ -148,6 +150,14 @@ async fn handle_sse(
         // Monitor: full snapshot on connect
         yield Ok(sse::Event::default().event("monitor").data(
             serde_json::to_string(&build_monitor(&s, true)).unwrap_or_default()));
+        // Strategies: initial snapshot
+        {
+            let strat = s.strategy_summary.lock().clone();
+            if !strat.is_null() {
+                yield Ok(sse::Event::default().event("strategies").data(
+                    serde_json::to_string(&strat).unwrap_or_default()));
+            }
+        }
 
         let mut tick = 0u64;
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -170,10 +180,15 @@ async fn handle_sse(
                     serde_json::to_string(&build_monitor(&s, false)).unwrap_or_default()));
             }
 
-            // Opportunities: every 15s (every 3rd tick)
+            // Opportunities + strategies: every 15s (every 3rd tick)
             if tick % 3 == 0 {
                 yield Ok(sse::Event::default().event("opportunities").data(
                     serde_json::to_string(&build_opportunities(&s)).unwrap_or_default()));
+                let strat = s.strategy_summary.lock().clone();
+                if !strat.is_null() {
+                    yield Ok(sse::Event::default().event("strategies").data(
+                        serde_json::to_string(&strat).unwrap_or_default()));
+                }
             }
 
             // C4.1: Send closed alongside positions (every 5s) to eliminate visual gap

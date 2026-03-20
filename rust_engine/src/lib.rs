@@ -43,6 +43,7 @@ pub mod executor;
 pub mod reconciliation;
 pub mod circuit_breaker;
 pub mod gas_monitor;
+pub mod strategy_tracker;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -103,6 +104,8 @@ pub struct TradingEngine {
     pub instruments: Arc<InstrumentStore>,
     /// C2: Kill switch flag — shared with dashboard, read by orchestrator.
     pub kill_switch: Arc<AtomicBool>,
+    /// Strategy tracker summary JSON — updated by orchestrator, read by dashboard SSE.
+    pub strategy_summary: Arc<parking_lot::Mutex<serde_json::Value>>,
 }
 
 impl TradingEngine {
@@ -233,6 +236,7 @@ impl TradingEngine {
             log_ring,
             resolved_events,
             kill_switch,
+            strategy_summary: Arc::new(parking_lot::Mutex::new(serde_json::Value::Null)),
         })
     }
 
@@ -270,6 +274,7 @@ impl TradingEngine {
                 monitor: Arc::clone(&self.monitor),
                 log_ring: Arc::clone(&self.log_ring),
                 kill_switch: Arc::clone(&self.kill_switch),
+                strategy_summary: Arc::clone(&self.strategy_summary),
             };
             let bind_addr = dashboard_bind.to_string();
             self.runtime.spawn(async move {
