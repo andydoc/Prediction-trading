@@ -5,95 +5,50 @@
 
 use rust_engine::executor::Executor;
 use rust_engine::signing::Side;
+use crate::clob_client::ClobClient;
 use crate::report::{TestResult, Exception, ExceptionReport};
-
-/// Pick a liquid market suitable for testing.
-/// Returns (market_id, yes_token_id, best_ask_price, name).
-pub fn pick_liquid_market(
-    engine: &rust_engine::TradingEngine,
-) -> Option<(String, String, f64, String)> {
-    // Get constraints and find one with active order books
-    let constraints = engine.constraints.all();
-
-    for c in &constraints {
-        if c.markets.len() < 2 { continue; }
-        let m = &c.markets[0];
-        let ask = engine.get_best_ask(&m.yes_asset_id);
-        if ask > 0.05 && ask < 0.95 {
-            return Some((
-                m.market_id.clone(),
-                m.yes_asset_id.clone(),
-                ask,
-                m.name.clone(),
-            ));
-        }
-    }
-    None
-}
-
-/// Pick a negRisk market for D4.
-pub fn pick_neg_risk_market(
-    engine: &rust_engine::TradingEngine,
-) -> Option<(String, String, f64, String)> {
-    let constraints = engine.constraints.all();
-    for c in &constraints {
-        if !c.is_neg_risk { continue; }
-        if c.markets.len() < 2 { continue; }
-        let m = &c.markets[0];
-        let ask = engine.get_best_ask(&m.yes_asset_id);
-        if ask > 0.05 && ask < 0.95 {
-            return Some((
-                m.market_id.clone(),
-                m.yes_asset_id.clone(),
-                ask,
-                m.name.clone(),
-            ));
-        }
-    }
-    None
-}
 
 /// Run D2: Submit GTC order at off-market price, verify it appears, cancel it.
 pub fn run(
     executor: &Executor,
-    engine: &rust_engine::TradingEngine,
+    _engine: &rust_engine::TradingEngine,
     notifier: &rust_engine::notify::Notifier,
     exceptions: &mut ExceptionReport,
+    clob: &ClobClient,
 ) -> TestResult {
     let start = std::time::Instant::now();
 
-    // 1. Pick a liquid market
-    let (market_id, token_id, best_ask, name) = match pick_liquid_market(engine) {
+    // 1. Pick a liquid market via REST API
+    let market = match clob.find_liquid_market() {
         Some(m) => m,
         None => {
-            let errors = vec!["No liquid market found for D2 test".into()];
+            let errors = vec!["No liquid market found via CLOB REST API".into()];
             exceptions.add(Exception {
                 severity: "CRITICAL".into(),
                 test_id: "D2".into(),
                 component: "market_selection".into(),
-                description: "Could not find a liquid market with active order books".into(),
+                description: "Could not find a liquid market via Gamma/CLOB REST API".into(),
                 expected: "At least one market with ask between 0.05 and 0.95".into(),
                 actual: "No suitable market found".into(),
-                recommendation: "Ensure WS connections are established and books have depth".into(),
+                recommendation: "Check CLOB API connectivity and market availability".into(),
             });
             return TestResult::fail("D2", "Submit and Cancel Order", 0, errors);
         }
     };
 
-    tracing::info!("[D2] Selected market: {} (ask={:.4}) — {}", market_id, best_ask, name);
+    tracing::info!("[D2] Selected market: {} (ask={:.4}) — {}", market.market_id, market.best_ask, market.question);
 
-    // 2. Submit order at off-market price (best_ask + 0.10 for BUY = overpay, won't fill on GTC book)
-    // Actually, for a BUY GTC at a LOWER price, it sits on the book. Use best_ask - 0.20
-    let off_market_price = (best_ask - 0.20).max(0.01);
+    // 2. Submit order at off-market price (best_ask - 0.20 for BUY = sits on book)
+    let off_market_price = (market.best_ask - 0.20).max(0.01);
     let min_size = 2.50;  // $2.50 minimum
 
     let position_id = format!("d2_test_{}", crate::now_secs() as u64);
-    tracing::info!("[D2] Submitting GTC BUY at {:.4} (off-market, best_ask={:.4})", off_market_price, best_ask);
+    tracing::info!("[D2] Submitting GTC BUY at {:.4} (off-market, best_ask={:.4})", off_market_price, market.best_ask);
 
-    // Execute via executor (uses its configured order_type)
+    // Execute via executor
     let legs = vec![(
-        market_id.clone(),
-        token_id.clone(),
+        market.market_id.clone(),
+        market.yes_token_id.clone(),
         Side::Buy,
         off_market_price,
         min_size,
@@ -142,15 +97,15 @@ pub fn run(
     let elapsed = start.elapsed().as_millis() as u64;
     crate::notify(notifier, &format!(
         "[CLOB-TEST] D2 PASSED: GTC order submitted + cancelled on {} ({:.4})",
-        name, off_market_price
+        market.question, off_market_price
     ));
 
     TestResult::pass("D2", "Submit and Cancel Order", elapsed,
         serde_json::json!({
-            "market_id": market_id,
-            "market_name": name,
+            "market_id": market.market_id,
+            "market_name": market.question,
             "order_price": off_market_price,
-            "best_ask": best_ask,
+            "best_ask": market.best_ask,
             "cancelled_count": cancelled,
             "dry_run": executor.is_dry_run(),
         }))

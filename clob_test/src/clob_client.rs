@@ -1,0 +1,240 @@
+/// CLOB REST API client for the test harness.
+///
+/// Queries the Gamma API and CLOB API directly, without requiring
+/// WebSocket connections or the full engine pipeline.
+
+use reqwest::blocking::Client;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::time::Duration;
+
+/// A market suitable for testing, discovered via REST API.
+#[derive(Debug, Clone)]
+pub struct TestMarket {
+    pub market_id: String,         // condition_id
+    pub question: String,
+    pub yes_token_id: String,
+    pub no_token_id: String,
+    pub best_ask: f64,
+    pub best_bid: f64,
+    pub neg_risk: bool,
+    pub active: bool,
+    pub volume: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GammaMarket {
+    #[serde(rename = "conditionId", default)]
+    condition_id: String,
+    question: Option<String>,
+    #[serde(default)]
+    tokens: Vec<GammaToken>,
+    #[serde(rename = "enableOrderBook", default)]
+    enable_order_book: bool,
+    #[serde(rename = "negRisk", default)]
+    neg_risk: bool,
+    #[serde(default)]
+    active: bool,
+    #[serde(rename = "volumeNum", default)]
+    volume_num: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GammaToken {
+    token_id: Option<String>,
+    outcome: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClobBook {
+    asks: Option<Vec<ClobOrder>>,
+    bids: Option<Vec<ClobOrder>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ClobOrder {
+    price: Option<String>,
+    size: Option<String>,
+}
+
+pub struct ClobClient {
+    http: Client,
+    clob_host: String,
+}
+
+impl ClobClient {
+    pub fn new(clob_host: &str) -> Self {
+        Self {
+            http: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            clob_host: clob_host.trim_end_matches('/').to_string(),
+        }
+    }
+
+    /// Find a liquid non-negRisk market suitable for D2/D3.
+    pub fn find_liquid_market(&self) -> Option<TestMarket> {
+        self.find_market(false)
+    }
+
+    /// Find a liquid negRisk market suitable for D4.
+    pub fn find_neg_risk_market(&self) -> Option<TestMarket> {
+        self.find_market(true)
+    }
+
+    /// Find a 2-outcome market for D5 forced arb (buy YES on both sides).
+    pub fn find_two_outcome_market(&self) -> Option<(TestMarket, TestMarket)> {
+        // Search Gamma for events with exactly 2 markets
+        let url = "https://gamma-api.polymarket.com/markets?limit=200&active=true&enableOrderBook=true&closed=false";
+        let resp = self.http.get(url).send().ok()?;
+        let markets: Vec<GammaMarket> = resp.json().ok()?;
+
+        // Group by condition_id prefix to find mutex pairs
+        // Actually, negRisk events with exactly 2 outcomes work best
+        // Let's find two markets from the same event
+        let mut by_group: HashMap<String, Vec<&GammaMarket>> = HashMap::new();
+        for m in &markets {
+            if m.condition_id.is_empty() || !m.enable_order_book || !m.active { continue; }
+            if m.tokens.len() < 2 { continue; }
+            // Group by first 20 chars of condition_id as rough grouping
+            // Actually, we need the event grouping. Let's use neg_risk markets which share a group
+            if m.neg_risk {
+                // For negRisk, multiple markets share the same negRisk group
+                // We need the event_id or parent_id, which isn't directly in this API
+                // Instead, just find any two active negRisk markets with order books
+                let key = "neg_risk_pool".to_string();
+                by_group.entry(key).or_default().push(m);
+            }
+        }
+
+        // Take first two negRisk markets with books
+        if let Some(pool) = by_group.get("neg_risk_pool") {
+            let mut found = Vec::new();
+            for m in pool.iter().take(20) {
+                if let Some(tm) = self.enrich_market(m) {
+                    if tm.best_ask > 0.10 && tm.best_ask < 0.90 {
+                        found.push(tm);
+                        if found.len() == 2 { break; }
+                    }
+                }
+            }
+            if found.len() == 2 {
+                return Some((found.remove(0), found.remove(0)));
+            }
+        }
+
+        // Fallback: any two markets with active books
+        let mut found = Vec::new();
+        for m in &markets {
+            if m.condition_id.is_empty() || !m.enable_order_book || !m.active { continue; }
+            if let Some(tm) = self.enrich_market(m) {
+                if tm.best_ask > 0.10 && tm.best_ask < 0.90 {
+                    found.push(tm);
+                    if found.len() == 2 { break; }
+                }
+            }
+        }
+        if found.len() == 2 {
+            Some((found.remove(0), found.remove(0)))
+        } else {
+            None
+        }
+    }
+
+    fn find_market(&self, want_neg_risk: bool) -> Option<TestMarket> {
+        // Query Gamma API for active markets with order books
+        let url = format!(
+            "https://gamma-api.polymarket.com/markets?limit=100&active=true&enableOrderBook=true&closed=false&negRisk={}",
+            want_neg_risk
+        );
+        let resp = self.http.get(&url).send().ok()?;
+        let markets: Vec<GammaMarket> = resp.json().ok()?;
+
+        tracing::info!("Gamma API returned {} markets (neg_risk={})", markets.len(), want_neg_risk);
+
+        // Sort by volume descending for liquidity
+        let mut sorted: Vec<&GammaMarket> = markets.iter()
+            .filter(|m| !m.condition_id.is_empty() && m.tokens.len() >= 2)
+            .collect();
+        sorted.sort_by(|a, b| b.volume_num.partial_cmp(&a.volume_num).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Try top markets by volume, check for actual book depth
+        for m in sorted.iter().take(30) {
+            if let Some(tm) = self.enrich_market(m) {
+                if tm.best_ask > 0.05 && tm.best_ask < 0.95 && tm.best_bid > 0.0 {
+                    tracing::info!("Found market: {} ask={:.4} bid={:.4} vol={:.0}",
+                        tm.question, tm.best_ask, tm.best_bid, tm.volume);
+                    return Some(tm);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Enrich a Gamma market with CLOB order book data.
+    fn enrich_market(&self, m: &GammaMarket) -> Option<TestMarket> {
+        let yes_token = m.tokens.iter()
+            .find(|t| t.outcome.as_deref() == Some("Yes"))
+            .and_then(|t| t.token_id.clone())?;
+        let no_token = m.tokens.iter()
+            .find(|t| t.outcome.as_deref() == Some("No"))
+            .and_then(|t| t.token_id.clone())
+            .unwrap_or_default();
+
+        // Query CLOB for order book
+        let book_url = format!("{}/book?token_id={}", self.clob_host, yes_token);
+        let resp = self.http.get(&book_url).send().ok()?;
+        if !resp.status().is_success() { return None; }
+        let book: ClobBook = resp.json().ok()?;
+
+        let best_ask = book.asks.as_ref()
+            .and_then(|a| a.first())
+            .and_then(|o| o.price.as_ref())
+            .and_then(|p| p.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        let best_bid = book.bids.as_ref()
+            .and_then(|b| b.first())
+            .and_then(|o| o.price.as_ref())
+            .and_then(|p| p.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        Some(TestMarket {
+            market_id: m.condition_id.clone(),
+            question: m.question.clone().unwrap_or_default(),
+            yes_token_id: yes_token,
+            no_token_id: no_token,
+            best_ask,
+            best_bid,
+            neg_risk: m.neg_risk,
+            active: m.active,
+            volume: m.volume_num,
+        })
+    }
+
+    /// Get current best ask for a token.
+    pub fn get_best_ask(&self, token_id: &str) -> f64 {
+        let url = format!("{}/book?token_id={}", self.clob_host, token_id);
+        self.http.get(&url).send().ok()
+            .and_then(|r| r.json::<ClobBook>().ok())
+            .and_then(|b| b.asks)
+            .and_then(|a| a.first().cloned())
+            .and_then(|o| o.price)
+            .and_then(|p| p.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Get current best bid for a token.
+    pub fn get_best_bid(&self, token_id: &str) -> f64 {
+        let url = format!("{}/book?token_id={}", self.clob_host, token_id);
+        self.http.get(&url).send().ok()
+            .and_then(|r| r.json::<ClobBook>().ok())
+            .and_then(|b| b.bids)
+            .and_then(|b| b.first().cloned())
+            .and_then(|o| o.price)
+            .and_then(|p| p.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+}

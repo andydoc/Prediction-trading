@@ -11,6 +11,7 @@ use rust_engine::TradingEngine;
 use rust_engine::executor::Executor;
 use rust_engine::notify::Notifier;
 
+use crate::clob_client::ClobClient;
 use crate::config::MergedTestConfig;
 use crate::dedup::PositionDedup;
 use crate::ipc;
@@ -63,6 +64,8 @@ pub struct TestHarness {
     open_position_ids: Vec<String>,
     /// Checkpoint for D6 resume.
     checkpoint: Option<ipc::Checkpoint>,
+    /// CLOB REST client for market discovery.
+    clob: ClobClient,
 }
 
 impl TestHarness {
@@ -78,6 +81,7 @@ impl TestHarness {
         skip_deposit_check: bool,
     ) -> Self {
         let report = TestReport::new(&wallet_address, test_config.initial_capital, 0.0);
+        let clob = ClobClient::new(&clob_host);
         Self {
             phase: Phase::D1,
             engine,
@@ -95,6 +99,7 @@ impl TestHarness {
             clob_host,
             open_position_ids: Vec::new(),
             checkpoint: None,
+            clob,
         }
     }
 
@@ -199,7 +204,7 @@ impl TestHarness {
         // Run D2 if not done
         if !d2_done {
             let result = tests::d2_submit_cancel::run(
-                &self.executor, &self.engine, &self.notifier, &mut self.exceptions,
+                &self.executor, &self.engine, &self.notifier, &mut self.exceptions, &self.clob,
             );
             let passed = result.result == "PASS";
             self.report.add_result(result);
@@ -221,7 +226,7 @@ impl TestHarness {
         if !d3_done {
             let (result, pid) = tests::d3_micro_fill::run(
                 &self.executor, &self.engine, &self.notifier,
-                &mut self.dedup, &mut self.exceptions,
+                &mut self.dedup, &mut self.exceptions, &self.clob,
             );
             let passed = result.result == "PASS";
             self.report.add_result(result);
@@ -245,7 +250,7 @@ impl TestHarness {
         if !d4_done {
             let (result, pid) = tests::d4_neg_risk::run(
                 &self.executor, &self.engine, &self.notifier,
-                &mut self.dedup, &mut self.exceptions,
+                &mut self.dedup, &mut self.exceptions, &self.clob,
             );
             self.report.add_result(result);
             if let Some(pid) = pid {
@@ -281,7 +286,7 @@ impl TestHarness {
             let need_d6 = self.open_position_ids.len() < 2;
             let (result, pids) = tests::d5_multi_leg::run(
                 &self.executor, &self.engine, &self.notifier,
-                &self.test_config, &mut self.dedup, need_d6, &mut self.exceptions,
+                &self.test_config, &mut self.dedup, need_d6, &mut self.exceptions, &self.clob,
             );
             self.report.add_result(result);
             self.open_position_ids.extend(pids);
