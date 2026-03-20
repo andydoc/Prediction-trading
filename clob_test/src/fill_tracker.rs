@@ -34,6 +34,7 @@ pub fn confirm_and_enter(
     legs: &[SubmittedLeg],
     is_sell: bool,
     runtime: &tokio::runtime::Handle,
+    wallet_address: &str,
 ) -> Result<String, String> {
     let market_ids: Vec<String> = legs.iter().map(|l| l.market.market_id.clone()).collect();
     let asset_ids: Vec<String> = legs.iter().map(|l| {
@@ -50,9 +51,9 @@ pub fn confirm_and_enter(
     user_ws.stop();
 
     if fills.is_empty() {
-        // Fallback: check REST /positions to see if fills landed
-        tracing::warn!("[FillTracker] No WS fills received, checking REST /positions...");
-        return confirm_via_rest(engine, clob, auth, position_id, legs, is_sell);
+        // Fallback: check Data API /positions to see if fills landed
+        tracing::warn!("[FillTracker] No WS fills received, checking Data API /positions...");
+        return confirm_via_rest(engine, clob, auth, position_id, legs, is_sell, wallet_address);
     }
 
     tracing::info!("[FillTracker] Got {} confirmed fills", fills.len());
@@ -61,54 +62,85 @@ pub fn confirm_and_enter(
     enter_position_from_fills(engine, position_id, legs, &fills, is_sell)
 }
 
-/// Fallback: confirm fills via REST API polling of /positions endpoint.
+/// Fallback: confirm fills via Data API /positions endpoint (public, no auth).
 fn confirm_via_rest(
     engine: &TradingEngine,
     _clob: &ClobClient,
-    auth: &ClobAuth,
+    _auth: &ClobAuth,
     position_id: &str,
     legs: &[SubmittedLeg],
     is_sell: bool,
+    wallet_address: &str,
 ) -> Result<String, String> {
     let http = reqwest::blocking::Client::new();
-    let clob_host = "https://clob.polymarket.com";
 
-    // Poll up to 6 times (every 5s = 30s total)
+    let condition_ids: Vec<String> = legs.iter().map(|l| l.market.market_id.clone()).collect();
     let asset_ids: std::collections::HashSet<String> = legs.iter().map(|l| {
         if is_sell { l.market.no_token_id.clone() } else { l.market.yes_token_id.clone() }
     }).collect();
 
+    // Poll Data API up to 6 times (every 5s = 30s total)
     for attempt in 1..=6 {
         std::thread::sleep(Duration::from_secs(5));
 
-        let positions = rust_engine::reconciliation::query_clob_positions(&http, clob_host, Some(auth))
-            .map_err(|e| format!("REST position query failed: {}", e))?;
+        let url = format!(
+            "https://data-api.polymarket.com/positions?user={}&market={}&sizeThreshold=0",
+            wallet_address,
+            condition_ids.join(","),
+        );
 
-        let matched: Vec<_> = positions.iter()
-            .filter(|p| asset_ids.contains(&p.asset_id) && p.size > 0.0)
+        let resp: Vec<serde_json::Value> = match http.get(&url).send().and_then(|r| r.json()) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("[FillTracker] Data API error: {}", e);
+                continue;
+            }
+        };
+
+        // Filter for positions with non-zero size matching our asset_ids
+        let matched: Vec<_> = resp.iter()
+            .filter(|p| {
+                let asset = p.get("asset").and_then(|v| v.as_str()).unwrap_or("");
+                let size = p.get("size")
+                    .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+                    .unwrap_or(0.0);
+                asset_ids.contains(asset) && size > 0.0
+            })
             .collect();
 
-        tracing::info!("[FillTracker] REST poll {}/6: {} matched positions", attempt, matched.len());
+        tracing::info!("[FillTracker] Data API poll {}/6: {} matched positions (of {} returned)",
+            attempt, matched.len(), resp.len());
 
         if matched.len() >= legs.len() {
-            // Build synthetic fill events from REST data
-            let fills: Vec<TradeEvent> = matched.iter().map(|p| TradeEvent {
-                id: String::new(),
-                market: p.market_id.clone(),
-                asset_id: p.asset_id.clone(),
-                outcome: if is_sell { "NO".into() } else { "YES".into() },
-                side: if is_sell { "SELL".into() } else { "BUY".into() },
-                size: p.size,
-                price: p.avg_price,
-                status: "CONFIRMED".into(),
-                timestamp: crate::now_secs(),
+            // Build synthetic fill events from Data API response
+            let fills: Vec<TradeEvent> = matched.iter().map(|p| {
+                let asset = p.get("asset").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let cid = p.get("conditionId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let size = p.get("size")
+                    .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+                    .unwrap_or(0.0);
+                let avg_price = p.get("avgPrice")
+                    .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+                    .unwrap_or(0.0);
+
+                TradeEvent {
+                    id: String::new(),
+                    market: cid,
+                    asset_id: asset,
+                    outcome: if is_sell { "NO".into() } else { "YES".into() },
+                    side: if is_sell { "SELL".into() } else { "BUY".into() },
+                    size,
+                    price: avg_price,
+                    status: "CONFIRMED".into(),
+                    timestamp: crate::now_secs(),
+                }
             }).collect();
 
             return enter_position_from_fills(engine, position_id, legs, &fills, is_sell);
         }
     }
 
-    Err("Fill confirmation timeout: positions not detected after 30s REST polling".into())
+    Err("Fill confirmation timeout: positions not detected after 30s Data API polling".into())
 }
 
 /// Enter a position in the engine from confirmed fill data.

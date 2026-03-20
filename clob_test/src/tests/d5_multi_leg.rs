@@ -27,6 +27,7 @@ pub fn run(
     clob: &ClobClient,
     clob_auth: &ClobAuth,
     runtime: &tokio::runtime::Handle,
+    wallet_address: &str,
 ) -> (TestResult, Vec<String>) {
     let start = std::time::Instant::now();
     let mut opened_position_ids = Vec::new();
@@ -100,7 +101,7 @@ pub fn run(
         SubmittedLeg { market: m2.clone(), size_usd: size },
     ];
 
-    match fill_tracker::confirm_and_enter(engine, clob, clob_auth, &position_id, &submitted_legs, false, runtime) {
+    match fill_tracker::confirm_and_enter(engine, clob, clob_auth, &position_id, &submitted_legs, false, runtime, wallet_address) {
         Ok(engine_pid) => {
             opened_position_ids.push(engine_pid.clone());
             tracing::info!("[D5] Position entered in engine: {}", engine_pid);

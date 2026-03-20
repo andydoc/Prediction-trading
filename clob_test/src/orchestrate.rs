@@ -328,7 +328,7 @@ impl TestHarness {
                 let (result, pids) = tests::d5_multi_leg::run(
                     &self.executor, &self.engine, &self.notifier,
                     &self.test_config, &mut self.dedup, need_d6, &mut self.exceptions, &self.clob,
-                    &self.clob_auth, &self.runtime,
+                    &self.clob_auth, &self.runtime, &self.wallet_address,
                 );
                 self.report.add_result(result);
                 self.open_position_ids.extend(pids);
