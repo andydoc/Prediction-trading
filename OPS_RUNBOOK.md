@@ -10,21 +10,21 @@
 
 | Item | Value |
 |------|-------|
-| Provider | ZAP-Hosting (Germany) |
-| IP | `193.23.127.99` |
-| SSH | `ssh vps-ubuntu` (ubuntu user) or `ssh vps` (root) |
+| Provider | is*hosting (Madrid, Spain) — interim. Dublin (Interxion DC) planned when capacity available. |
+| IP | `176.97.72.199` |
+| SSH | `ssh madrid-ubuntu` (ubuntu user) or `ssh madrid` (root) |
 | Specs | 4 vCPU, 8 GB RAM, 25 GB NVMe, Ubuntu 24.04 |
 | Workspace | `/home/ubuntu/prediction-trader` |
 | Binary | `/home/ubuntu/prediction-trader/target/release/prediction-trader` |
 
 **SSH quick commands:**
 ```bash
-ssh vps-ubuntu                                  # Shell (ubuntu user)
-ssh vps-ubuntu 'systemctl status prediction-trader'
-ssh vps-ubuntu 'tail -50 /home/ubuntu/prediction-trader/logs/supervisor-*.log'
+ssh madrid-ubuntu                                  # Shell (ubuntu user)
+ssh madrid-ubuntu 'systemctl status prediction-trader'
+ssh madrid-ubuntu 'tail -50 /home/ubuntu/prediction-trader/logs/supervisor-*.log'
 ```
 
-**ZAP-Hosting login reminder**: Set a calendar reminder every 3 months to log in to the ZAP dashboard and verify account/billing status.
+**Host migration note**: Madrid is a temporary location. is*hosting offered free migration to Dublin (lower latency: 0.83ms to clob.polymarket.com) when capacity is available.
 
 ---
 
@@ -95,7 +95,7 @@ All numeric values are bounds-checked (e.g., `capital_per_trade_pct` max 0.5, `m
 
 **Remote access via SSH tunnel:**
 ```bash
-ssh -L 5558:127.0.0.1:5558 vps-ubuntu
+ssh -L 5558:127.0.0.1:5558 madrid-ubuntu
 # Then open http://localhost:5558 in browser
 ```
 
@@ -288,13 +288,49 @@ cp -p data/state_rust.db data/state_rust.db.pre-maintenance-$(date +%s)
 - Daily P&L summary at midnight UTC: entries, exits, fees, net P&L, capital utilisation, drawdown
 
 **Weekly**:
-- Check VPS disk usage: `ssh vps-ubuntu 'df -h /'`
-- Check VPS memory: `ssh vps-ubuntu 'free -h'`
+- Check VPS disk usage: `ssh madrid-ubuntu 'df -h /'`
+- Check VPS memory: `ssh madrid-ubuntu 'free -h'`
 - Review log retention (30-day auto-cleanup)
 
 **Monthly**:
 - Verify POL gas balance
-- Check ZAP-Hosting dashboard / billing
+- Check is*hosting dashboard / billing
 
-**Quarterly**:
-- Log in to ZAP-Hosting dashboard to prevent account dormancy
+---
+
+## 13. CLOB Integration Tests
+
+**Binary**: `clob-test` (in `clob_test/` crate)
+
+**Build**:
+```bash
+cd ~/prediction-trader && cargo build --release -p clob-test
+```
+
+**Run** (quick — skip already-passing tests):
+```bash
+./target/release/clob-test --workspace . --skip-tests D2,D3,D4,D7
+```
+
+**Run** (full suite):
+```bash
+./target/release/clob-test --workspace . --skip-deposit-check
+```
+
+**CLI flags**:
+| Flag | Description |
+|------|-------------|
+| `--workspace` | Path to prediction-trader root (default: `.`) |
+| `--skip-deposit-check` | Skip D1 deposit verification |
+| `--skip-tests D2,D3` | Comma-separated test IDs to auto-PASS |
+| `--dry-run` | Simulate orders without CLOB submission |
+| `--resume-from <path>` | Resume from D6 checkpoint file |
+| `--timeout-minutes <n>` | Max runtime (default: 720) |
+
+**Reports**: Written to `data/clob_test_report.json` and `data/clob_test_exceptions.json`.
+
+**Prerequisites**:
+- Wallet private key in `config/secrets.yaml` under `polymarket.private_key`
+- CLOB API credentials (auto-derived from wallet if missing)
+- USDC.e balance ≥ $20 for test orders
+- VPS must NOT be in a geoblocked country (see §1)

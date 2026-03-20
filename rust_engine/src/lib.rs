@@ -28,6 +28,7 @@ pub mod ws_pool;
 pub mod ws_tier_b;
 pub mod ws_tier_c;
 pub mod ws_tiered;
+pub mod ws_user;
 pub mod dashboard;
 pub mod resolution;
 pub mod postponement;
@@ -799,20 +800,35 @@ impl TradingEngine {
 
     /// Run startup reconciliation (B4.1).
     /// Called once after state is loaded from SQLite.
-    pub fn reconcile_startup(&self, escalation_threshold: f64) -> reconciliation::ReconciliationReport {
+    /// Pass `clob_auth` for live CLOB position query, or None for shadow mode.
+    pub fn reconcile_startup_with_auth(
+        &self, clob_host: &str, auth: Option<&signing::ClobAuth>, escalation_threshold: f64,
+    ) -> reconciliation::ReconciliationReport {
         let positions = self.extract_position_data();
         reconciliation::reconcile_startup(
-            &positions, &self.http_client, "https://clob.polymarket.com", escalation_threshold,
+            &positions, &self.http_client, clob_host, auth, escalation_threshold,
         )
+    }
+
+    /// Legacy: startup reconciliation without auth (shadow mode).
+    pub fn reconcile_startup(&self, escalation_threshold: f64) -> reconciliation::ReconciliationReport {
+        self.reconcile_startup_with_auth("https://clob.polymarket.com", None, escalation_threshold)
     }
 
     /// Run periodic reconciliation (B4.0).
     /// Called on interval from the orchestrator tick loop.
-    pub fn reconcile_periodic(&self, escalation_threshold: f64) -> reconciliation::ReconciliationReport {
+    pub fn reconcile_periodic_with_auth(
+        &self, clob_host: &str, auth: Option<&signing::ClobAuth>, escalation_threshold: f64,
+    ) -> reconciliation::ReconciliationReport {
         let positions = self.extract_position_data();
         reconciliation::reconcile_periodic(
-            &positions, &self.http_client, "https://clob.polymarket.com", escalation_threshold,
+            &positions, &self.http_client, clob_host, auth, escalation_threshold,
         )
+    }
+
+    /// Legacy: periodic reconciliation without auth (shadow mode).
+    pub fn reconcile_periodic(&self, escalation_threshold: f64) -> reconciliation::ReconciliationReport {
+        self.reconcile_periodic_with_auth("https://clob.polymarket.com", None, escalation_threshold)
     }
 
     // === Dashboard helpers ===

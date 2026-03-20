@@ -55,19 +55,30 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 
 ---
 
-## Milestone D: CLOB Integration Test — ⬚ Not Started
+## Milestone D: CLOB Integration Test — 🔧 In Progress
 
 **Goal**: Prove full execution path works against real Polymarket CLOB. Place, fill, cancel, and reconcile real micro-orders. Target: 1 week.
 
 | Status | Count |
 |--------|-------|
-| ⬚ Remaining | 8/8 |
+| ✅ Complete | 5/8 |
+| 🔧 In Progress | 3/8 |
 
-**Funds required**: ~$50 USDC.e + ~5 POL.
+**VPS**: is*hosting Madrid (176.97.72.199). Interim location — Dublin (Interxion DC, 0.83ms latency) planned when capacity available.
+**Funds**: ~$50 USDC.e deposited, wallet 0x21f1...fb1.
+**First real CLOB order**: 2026-03-20 from Madrid VPS.
 
-**Why separate**: Many B tasks (partial fills, cross-asset matching, reconciliation, batch orders) cannot be fully validated without actual CLOB fills. Dry-run verifies code paths; only real micro-orders confirm end-to-end correctness.
-
-Tasks: deposit test funds, smoke tests (place/cancel, real fill, negRisk, multi-leg arb), cold-start reconciliation test, circuit breaker + kill switch test, clean up positions.
+| Task | Status | Notes |
+|------|--------|-------|
+| D1: Deposit test funds | ✅ | REST API balance check |
+| D2: Submit + cancel order | ✅ | GTC order, verify on book, cancel |
+| D3: Real micro-fill | ✅ | FAK BUY at market price |
+| D4: negRisk market fill | ✅ | negRisk-specific signing |
+| D5: Multi-leg arb execution | 🔧 | WS User Channel fill tracking added |
+| D6: Cold-start reconciliation | 🔧 | Position serialization + real CLOB reconciliation |
+| D7a: Circuit breaker | ✅ | Engine state validation |
+| D7b: Kill switch | ✅ | Executor cancel-all |
+| D8: Closeout positions | 🔧 | Real SELL orders + accounting verification |
 
 ---
 
@@ -123,8 +134,8 @@ Tasks: deposit funds, configure winning parameters, switch to live mode, supervi
 |-----------|-------|--------|
 | A: Rust Port | 13/13 | ✅ Complete |
 | B: Execution Infrastructure | 27/27 | ✅ Complete |
-| C: Safety | 2/7 | 🔧 In Progress |
-| D: CLOB Integration Test | 0/8 | ⬚ Planned |
+| C: Safety | 10/10 | ✅ Complete |
+| D: CLOB Integration Test | 5/8 | 🔧 In Progress |
 | E: Shadow Validation | 1/10 | 🔧 In Progress |
 | F: Go Live | 0/6 | ⬚ Planned |
 | G: Scale | 0/4 | ⬚ Future |
