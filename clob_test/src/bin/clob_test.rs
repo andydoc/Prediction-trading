@@ -169,7 +169,7 @@ fn main() {
         ExecutorConfig {
             clob_host: clob_host.clone(),
             dry_run: cli.dry_run,
-            order_type: OrderType::Fak,
+            order_type: OrderType::Gtc,  // GTC so D2 orders sit on book for cancel test
             aggression: OrderAggression::AtMarket,
             fee_rate_bps: 0,
             confirmation_timeout_secs: 120.0,
