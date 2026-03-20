@@ -4,9 +4,21 @@
 /// WebSocket connections or the full engine pipeline.
 
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::time::Duration;
+
+/// Gamma API returns clobTokenIds as a stringified JSON array.
+fn deserialize_string_array<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where D: Deserializer<'de> {
+    let s: Option<String> = Option::deserialize(deserializer)?;
+    match s {
+        Some(ref val) if val.starts_with('[') => {
+            serde_json::from_str(val).map_err(serde::de::Error::custom)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
 
 /// A market suitable for testing, discovered via REST API.
 #[derive(Debug, Clone)]
@@ -27,8 +39,8 @@ struct GammaMarket {
     #[serde(rename = "conditionId", default)]
     condition_id: String,
     question: Option<String>,
-    /// Token IDs: [YES_token_id, NO_token_id]
-    #[serde(rename = "clobTokenIds", default)]
+    /// Token IDs as stringified JSON array: "[\"yes_id\", \"no_id\"]"
+    #[serde(rename = "clobTokenIds", default, deserialize_with = "deserialize_string_array")]
     clob_token_ids: Vec<String>,
     #[serde(rename = "enableOrderBook", default)]
     enable_order_book: bool,
