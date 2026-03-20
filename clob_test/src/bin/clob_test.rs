@@ -207,8 +207,12 @@ fn main() {
         tracing::info!("Skipping tests: {:?}", skip_tests);
     }
 
-    // Get tokio runtime handle
-    let runtime = tokio::runtime::Handle::current();
+    // Create tokio runtime for async WS operations
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        tracing::error!("Failed to create tokio runtime: {}", e);
+        std::process::exit(1);
+    });
+    let runtime_handle = runtime.handle().clone();
 
     // Build harness
     let mut harness = TestHarness::new(
@@ -223,7 +227,7 @@ fn main() {
         cli.skip_deposit_check,
         harness_auth,
         skip_tests,
-        runtime,
+        runtime_handle,
     );
 
     // Check for D6 resume
