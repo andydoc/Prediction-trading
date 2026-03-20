@@ -154,7 +154,7 @@ The following inconsistencies were identified. These will be addressed by the do
 ✅ Milestone C: Safety Infrastructure + docs (OPS_RUNBOOK, USER_GUIDE) + retire PROGRESS_ROADMAP
     |                Complete. 10/10 tasks. No funded account required.
     |
-🔧 Milestone D: CLOB Integration Test (small deposit: ~$50 USDC + POL gas) — 5/8 PASS
+🔧 Milestone D: CLOB Integration Test (small deposit: ~$50 USDC + POL gas) — 7/8 PASS
     |                Prove the execution path works against the real CLOB.
     |                Place, fill, cancel, and reconcile real micro-orders.
     |
@@ -398,10 +398,10 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | ✅ **D2: Submit and cancel a real order** | PASS | GTC order placed, verified on CLOB, cancelled. Signing correct, internal state matches CLOB. |
 | ✅ **D3: Execute a real micro-fill** | PASS | FAK BUY at market price. Fill received, order accepted by CLOB. |
 | ✅ **D4: Test negRisk fill** | PASS | negRisk market fill with correct signing. |
-| 🔧 **D5: Test multi-leg arb execution** | IN PROGRESS | 2-leg forced BUY submitted. WS User Channel fill tracking added for position entry confirmation. |
-| 🔧 **D6: Test reconciliation cold-start** | IN PROGRESS | Position serialization in checkpoint. Real CLOB reconciliation via `query_clob_positions()`. |
+| ✅ **D5: Test multi-leg arb execution** | PASS | 2-leg forced BUY with WS User Channel fill tracking. Auth fix: WS uses raw creds (not HMAC). |
+| 🔧 **D6: Test reconciliation cold-start** | IN PROGRESS | Orchestrator reordered (D5 before D6 trigger). Position count check replaces phantom ID list. |
 | ✅ **D7: Test circuit breaker + kill switch** | PASS | (a) Circuit breaker state validated. (b) Kill switch cancel-all executed. |
-| 🔧 **D8: Resolve or sell test positions** | IN PROGRESS | Real SELL orders at best bid. Fails explicitly if no positions (detects trivial pass). |
+| ✅ **D8: Resolve or sell test positions** | PASS | Real SELL orders at best bid. Accounting verified. |
 
 **Exit criteria**: All 8 tasks pass. Zero unexplained discrepancies between internal state and CLOB. All funds accounted for. Ready to proceed to 14-day shadow validation.
 

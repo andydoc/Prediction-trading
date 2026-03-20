@@ -53,6 +53,10 @@ struct Cli {
     /// Skipped tests auto-PASS with a skip note.
     #[arg(long)]
     skip_tests: Option<String>,
+
+    /// Cleanup mode: cancel all orders + sell all open positions, then exit.
+    #[arg(long)]
+    cleanup: bool,
 }
 
 fn main() {
@@ -190,6 +194,81 @@ fn main() {
     // Set L2 auth on executor (clone for harness)
     let harness_auth = clob_auth.clone();
     executor.set_clob_auth(clob_auth);
+
+    // Cleanup mode: cancel all orders + sell all positions, then exit
+    if cli.cleanup {
+        tracing::info!("=== CLEANUP MODE ===");
+        // 1. Cancel all open orders
+        let (cancelled, err) = executor.cancel_all_orders();
+        tracing::info!("Cancelled {} orders (err={:?})", cancelled, err);
+
+        // 2. Query positions via Data API
+        let http = reqwest::blocking::Client::new();
+        let url = format!(
+            "https://data-api.polymarket.com/positions?user={}&sizeThreshold=0",
+            wallet_address.to_lowercase()
+        );
+        let positions: Vec<serde_json::Value> = http.get(&url)
+            .send().and_then(|r| r.json()).unwrap_or_default();
+        tracing::info!("Found {} open positions", positions.len());
+
+        // 3. Sell each position
+        let clob = clob_test::clob_client::ClobClient::new(&clob_host);
+        for p in &positions {
+            let asset = p.get("asset").and_then(|v| v.as_str()).unwrap_or("");
+            let cond_id = p.get("conditionId").and_then(|v| v.as_str()).unwrap_or("");
+            let size = p.get("size").and_then(|v| v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0.0);
+            let title = p.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+
+            if size <= 0.0 || asset.is_empty() { continue; }
+
+            // Get best bid
+            let bid = clob.get_best_bid(asset);
+            if bid <= 0.0 {
+                tracing::warn!("No bid for {}, skipping", &title[..title.len().min(40)]);
+                continue;
+            }
+
+            // Register instrument so executor can find it
+            // Default to negRisk=true — most Polymarket markets are negRisk, and
+            // incorrect negRisk causes "invalid signature" (wrong taker address).
+            let neg_risk = p.get("negRisk").and_then(|v| v.as_bool()).unwrap_or(true);
+            engine.instruments.insert_instrument(rust_engine::instrument::Instrument {
+                market_id: cond_id.to_string(),
+                token_id: asset.to_string(),
+                outcome: "yes".to_string(),
+                condition_id: cond_id.to_string(),
+                neg_risk,
+                tick_size: 0.001,
+                rounding: rust_engine::instrument::RoundingConfig::from_tick_size_f64(0.001),
+                min_order_size: 1.0,
+                max_order_size: 0.0,
+                order_book_enabled: true,
+                accepting_orders: true,
+            });
+
+            let sell_value = size * bid;
+            tracing::info!("SELL {} shares of {} at {:.4} (value={:.2})",
+                size, &title[..title.len().min(40)], bid, sell_value);
+
+            let legs = vec![(
+                cond_id.to_string(),
+                asset.to_string(),
+                rust_engine::signing::Side::Sell,
+                bid,
+                sell_value,
+            )];
+            let result = executor.execute_arb(&format!("cleanup_{}", &cond_id[..10.min(cond_id.len())]), &legs);
+            let accepted = result.legs.iter()
+                .filter(|l| matches!(l, rust_engine::executor::OrderResult::Accepted(_)))
+                .count();
+            tracing::info!("  Result: {}/{} accepted", accepted, legs.len());
+        }
+
+        tracing::info!("=== CLEANUP COMPLETE ===");
+        std::process::exit(0);
+    }
 
     // Create notifier
     let notify_cfg = build_notify_config(&workspace, &secrets);

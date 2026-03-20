@@ -299,15 +299,35 @@ impl ClobClient {
         tracing::info!("Registered instrument: {} (neg_risk={})", market.question, market.neg_risk);
     }
 
+    /// Look up a market by condition_id via gamma API.
+    /// Returns (yes_token_id, no_token_id, neg_risk, tick_size) or None.
+    pub fn lookup_by_condition_id(&self, condition_id: &str) -> Option<(String, String, bool, f64)> {
+        let url = format!(
+            "https://gamma-api.polymarket.com/markets?condition_id={}",
+            condition_id
+        );
+        let markets: Vec<GammaMarket> = self.http.get(&url).send().ok()
+            .and_then(|r| r.json().ok())
+            .unwrap_or_default();
+
+        let m = markets.first()?;
+        let yes_id = m.clob_token_ids.first()?.clone();
+        let no_id = m.clob_token_ids.get(1).cloned().unwrap_or_default();
+        Some((yes_id, no_id, m.neg_risk, m.tick_size))
+    }
+
     /// Get current best bid for a token.
     pub fn get_best_bid(&self, token_id: &str) -> f64 {
         let url = format!("{}/book?token_id={}", self.clob_host, token_id);
         self.http.get(&url).send().ok()
             .and_then(|r| r.json::<ClobBook>().ok())
             .and_then(|b| b.bids)
-            .and_then(|b| b.first().cloned())
-            .and_then(|o| o.price)
-            .and_then(|p| p.parse::<f64>().ok())
+            .and_then(|bids| {
+                // CLOB returns bids — find the highest price (best bid)
+                bids.iter()
+                    .filter_map(|o| o.price.as_ref().and_then(|p| p.parse::<f64>().ok()))
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            })
             .unwrap_or(0.0)
     }
 }

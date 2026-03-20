@@ -407,6 +407,17 @@ impl ClobAuth {
     /// Get the API key (UUID) for use as `owner` in order payloads.
     pub fn api_key(&self) -> &str { &self.api_key }
 
+    /// Raw base64url-encoded API secret for WS user channel auth.
+    /// The WS subscription message wants the original secret string, NOT an HMAC signature.
+    /// REST endpoints use build_headers() which computes HMAC; WS just wants raw creds.
+    pub fn raw_secret_b64(&self) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE.encode(&self.secret)
+    }
+
+    /// API passphrase for WS auth.
+    pub fn passphrase(&self) -> &str { &self.passphrase }
+
     /// Create from API credentials.
     pub fn new(creds: &ClobApiCreds, address: &str) -> Result<Self, String> {
         use base64::Engine;

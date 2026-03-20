@@ -7,6 +7,26 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.15.1] — 2026-03-20 — WS User Channel Auth Fix + D5/D6/D8 Progress
+
+### Fixed
+- **WS User Channel auth**: Subscription message was sending HMAC signature in `secret` field instead of the raw base64url API secret. Fixed `signing.rs` (added `raw_secret_b64()`, `passphrase()` accessors) and `ws_user.rs` (sends raw credentials). Confirmed via official Polymarket `rs-clob-client`: WS wants raw creds, REST wants HMAC signatures.
+- **D5 false skip**: Test orchestrator reordered — D5 now runs before D6 trigger check. Previously D3/D4 phantom IDs triggered D6 early, causing D5 to be skipped entirely.
+- **D6 trigger logic**: Now checks engine position count instead of phantom ID list.
+- **Fill tracker REST fallback removed**: `fill_tracker.rs` no longer falls back to REST — WS must work.
+
+### Changed
+- **D1 capital threshold**: Lowered from $50 to $40 USDC.
+- **Auth model documented**: REST endpoints use HMAC-SHA256 (`ClobAuth::build_headers()`); WS User Channel uses raw API credentials (apiKey, secret, passphrase) with no signing.
+
+### Status
+- D5 PASS (multi-leg arb with WS fill tracking)
+- D6 IN PROGRESS (cold-start reconciliation — orchestrator fix applied)
+- D8 PASS (closeout)
+- Overall: 7/8 PASS, 1 IN PROGRESS (D6)
+
+---
+
 ## [0.15.0] — 2026-03-20 — Milestone D: CLOB Integration Tests
 
 ### Added

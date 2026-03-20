@@ -61,8 +61,8 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 
 | Status | Count |
 |--------|-------|
-| ✅ Complete | 5/8 |
-| 🔧 In Progress | 3/8 |
+| ✅ Complete | 7/8 |
+| 🔧 In Progress | 1/8 |
 
 **VPS**: is*hosting Madrid (176.97.72.199). Interim location — Dublin (Interxion DC, 0.83ms latency) planned when capacity available.
 **Funds**: ~$50 USDC.e deposited, wallet 0x21f1...fb1.
@@ -74,11 +74,11 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 | D2: Submit + cancel order | ✅ | GTC order, verify on book, cancel |
 | D3: Real micro-fill | ✅ | FAK BUY at market price |
 | D4: negRisk market fill | ✅ | negRisk-specific signing |
-| D5: Multi-leg arb execution | 🔧 | WS User Channel fill tracking added |
-| D6: Cold-start reconciliation | 🔧 | Position serialization + real CLOB reconciliation |
+| D5: Multi-leg arb execution | ✅ | WS User Channel fill tracking confirmed. Auth fix: WS uses raw creds (not HMAC). |
+| D6: Cold-start reconciliation | 🔧 | Orchestrator reordered (D5 before D6 trigger). Position count check replaces phantom ID list. |
 | D7a: Circuit breaker | ✅ | Engine state validation |
 | D7b: Kill switch | ✅ | Executor cancel-all |
-| D8: Closeout positions | 🔧 | Real SELL orders + accounting verification |
+| D8: Closeout positions | ✅ | Real SELL orders + accounting verification |
 
 ---
 
@@ -135,7 +135,7 @@ Tasks: deposit funds, configure winning parameters, switch to live mode, supervi
 | A: Rust Port | 13/13 | ✅ Complete |
 | B: Execution Infrastructure | 27/27 | ✅ Complete |
 | C: Safety | 10/10 | ✅ Complete |
-| D: CLOB Integration Test | 5/8 | 🔧 In Progress |
+| D: CLOB Integration Test | 7/8 | 🔧 In Progress |
 | E: Shadow Validation | 1/10 | 🔧 In Progress |
 | F: Go Live | 0/6 | ⬚ Planned |
 | G: Scale | 0/4 | ⬚ Future |

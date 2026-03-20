@@ -2,7 +2,7 @@
 
 **System**: Prediction Market Arbitrage Trading System
 **Binary**: `prediction-trader` (Rust, single binary)
-**Version**: v0.14.7
+**Version**: v0.15.1
 
 ---
 
@@ -309,7 +309,7 @@ cd ~/prediction-trader && cargo build --release -p clob-test
 
 **Run** (quick — skip already-passing tests):
 ```bash
-./target/release/clob-test --workspace . --skip-tests D2,D3,D4,D7
+./target/release/clob-test --workspace . --skip-tests D1,D2,D3,D4,D5,D7,D8
 ```
 
 **Run** (full suite):
@@ -332,5 +332,9 @@ cd ~/prediction-trader && cargo build --release -p clob-test
 **Prerequisites**:
 - Wallet private key in `config/secrets.yaml` under `polymarket.private_key`
 - CLOB API credentials (auto-derived from wallet if missing)
-- USDC.e balance ≥ $20 for test orders
+- USDC.e balance ≥ $20 for test orders (D1 threshold: $40)
 - VPS must NOT be in a geoblocked country (see §1)
+
+**Test execution order**: D1 → D2 → D3 → D4 → D5 → D6 → D7a → D7b → D8. D5 must run before D6 trigger check (D6 checks engine position count, not phantom ID list). Status as of v0.15.1: 7/8 PASS (D6 in progress).
+
+**Auth model**: REST endpoints (order, cancel, positions) use HMAC-SHA256 via `ClobAuth::build_headers()`. WS User Channel uses raw API credentials (apiKey, secret, passphrase) with no signing. See ARCHITECTURE.md for full details.

@@ -1,7 +1,7 @@
 # User Guide
 
 **System**: Prediction Market Arbitrage Trading System
-**Version**: v0.14.7
+**Version**: v0.15.1
 
 ---
 
@@ -33,7 +33,7 @@ Automated detection and execution of guaranteed-profit arbitrage on Polymarket p
 | Telegram bot | Optional, for notifications (recommended) |
 | Anthropic API key | For AI resolution validation + postponement detection |
 | Geoblocking check | VPS must NOT be in a Polymarket-geoblocked country (33 countries blocked including Germany, UK, Netherlands, France, Italy). Test: `curl -I https://clob.polymarket.com` must return 200. Allowed: Ireland, Spain, Czech Republic. Full list: https://docs.polymarket.com/developers/CLOB/geoblock |
-| CLOB API credentials | Either manually configured or auto-derived from wallet private key on first run of `clob-test`. |
+| CLOB API credentials | Either manually configured or auto-derived from wallet private key on first run of `clob-test`. **Note**: REST endpoints use HMAC-SHA256 signing; WS User Channel uses raw credentials (no signing). See ARCHITECTURE.md for details. |
 
 ---
 
@@ -257,7 +257,7 @@ Automated Telegram summary at midnight UTC: entries, exits, fees, net P&L, capit
 Before switching from shadow to live trading:
 
 - [ ] **Milestone C complete**: Circuit breaker, kill switch, notifications all working
-- [x] **Milestone D**: CLOB integration tests: 5/8 PASS (D1-D4, D7), 3 in progress (D5, D6, D8)
+- [x] **Milestone D**: CLOB integration tests: 7/8 PASS (D1-D5, D7, D8), 1 in progress (D6)
 - [ ] **Milestone E**: 14 consecutive days of shadow trading at $1,000 capital across 6 instances with zero unhandled errors
 - [ ] **Parameter selection**: Compare shadow instances, select winning config
 - [ ] **Fund account**: Deposit ~$1,000 USDC + ~5 POL to Polymarket wallet

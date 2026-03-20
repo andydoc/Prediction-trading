@@ -22,12 +22,15 @@ pub fn maybe_trigger(
     initial_pol: f64,
     engine: &rust_engine::TradingEngine,
 ) -> bool {
-    if open_position_ids.len() < 2 {
+    let engine_open = engine.pm_open_count();
+    if engine_open < 1 {
+        tracing::warn!("[D6] Cannot trigger: 0 engine positions (IDs={}, but no fill tracking ran)",
+            open_position_ids.len());
         return false;
     }
 
-    tracing::info!("[D6] 2+ positions open ({}), writing checkpoint for cold-start test",
-        open_position_ids.len());
+    tracing::info!("[D6] {} engine positions open, writing checkpoint for cold-start test",
+        engine_open);
 
     // Write PID
     if let Err(e) = ipc::write_pid(workspace) {
@@ -98,8 +101,8 @@ pub fn verify_cold_start(
     }
 
     // The helper closed one position before restarting us.
-    // We should detect N-1 positions via reconciliation.
-    let expected_count = checkpoint.open_position_ids.len().saturating_sub(1);
+    // Expected count = serialized engine positions (not phantom IDs from D3/D4).
+    let expected_count = checkpoint.open_positions_json.len().saturating_sub(1);
 
     tracing::info!("[D6] Verifying cold-start reconciliation. Expected positions: {} (was {}, helper closed 1)",
         expected_count, checkpoint.open_position_ids.len());

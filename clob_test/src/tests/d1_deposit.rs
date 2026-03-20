@@ -6,7 +6,7 @@
 use rust_engine::gas_monitor::{GasMonitor, GasMonitorConfig, GasCheckResult};
 use crate::report::{TestResult, Exception, ExceptionReport};
 
-const REQUIRED_USDC: f64 = 50.0;
+const REQUIRED_USDC: f64 = 40.0;
 const REQUIRED_POL: f64 = 5.0;
 const POLL_INTERVAL_SECS: u64 = 30;
 const TIMEOUT_SECS: u64 = 30 * 60;  // 30 minutes

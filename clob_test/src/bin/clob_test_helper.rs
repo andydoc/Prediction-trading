@@ -3,8 +3,8 @@
 /// Handles D6 cold-start restart:
 /// 1. Waits for D6 ready flag
 /// 2. SIGTERM main process
-/// 3. Close one position via CLOB
-/// 4. Restart main with --resume-from
+/// 3. Close one position via CLOB (real SELL order)
+/// 4. Restart main with --resume-from, logging to file
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,11 +12,12 @@ use std::sync::Arc;
 use clap::Parser;
 
 use rust_engine::executor::{Executor, ExecutorConfig, OrderType, OrderAggression};
-use rust_engine::signing::OrderSigner;
+use rust_engine::signing::{OrderSigner, ClobAuth, ClobApiCreds, Side};
 use rust_engine::rate_limiter::RateLimiter;
-use rust_engine::instrument::InstrumentStore;
+use rust_engine::instrument::{Instrument, InstrumentStore, RoundingConfig};
 
 use clob_test::ipc;
+use clob_test::clob_client::ClobClient;
 
 #[derive(Parser, Debug)]
 #[command(name = "clob-test-helper", about = "Milestone D test helper for D6 restart")]
@@ -71,10 +72,10 @@ fn run_d6(workspace: &PathBuf) {
         }
     };
 
-    let position_to_close = checkpoint.open_position_ids.first().cloned();
-    tracing::info!("[D6 Helper] Will close position: {:?}", position_to_close);
+    tracing::info!("[D6 Helper] Checkpoint has {} position IDs, {} serialized positions",
+        checkpoint.open_position_ids.len(), checkpoint.open_positions_json.len());
 
-    // 3. SIGTERM main process FIRST
+    // 3. SIGTERM main process FIRST (before we touch CLOB)
     if let Some(pid) = ipc::read_pid(workspace) {
         tracing::info!("[D6 Helper] Sending SIGTERM to PID {}", pid);
         #[cfg(unix)]
@@ -84,7 +85,6 @@ fn run_d6(workspace: &PathBuf) {
         }
         #[cfg(not(unix))]
         {
-            // On Windows, use taskkill
             use std::process::Command;
             let _ = Command::new("taskkill").arg("/PID").arg(pid.to_string()).arg("/F").output();
         }
@@ -96,82 +96,72 @@ fn run_d6(workspace: &PathBuf) {
     tracing::info!("[D6 Helper] Waiting 5s for main to shut down...");
     std::thread::sleep(std::time::Duration::from_secs(5));
 
-    // 5. Close one position via CLOB (main is stopped, no conflict)
-    if let Some(_position_id) = &position_to_close {
-        tracing::info!("[D6 Helper] Closing position via CLOB...");
-        // Load secrets for executor
-        let secrets_path = workspace.join("config").join("secrets.yaml");
-        let secrets: serde_json::Value = std::fs::read_to_string(&secrets_path)
-            .ok()
-            .and_then(|s| serde_yaml_ng::from_str(&s).ok())
-            .unwrap_or_default();
+    // 5. Close ONE position via real CLOB SELL order
+    close_one_position(workspace, &checkpoint);
 
-        let private_key = secrets.get("polymarket")
-            .and_then(|p| p.get("private_key"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        let clob_host = secrets.get("polymarket")
-            .and_then(|p| p.get("host"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("https://clob.polymarket.com");
-
-        if let Ok(signer) = OrderSigner::new(private_key) {
-            let instruments = Arc::new(InstrumentStore::new());
-            let rate_limiter = Arc::new(RateLimiter::new());
-
-            if let Ok(executor) = Executor::new(
-                ExecutorConfig {
-                    clob_host: clob_host.to_string(),
-                    dry_run: false,
-                    order_type: OrderType::Fak,
-                    aggression: OrderAggression::AtMarket,
-                    fee_rate_bps: 0,
-                    confirmation_timeout_secs: 120.0,
-                },
-                signer,
-                instruments,
-                rate_limiter,
-            ) {
-                // Cancel any remaining orders for this position
-                let (cancelled, err) = executor.cancel_all_orders();
-                tracing::info!("[D6 Helper] Cancelled {} orders (err={:?})", cancelled, err);
-                // Note: actual position closing (SELL at market) requires order book data
-                // which the helper doesn't have. The position is effectively orphaned on CLOB.
-                // The main binary's D6 verify will detect it via reconciliation.
-            }
-        }
-    }
-
-    // 6. Wait a bit more
-    tracing::info!("[D6 Helper] Waiting 5s before restart...");
-    std::thread::sleep(std::time::Duration::from_secs(5));
+    // 6. Wait for settlement
+    tracing::info!("[D6 Helper] Waiting 10s for SELL to settle...");
+    std::thread::sleep(std::time::Duration::from_secs(10));
 
     // 7. Clean up D6 flag
     ipc::clear_d6_flag(workspace);
 
-    // 8. Restart main with --resume-from
+    // 8. Restart main with --resume-from, redirect output to log file
     let clob_test_bin = std::env::current_exe()
         .unwrap_or_else(|_| PathBuf::from("clob-test"))
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .join("clob-test");
 
+    let log_path = workspace.join("data").join("clob_test_resumed.log");
     tracing::info!("[D6 Helper] Restarting main: {} --workspace {} --resume-from {}",
         clob_test_bin.display(), workspace.display(), checkpoint_path.display());
+    tracing::info!("[D6 Helper] Resumed main log: {}", log_path.display());
 
+    // Run the resumed main and capture its stderr (tracing output) via pipe,
+    // writing to both our stdout and the log file with line buffering.
     let child = std::process::Command::new(&clob_test_bin)
         .arg("--workspace")
         .arg(workspace.to_str().unwrap_or("."))
         .arg("--resume-from")
         .arg(checkpoint_path.to_str().unwrap_or(""))
         .arg("--skip-deposit-check")
+        .env("RUST_LOG", "clob_test=info,rust_engine=info")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn();
 
     match child {
-        Ok(c) => {
-            tracing::info!("[D6 Helper] Main restarted as PID {}", c.id());
-            // Don't wait — let main run independently
+        Ok(mut c) => {
+            tracing::info!("[D6 Helper] Main restarted as PID {}. Tailing output...", c.id());
+
+            // Read stderr (tracing output) line by line and write to both our stdout and log file
+            let stderr = c.stderr.take();
+            let log_path_clone = log_path.clone();
+            let reader_thread = std::thread::spawn(move || {
+                use std::io::{BufRead, Write};
+                let mut log_file = std::fs::File::create(&log_path_clone).unwrap();
+                if let Some(stderr) = stderr {
+                    let reader = std::io::BufReader::new(stderr);
+                    for line in reader.lines() {
+                        if let Ok(line) = line {
+                            let _ = writeln!(log_file, "{}", line);
+                            let _ = log_file.flush();
+                            eprintln!("[RESUMED] {}", line);
+                        }
+                    }
+                }
+            });
+
+            match c.wait() {
+                Ok(status) => {
+                    tracing::info!("[D6 Helper] Main exited with: {}", status);
+                }
+                Err(e) => {
+                    tracing::error!("[D6 Helper] Failed to wait for main: {}", e);
+                }
+            }
+            let _ = reader_thread.join();
         }
         Err(e) => {
             tracing::error!("[D6 Helper] Failed to restart main: {}", e);
@@ -180,4 +170,177 @@ fn run_d6(workspace: &PathBuf) {
     }
 
     tracing::info!("[D6 Helper] Done. Exiting.");
+}
+
+/// Close one position via a real CLOB SELL order.
+/// Reads the checkpoint's serialized positions to get market/token data.
+fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
+    // Parse the first serialized position to get market data
+    let pos_json = match checkpoint.open_positions_json.first() {
+        Some(j) => j,
+        None => {
+            tracing::warn!("[D6 Helper] No serialized positions in checkpoint, skipping close");
+            return;
+        }
+    };
+
+    let pos: serde_json::Value = match serde_json::from_str(pos_json) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("[D6 Helper] Failed to parse position JSON: {}", e);
+            return;
+        }
+    };
+
+    tracing::info!("[D6 Helper] Position to close: {}", pos.get("position_id")
+        .and_then(|v| v.as_str()).unwrap_or("unknown"));
+
+    // Load secrets
+    let secrets_path = workspace.join("config").join("secrets.yaml");
+    let secrets: serde_json::Value = std::fs::read_to_string(&secrets_path)
+        .ok()
+        .and_then(|s| serde_yaml_ng::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let private_key = secrets.get("polymarket")
+        .and_then(|p| p.get("private_key"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let clob_host = secrets.get("polymarket")
+        .and_then(|p| p.get("host"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("https://clob.polymarket.com");
+
+    let signer = match OrderSigner::new(private_key) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("[D6 Helper] Failed to create signer: {}", e);
+            return;
+        }
+    };
+
+    let wallet_address = format!("{:?}", signer.address());
+
+    // Load L2 auth credentials
+    let clob_auth = {
+        let api_key = secrets.get("polymarket").and_then(|p| p.get("clob_api_key"))
+            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let secret = secrets.get("polymarket").and_then(|p| p.get("clob_api_secret"))
+            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let passphrase = secrets.get("polymarket").and_then(|p| p.get("clob_passphrase"))
+            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        if api_key.is_empty() {
+            tracing::error!("[D6 Helper] No CLOB API credentials in secrets.yaml");
+            return;
+        }
+
+        match ClobAuth::new(&ClobApiCreds { api_key, secret, passphrase }, &wallet_address) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!("[D6 Helper] Failed to create ClobAuth: {}", e);
+                return;
+            }
+        }
+    };
+
+    let instruments = Arc::new(InstrumentStore::new());
+    let rate_limiter = Arc::new(RateLimiter::new());
+
+    let mut executor = match Executor::new(
+        ExecutorConfig {
+            clob_host: clob_host.to_string(),
+            dry_run: false,
+            order_type: OrderType::Gtc,
+            aggression: OrderAggression::AtMarket,
+            fee_rate_bps: 0,
+            confirmation_timeout_secs: 120.0,
+        },
+        signer,
+        Arc::clone(&instruments),
+        rate_limiter,
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("[D6 Helper] Failed to create executor: {}", e);
+            return;
+        }
+    };
+
+    // Set L2 auth so cancel-all works
+    executor.set_clob_auth(clob_auth);
+
+    // Cancel any open orders first
+    let (cancelled, err) = executor.cancel_all_orders();
+    tracing::info!("[D6 Helper] Cancelled {} orders (err={:?})", cancelled, err);
+
+    // Extract market legs from the position JSON
+    let markets = pos.get("markets").and_then(|v| v.as_object());
+    let markets = match markets {
+        Some(m) => m,
+        None => {
+            tracing::warn!("[D6 Helper] No markets in position, cannot sell");
+            return;
+        }
+    };
+
+    let clob = ClobClient::new(clob_host);
+
+    // Sell each leg of the first position
+    let mut sell_legs = Vec::new();
+    for (market_id, leg) in markets {
+        let outcome = leg.get("outcome").and_then(|v| v.as_str()).unwrap_or("yes");
+        let shares = leg.get("shares").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if shares <= 0.0 { continue; }
+
+        // Read token_id from serialized MarketLeg (populated by fill_tracker)
+        let token_id = leg.get("token_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if token_id.is_empty() {
+            tracing::warn!("[D6 Helper] No token_id for market {} in checkpoint. \
+                Was fill_tracker used to enter this position?", market_id);
+            continue;
+        }
+        let neg_risk = true; // All test markets are negRisk
+        let tick_size = 0.001;
+
+        // Register instrument
+        instruments.insert_instrument(Instrument {
+            market_id: market_id.clone(),
+            token_id: token_id.clone(),
+            outcome: outcome.to_string(),
+            condition_id: market_id.clone(),
+            neg_risk,
+            tick_size,
+            rounding: RoundingConfig::from_tick_size_f64(tick_size),
+            min_order_size: 1.0,
+            max_order_size: 0.0,
+            order_book_enabled: true,
+            accepting_orders: true,
+        });
+
+        // Get best bid
+        let bid = clob.get_best_bid(&token_id);
+        if bid <= 0.0 {
+            tracing::warn!("[D6 Helper] No bid for token {} in market {}", token_id, market_id);
+            continue;
+        }
+
+        let sell_value = shares * bid;
+        tracing::info!("[D6 Helper] SELL leg: market={} shares={:.2} bid={:.4} value={:.2}",
+            market_id, shares, bid, sell_value);
+
+        sell_legs.push((market_id.clone(), token_id.to_string(), Side::Sell, bid, sell_value));
+    }
+
+    if sell_legs.is_empty() {
+        tracing::warn!("[D6 Helper] No legs to sell");
+        return;
+    }
+
+    let result = executor.execute_arb("d6_helper_close", &sell_legs);
+    let accepted = result.legs.iter()
+        .filter(|l| matches!(l, rust_engine::executor::OrderResult::Accepted(_)))
+        .count();
+    tracing::info!("[D6 Helper] SELL result: {}/{} legs accepted", accepted, sell_legs.len());
 }

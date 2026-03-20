@@ -32,6 +32,10 @@ pub struct MarketLeg {
     pub outcome: String,      // "yes" or "no"
     #[serde(default)]
     pub shares: f64,          // Actual shares purchased (computed at entry with correct prices)
+    /// ERC1155 token ID for this leg (populated by fill tracking / instrument lookup).
+    /// Used by D6 helper to sell positions without needing gamma API lookup.
+    #[serde(default)]
+    pub token_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +237,7 @@ impl PositionManager {
                 name, entry_price: price, bet_amount: bet,
                 outcome: outcome.to_string(),
                 shares,
+                token_id: String::new(), // Populated later by fill_tracker
             });
         }
 

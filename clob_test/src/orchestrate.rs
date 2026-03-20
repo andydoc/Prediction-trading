@@ -24,7 +24,7 @@ use crate::tests;
 enum Phase {
     /// Waiting for deposit confirmation.
     D1,
-    /// Running D2-D5 in parallel. D6 triggers when 2+ positions exist.
+    /// Running D2-D5 sequentially. D6 triggers after D5 when engine positions exist.
     D2D5 {
         d2_done: bool,
         d3_done: bool,
@@ -32,8 +32,8 @@ enum Phase {
         d5_done: bool,
         d6_triggered: bool,
     },
-    /// Waiting for helper to restart us (D6).
-    D6Waiting,
+    /// Waiting for helper to restart us (D6). Timeout after 60s → auto-fail D6.
+    D6Waiting { entered: Instant },
     /// Resumed after D6 restart — verify cold-start reconciliation.
     D6Verify,
     /// Circuit breaker + kill switch tests.
@@ -168,10 +168,21 @@ impl TestHarness {
             match self.phase.clone() {
                 Phase::D1 => self.run_d1(),
                 Phase::D2D5 { .. } => self.run_d2d5(),
-                Phase::D6Waiting => {
-                    // We're waiting for the helper to kill us — just sleep
-                    tracing::info!("[D6] Waiting for helper to restart us...");
-                    std::thread::sleep(std::time::Duration::from_secs(5));
+                Phase::D6Waiting { entered } => {
+                    if entered.elapsed().as_secs() > 60 {
+                        tracing::warn!("[D6] Helper did not arrive within 60s — auto-failing D6");
+                        self.report.add_result(TestResult::fail(
+                            "D6", "Cold-Start Reconciliation",
+                            entered.elapsed().as_millis() as u64,
+                            vec!["D6 helper process did not restart us within 60s timeout. \
+                                Run with a D6 helper process for full cold-start test.".into()],
+                        ));
+                        self.phase = Phase::D7;
+                    } else {
+                        tracing::info!("[D6] Waiting for helper to restart us... ({}s/60s)",
+                            entered.elapsed().as_secs());
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
                 }
                 Phase::D6Verify => self.run_d6_verify(),
                 Phase::D7 => self.run_d7(),
@@ -302,22 +313,10 @@ impl TestHarness {
             _ => return,
         };
 
-        // Check if we need to trigger D6 before D5
-        if !d6_triggered && self.open_position_ids.len() >= 2 {
-            let triggered = tests::d6_cold_start::maybe_trigger(
-                &self.workspace,
-                &self.open_position_ids,
-                d2_done, d3_done, d4_done, d5_done,
-                &self.report.tests,
-                self.test_config.initial_capital,
-                0.0,
-                &self.engine,
-            );
-            if triggered {
-                self.phase = Phase::D6Waiting;
-                return;
-            }
-        }
+        // NOTE: D6 trigger check moved AFTER D5 completes.
+        // D3/D4 submit orders but don't enter engine positions (no fill tracking).
+        // Only D5 enters real positions via fill_tracker. D6 needs real engine
+        // positions to checkpoint, so we must run D5 first.
 
         // Run D5 if not done (also seeds positions for D6 if needed)
         if !d5_done {
@@ -336,14 +335,17 @@ impl TestHarness {
             self.phase = Phase::D2D5 { d2_done, d3_done, d4_done, d5_done: true, d6_triggered };
         }
 
-        // After all D2-D5 done, trigger D6 if not already triggered
+        // After all D2-D5 done, trigger D6 if not already triggered.
+        // Use engine position count (real positions) not open_position_ids (may have phantom IDs
+        // from D3/D4 which submit orders but don't enter positions via fill_tracker).
         let (_, _, _, _, d6_triggered) = match &self.phase {
             Phase::D2D5 { d2_done, d3_done, d4_done, d5_done, d6_triggered } =>
                 (*d2_done, *d3_done, *d4_done, *d5_done, *d6_triggered),
             _ => return,
         };
 
-        if !d6_triggered && self.open_position_ids.len() >= 2 {
+        let engine_positions = self.engine.pm_open_count();
+        if !d6_triggered && engine_positions >= 1 {
             let triggered = tests::d6_cold_start::maybe_trigger(
                 &self.workspace,
                 &self.open_position_ids,
@@ -354,18 +356,18 @@ impl TestHarness {
                 &self.engine,
             );
             if triggered {
-                self.phase = Phase::D6Waiting;
+                self.phase = Phase::D6Waiting { entered: Instant::now() };
                 return;
             }
         }
 
-        // If we can't trigger D6 (not enough positions), skip it
-        if !d6_triggered && self.open_position_ids.len() < 2 {
-            tracing::warn!("[D6] Cannot trigger: only {} positions open. Skipping D6.",
-                self.open_position_ids.len());
+        // If we can't trigger D6 (no engine positions), skip it
+        if !d6_triggered && engine_positions < 1 {
+            tracing::warn!("[D6] Cannot trigger: only {} engine positions (need >= 1). Skipping D6.",
+                engine_positions);
             self.report.add_result(TestResult::fail(
                 "D6", "Cold-Start Reconciliation", 0,
-                vec!["Insufficient positions to test cold-start".into()],
+                vec![format!("Insufficient engine positions ({}) to test cold-start", engine_positions)],
             ));
             self.phase = Phase::D7;
         }
