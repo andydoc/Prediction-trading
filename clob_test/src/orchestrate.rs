@@ -10,6 +10,7 @@ use std::time::Instant;
 use rust_engine::TradingEngine;
 use rust_engine::executor::Executor;
 use rust_engine::notify::Notifier;
+use rust_engine::signing::ClobAuth;
 
 use crate::clob_client::ClobClient;
 use crate::config::MergedTestConfig;
@@ -66,6 +67,12 @@ pub struct TestHarness {
     checkpoint: Option<ipc::Checkpoint>,
     /// CLOB REST client for market discovery.
     clob: ClobClient,
+    /// CLOB L2 auth (HMAC-signed headers for authenticated endpoints).
+    clob_auth: ClobAuth,
+    /// Test IDs to skip (e.g., ["D2", "D3", "D4", "D7"]).
+    skip_tests: Vec<String>,
+    /// Tokio runtime handle for async WS tasks.
+    runtime: tokio::runtime::Handle,
 }
 
 impl TestHarness {
@@ -79,6 +86,9 @@ impl TestHarness {
         clob_host: String,
         timeout_minutes: u64,
         skip_deposit_check: bool,
+        clob_auth: ClobAuth,
+        skip_tests: Vec<String>,
+        runtime: tokio::runtime::Handle,
     ) -> Self {
         let report = TestReport::new(&wallet_address, test_config.initial_capital, 0.0);
         let clob = ClobClient::new(&clob_host);
@@ -100,6 +110,9 @@ impl TestHarness {
             open_position_ids: Vec::new(),
             checkpoint: None,
             clob,
+            clob_auth,
+            skip_tests,
+            runtime,
         }
     }
 
@@ -116,6 +129,19 @@ impl TestHarness {
         self.open_position_ids = checkpoint.open_position_ids.clone();
         self.checkpoint = Some(checkpoint);
         self
+    }
+
+    /// Check if a test should be skipped.
+    fn should_skip(&self, test_id: &str) -> bool {
+        self.skip_tests.iter().any(|s| s.eq_ignore_ascii_case(test_id))
+    }
+
+    /// Auto-pass a skipped test.
+    fn skip_test(&mut self, id: &str, name: &str) {
+        tracing::info!("[{}] SKIPPED via --skip-tests", id);
+        self.report.add_result(TestResult::pass(id, name, 0,
+            serde_json::json!({ "skipped": true, "reason": "Skipped via --skip-tests" })
+        ));
     }
 
     /// Run the full test sequence. Returns when all tests complete or a fatal error occurs.
@@ -203,14 +229,18 @@ impl TestHarness {
 
         // Run D2 if not done
         if !d2_done {
-            let result = tests::d2_submit_cancel::run(
-                &self.executor, &self.engine, &self.notifier, &mut self.exceptions, &self.clob,
-            );
-            let passed = result.result == "PASS";
-            self.report.add_result(result);
-            if !passed {
-                self.phase = Phase::Failed("D2 submit/cancel test failed".into());
-                return;
+            if self.should_skip("D2") {
+                self.skip_test("D2", "Submit/Cancel");
+            } else {
+                let result = tests::d2_submit_cancel::run(
+                    &self.executor, &self.engine, &self.notifier, &mut self.exceptions, &self.clob,
+                );
+                let passed = result.result == "PASS";
+                self.report.add_result(result);
+                if !passed {
+                    self.phase = Phase::Failed("D2 submit/cancel test failed".into());
+                    return;
+                }
             }
             self.phase = Phase::D2D5 { d2_done: true, d3_done, d4_done, d5_done, d6_triggered };
         }
@@ -224,18 +254,21 @@ impl TestHarness {
 
         // Run D3 if not done
         if !d3_done {
-            let (result, pid) = tests::d3_micro_fill::run(
-                &self.executor, &self.engine, &self.notifier,
-                &mut self.dedup, &mut self.exceptions, &self.clob,
-            );
-            let passed = result.result == "PASS";
-            self.report.add_result(result);
-            if let Some(pid) = pid {
-                self.open_position_ids.push(pid);
-            }
-            if !passed {
-                // D3 failure is not fatal — market conditions may not allow it
-                tracing::warn!("[D3] Non-fatal failure, continuing...");
+            if self.should_skip("D3") {
+                self.skip_test("D3", "Micro-Fill");
+            } else {
+                let (result, pid) = tests::d3_micro_fill::run(
+                    &self.executor, &self.engine, &self.notifier,
+                    &mut self.dedup, &mut self.exceptions, &self.clob,
+                );
+                let passed = result.result == "PASS";
+                self.report.add_result(result);
+                if let Some(pid) = pid {
+                    self.open_position_ids.push(pid);
+                }
+                if !passed {
+                    tracing::warn!("[D3] Non-fatal failure, continuing...");
+                }
             }
             self.phase = Phase::D2D5 { d2_done, d3_done: true, d4_done, d5_done, d6_triggered };
         }
@@ -248,13 +281,17 @@ impl TestHarness {
 
         // Run D4 if not done
         if !d4_done {
-            let (result, pid) = tests::d4_neg_risk::run(
-                &self.executor, &self.engine, &self.notifier,
-                &mut self.dedup, &mut self.exceptions, &self.clob,
-            );
-            self.report.add_result(result);
-            if let Some(pid) = pid {
-                self.open_position_ids.push(pid);
+            if self.should_skip("D4") {
+                self.skip_test("D4", "NegRisk Fill");
+            } else {
+                let (result, pid) = tests::d4_neg_risk::run(
+                    &self.executor, &self.engine, &self.notifier,
+                    &mut self.dedup, &mut self.exceptions, &self.clob,
+                );
+                self.report.add_result(result);
+                if let Some(pid) = pid {
+                    self.open_position_ids.push(pid);
+                }
             }
             self.phase = Phase::D2D5 { d2_done, d3_done, d4_done: true, d5_done, d6_triggered };
         }
@@ -274,6 +311,7 @@ impl TestHarness {
                 &self.report.tests,
                 self.test_config.initial_capital,
                 0.0,
+                &self.engine,
             );
             if triggered {
                 self.phase = Phase::D6Waiting;
@@ -283,13 +321,18 @@ impl TestHarness {
 
         // Run D5 if not done (also seeds positions for D6 if needed)
         if !d5_done {
-            let need_d6 = self.open_position_ids.len() < 2;
-            let (result, pids) = tests::d5_multi_leg::run(
-                &self.executor, &self.engine, &self.notifier,
-                &self.test_config, &mut self.dedup, need_d6, &mut self.exceptions, &self.clob,
-            );
-            self.report.add_result(result);
-            self.open_position_ids.extend(pids);
+            if self.should_skip("D5") {
+                self.skip_test("D5", "Multi-Leg Arb");
+            } else {
+                let need_d6 = self.open_position_ids.len() < 2;
+                let (result, pids) = tests::d5_multi_leg::run(
+                    &self.executor, &self.engine, &self.notifier,
+                    &self.test_config, &mut self.dedup, need_d6, &mut self.exceptions, &self.clob,
+                    &self.clob_auth, &self.runtime,
+                );
+                self.report.add_result(result);
+                self.open_position_ids.extend(pids);
+            }
             self.phase = Phase::D2D5 { d2_done, d3_done, d4_done, d5_done: true, d6_triggered };
         }
 
@@ -308,6 +351,7 @@ impl TestHarness {
                 &self.report.tests,
                 self.test_config.initial_capital,
                 0.0,
+                &self.engine,
             );
             if triggered {
                 self.phase = Phase::D6Waiting;
@@ -339,6 +383,7 @@ impl TestHarness {
 
         let result = tests::d6_cold_start::verify_cold_start(
             &self.engine, &checkpoint, &self.notifier, &mut self.exceptions,
+            &self.clob_host, &self.clob_auth,
         );
 
         if result.result == "FAIL" {
@@ -353,27 +398,38 @@ impl TestHarness {
     }
 
     fn run_d7(&mut self) {
-        // D7a: Circuit breaker
-        let cb_result = tests::d7_circuit_breaker::run_circuit_breaker(
-            &self.engine, &self.notifier, &mut self.exceptions,
-        );
-        self.report.add_result(cb_result);
+        if self.should_skip("D7") || self.should_skip("D7a") {
+            self.skip_test("D7a", "Circuit Breaker");
+        } else {
+            let cb_result = tests::d7_circuit_breaker::run_circuit_breaker(
+                &self.engine, &self.notifier, &mut self.exceptions,
+            );
+            self.report.add_result(cb_result);
+        }
 
-        // D7b: Kill switch
-        let ks_result = tests::d7_circuit_breaker::run_kill_switch(
-            &self.executor, &self.engine, &self.notifier, &mut self.exceptions,
-        );
-        self.report.add_result(ks_result);
+        if self.should_skip("D7") || self.should_skip("D7b") {
+            self.skip_test("D7b", "Kill Switch");
+        } else {
+            let ks_result = tests::d7_circuit_breaker::run_kill_switch(
+                &self.executor, &self.engine, &self.notifier, &mut self.exceptions,
+            );
+            self.report.add_result(ks_result);
+        }
 
         self.phase = Phase::D8;
     }
 
     fn run_d8(&mut self) {
-        let result = tests::d8_closeout::run(
-            &self.executor, &self.engine, &self.notifier,
-            self.test_config.initial_capital, &mut self.exceptions,
-        );
-        self.report.add_result(result);
+        if self.should_skip("D8") {
+            self.skip_test("D8", "Closeout");
+        } else {
+            let result = tests::d8_closeout::run(
+                &self.executor, &self.engine, &self.notifier,
+                self.test_config.initial_capital, &mut self.exceptions,
+                &self.clob,
+            );
+            self.report.add_result(result);
+        }
         self.phase = Phase::Complete;
     }
 

@@ -20,6 +20,9 @@ pub struct Checkpoint {
     pub test_results: Vec<crate::report::TestResult>,
     pub initial_usdc: f64,
     pub initial_pol: f64,
+    /// Serialized Position objects for cold-start recovery.
+    #[serde(default)]
+    pub open_positions_json: Vec<String>,
 }
 
 /// Write the PID file.

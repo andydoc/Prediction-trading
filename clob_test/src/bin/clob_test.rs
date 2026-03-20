@@ -48,6 +48,11 @@ struct Cli {
     /// Dry-run mode: simulate orders without submitting to CLOB.
     #[arg(long)]
     dry_run: bool,
+
+    /// Comma-separated test IDs to skip (e.g., "D2,D3,D4,D7").
+    /// Skipped tests auto-PASS with a skip note.
+    #[arg(long)]
+    skip_tests: Option<String>,
 }
 
 fn main() {
@@ -182,12 +187,28 @@ fn main() {
         std::process::exit(1);
     });
 
-    // Set L2 auth on executor
+    // Set L2 auth on executor (clone for harness)
+    let harness_auth = clob_auth.clone();
     executor.set_clob_auth(clob_auth);
 
     // Create notifier
     let notify_cfg = build_notify_config(&workspace, &secrets);
     let notifier = Arc::new(Notifier::new(notify_cfg));
+
+    // Parse skip-tests
+    let skip_tests: Vec<String> = cli.skip_tests
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !skip_tests.is_empty() {
+        tracing::info!("Skipping tests: {:?}", skip_tests);
+    }
+
+    // Get tokio runtime handle
+    let runtime = tokio::runtime::Handle::current();
 
     // Build harness
     let mut harness = TestHarness::new(
@@ -200,6 +221,9 @@ fn main() {
         clob_host,
         cli.timeout_minutes,
         cli.skip_deposit_check,
+        harness_auth,
+        skip_tests,
+        runtime,
     );
 
     // Check for D6 resume

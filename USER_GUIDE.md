@@ -32,6 +32,8 @@ Automated detection and execution of guaranteed-profit arbitrage on Polymarket p
 | POL | ~5 POL for transaction gas fees |
 | Telegram bot | Optional, for notifications (recommended) |
 | Anthropic API key | For AI resolution validation + postponement detection |
+| Geoblocking check | VPS must NOT be in a Polymarket-geoblocked country (33 countries blocked including Germany, UK, Netherlands, France, Italy). Test: `curl -I https://clob.polymarket.com` must return 200. Allowed: Ireland, Spain, Czech Republic. Full list: https://docs.polymarket.com/developers/CLOB/geoblock |
+| CLOB API credentials | Either manually configured or auto-derived from wallet private key on first run of `clob-test`. |
 
 ---
 
@@ -56,6 +58,10 @@ polymarket:
   signature_type: 1              # 1=email/Magic, 2=browser, 0=EOA
   host: 'https://clob.polymarket.com'
   chain_id: 137
+  # CLOB API credentials (auto-derived on first clob-test run if missing)
+  clob_api_key: 'your-uuid-key'
+  clob_api_secret: 'your-base64url-secret'
+  clob_passphrase: 'your-passphrase'
 resolution_validation:
   enabled: true
   anthropic_api_key: 'sk-ant-...'
@@ -130,7 +136,7 @@ bash scripts/restart.sh --clean                  # Also purge stale cache
 
 Access at `http://localhost:5558` (default port). For VPS, use an SSH tunnel:
 ```bash
-ssh -L 5558:127.0.0.1:5558 vps-ubuntu
+ssh -L 5558:127.0.0.1:5558 madrid-ubuntu
 ```
 
 ### Tabs
@@ -251,7 +257,7 @@ Automated Telegram summary at midnight UTC: entries, exits, fees, net P&L, capit
 Before switching from shadow to live trading:
 
 - [ ] **Milestone C complete**: Circuit breaker, kill switch, notifications all working
-- [ ] **Milestone D**: CLOB integration test with ~$50 USDC — place and cancel real micro-orders, verify execution path
+- [x] **Milestone D**: CLOB integration tests: 5/8 PASS (D1-D4, D7), 3 in progress (D5, D6, D8)
 - [ ] **Milestone E**: 14 consecutive days of shadow trading at $1,000 capital across 6 instances with zero unhandled errors
 - [ ] **Parameter selection**: Compare shadow instances, select winning config
 - [ ] **Fund account**: Deposit ~$1,000 USDC + ~5 POL to Polymarket wallet

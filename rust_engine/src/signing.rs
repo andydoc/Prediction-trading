@@ -395,6 +395,7 @@ impl OrderSigner {
 // ---------------------------------------------------------------------------
 
 /// L2 HMAC-SHA256 auth for CLOB API trading endpoints.
+#[derive(Clone)]
 pub struct ClobAuth {
     api_key: String,
     secret: Vec<u8>,  // base64url-decoded secret

@@ -20,6 +20,7 @@ pub fn maybe_trigger(
     test_results: &[crate::report::TestResult],
     initial_usdc: f64,
     initial_pol: f64,
+    engine: &rust_engine::TradingEngine,
 ) -> bool {
     if open_position_ids.len() < 2 {
         return false;
@@ -34,6 +35,15 @@ pub fn maybe_trigger(
         return false;
     }
 
+    // Serialize open positions for cold-start recovery
+    let open_positions_json: Vec<String> = {
+        let pm = engine.positions.lock();
+        pm.open_positions().values()
+            .filter_map(|p| serde_json::to_string(p).ok())
+            .collect()
+    };
+    tracing::info!("[D6] Serialized {} positions for checkpoint", open_positions_json.len());
+
     // Write checkpoint
     let checkpoint = Checkpoint {
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -46,6 +56,7 @@ pub fn maybe_trigger(
         test_results: test_results.to_vec(),
         initial_usdc,
         initial_pol,
+        open_positions_json,
     };
 
     if let Err(e) = ipc::write_checkpoint(workspace, &checkpoint) {
@@ -70,8 +81,21 @@ pub fn verify_cold_start(
     checkpoint: &Checkpoint,
     notifier: &rust_engine::notify::Notifier,
     exceptions: &mut ExceptionReport,
+    clob_host: &str,
+    clob_auth: &rust_engine::signing::ClobAuth,
 ) -> TestResult {
     let start = std::time::Instant::now();
+
+    // Import positions from checkpoint into engine
+    if !checkpoint.open_positions_json.is_empty() {
+        tracing::info!("[D6] Importing {} positions from checkpoint into engine",
+            checkpoint.open_positions_json.len());
+        engine.positions.lock().import_positions_json(
+            &checkpoint.open_positions_json, &[], // no closed positions
+            engine.current_capital(), engine.current_capital(),
+        );
+        tracing::info!("[D6] After import: {} open positions in engine", engine.pm_open_count());
+    }
 
     // The helper closed one position before restarting us.
     // We should detect N-1 positions via reconciliation.
@@ -80,8 +104,8 @@ pub fn verify_cold_start(
     tracing::info!("[D6] Verifying cold-start reconciliation. Expected positions: {} (was {}, helper closed 1)",
         expected_count, checkpoint.open_position_ids.len());
 
-    // Run startup reconciliation
-    let recon = engine.reconcile_startup(0.1);
+    // Run startup reconciliation with real CLOB credentials
+    let recon = engine.reconcile_startup_with_auth(clob_host, Some(clob_auth), 0.1);
 
     tracing::info!("[D6] Reconciliation result: passed={}, checked={}, matched={}",
         recon.passed, recon.positions_checked, recon.positions_matched);

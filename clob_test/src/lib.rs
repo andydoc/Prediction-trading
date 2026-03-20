@@ -10,6 +10,7 @@ pub mod ipc;
 pub mod orchestrate;
 pub mod tests;
 pub mod clob_client;
+pub mod fill_tracker;
 
 /// Convenience wrapper: send a Telegram notification via the Notifier.
 /// Uses NotifyEvent::Error variant to carry custom test messages.

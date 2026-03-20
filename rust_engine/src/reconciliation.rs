@@ -265,28 +265,74 @@ pub fn detect_neg_risk_synthetics(
 
 /// Query the CLOB API for user positions.
 ///
-/// Requires CLOB API credentials (API key, secret, passphrase).
+/// Requires CLOB API credentials via ClobAuth (HMAC-signed L2 headers).
 /// Returns parsed venue positions or an error message.
 ///
-/// Endpoint: GET /positions
-/// Auth: POLY_API_KEY, POLY_TIMESTAMP, POLY_SIGNATURE headers
+/// Endpoint: GET {clob_host}/positions
+/// Auth: POLY_API_KEY, POLY_TIMESTAMP, POLY_SIGNATURE, POLY_PASSPHRASE headers
 pub fn query_clob_positions(
-    _http_client: &reqwest::blocking::Client,
-    _clob_host: &str,
-    _api_key: &str,
-    _api_secret: &str,
-    _passphrase: &str,
+    http_client: &reqwest::blocking::Client,
+    clob_host: &str,
+    auth: Option<&crate::signing::ClobAuth>,
 ) -> Result<Vec<VenuePosition>, String> {
-    // TODO: Implement when CLOB API credentials are available.
-    // For shadow mode, this returns empty (no real positions to reconcile).
-    //
-    // Implementation notes from NT:
-    //   1. Sign request: HMAC-SHA256(timestamp + "GET" + "/positions" + "")
-    //   2. Headers: POLY_API_KEY, POLY_TIMESTAMP, POLY_SIGNATURE, POLY_PASSPHRASE
-    //   3. Parse response: array of { asset_id, market, size, avg_price, side }
-    //   4. Filter: only non-zero positions (size > 0)
-    tracing::debug!("B4.0: CLOB position query skipped (no API credentials configured)");
-    Ok(Vec::new())
+    let auth = match auth {
+        Some(a) => a,
+        None => {
+            tracing::debug!("B4.0: CLOB position query skipped (no credentials)");
+            return Ok(Vec::new());
+        }
+    };
+
+    let url = format!("{}/positions", clob_host.trim_end_matches('/'));
+    let headers = auth.build_headers("GET", "/positions", None);
+
+    let mut req = http_client.get(&url);
+    for (k, v) in &headers {
+        req = req.header(k, v);
+    }
+
+    let resp = req.send().map_err(|e| format!("CLOB /positions request failed: {}", e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!("CLOB /positions returned {}: {}", status, body));
+    }
+
+    let body: serde_json::Value = resp.json()
+        .map_err(|e| format!("CLOB /positions JSON parse error: {}", e))?;
+
+    let positions_arr = body.as_array()
+        .or_else(|| body.get("positions").and_then(|v| v.as_array()))
+        .cloned()
+        .unwrap_or_default();
+
+    let mut result = Vec::new();
+    for p in &positions_arr {
+        let size = p.get("size")
+            .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+            .unwrap_or(0.0);
+        if size <= 0.0 { continue; }
+
+        let asset_id = p.get("asset_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let market_id = p.get("market").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let condition_id = p.get("condition_id").and_then(|v| v.as_str()).unwrap_or(&market_id).to_string();
+        let avg_price = p.get("avg_price")
+            .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+            .unwrap_or(0.0);
+        let side = p.get("side").and_then(|v| v.as_str()).unwrap_or("BUY").to_string();
+
+        result.push(VenuePosition {
+            asset_id,
+            market_id,
+            size,
+            avg_price,
+            side,
+            condition_id,
+        });
+    }
+
+    tracing::info!("B4.0: CLOB /positions returned {} non-zero positions", result.len());
+    Ok(result)
 }
 
 /// Run startup reconciliation (B4.1).
@@ -297,9 +343,10 @@ pub fn reconcile_startup(
     open_positions: &[(String, String, f64)], // (position_id, market_id, shares)
     http_client: &reqwest::blocking::Client,
     clob_host: &str,
+    auth: Option<&crate::signing::ClobAuth>,
     escalation_threshold: f64,
 ) -> ReconciliationReport {
-    let venue = match query_clob_positions(http_client, clob_host, "", "", "") {
+    let venue = match query_clob_positions(http_client, clob_host, auth) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("B4.1 startup reconciliation: CLOB query failed: {}", e);
@@ -310,7 +357,7 @@ pub fn reconcile_startup(
     };
 
     // No credentials configured — skip comparison (shadow mode)
-    if venue.is_empty() {
+    if venue.is_empty() && auth.is_none() {
         tracing::info!(
             "B4.1 startup reconciliation: skipped (no venue credentials, {} internal positions)",
             open_positions.len()
@@ -350,9 +397,10 @@ pub fn reconcile_periodic(
     open_positions: &[(String, String, f64)],
     http_client: &reqwest::blocking::Client,
     clob_host: &str,
+    auth: Option<&crate::signing::ClobAuth>,
     escalation_threshold: f64,
 ) -> ReconciliationReport {
-    let venue = match query_clob_positions(http_client, clob_host, "", "", "") {
+    let venue = match query_clob_positions(http_client, clob_host, auth) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("B4.0 periodic reconciliation: CLOB query failed: {}", e);
@@ -363,7 +411,7 @@ pub fn reconcile_periodic(
     };
 
     // No credentials configured — skip comparison (shadow mode)
-    if venue.is_empty() {
+    if venue.is_empty() && auth.is_none() {
         tracing::debug!("B4.0 periodic reconciliation: skipped (no venue credentials)");
         let mut report = ReconciliationReport::new(false);
         report.positions_checked = open_positions.len();

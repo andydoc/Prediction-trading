@@ -293,6 +293,50 @@ All parameterised values in `config/config.yaml`:
 
 ---
 
+## WS User Channel (Fill Tracking)
+
+Separate authenticated WebSocket connection to `wss://ws-subscriptions-clob.polymarket.com/ws/user`.
+
+**Purpose**: Real-time trade and order event tracking for position management.
+
+**Events**:
+- `trade`: Fill lifecycle (MATCHED → MINED → CONFIRMED / RETRYING → FAILED). Fields: market, asset_id, outcome, side, size, price, status.
+- `order`: Order lifecycle (PLACEMENT / UPDATE / CANCELLATION). Fields: original_size, size_matched, outcome, side, price, market.
+
+**Authentication**: HMAC-SHA256 signed subscription with `ClobAuth` credentials (api_key, secret, passphrase).
+
+**File**: `rust_engine/src/ws_user.rs`
+
+---
+
+## CLOB L1/L2 Authentication
+
+Two-tier auth system for Polymarket CLOB API:
+
+- **L1 (EIP-712)**: Wallet-signed typed data for `/auth/*` endpoints. Used to derive or look up API credentials.
+- **L2 (HMAC-SHA256)**: API key + secret + passphrase for trading endpoints (`/order`, `/cancel-all`, `/positions`). Message = `timestamp + method + path + body`.
+
+**File**: `rust_engine/src/signing.rs` — `ClobAuth` struct with `build_headers(method, path, body)`.
+
+---
+
+## CLOB Integration Test Harness
+
+Standalone binary (`clob-test`) exercising the full execution path against real Polymarket CLOB.
+
+**8 acceptance tests**: D1 (deposit), D2 (submit/cancel), D3 (micro-fill), D4 (negRisk), D5 (multi-leg arb), D6 (cold-start reconciliation), D7 (circuit breaker + kill switch), D8 (closeout).
+
+**Architecture**:
+- State machine orchestrator (`orchestrate.rs`) drives test progression
+- REST market discovery via Gamma API (`clob_client.rs`)
+- WS User Channel for fill tracking (`fill_tracker.rs`)
+- File-based IPC for D6 restart test (`ipc.rs`)
+- `--skip-tests` flag for selective reruns
+
+**Crate**: `clob_test/` — depends on `rust_engine`
+
+---
+
 ## Glossary
 
 | Term | Definition |

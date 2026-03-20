@@ -4,6 +4,30 @@ Operational incidents for the Prediction Market Arbitrage System. Most recent fi
 
 ---
 
+### INC-012: VPS Migration — Germany to Madrid (2026-03-19)
+
+**Severity**: MEDIUM
+**Status**: ✅ Resolved (interim)
+
+**Summary**: Migrated VPS from ZAP-Hosting Germany (193.23.127.99) to is*hosting Madrid (176.97.72.199) because Germany is geoblocked from Polymarket CLOB API.
+
+**Root Cause**: Polymarket blocks 33 countries from CLOB API access, including Germany, UK, Netherlands. All CLOB order submissions returned 403 Forbidden from the Germany VPS.
+
+**Resolution**:
+- Contracted is*hosting for a Madrid VPS (Spain is not geoblocked)
+- Dublin (Interxion DC) was first choice (0.83ms latency to CLOB) but had no capacity
+- Host company offered free migration to Dublin when capacity becomes available
+- IP address: 176.97.72.199 (same for both Madrid and eventual Dublin)
+
+**Lessons Learned**:
+- Always verify CLOB API geoblocking before provisioning VPS: `curl -I https://clob.polymarket.com`
+- Polymarket geoblocked countries list: https://docs.polymarket.com/developers/CLOB/geoblock
+- Allowed countries include: Ireland, Spain, Czech Republic (Prague)
+
+**Follow-up**: Migrate to Dublin when capacity available (lower latency, free migration).
+
+---
+
 ## INC-011: WebSocket Connection Leak on Constraint Rebuild
 
 **Date**: 2026-03-17
