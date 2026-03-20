@@ -444,6 +444,15 @@ impl Default for ExecutorConfig {
 /// HTTP client timeout in seconds.
 const HTTP_TIMEOUT_SECS: u64 = 30;
 
+/// Format tick size for CLOB API (must be "0.1", "0.01", "0.001", or "0.0001").
+fn format_tick_size(tick: f64) -> String {
+    if (tick - 0.1).abs() < 1e-6 { "0.1".into() }
+    else if (tick - 0.01).abs() < 1e-6 { "0.01".into() }
+    else if (tick - 0.001).abs() < 1e-6 { "0.001".into() }
+    else if (tick - 0.0001).abs() < 1e-6 { "0.0001".into() }
+    else { "0.01".into() } // fallback
+}
+
 /// The live order executor. Constructs, signs, and submits orders to Polymarket CLOB.
 pub struct Executor {
     config: ExecutorConfig,
@@ -577,8 +586,8 @@ impl Executor {
         // 3. Round price to instrument tick size
         let rounded_price = self.apply_aggression(price, side, &instrument);
 
-        // 4. Build and sign order
-        let order = match signing::build_order(
+        // 4. Build and sign order (use instrument's amount_decimals for precision)
+        let order = match signing::build_order_with_precision(
             self.signer.address(),
             token_id,
             rounded_price,
@@ -586,6 +595,7 @@ impl Executor {
             side,
             instrument.neg_risk,
             self.config.fee_rate_bps,
+            instrument.rounding.amount_decimals,
         ) {
             Ok(o) => o,
             Err(msg) => return OrderResult::Rejected(ExecutionError::SigningError {
@@ -703,10 +713,10 @@ impl Executor {
 
         let order_payload = serde_json::json!({
             "order": {
-                "salt": signed.order.salt.to_string(),
-                "maker": format!("{:?}", signed.order.maker),
-                "signer": format!("{:?}", signed.order.signer),
-                "taker": format!("{:?}", signed.order.taker),
+                "salt": signed.order.salt.saturating_to::<u64>(),
+                "maker": format!("{}", signed.order.maker),
+                "signer": format!("{}", signed.order.signer),
+                "taker": "0x0000000000000000000000000000000000000000",
                 "tokenId": signed.order.token_id.to_string(),
                 "makerAmount": signed.order.maker_amount.to_string(),
                 "takerAmount": signed.order.taker_amount.to_string(),
@@ -717,14 +727,21 @@ impl Executor {
                 "signatureType": signed.order.signature_type,
                 "signature": &signed.signature,
             },
+            "owner": self.clob_auth.as_ref().map(|a| a.api_key()).unwrap_or_default(),
             "orderType": self.config.order_type.as_str(),
             "negRisk": instrument.neg_risk,
+            "tickSize": format_tick_size(instrument.tick_size),
         });
 
-        let mut req = self.http_client.post(&url).json(&order_payload);
+        // Serialize once — same string for HMAC signing and HTTP body
+        let body_str = serde_json::to_string(&order_payload).unwrap_or_default();
+        tracing::warn!("[CLOB SUBMIT] POST {} payload: {}", url, &body_str);
+
+        let mut req = self.http_client.post(&url)
+            .header("Content-Type", "application/json")
+            .body(body_str.clone());
         // Add L2 HMAC auth headers if configured
         if let Some(ref auth) = self.clob_auth {
-            let body_str = serde_json::to_string(&order_payload).unwrap_or_default();
             let headers = auth.build_headers("POST", "/order", Some(&body_str));
             for (k, v) in headers {
                 req = req.header(&k, &v);
@@ -754,6 +771,7 @@ impl Executor {
 
         if !status.is_success() {
             let text = response.text().unwrap_or_default();
+            tracing::warn!("[CLOB REJECT] HTTP {}: {}", status.as_u16(), &text[..text.len().min(500)]);
             let (code, message) = if let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) {
                 let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("UNKNOWN").to_string();
                 let msg = body.get("message")

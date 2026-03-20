@@ -403,6 +403,9 @@ pub struct ClobAuth {
 }
 
 impl ClobAuth {
+    /// Get the API key (UUID) for use as `owner` in order payloads.
+    pub fn api_key(&self) -> &str { &self.api_key }
+
     /// Create from API credentials.
     pub fn new(creds: &ClobApiCreds, address: &str) -> Result<Self, String> {
         use base64::Engine;
@@ -459,12 +462,11 @@ impl ClobAuth {
 // ---------------------------------------------------------------------------
 
 /// Generate a random salt for order uniqueness.
+/// Must fit in JavaScript's Number.MAX_SAFE_INTEGER (2^53 - 1) for CLOB API compatibility.
 pub fn random_salt() -> U256 {
     use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let mut bytes = [0u8; 32];
-    rng.fill(&mut bytes);
-    U256::from_be_bytes(bytes)
+    let val: u64 = rand::thread_rng().gen_range(0..=(1u64 << 53) - 1);
+    U256::from(val)
 }
 
 /// Convert a human price (0.0 - 1.0) and size (in USDC) to maker/taker amounts.
@@ -478,20 +480,37 @@ pub fn random_salt() -> U256 {
 ///   - takerAmount = shares * price (USDC you receive) — raw units (6 decimals)
 ///
 /// Returns (maker_amount, taker_amount) in raw token units.
-pub fn compute_amounts(price: f64, size_usd: f64, side: Side, decimals: u32) -> (U256, U256) {
-    let scale = 10f64.powi(decimals as i32);
+///
+/// Rounding follows Polymarket's precision rules:
+/// - BUY: makerAmount (USDC) rounded to `amount_decimals`, takerAmount (shares) rounded down
+/// - SELL: makerAmount (shares), takerAmount (USDC) similarly rounded
+///
+/// `amount_decimals` comes from the tick size rounding config (e.g., 4 for 0.001 tick).
+pub fn compute_amounts(price: f64, size_usd: f64, side: Side, amount_decimals: u32) -> (U256, U256) {
+    let scale = 10f64.powi(6); // Always 6 decimal raw units (USDC = 6 decimals, CTF = 6 decimals)
+    let round_scale = 10f64.powi(amount_decimals as i32);
+
+    // Polymarket precision: shares always use 2 decimal places (size_decimals),
+    // USDC uses amount_decimals from the tick size config.
+    let shares_round = 100.0f64;  // Always 2 decimal places for shares
+    let amount_round = 10f64.powi(amount_decimals as i32);
+
     match side {
         Side::Buy => {
-            let maker = (size_usd * scale).round() as u128;
-            let shares = size_usd / price;
-            let taker = (shares * scale).round() as u128;
+            // Round shares first, then derive USDC from shares × price
+            let shares_human = (size_usd / price * shares_round).floor() / shares_round;
+            let taker = (shares_human * scale).round() as u128;
+            // makerAmount must equal shares × price (internally consistent)
+            let maker_human = (shares_human * price * amount_round).round() / amount_round;
+            let maker = (maker_human * scale).round() as u128;
             (U256::from(maker), U256::from(taker))
         }
         Side::Sell => {
-            let shares = size_usd / price;
-            let maker = (shares * scale).round() as u128;
-            let taker_usd = shares * price;
-            let taker = (taker_usd * scale).round() as u128;
+            // Round shares first, then derive USDC from shares × price
+            let shares_human = (size_usd / price * shares_round).floor() / shares_round;
+            let maker = (shares_human * scale).round() as u128;
+            let taker_human = (shares_human * price * amount_round).round() / amount_round;
+            let taker = (taker_human * scale).round() as u128;
             (U256::from(maker), U256::from(taker))
         }
     }
@@ -507,17 +526,29 @@ pub fn build_order(
     neg_risk: bool,
     fee_rate_bps: u64,
 ) -> Result<OrderData, String> {
+    // Default amount_decimals based on price range (matching Python ROUNDING_CONFIG)
+    let amount_decimals = if size_usd / price > 10000.0 { 2 } else { 4 };
+    build_order_with_precision(maker, token_id, price, size_usd, side, neg_risk, fee_rate_bps, amount_decimals)
+}
+
+/// Build order with explicit amount precision.
+pub fn build_order_with_precision(
+    maker: Address,
+    token_id: &str,
+    price: f64,
+    size_usd: f64,
+    side: Side,
+    neg_risk: bool,
+    fee_rate_bps: u64,
+    amount_decimals: u32,
+) -> Result<OrderData, String> {
     let token_id_u256 = U256::from_str_radix(token_id, 10)
         .map_err(|e| format!("Invalid token_id '{}': {}", token_id, e))?;
 
-    let taker = if neg_risk {
-        NEG_RISK_ADAPTER.parse::<Address>()
-            .map_err(|e| format!("Invalid adapter address: {}", e))?
-    } else {
-        Address::ZERO
-    };
+    // Taker is always 0x0 — neg risk routing is handled server-side by the CLOB.
+    let taker = Address::ZERO;
 
-    let (maker_amount, taker_amount) = compute_amounts(price, size_usd, side, 6);
+    let (maker_amount, taker_amount) = compute_amounts(price, size_usd, side, amount_decimals);
 
     Ok(OrderData {
         salt: random_salt(),
