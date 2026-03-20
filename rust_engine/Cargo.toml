@@ -38,3 +38,7 @@ alloy-signer = "0.8"
 alloy-signer-local = "0.8"
 hex = "0.4"
 rand = "0.8"
+# L2 HMAC auth for CLOB API (Milestone D)
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"

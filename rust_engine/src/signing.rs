@@ -241,6 +241,220 @@ impl OrderSigner {
 }
 
 // ---------------------------------------------------------------------------
+// L1 Auth: CLOB API key derivation (ClobAuth EIP-712)
+// ---------------------------------------------------------------------------
+
+/// CLOB API credentials returned by /auth/derive-api-key or /auth/api-key.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ClobApiCreds {
+    #[serde(rename = "apiKey")]
+    pub api_key: String,
+    pub secret: String,
+    pub passphrase: String,
+}
+
+impl OrderSigner {
+    /// Build L1 auth headers for /auth/* endpoints.
+    /// Signs ClobAuth EIP-712 typed data with the wallet key.
+    pub fn build_l1_headers(&self, nonce: u64) -> Result<Vec<(String, String)>, String> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string();
+
+        let address = format!("{:?}", self.address()); // 0x-prefixed checksummed
+
+        // ClobAuth domain
+        let domain_hash = {
+            let type_hash = keccak256(b"EIP712Domain(string name,string version,uint256 chainId)");
+            let name_hash = keccak256(b"ClobAuthDomain");
+            let version_hash = keccak256(b"1");
+            let chain_id = U256::from(CHAIN_ID);
+            let mut buf = Vec::with_capacity(4 * 32);
+            buf.extend_from_slice(type_hash.as_slice());
+            buf.extend_from_slice(name_hash.as_slice());
+            buf.extend_from_slice(version_hash.as_slice());
+            buf.extend_from_slice(&chain_id.to_be_bytes::<32>());
+            keccak256(&buf)
+        };
+
+        // ClobAuth struct hash
+        let struct_hash = {
+            let type_hash = keccak256(
+                b"ClobAuth(address address,string timestamp,uint256 nonce,string message)"
+            );
+            let addr: Address = address.parse().map_err(|e| format!("bad addr: {}", e))?;
+            let ts_hash = keccak256(ts.as_bytes());
+            let msg_hash = keccak256(
+                b"This message attests that I control the given wallet"
+            );
+            let mut buf = Vec::with_capacity(5 * 32);
+            buf.extend_from_slice(type_hash.as_slice());
+            buf.extend_from_slice(&{
+                let mut padded = [0u8; 32];
+                padded[12..].copy_from_slice(addr.as_slice());
+                padded
+            });
+            buf.extend_from_slice(ts_hash.as_slice());
+            buf.extend_from_slice(&U256::from(nonce).to_be_bytes::<32>());
+            buf.extend_from_slice(msg_hash.as_slice());
+            keccak256(&buf)
+        };
+
+        let signing_hash = eip712_hash(domain_hash, struct_hash);
+        let sig = self.signer.sign_hash_sync(&signing_hash)
+            .map_err(|e| format!("ClobAuth signing failed: {}", e))?;
+
+        let sig_bytes = {
+            let mut buf = [0u8; 65];
+            buf[..32].copy_from_slice(&sig.r().to_be_bytes::<32>());
+            buf[32..64].copy_from_slice(&sig.s().to_be_bytes::<32>());
+            buf[64] = sig.v() as u8;
+            buf
+        };
+
+        Ok(vec![
+            ("POLY_ADDRESS".into(), address),
+            ("POLY_SIGNATURE".into(), format!("0x{}", hex::encode(sig_bytes))),
+            ("POLY_TIMESTAMP".into(), ts),
+            ("POLY_NONCE".into(), nonce.to_string()),
+        ])
+    }
+
+    /// Derive existing CLOB API credentials from the wallet.
+    /// Calls GET /auth/derive-api-key with L1 auth headers.
+    pub fn derive_api_key(&self, clob_host: &str) -> Result<ClobApiCreds, String> {
+        let headers = self.build_l1_headers(0)?;
+        let client = reqwest::blocking::Client::new();
+        let url = format!("{}/auth/derive-api-key", clob_host.trim_end_matches('/'));
+
+        let mut req = client.get(&url);
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().map_err(|e| format!("derive-api-key request failed: {}", e))?;
+        let status = resp.status();
+
+        if status.is_success() {
+            let creds: ClobApiCreds = resp.json()
+                .map_err(|e| format!("derive-api-key JSON parse error: {}", e))?;
+            Ok(creds)
+        } else {
+            let body = resp.text().unwrap_or_default();
+            Err(format!("derive-api-key failed ({}): {}", status, body))
+        }
+    }
+
+    /// Create new CLOB API credentials from the wallet.
+    /// Calls POST /auth/api-key with L1 auth headers.
+    pub fn create_api_key(&self, clob_host: &str) -> Result<ClobApiCreds, String> {
+        let headers = self.build_l1_headers(0)?;
+        let client = reqwest::blocking::Client::new();
+        let url = format!("{}/auth/api-key", clob_host.trim_end_matches('/'));
+
+        let mut req = client.post(&url);
+        for (k, v) in &headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().map_err(|e| format!("create-api-key request failed: {}", e))?;
+        let status = resp.status();
+
+        if status.is_success() {
+            let creds: ClobApiCreds = resp.json()
+                .map_err(|e| format!("create-api-key JSON parse error: {}", e))?;
+            Ok(creds)
+        } else {
+            let body = resp.text().unwrap_or_default();
+            Err(format!("create-api-key failed ({}): {}", status, body))
+        }
+    }
+
+    /// Derive or create CLOB API credentials.
+    /// Tries derive first, falls back to create if no existing credentials.
+    pub fn create_or_derive_api_key(&self, clob_host: &str) -> Result<ClobApiCreds, String> {
+        match self.derive_api_key(clob_host) {
+            Ok(creds) => {
+                tracing::info!("Derived existing CLOB API credentials (key={}...)", &creds.api_key[..8.min(creds.api_key.len())]);
+                Ok(creds)
+            }
+            Err(e) => {
+                tracing::info!("No existing API key ({}), creating new one...", e);
+                let creds = self.create_api_key(clob_host)?;
+                tracing::info!("Created new CLOB API credentials (key={}...)", &creds.api_key[..8.min(creds.api_key.len())]);
+                Ok(creds)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// L2 Auth: HMAC-SHA256 signing for authenticated requests
+// ---------------------------------------------------------------------------
+
+/// L2 HMAC-SHA256 auth for CLOB API trading endpoints.
+pub struct ClobAuth {
+    api_key: String,
+    secret: Vec<u8>,  // base64url-decoded secret
+    passphrase: String,
+    address: String,
+}
+
+impl ClobAuth {
+    /// Create from API credentials.
+    pub fn new(creds: &ClobApiCreds, address: &str) -> Result<Self, String> {
+        use base64::Engine;
+        let secret = base64::engine::general_purpose::URL_SAFE
+            .decode(&creds.secret)
+            .map_err(|e| format!("Invalid API secret (base64 decode): {}", e))?;
+        Ok(Self {
+            api_key: creds.api_key.clone(),
+            secret,
+            passphrase: creds.passphrase.clone(),
+            address: address.to_string(),
+        })
+    }
+
+    /// Build L2 auth headers for an authenticated request.
+    /// `method`: "GET", "POST", "DELETE"
+    /// `path`: request path, e.g., "/order"
+    /// `body`: optional JSON body string
+    pub fn build_headers(&self, method: &str, path: &str, body: Option<&str>) -> Vec<(String, String)> {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        use base64::Engine;
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string();
+
+        // Message: timestamp + method + path + body
+        let mut message = format!("{}{}{}", ts, method, path);
+        if let Some(b) = body {
+            // Replace single quotes with double quotes for cross-language compat
+            message.push_str(&b.replace('\'', "\""));
+        }
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret)
+            .expect("HMAC accepts any key size");
+        mac.update(message.as_bytes());
+        let sig = base64::engine::general_purpose::URL_SAFE.encode(mac.finalize().into_bytes());
+
+        vec![
+            ("POLY_ADDRESS".into(), self.address.clone()),
+            ("POLY_SIGNATURE".into(), sig),
+            ("POLY_TIMESTAMP".into(), ts),
+            ("POLY_API_KEY".into(), self.api_key.clone()),
+            ("POLY_PASSPHRASE".into(), self.passphrase.clone()),
+        ]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Order construction helpers
 // ---------------------------------------------------------------------------
 

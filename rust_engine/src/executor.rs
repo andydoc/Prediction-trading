@@ -453,6 +453,8 @@ pub struct Executor {
     http_client: reqwest::blocking::Client,
     /// Active orders being tracked (trade_id → TrackedOrder).
     tracked: parking_lot::Mutex<HashMap<String, TrackedOrder>>,
+    /// L2 HMAC auth for CLOB API (None = unauthenticated / shadow mode).
+    clob_auth: Option<crate::signing::ClobAuth>,
 }
 
 impl Executor {
@@ -474,7 +476,13 @@ impl Executor {
             rate_limiter,
             http_client,
             tracked: parking_lot::Mutex::new(HashMap::new()),
+            clob_auth: None,
         })
+    }
+
+    /// Set L2 CLOB API credentials for authenticated trading.
+    pub fn set_clob_auth(&mut self, auth: crate::signing::ClobAuth) {
+        self.clob_auth = Some(auth);
     }
 
     /// Execute all legs of an arb opportunity.
@@ -713,10 +721,16 @@ impl Executor {
             "negRisk": instrument.neg_risk,
         });
 
-        let response = self.http_client
-            .post(&url)
-            .json(&order_payload)
-            .send()
+        let mut req = self.http_client.post(&url).json(&order_payload);
+        // Add L2 HMAC auth headers if configured
+        if let Some(ref auth) = self.clob_auth {
+            let body_str = serde_json::to_string(&order_payload).unwrap_or_default();
+            let headers = auth.build_headers("POST", "/order", Some(&body_str));
+            for (k, v) in headers {
+                req = req.header(&k, &v);
+            }
+        }
+        let response = req.send()
             .map_err(|e| {
                 if e.is_timeout() {
                     ExecutionError::Timeout {
