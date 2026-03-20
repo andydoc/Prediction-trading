@@ -121,8 +121,51 @@ fn main() {
     // Initialize positions with test capital
     engine.init_positions(test_config.initial_capital, test_config.taker_fee_rate);
 
+    // Derive or load CLOB API credentials
+    let clob_creds = {
+        // Check if credentials are already in secrets.yaml
+        let existing = secrets.get("polymarket")
+            .and_then(|p| p.get("clob_api_key"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+
+        if let Some(api_key) = existing {
+            let secret = secrets.get("polymarket")
+                .and_then(|p| p.get("clob_api_secret"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let passphrase = secrets.get("polymarket")
+                .and_then(|p| p.get("clob_passphrase"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            tracing::info!("Using existing CLOB API credentials (key={}...)", &api_key[..8.min(api_key.len())]);
+            rust_engine::signing::ClobApiCreds {
+                api_key: api_key.to_string(),
+                secret,
+                passphrase,
+            }
+        } else {
+            tracing::info!("No CLOB API credentials found, deriving from wallet...");
+            let creds = signer.create_or_derive_api_key(&clob_host).unwrap_or_else(|e| {
+                tracing::error!("Failed to derive CLOB API credentials: {}", e);
+                std::process::exit(1);
+            });
+            // Save to secrets.yaml for future use
+            save_clob_creds_to_secrets(&secrets_path, &creds);
+            creds
+        }
+    };
+
+    let clob_auth = rust_engine::signing::ClobAuth::new(&clob_creds, &wallet_address)
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to create CLOB auth: {}", e);
+            std::process::exit(1);
+        });
+
     // Create executor (live mode — real CLOB orders)
-    let executor = Executor::new(
+    let mut executor = Executor::new(
         ExecutorConfig {
             clob_host: clob_host.clone(),
             dry_run: cli.dry_run,
@@ -138,6 +181,9 @@ fn main() {
         tracing::error!("Failed to create executor: {}", e);
         std::process::exit(1);
     });
+
+    // Set L2 auth on executor
+    executor.set_clob_auth(clob_auth);
 
     // Create notifier
     let notify_cfg = build_notify_config(&workspace, &secrets);
@@ -212,5 +258,33 @@ fn build_notify_config(workspace: &PathBuf, secrets: &serde_json::Value) -> Noti
         rate_limit_seconds: 5.0,  // Faster rate for testing
         hostname,
         instance: "clob-test".to_string(),
+    }
+}
+
+/// Save derived CLOB API credentials to secrets.yaml for future use.
+fn save_clob_creds_to_secrets(secrets_path: &std::path::Path, creds: &rust_engine::signing::ClobApiCreds) {
+    // Read existing secrets.yaml
+    let content = std::fs::read_to_string(secrets_path).unwrap_or_default();
+
+    // Append CLOB credentials under polymarket section
+    let new_lines = format!(
+        "\n  # CLOB API credentials (auto-derived {})\n  clob_api_key: '{}'\n  clob_api_secret: '{}'\n  clob_passphrase: '{}'\n",
+        chrono::Utc::now().format("%Y-%m-%d"),
+        creds.api_key,
+        creds.secret,
+        creds.passphrase,
+    );
+
+    // Find the polymarket section and append
+    if content.contains("polymarket:") {
+        // Append to end of file (inside polymarket section)
+        let updated = format!("{}{}", content.trim_end(), new_lines);
+        if let Err(e) = std::fs::write(secrets_path, updated) {
+            tracing::warn!("Failed to save CLOB credentials to secrets.yaml: {}", e);
+        } else {
+            tracing::info!("CLOB API credentials saved to {}", secrets_path.display());
+        }
+    } else {
+        tracing::warn!("No 'polymarket:' section in secrets.yaml — credentials not saved");
     }
 }
