@@ -36,6 +36,9 @@ pub fn run(
         }
     };
 
+    // Register instrument so executor can validate it
+    clob.register_instrument(&market, _engine);
+
     tracing::info!("[D2] Selected market: {} (ask={:.4}) — {}", market.market_id, market.best_ask, market.question);
 
     // 2. Submit order at off-market price (best_ask - 0.20 for BUY = sits on book)

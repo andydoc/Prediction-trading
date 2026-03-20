@@ -253,6 +253,46 @@ impl ClobClient {
             .unwrap_or(0.0)
     }
 
+    /// Register a TestMarket's instruments in the engine's InstrumentStore.
+    /// Must be called before executing orders on this market.
+    pub fn register_instrument(&self, market: &TestMarket, engine: &rust_engine::TradingEngine) {
+        use rust_engine::instrument::{Instrument, RoundingConfig};
+
+        let yes_inst = Instrument {
+            market_id: market.market_id.clone(),
+            token_id: market.yes_token_id.clone(),
+            outcome: "yes".to_string(),
+            condition_id: market.market_id.clone(),
+            neg_risk: market.neg_risk,
+            tick_size: 0.01,
+            rounding: RoundingConfig::from_tick_size_f64(0.01),
+            min_order_size: 1.0,
+            max_order_size: 0.0,
+            order_book_enabled: true,
+            accepting_orders: true,
+        };
+        engine.instruments.insert_instrument(yes_inst);
+
+        if !market.no_token_id.is_empty() {
+            let no_inst = Instrument {
+                market_id: market.market_id.clone(),
+                token_id: market.no_token_id.clone(),
+                outcome: "no".to_string(),
+                condition_id: market.market_id.clone(),
+                neg_risk: market.neg_risk,
+                tick_size: 0.01,
+                rounding: RoundingConfig::from_tick_size_f64(0.01),
+                min_order_size: 1.0,
+                max_order_size: 0.0,
+                order_book_enabled: true,
+                accepting_orders: true,
+            };
+            engine.instruments.insert_instrument(no_inst);
+        }
+
+        tracing::info!("Registered instrument: {} (neg_risk={})", market.question, market.neg_risk);
+    }
+
     /// Get current best bid for a token.
     pub fn get_best_bid(&self, token_id: &str) -> f64 {
         let url = format!("{}/book?token_id={}", self.clob_host, token_id);

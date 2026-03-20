@@ -39,6 +39,8 @@ pub fn run(
         }
     };
 
+    clob.register_instrument(&market, engine);
+
     tracing::info!("[D4] Selected negRisk market: {} (ask={:.4}) — {}", market.market_id, market.best_ask, market.question);
 
     // 2. Execute micro-fill

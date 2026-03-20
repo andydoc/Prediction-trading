@@ -36,6 +36,8 @@ pub fn run(
         }
     };
 
+    clob.register_instrument(&market, engine);
+
     tracing::info!("[D3] Selected market: {} (ask={:.4}) — {}", market.market_id, market.best_ask, market.question);
 
     // 2. Execute FAK BUY at best_ask

@@ -50,6 +50,9 @@ pub fn run(
         }
     };
 
+    clob.register_instrument(&m1, _engine);
+    clob.register_instrument(&m2, _engine);
+
     tracing::info!("[D5] Market 1: {} (ask={:.4}) — {}", m1.market_id, m1.best_ask, m1.question);
     tracing::info!("[D5] Market 2: {} (ask={:.4}) — {}", m2.market_id, m2.best_ask, m2.question);
 
