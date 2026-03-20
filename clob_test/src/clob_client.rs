@@ -142,8 +142,27 @@ impl ClobClient {
             "https://gamma-api.polymarket.com/markets?limit=100&active=true&enableOrderBook=true&closed=false&negRisk={}",
             want_neg_risk
         );
-        let resp = self.http.get(&url).send().ok()?;
-        let markets: Vec<GammaMarket> = resp.json().ok()?;
+        let resp = match self.http.get(&url).send() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Gamma API request failed: {}", e);
+                return None;
+            }
+        };
+        let body = match resp.text() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("Gamma API response body error: {}", e);
+                return None;
+            }
+        };
+        let markets: Vec<GammaMarket> = match serde_json::from_str(&body) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("Gamma API JSON parse error: {} — first 500 chars: {}", e, &body[..body.len().min(500)]);
+                return None;
+            }
+        };
 
         tracing::info!("Gamma API returned {} markets (neg_risk={})", markets.len(), want_neg_risk);
 
