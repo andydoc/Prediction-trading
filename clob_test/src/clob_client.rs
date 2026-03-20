@@ -32,6 +32,7 @@ pub struct TestMarket {
     pub neg_risk: bool,
     pub active: bool,
     pub volume: f64,
+    pub tick_size: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,7 +55,11 @@ struct GammaMarket {
     best_ask: f64,
     #[serde(rename = "bestBid", default)]
     best_bid: f64,
+    #[serde(rename = "orderPriceMinTickSize", default = "default_tick")]
+    tick_size: f64,
 }
+
+fn default_tick() -> f64 { 0.01 }
 
 #[derive(Debug, Deserialize)]
 struct ClobBook {
@@ -238,6 +243,7 @@ impl ClobClient {
             neg_risk: m.neg_risk,
             active: m.active,
             volume: m.volume_num,
+            tick_size: if m.tick_size > 0.0 { m.tick_size } else { 0.01 },
         })
     }
 
@@ -264,8 +270,8 @@ impl ClobClient {
             outcome: "yes".to_string(),
             condition_id: market.market_id.clone(),
             neg_risk: market.neg_risk,
-            tick_size: 0.01,
-            rounding: RoundingConfig::from_tick_size_f64(0.01),
+            tick_size: market.tick_size,
+            rounding: RoundingConfig::from_tick_size_f64(market.tick_size),
             min_order_size: 1.0,
             max_order_size: 0.0,
             order_book_enabled: true,
