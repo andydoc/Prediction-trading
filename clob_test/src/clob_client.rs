@@ -27,8 +27,9 @@ struct GammaMarket {
     #[serde(rename = "conditionId", default)]
     condition_id: String,
     question: Option<String>,
-    #[serde(default)]
-    tokens: Vec<GammaToken>,
+    /// Token IDs: [YES_token_id, NO_token_id]
+    #[serde(rename = "clobTokenIds", default)]
+    clob_token_ids: Vec<String>,
     #[serde(rename = "enableOrderBook", default)]
     enable_order_book: bool,
     #[serde(rename = "negRisk", default)]
@@ -37,12 +38,10 @@ struct GammaMarket {
     active: bool,
     #[serde(rename = "volumeNum", default)]
     volume_num: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct GammaToken {
-    token_id: Option<String>,
-    outcome: Option<String>,
+    #[serde(rename = "bestAsk", default)]
+    best_ask: f64,
+    #[serde(rename = "bestBid", default)]
+    best_bid: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,13 +95,8 @@ impl ClobClient {
         let mut by_group: HashMap<String, Vec<&GammaMarket>> = HashMap::new();
         for m in &markets {
             if m.condition_id.is_empty() || !m.enable_order_book || !m.active { continue; }
-            if m.tokens.len() < 2 { continue; }
-            // Group by first 20 chars of condition_id as rough grouping
-            // Actually, we need the event grouping. Let's use neg_risk markets which share a group
+            if m.clob_token_ids.len() < 2 { continue; }
             if m.neg_risk {
-                // For negRisk, multiple markets share the same negRisk group
-                // We need the event_id or parent_id, which isn't directly in this API
-                // Instead, just find any two active negRisk markets with order books
                 let key = "neg_risk_pool".to_string();
                 by_group.entry(key).or_default().push(m);
             }
@@ -127,7 +121,7 @@ impl ClobClient {
         // Fallback: any two markets with active books
         let mut found = Vec::new();
         for m in &markets {
-            if m.condition_id.is_empty() || !m.enable_order_book || !m.active { continue; }
+            if m.condition_id.is_empty() || !m.enable_order_book || !m.active || m.clob_token_ids.len() < 2 { continue; }
             if let Some(tm) = self.enrich_market(m) {
                 if tm.best_ask > 0.10 && tm.best_ask < 0.90 {
                     found.push(tm);
@@ -155,7 +149,7 @@ impl ClobClient {
 
         // Sort by volume descending for liquidity
         let mut sorted: Vec<&GammaMarket> = markets.iter()
-            .filter(|m| !m.condition_id.is_empty() && m.tokens.len() >= 2)
+            .filter(|m| !m.condition_id.is_empty() && m.clob_token_ids.len() >= 2)
             .collect();
         sorted.sort_by(|a, b| b.volume_num.partial_cmp(&a.volume_num).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -173,33 +167,35 @@ impl ClobClient {
         None
     }
 
-    /// Enrich a Gamma market with CLOB order book data.
+    /// Convert a Gamma market to TestMarket using top-level bestAsk/bestBid.
+    /// Falls back to CLOB /book query if Gamma prices are missing.
     fn enrich_market(&self, m: &GammaMarket) -> Option<TestMarket> {
-        let yes_token = m.tokens.iter()
-            .find(|t| t.outcome.as_deref() == Some("Yes"))
-            .and_then(|t| t.token_id.clone())?;
-        let no_token = m.tokens.iter()
-            .find(|t| t.outcome.as_deref() == Some("No"))
-            .and_then(|t| t.token_id.clone())
-            .unwrap_or_default();
+        if m.clob_token_ids.len() < 2 { return None; }
+        let yes_token = m.clob_token_ids[0].clone();
+        let no_token = m.clob_token_ids[1].clone();
 
-        // Query CLOB for order book
-        let book_url = format!("{}/book?token_id={}", self.clob_host, yes_token);
-        let resp = self.http.get(&book_url).send().ok()?;
-        if !resp.status().is_success() { return None; }
-        let book: ClobBook = resp.json().ok()?;
+        // Use Gamma's top-level bestAsk/bestBid if available
+        let (best_ask, best_bid) = if m.best_ask > 0.0 && m.best_bid > 0.0 {
+            (m.best_ask, m.best_bid)
+        } else {
+            // Fallback: query CLOB for order book
+            let book_url = format!("{}/book?token_id={}", self.clob_host, yes_token);
+            let resp = self.http.get(&book_url).send().ok()?;
+            if !resp.status().is_success() { return None; }
+            let book: ClobBook = resp.json().ok()?;
 
-        let best_ask = book.asks.as_ref()
-            .and_then(|a| a.first())
-            .and_then(|o| o.price.as_ref())
-            .and_then(|p| p.parse::<f64>().ok())
-            .unwrap_or(0.0);
-
-        let best_bid = book.bids.as_ref()
-            .and_then(|b| b.first())
-            .and_then(|o| o.price.as_ref())
-            .and_then(|p| p.parse::<f64>().ok())
-            .unwrap_or(0.0);
+            let ask = book.asks.as_ref()
+                .and_then(|a| a.first())
+                .and_then(|o| o.price.as_ref())
+                .and_then(|p| p.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let bid = book.bids.as_ref()
+                .and_then(|b| b.first())
+                .and_then(|o| o.price.as_ref())
+                .and_then(|p| p.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            (ask, bid)
+        };
 
         Some(TestMarket {
             market_id: m.condition_id.clone(),
