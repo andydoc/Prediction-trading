@@ -96,13 +96,19 @@ fn run_d6(workspace: &PathBuf) {
     tracing::info!("[D6 Helper] Waiting 5s for main to shut down...");
     std::thread::sleep(std::time::Duration::from_secs(5));
 
-    // 5. Close ONE position via real CLOB FAK SELL + WS confirmation
-    close_one_position(workspace, &checkpoint);
+    // 5. Close ONE position via real CLOB GTC SELL at best bid + WS confirmation
+    let confirmed = close_one_position(workspace, &checkpoint);
+
+    if !confirmed {
+        tracing::error!("[D6 Helper] No venue state change confirmed — NOT restarting main");
+        tracing::error!("[D6 Helper] Re-run the helper when the sell fills");
+        std::process::exit(1);
+    }
 
     // 6. Clean up D6 flag
     ipc::clear_d6_flag(workspace);
 
-    // 8. Restart main
+    // 7. Restart main
     restart_main(workspace);
 }
 
@@ -148,13 +154,13 @@ fn restart_main(workspace: &PathBuf) {
 
 /// Close one position via a real CLOB SELL order.
 /// Reads the checkpoint's serialized positions to get market/token data.
-fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
+fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) -> bool {
     // Parse the first serialized position to get market data
     let pos_json = match checkpoint.open_positions_json.first() {
         Some(j) => j,
         None => {
             tracing::warn!("[D6 Helper] No serialized positions in checkpoint, skipping close");
-            return;
+            return false;
         }
     };
 
@@ -162,7 +168,7 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!("[D6 Helper] Failed to parse position JSON: {}", e);
-            return;
+            return false;
         }
     };
 
@@ -190,7 +196,7 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("[D6 Helper] Failed to create signer: {}", e);
-            return;
+            return false;
         }
     };
 
@@ -207,14 +213,14 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
 
         if api_key.is_empty() {
             tracing::error!("[D6 Helper] No CLOB API credentials in secrets.yaml");
-            return;
+            return false;
         }
 
         match ClobAuth::new(&ClobApiCreds { api_key, secret, passphrase }, &wallet_address) {
             Ok(a) => a,
             Err(e) => {
                 tracing::error!("[D6 Helper] Failed to create ClobAuth: {}", e);
-                return;
+                return false;
             }
         }
     };
@@ -226,7 +232,7 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
         ExecutorConfig {
             clob_host: clob_host.to_string(),
             dry_run: false,
-            order_type: OrderType::Fak,
+            order_type: OrderType::Gtc,
             aggression: OrderAggression::AtMarket,
             fee_rate_bps: 0,
             confirmation_timeout_secs: 120.0,
@@ -238,7 +244,7 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
         Ok(e) => e,
         Err(e) => {
             tracing::error!("[D6 Helper] Failed to create executor: {}", e);
-            return;
+            return false;
         }
     };
 
@@ -294,9 +300,7 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
         tracing::error!("[D6 Helper] No confirmed shares after 60s — cannot sell. Proceeding to restart.");
         // Clear D6 flag and restart main without selling
         ipc::clear_d6_flag(workspace);
-        // Still restart main so the test can continue (D6 will fail)
-        restart_main(workspace);
-        return;
+        return false;
     }
 
     // Log all confirmed positions
@@ -317,7 +321,7 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
         Some(m) => m,
         None => {
             tracing::warn!("[D6 Helper] No markets in position, cannot sell");
-            return;
+            return false;
         }
     };
 
@@ -393,7 +397,7 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
 
     if sell_legs.is_empty() {
         tracing::warn!("[D6 Helper] No legs to sell");
-        return;
+        return false;
     }
 
     // Collect market_ids for WS subscription
@@ -418,14 +422,16 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
     if accepted == 0 {
         tracing::error!("[D6 Helper] No sells accepted — venue state unchanged");
         ws_client.stop();
-        return;
+        return false;
     }
 
-    // Wait for WS confirmation: MATCHED then CONFIRMED on any trade
-    tracing::info!("[D6 Helper] Waiting for WS User Channel trade confirmation (60s timeout)...");
+    // Wait for WS confirmation: MATCHED then CONFIRMED on any trade.
+    // Patient wait — sell is GTC at best bid, may take hours/days to fill on illiquid markets.
+    let wait_hours = 48;
+    tracing::info!("[D6 Helper] Waiting for WS User Channel trade confirmation ({}h timeout)...", wait_hours);
     let mut saw_matched = false;
     let mut saw_confirmed = false;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_hours * 3600);
 
     while !saw_confirmed {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -458,8 +464,10 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
     if saw_confirmed {
         tracing::info!("[D6 Helper] Venue state change confirmed via WS (MATCHED → CONFIRMED)");
     } else if saw_matched {
-        tracing::warn!("[D6 Helper] Got MATCHED but not CONFIRMED — proceeding anyway");
+        tracing::warn!("[D6 Helper] Got MATCHED but not CONFIRMED");
     } else {
-        tracing::error!("[D6 Helper] No trade signals received — D6 may fail reconciliation");
+        tracing::error!("[D6 Helper] No trade signals received after {}h", wait_hours);
     }
+
+    saw_confirmed
 }
