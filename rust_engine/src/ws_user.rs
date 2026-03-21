@@ -93,10 +93,14 @@ impl UserChannelClient {
         let running = Arc::clone(&self.running);
         let shutdown = Arc::clone(&self.shutdown);
         let sender = self.sender.clone();
-        let auth_headers = auth.build_headers("GET", "/ws/user", None);
+        // WS user channel wants raw API credentials, NOT HMAC signatures.
+        // build_headers() computes HMAC which is only for REST endpoints.
+        let api_key = auth.api_key().to_string();
+        let secret = auth.raw_secret_b64();
+        let passphrase = auth.passphrase().to_string();
 
         runtime.spawn(async move {
-            user_channel_loop(running, shutdown, sender, auth_headers, market_ids).await;
+            user_channel_loop(running, shutdown, sender, api_key, secret, passphrase, market_ids).await;
         });
     }
 
@@ -169,7 +173,9 @@ async fn user_channel_loop(
     running: Arc<AtomicBool>,
     shutdown: Arc<Notify>,
     sender: Sender<UserEvent>,
-    auth_headers: Vec<(String, String)>,
+    api_key: String,
+    secret: String,
+    passphrase: String,
     market_ids: Vec<String>,
 ) {
     let mut backoff_ms: u64 = 1000;
@@ -177,7 +183,7 @@ async fn user_channel_loop(
     while running.load(Ordering::Relaxed) {
         tracing::info!("UserChannel: connecting to {} ({} markets)...", USER_WS_URL, market_ids.len());
 
-        match user_channel_connect(&running, &shutdown, &sender, &auth_headers, &market_ids).await {
+        match user_channel_connect(&running, &shutdown, &sender, &api_key, &secret, &passphrase, &market_ids).await {
             Ok(()) => {
                 tracing::info!("UserChannel: clean disconnect");
                 backoff_ms = 1000;
@@ -205,7 +211,9 @@ async fn user_channel_connect(
     running: &Arc<AtomicBool>,
     shutdown: &Arc<Notify>,
     sender: &Sender<UserEvent>,
-    auth_headers: &[(String, String)],
+    api_key: &str,
+    secret: &str,
+    passphrase: &str,
     market_ids: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (ws_stream, _) = tokio_tungstenite::connect_async(USER_WS_URL).await?;
@@ -213,26 +221,13 @@ async fn user_channel_connect(
 
     tracing::info!("UserChannel: connected, sending auth + subscribe");
 
-    // Build auth object from headers
-    let mut api_key = String::new();
-    let mut passphrase = String::new();
-    let mut signature = String::new();
-    let mut timestamp = String::new();
-    for (k, v) in auth_headers {
-        match k.as_str() {
-            "POLY_API_KEY" => api_key = v.clone(),
-            "POLY_PASSPHRASE" => passphrase = v.clone(),
-            "POLY_SIGNATURE" => signature = v.clone(),
-            "POLY_TIMESTAMP" => timestamp = v.clone(),
-            _ => {}
-        }
-    }
-
-    // Subscribe message per Polymarket docs
+    // Subscribe message per Polymarket docs + official rs-clob-client.
+    // WS wants raw API credentials (apiKey, secret, passphrase) — NOT HMAC signatures.
+    // The secret field is the base64url-encoded API secret, not a computed signature.
     let sub_msg = serde_json::json!({
         "auth": {
             "apiKey": api_key,
-            "secret": signature,
+            "secret": secret,
             "passphrase": passphrase,
         },
         "markets": market_ids,

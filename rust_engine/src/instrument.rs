@@ -266,6 +266,57 @@ impl InstrumentStore {
             .cloned()
             .collect()
     }
+
+    /// Persist all instruments to SQLite via StateDB.
+    pub fn save_to_db(&self, db: &crate::state::StateDB) {
+        let store = self.instruments.read();
+        let rows: Vec<_> = store.values().map(|i| (
+            i.token_id.clone(),
+            i.market_id.clone(),
+            i.outcome.clone(),
+            i.condition_id.clone(),
+            i.neg_risk,
+            i.tick_size,
+            i.min_order_size,
+            i.max_order_size,
+            i.order_book_enabled,
+            i.accepting_orders,
+        )).collect();
+        db.save_instruments_bulk(&rows);
+        tracing::info!("InstrumentStore persisted {} instruments to SQLite", rows.len());
+    }
+
+    /// Load instruments from SQLite via StateDB (startup recovery).
+    /// Only loads if the store is currently empty (scanner hasn't run yet).
+    pub fn load_from_db(&self, db: &crate::state::StateDB) {
+        if self.len() > 0 {
+            tracing::debug!("InstrumentStore already has {} instruments, skipping SQLite load", self.len());
+            return;
+        }
+        let rows = db.load_instruments();
+        if rows.is_empty() {
+            return;
+        }
+        let mut store = self.instruments.write();
+        for (token_id, market_id, outcome, condition_id, neg_risk, tick_size,
+             min_order_size, max_order_size, order_book_enabled, accepting_orders) in rows
+        {
+            store.insert(token_id.clone(), Instrument {
+                market_id,
+                token_id,
+                outcome,
+                condition_id,
+                neg_risk,
+                tick_size,
+                rounding: RoundingConfig::from_tick_size_f64(tick_size),
+                min_order_size,
+                max_order_size,
+                order_book_enabled,
+                accepting_orders,
+            });
+        }
+        tracing::info!("InstrumentStore loaded {} instruments from SQLite", store.len());
+    }
 }
 
 impl Default for InstrumentStore {

@@ -4,6 +4,31 @@ Operational incidents for the Prediction Market Arbitrage System. Most recent fi
 
 ---
 
+### INC-013: WS User Channel Auth — HMAC Sent Instead of Raw Secret (2026-03-20)
+
+**Severity**: MEDIUM
+**Status**: ✅ Resolved
+
+**Summary**: WS User Channel subscription was sending an HMAC-SHA256 signature in the `secret` field instead of the raw base64url API secret. This caused authentication failures on the WebSocket user channel, preventing real-time fill tracking.
+
+**Root Cause**: The `ws_user.rs` subscription builder called the same HMAC signing path used for REST endpoints (`ClobAuth::build_headers()`). Polymarket's WS User Channel expects raw API credentials (`apiKey`, `secret`, `passphrase`) with no HMAC computation — unlike REST endpoints which require HMAC-SHA256 signatures. This was not documented in Polymarket's public API docs; confirmed by reading the official `rs-clob-client` Rust SDK source.
+
+**Impact**: D5 (multi-leg arb fill tracking) and D8 (closeout) were blocked. Fill tracker fell back to REST polling, masking the issue until the REST fallback was intentionally removed.
+
+**Fix**:
+1. Added `raw_secret_b64()` and `passphrase()` accessor methods to `ClobAuth` in `signing.rs`
+2. Updated `ws_user.rs` to send raw credentials in the subscription `auth` field instead of HMAC-signed headers
+3. Removed REST fallback from `fill_tracker.rs` to ensure WS path is exercised
+
+**Lessons Learned**:
+- REST and WS authentication models are fundamentally different on Polymarket CLOB: REST = HMAC-SHA256, WS = raw credentials
+- Always verify auth against the official SDK source (`rs-clob-client`) when docs are ambiguous
+- Removing fallback paths early forces bugs to surface rather than hiding behind workarounds
+
+**Prevention**: Auth model documented in ARCHITECTURE.md ("CLOB Authentication: Dual Model" section).
+
+---
+
 ### INC-012: VPS Migration — Germany to Madrid (2026-03-19)
 
 **Severity**: MEDIUM

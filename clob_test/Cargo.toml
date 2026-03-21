@@ -1,0 +1,26 @@
+[package]
+name = "clob-test"
+version = "0.1.0"
+edition = "2021"
+description = "Milestone D CLOB integration test harness"
+
+[[bin]]
+name = "clob-test"
+path = "src/bin/clob_test.rs"
+
+[[bin]]
+name = "clob-test-helper"
+path = "src/bin/clob_test_helper.rs"
+
+[dependencies]
+rust_engine = { path = "../rust_engine" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.9"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = "0.4"
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
+parking_lot = "0.12"

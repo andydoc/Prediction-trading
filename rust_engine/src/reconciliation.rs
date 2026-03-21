@@ -283,43 +283,42 @@ pub fn query_clob_positions(
         }
     };
 
-    let url = format!("{}/positions", clob_host.trim_end_matches('/'));
-    let headers = auth.build_headers("GET", "/positions", None);
+    // Use Data API for positions (CLOB has no /positions endpoint).
+    // Data API needs a browser-like User-Agent to avoid Cloudflare 403.
+    let wallet = auth.wallet_address();
+    let url = format!(
+        "https://data-api.polymarket.com/positions?user={}&sizeThreshold=0",
+        wallet.to_lowercase()
+    );
 
-    let mut req = http_client.get(&url);
-    for (k, v) in &headers {
-        req = req.header(k, v);
-    }
-
-    let resp = req.send().map_err(|e| format!("CLOB /positions request failed: {}", e))?;
+    let resp = http_client.get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .map_err(|e| format!("Data API positions request failed: {}", e))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().unwrap_or_default();
-        return Err(format!("CLOB /positions returned {}: {}", status, body));
+        return Err(format!("Data API positions returned {}: {}", status, body));
     }
 
-    let body: serde_json::Value = resp.json()
-        .map_err(|e| format!("CLOB /positions JSON parse error: {}", e))?;
-
-    let positions_arr = body.as_array()
-        .or_else(|| body.get("positions").and_then(|v| v.as_array()))
-        .cloned()
-        .unwrap_or_default();
+    let positions_arr: Vec<serde_json::Value> = resp.json()
+        .map_err(|e| format!("Data API positions JSON parse error: {}", e))?;
 
     let mut result = Vec::new();
     for p in &positions_arr {
+        // Data API fields: asset, conditionId, size, avgPrice, curPrice, title
         let size = p.get("size")
-            .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
             .unwrap_or(0.0);
         if size <= 0.0 { continue; }
 
-        let asset_id = p.get("asset_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let market_id = p.get("market").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let condition_id = p.get("condition_id").and_then(|v| v.as_str()).unwrap_or(&market_id).to_string();
-        let avg_price = p.get("avg_price")
-            .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+        let asset_id = p.get("asset").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let condition_id = p.get("conditionId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let market_id = condition_id.clone();
+        let avg_price = p.get("avgPrice")
+            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
             .unwrap_or(0.0);
-        let side = p.get("side").and_then(|v| v.as_str()).unwrap_or("BUY").to_string();
+        let side = "BUY".to_string(); // Data API doesn't expose side
 
         result.push(VenuePosition {
             asset_id,

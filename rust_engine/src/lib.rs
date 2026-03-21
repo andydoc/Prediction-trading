@@ -45,6 +45,7 @@ pub mod reconciliation;
 pub mod circuit_breaker;
 pub mod gas_monitor;
 pub mod strategy_tracker;
+pub mod accounting;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -107,6 +108,8 @@ pub struct TradingEngine {
     pub kill_switch: Arc<AtomicBool>,
     /// Strategy tracker summary JSON — updated by orchestrator, read by dashboard SSE.
     pub strategy_summary: Arc<parking_lot::Mutex<serde_json::Value>>,
+    /// Double-entry accounting ledger — tracks all cash movements independently.
+    pub accounting: Arc<parking_lot::Mutex<accounting::AccountingLedger>>,
 }
 
 impl TradingEngine {
@@ -238,6 +241,7 @@ impl TradingEngine {
             resolved_events,
             kill_switch,
             strategy_summary: Arc::new(parking_lot::Mutex::new(serde_json::Value::Null)),
+            accounting: Arc::new(parking_lot::Mutex::new(accounting::AccountingLedger::new(0.0, 0.0))),
         })
     }
 
@@ -528,6 +532,9 @@ impl TradingEngine {
     pub fn init_positions(&self, initial_capital: f64, taker_fee: f64) {
         let mut pm = self.positions.lock();
         *pm = PositionManager::new(initial_capital, taker_fee);
+        // Initialize accounting ledger with same capital and fee rate
+        let mut acct = self.accounting.lock();
+        *acct = accounting::AccountingLedger::new(initial_capital, taker_fee);
     }
 
     pub fn set_trade_size(&self, trade_size_usd: f64) {
@@ -568,16 +575,67 @@ impl TradingEngine {
         let end_date_ts = self.constraints.get(constraint_id)
             .map(|c| c.end_date_ts).unwrap_or(0.0);
 
-        self.positions.lock().enter_position(
+        let result = self.positions.lock().enter_position(
             opportunity_id, constraint_id, strategy, method,
             market_ids, market_names, current_prices, current_no_prices,
             optimal_bets, expected_profit, expected_profit_pct, is_sell,
             end_date_ts, chain_info,
-        )
+        );
+
+        // Record on accounting ledger if position was entered (with dedup)
+        if let position::EntryResult::Entered(ref pos) = result {
+            let desc = format!("BUY {} markets, ${:.2} capital", pos.markets.len(), pos.total_capital);
+            let mut acct = self.accounting.lock();
+            for (mid, leg) in &pos.markets {
+                let asset_id = if !leg.token_id.is_empty() {
+                    leg.token_id.clone()
+                } else {
+                    mid.clone()
+                };
+                // Dedup key: position_id + market_id (unique per leg entry)
+                let trade_key = format!("entry_{}_{}", pos.position_id, mid);
+                acct.record_buy_dedup(
+                    &trade_key, &pos.position_id,
+                    leg.bet_amount, pos.fees_paid / pos.markets.len() as f64,
+                    &asset_id, mid, leg.shares, leg.entry_price, &desc,
+                );
+            }
+        }
+
+        result
     }
 
     pub fn close_on_resolution(&self, position_id: &str, winning_market_id: &str) -> Option<position::ResolutionEvent> {
-        self.positions.lock().close_on_resolution(position_id, winning_market_id)
+        // Get position data before resolution for accounting
+        let pos_data = {
+            let pm = self.positions.lock();
+            pm.open_positions().get(position_id).map(|p| {
+                let legs: Vec<(String, String, f64, f64)> = p.markets.iter().map(|(mid, leg)| {
+                    let asset_id = if !leg.token_id.is_empty() { leg.token_id.clone() } else { mid.clone() };
+                    (mid.clone(), asset_id, leg.shares, leg.bet_amount)
+                }).collect();
+                (p.total_capital, legs)
+            })
+        };
+
+        let result = self.positions.lock().close_on_resolution(position_id, winning_market_id);
+
+        // Record on accounting ledger (with dedup)
+        if let (Some(ref event), Some((total_capital, legs))) = (&result, pos_data) {
+            let desc = format!("Resolution {} (winner={})", position_id, winning_market_id);
+            let payout = event.payout;
+            let mut acct = self.accounting.lock();
+            for (mid, asset_id, shares, cost_basis) in &legs {
+                let leg_payout = payout * (cost_basis / total_capital.max(0.01));
+                let trade_key = format!("resolve_{}_{}", position_id, mid);
+                acct.record_sell_dedup(
+                    &trade_key, position_id, leg_payout, *cost_basis, 0.0,
+                    asset_id, *shares, 0.0, &desc,
+                );
+            }
+        }
+
+        result
     }
 
     pub fn calculate_liquidation_value(
@@ -601,7 +659,38 @@ impl TradingEngine {
     pub fn liquidate_position(
         &self, position_id: &str, reason: &str, current_bids: &HashMap<String, f64>,
     ) -> Option<(f64, f64)> {
-        self.positions.lock().liquidate_position(position_id, reason, current_bids)
+        // Get position data before liquidation for accounting
+        let pos_data = {
+            let pm = self.positions.lock();
+            pm.open_positions().get(position_id).map(|p| {
+                let legs: Vec<(String, String, f64, f64)> = p.markets.iter().map(|(mid, leg)| {
+                    let asset_id = if !leg.token_id.is_empty() { leg.token_id.clone() } else { mid.clone() };
+                    (mid.clone(), asset_id, leg.shares, leg.bet_amount)
+                }).collect();
+                (p.total_capital, p.fees_paid, legs)
+            })
+        };
+
+        let result = self.positions.lock().liquidate_position(position_id, reason, current_bids);
+
+        // Record sell on accounting ledger (with dedup)
+        if let (Some((_net_proceeds, _profit)), Some((_total_capital, _entry_fees, legs))) = (result, pos_data) {
+            let desc = format!("SELL {} ({})", position_id, reason);
+            let taker_fee = self.positions.lock().taker_fee();
+            let mut acct = self.accounting.lock();
+            for (mid, asset_id, shares, cost_basis) in &legs {
+                let bid = current_bids.get(mid).copied().unwrap_or(0.0);
+                let leg_proceeds = shares * bid;
+                let leg_fees = leg_proceeds * taker_fee;
+                let trade_key = format!("liquidate_{}_{}", position_id, mid);
+                acct.record_sell_dedup(
+                    &trade_key, position_id, leg_proceeds, *cost_basis, leg_fees,
+                    asset_id, *shares, bid, &desc,
+                );
+            }
+        }
+
+        result
     }
 
     pub fn set_resolution_index(&self, index: HashMap<String, (String, bool)>) {

@@ -119,7 +119,7 @@ Maps `token_id` → `Instrument` (tick_size, rounding config, neg_risk flag, con
 Updated dynamically on `tick_size_change` WS events via Tier C.
 
 ### Signing (`signing.rs`)
-EIP-712 order signing for Polymarket CLOB Exchange. Pure Rust using `alloy-primitives` + `alloy-signer-local`. Signature type 0 (EOA). Supports both regular CTF Exchange and Neg Risk CTF Exchange contracts on Polygon (chain ID 137).
+EIP-712 order signing for Polymarket CLOB Exchange. Pure Rust using `alloy-primitives` + `alloy-signer-local`. Signature type 0 (EOA). Supports both regular CTF Exchange and Neg Risk CTF Exchange contracts on Polygon (chain ID 137). Also provides `ClobAuth` with dual auth: `build_headers()` for REST (HMAC-SHA256), `raw_secret_b64()` + `passphrase()` for WS User Channel (raw credentials).
 
 ### Reconciliation (`reconciliation.rs`)
 Compares internal position state against CLOB API venue state. Runs on startup and periodically (every 5 min). Detects: quantity mismatch, missing positions (both directions), orphan orders, negRisk synthetic fills. In shadow mode (no venue credentials): skips CLOB comparison, no false alarms.
@@ -303,20 +303,47 @@ Separate authenticated WebSocket connection to `wss://ws-subscriptions-clob.poly
 - `trade`: Fill lifecycle (MATCHED → MINED → CONFIRMED / RETRYING → FAILED). Fields: market, asset_id, outcome, side, size, price, status.
 - `order`: Order lifecycle (PLACEMENT / UPDATE / CANCELLATION). Fields: original_size, size_matched, outcome, side, price, market.
 
-**Authentication**: HMAC-SHA256 signed subscription with `ClobAuth` credentials (api_key, secret, passphrase).
+**Authentication**: Raw API credentials in subscription message — `auth: { apiKey, secret, passphrase }`. The `secret` is the base64url-encoded API secret, NOT an HMAC signature. See "CLOB Authentication: Dual Model" below.
 
 **File**: `rust_engine/src/ws_user.rs`
 
 ---
 
-## CLOB L1/L2 Authentication
+## CLOB Authentication: Dual Model
 
-Two-tier auth system for Polymarket CLOB API:
+Polymarket CLOB uses two distinct authentication mechanisms depending on the transport:
 
-- **L1 (EIP-712)**: Wallet-signed typed data for `/auth/*` endpoints. Used to derive or look up API credentials.
-- **L2 (HMAC-SHA256)**: API key + secret + passphrase for trading endpoints (`/order`, `/cancel-all`, `/positions`). Message = `timestamp + method + path + body`.
+### REST Endpoints (HMAC-SHA256)
 
-**File**: `rust_engine/src/signing.rs` — `ClobAuth` struct with `build_headers(method, path, body)`.
+Used for: `POST /order`, `GET /positions`, `DELETE /cancel-all`, and all other REST trading endpoints.
+
+`ClobAuth::build_headers(method, path, body)` computes an HMAC-SHA256 signature over `timestamp + method + path + body`. Headers sent:
+- `POLY_ADDRESS` — wallet address
+- `POLY_SIGNATURE` — HMAC-SHA256 signature (hex-encoded)
+- `POLY_TIMESTAMP` — Unix timestamp
+- `POLY_API_KEY` — API key (UUID)
+- `POLY_PASSPHRASE` — passphrase
+
+### WS User Channel (Raw Credentials)
+
+Used for: `wss://ws-subscriptions-clob.polymarket.com/ws/user` subscription message.
+
+The subscription `auth` field contains raw API credentials with **no signing**:
+```json
+{ "apiKey": "<uuid>", "secret": "<base64url-encoded-secret>", "passphrase": "<passphrase>" }
+```
+
+The `secret` is the raw base64url API secret — NOT an HMAC signature. This was confirmed against the official Polymarket `rs-clob-client` source.
+
+### WS Market Data (No Auth)
+
+Used for: `wss://ws-subscriptions-clob.polymarket.com/ws/market` — public order book data. No authentication required.
+
+### L1 Authentication (EIP-712)
+
+Used for: `/auth/*` endpoints (credential derivation/lookup). Wallet-signed EIP-712 typed data. One-time use to obtain L2 API credentials.
+
+**Files**: `rust_engine/src/signing.rs` (`ClobAuth`, `build_headers()`, `raw_secret_b64()`, `passphrase()`), `rust_engine/src/ws_user.rs`
 
 ---
 

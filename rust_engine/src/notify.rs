@@ -128,6 +128,9 @@ pub struct Notifier {
     consecutive_failures: AtomicU32,
     backoff_until: Mutex<f64>,
     disabled: AtomicBool,
+    /// Message buffer for batched sending. Flushed every 30s via flush_buffer().
+    buffer: Mutex<Vec<String>>,
+    buffer_last_flush: Mutex<f64>,
 }
 
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
@@ -176,6 +179,8 @@ impl Notifier {
             consecutive_failures: AtomicU32::new(0),
             backoff_until: Mutex::new(0.0),
             disabled: AtomicBool::new(false),
+            buffer: Mutex::new(Vec::new()),
+            buffer_last_flush: Mutex::new(0.0),
         }
     }
 
@@ -188,12 +193,58 @@ impl Notifier {
             consecutive_failures: AtomicU32::new(0),
             backoff_until: Mutex::new(0.0),
             disabled: AtomicBool::new(true),
+            buffer: Mutex::new(Vec::new()),
+            buffer_last_flush: Mutex::new(0.0),
         }
     }
 
     /// Returns true if this notifier is effectively disabled (noop or no client).
     pub fn is_active(&self) -> bool {
         !self.disabled.load(Ordering::Relaxed) && self.client.is_some()
+    }
+
+    /// Add a message to the buffer. Call flush_buffer() to send.
+    pub fn buffer_message(&self, msg: &str) {
+        if !self.is_active() { return; }
+        let mut buf = self.buffer.lock();
+        buf.push(msg.to_string());
+    }
+
+    /// Flush the message buffer: if non-empty, concatenate all messages
+    /// and send as a single notification. Returns true if a message was sent.
+    pub fn flush_buffer(&self) -> bool {
+        if !self.is_active() { return false; }
+        let messages: Vec<String> = {
+            let mut buf = self.buffer.lock();
+            if buf.is_empty() { return false; }
+            std::mem::take(&mut *buf)
+        };
+        let combined = messages.join("\n\n");
+        let pfx = self.prefix();
+        let full_msg = format!("{}{}", pfx, combined);
+        match self.do_send(&full_msg) {
+            Ok(()) => {
+                let mut last = self.buffer_last_flush.lock();
+                *last = now_secs();
+                true
+            }
+            Err(e) => {
+                tracing::warn!("Buffer flush failed: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Check if enough time has passed since last flush (30s default).
+    /// If so, flush automatically.
+    pub fn maybe_flush(&self) {
+        let elapsed = {
+            let last = self.buffer_last_flush.lock();
+            now_secs() - *last
+        };
+        if elapsed >= 30.0 {
+            self.flush_buffer();
+        }
     }
 
     /// Send a notification for the given event. Returns Ok(()) on success or
@@ -310,7 +361,13 @@ impl Notifier {
                 )
             }
             NotifyEvent::Error { message } => {
-                format!("{}[ERROR] {}", pfx, message)
+                // Messages that already have their own prefix (e.g. [CLOB-TEST])
+                // don't need the [ERROR] tag — they're informational, not errors.
+                if message.starts_with("[CLOB-TEST]") || message.starts_with("[CLOB-TEST EXCEPTION]") {
+                    format!("{}{}", pfx, message)
+                } else {
+                    format!("{}[ERROR] {}", pfx, message)
+                }
             }
             NotifyEvent::CircuitBreaker { reason } => {
                 format!("{}[CIRCUIT BREAKER] Trading halted: {}", pfx, reason)

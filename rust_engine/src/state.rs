@@ -67,6 +67,34 @@ const STATE_SCHEMA: &str = "
         is_win INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_strat_closed_ts ON strategy_closed_positions(close_ts);
+    CREATE TABLE IF NOT EXISTS journal (
+        id INTEGER PRIMARY KEY,
+        timestamp REAL NOT NULL,
+        account TEXT NOT NULL,
+        debit REAL NOT NULL DEFAULT 0.0,
+        credit REAL NOT NULL DEFAULT 0.0,
+        position_id TEXT,
+        description TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_journal_ts ON journal(timestamp);
+    CREATE TABLE IF NOT EXISTS instruments (
+        token_id TEXT PRIMARY KEY,
+        market_id TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        condition_id TEXT NOT NULL,
+        neg_risk INTEGER NOT NULL DEFAULT 0,
+        tick_size REAL NOT NULL DEFAULT 0.01,
+        min_order_size REAL NOT NULL DEFAULT 1.0,
+        max_order_size REAL NOT NULL DEFAULT 0.0,
+        order_book_enabled INTEGER NOT NULL DEFAULT 1,
+        accepting_orders INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE INDEX IF NOT EXISTS idx_instr_market ON instruments(market_id);
+    CREATE TABLE IF NOT EXISTS checkpoints (
+        key TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        updated_at TEXT
+    );
 ";
 
 pub struct StateDB {
@@ -475,6 +503,24 @@ impl StateDB {
                 is_win INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_strat_closed_ts ON strategy_closed_positions(close_ts);
+            CREATE TABLE IF NOT EXISTS instruments (
+                token_id TEXT PRIMARY KEY,
+                market_id TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                neg_risk INTEGER NOT NULL DEFAULT 0,
+                tick_size REAL NOT NULL DEFAULT 0.01,
+                min_order_size REAL NOT NULL DEFAULT 1.0,
+                max_order_size REAL NOT NULL DEFAULT 0.0,
+                order_book_enabled INTEGER NOT NULL DEFAULT 1,
+                accepting_orders INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE INDEX IF NOT EXISTS idx_instr_market ON instruments(market_id);
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                key TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                updated_at TEXT
+            );
         ");
 
         Ok(ms)
@@ -483,5 +529,94 @@ impl StateDB {
     /// Get dirty count (positions changed since last mirror).
     pub fn dirty_count(&self) -> usize {
         *self.dirty_count.lock()
+    }
+
+    // --- Instrument persistence ---
+
+    /// Bulk upsert instruments into SQLite.
+    pub fn save_instruments_bulk(&self, rows: &[(String, String, String, String, bool, f64, f64, f64, bool, bool)]) {
+        let db = self.db.conn();
+        for (token_id, market_id, outcome, condition_id, neg_risk, tick_size,
+             min_order_size, max_order_size, order_book_enabled, accepting_orders) in rows
+        {
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO instruments \
+                 (token_id, market_id, outcome, condition_id, neg_risk, tick_size, \
+                  min_order_size, max_order_size, order_book_enabled, accepting_orders) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![token_id, market_id, outcome, condition_id,
+                        *neg_risk as i32, tick_size, min_order_size, max_order_size,
+                        *order_book_enabled as i32, *accepting_orders as i32],
+            );
+        }
+    }
+
+    /// Load all instruments from SQLite.
+    /// Returns (token_id, market_id, outcome, condition_id, neg_risk, tick_size,
+    ///          min_order_size, max_order_size, order_book_enabled, accepting_orders).
+    pub fn load_instruments(&self) -> Vec<(String, String, String, String, bool, f64, f64, f64, bool, bool)> {
+        let db = self.db.conn();
+        let mut stmt = match db.prepare(
+            "SELECT token_id, market_id, outcome, condition_id, neg_risk, tick_size, \
+             min_order_size, max_order_size, order_book_enabled, accepting_orders FROM instruments"
+        ) {
+            Ok(s) => s,
+            Err(e) => { tracing::warn!("load_instruments prepare failed: {}", e); return Vec::new(); }
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i32>(4)? != 0,
+                row.get::<_, f64>(5)?,
+                row.get::<_, f64>(6)?,
+                row.get::<_, f64>(7)?,
+                row.get::<_, i32>(8)? != 0,
+                row.get::<_, i32>(9)? != 0,
+            ))
+        });
+        match rows {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(e) => { tracing::warn!("load_instruments query failed: {}", e); Vec::new() }
+        }
+    }
+
+    // --- Checkpoint persistence ---
+
+    /// Save a JSON checkpoint blob by key.
+    pub fn save_checkpoint(&self, key: &str, data_json: &str) {
+        let db = self.db.conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = db.execute(
+            "INSERT OR REPLACE INTO checkpoints (key, data, updated_at) VALUES (?1, ?2, ?3)",
+            params![key, data_json, now],
+        );
+    }
+
+    /// Load a JSON checkpoint blob by key.
+    pub fn load_checkpoint(&self, key: &str) -> Option<String> {
+        let db = self.db.conn();
+        db.query_row(
+            "SELECT data FROM checkpoints WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        ).ok()
+    }
+
+    // --- Journal persistence ---
+
+    /// Bulk insert journal entries into SQLite.
+    pub fn save_journal_entries(&self, entries: &[crate::accounting::JournalEntry]) {
+        let db = self.db.conn();
+        for e in entries {
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO journal (id, timestamp, account, debit, credit, position_id, description) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![e.id as i64, e.timestamp, e.account, e.debit, e.credit,
+                        e.position_id, e.description],
+            );
+        }
     }
 }
