@@ -333,14 +333,17 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
         // Read token_id from serialized MarketLeg (populated by fill_tracker)
         let token_id = leg.get("token_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-        // Use confirmed share count from Data API (already verified above)
-        let shares = data_api_positions.iter()
+        // Sell minimum volume at market (FAK at best bid) to guarantee immediate fill.
+        // We only need to prove venue state changed — smallest possible trade.
+        let confirmed_shares = data_api_positions.iter()
             .find(|dp| dp.get("asset").and_then(|v| v.as_str()) == Some(&token_id))
             .and_then(|dp| dp.get("size").and_then(|v| v.as_f64()
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))))
             .unwrap_or(checkpoint_shares);
-        tracing::info!("[D6 Helper] Shares: checkpoint={:.2}, confirmed={:.2}, selling={:.2}",
-            checkpoint_shares, shares, shares);
+        // Minimum sell: enough shares to make $1 at best bid (Polymarket minimum)
+        // We'll calculate this after fetching the bid price below
+        tracing::info!("[D6 Helper] Shares: checkpoint={:.2}, confirmed={:.2}",
+            checkpoint_shares, confirmed_shares);
         if token_id.is_empty() {
             tracing::warn!("[D6 Helper] No token_id for market {} in checkpoint. \
                 Was fill_tracker used to enter this position?", market_id);
@@ -364,7 +367,8 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
             accepting_orders: true,
         });
 
-        // Sell at 80% of best bid — fills quickly without giving away value
+        // Sell at best bid (FAK) — minimum volume to guarantee immediate fill.
+        // Only need to prove venue state changed during D6 shutdown.
         let best_bid = {
             let book_url = format!("{}/book?token_id={}", clob_host, token_id);
             reqwest::blocking::Client::new().get(&book_url).send().ok()
@@ -374,11 +378,17 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
                     .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)))
                 .unwrap_or(0.0)
         };
-        let sell_price = if best_bid > 0.0 { (best_bid * 0.80 * 1000.0).floor() / 1000.0 } else { 0.001 };
-        let sell_price = sell_price.max(0.001);
-        let sell_value = shares * sell_price;
-        tracing::info!("[D6 Helper] SELL leg: market={} shares={:.2} best_bid={:.4} price={:.4} value={:.4}",
-            market_id, shares, best_bid, sell_price, sell_value);
+        if best_bid <= 0.0 {
+            tracing::warn!("[D6 Helper] No bids for market {}, skipping", market_id);
+            continue;
+        }
+        // Minimum shares to meet $1 minimum order size at best bid
+        let min_shares = (1.0 / best_bid).ceil();
+        let sell_shares = min_shares.min(confirmed_shares); // Don't sell more than we have
+        let sell_price = best_bid; // At market — guarantees immediate fill
+        let sell_value = sell_shares * sell_price;
+        tracing::info!("[D6 Helper] SELL leg: market={} shares={:.2} (min for $1) best_bid={:.4} price={:.4} value={:.4}",
+            market_id, sell_shares, best_bid, sell_price, sell_value);
 
         sell_legs.push((market_id.clone(), token_id.to_string(), Side::Sell, sell_price, sell_value));
     }

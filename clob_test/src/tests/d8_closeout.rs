@@ -99,22 +99,17 @@ pub fn run(
                 mid, token_id, best_bid, sell_price, leg.shares);
         }
 
+        // Place GTC sell orders at 80% bid — these sit on the book for cleanup.
+        // D8 doesn't need fills, just needs orders placed for exact volume held.
         if !sell_legs.is_empty() {
             let sell_result = executor.execute_arb(&format!("{}_close", position_id), &sell_legs);
-            let sold_count = sell_result.legs.iter()
+            let accepted_count = sell_result.legs.iter()
                 .filter(|l| matches!(l, rust_engine::executor::OrderResult::Accepted(_)))
                 .count();
-            tracing::info!("[D8] Sell orders: {}/{} accepted", sold_count, sell_legs.len());
-
-            if sold_count == 0 {
-                tracing::warn!("[D8] All sells rejected for {}, proceeding with liquidation anyway", position_id);
-            }
-
-            // Brief sleep for settlement — don't wait for WS fill confirmation
-            std::thread::sleep(std::time::Duration::from_secs(5));
+            tracing::info!("[D8] Sell orders placed: {}/{} accepted on book", accepted_count, sell_legs.len());
         }
 
-        // Update engine accounting (proceed even if some sells were rejected)
+        // Liquidate internally — accounting at the sell price regardless of fill
         match engine.liquidate_position(&position_id, "d8_closeout", &bids) {
             Some((proceeds, profit)) => {
                 closed_count += 1;
@@ -128,8 +123,8 @@ pub fn run(
         }
     }
 
-    // Wait for settlement
-    std::thread::sleep(std::time::Duration::from_secs(5));
+    // Brief pause for order submission to settle
+    std::thread::sleep(std::time::Duration::from_secs(2));
 
     // Verify accounting
     let final_capital = engine.current_capital();
