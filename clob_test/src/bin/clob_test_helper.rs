@@ -15,6 +15,7 @@ use rust_engine::executor::{Executor, ExecutorConfig, OrderType, OrderAggression
 use rust_engine::signing::{OrderSigner, ClobAuth, ClobApiCreds, Side};
 use rust_engine::rate_limiter::RateLimiter;
 use rust_engine::instrument::{Instrument, InstrumentStore, RoundingConfig};
+use rust_engine::ws_user::{UserChannelClient, UserEvent};
 
 use clob_test::ipc;
 
@@ -95,14 +96,10 @@ fn run_d6(workspace: &PathBuf) {
     tracing::info!("[D6 Helper] Waiting 5s for main to shut down...");
     std::thread::sleep(std::time::Duration::from_secs(5));
 
-    // 5. Close ONE position via real CLOB SELL order
+    // 5. Close ONE position via real CLOB FAK SELL + WS confirmation
     close_one_position(workspace, &checkpoint);
 
-    // 6. Wait for settlement
-    tracing::info!("[D6 Helper] Waiting 10s for SELL to settle...");
-    std::thread::sleep(std::time::Duration::from_secs(10));
-
-    // 7. Clean up D6 flag
+    // 6. Clean up D6 flag
     ipc::clear_d6_flag(workspace);
 
     // 8. Restart main
@@ -229,7 +226,7 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
         ExecutorConfig {
             clob_host: clob_host.to_string(),
             dry_run: false,
-            order_type: OrderType::Gtc,
+            order_type: OrderType::Fak,
             aggression: OrderAggression::AtMarket,
             fee_rate_bps: 0,
             confirmation_timeout_secs: 120.0,
@@ -246,6 +243,7 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
     };
 
     // Set L2 auth so cancel-all works
+    let ws_auth = clob_auth.clone();
     executor.set_clob_auth(clob_auth);
 
     // Cancel any open orders first
@@ -398,9 +396,70 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
         return;
     }
 
+    // Collect market_ids for WS subscription
+    let ws_market_ids: Vec<String> = sell_legs.iter().map(|(mid, _, _, _, _)| mid.clone()).collect();
+
+    // Start WS User Channel BEFORE placing the sell — so we don't miss events
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let ws_client = UserChannelClient::new();
+    ws_client.start(&ws_auth, ws_market_ids, rt.handle());
+    std::thread::sleep(std::time::Duration::from_millis(500)); // let WS connect
+
+    // Place FAK sell
     let result = executor.execute_arb("d6_helper_close", &sell_legs);
     let accepted = result.legs.iter()
         .filter(|l| matches!(l, rust_engine::executor::OrderResult::Accepted(_)))
         .count();
     tracing::info!("[D6 Helper] SELL result: {}/{} legs accepted", accepted, sell_legs.len());
+
+    if accepted == 0 {
+        tracing::error!("[D6 Helper] No sells accepted — venue state unchanged");
+        ws_client.stop();
+        return;
+    }
+
+    // Wait for WS confirmation: MATCHED then CONFIRMED on any trade
+    tracing::info!("[D6 Helper] Waiting for WS User Channel trade confirmation (60s timeout)...");
+    let mut saw_matched = false;
+    let mut saw_confirmed = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+
+    while !saw_confirmed {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!("[D6 Helper] Timeout waiting for trade confirmation (matched={}, confirmed={})",
+                saw_matched, saw_confirmed);
+            break;
+        }
+
+        match ws_client.receiver.recv_timeout(remaining) {
+            Ok(UserEvent::Trade(trade)) => {
+                tracing::info!("[D6 Helper] WS trade: asset={}... status={} size={} price={}",
+                    &trade.asset_id[..trade.asset_id.len().min(20)], trade.status, trade.size, trade.price);
+                if trade.status == "MATCHED" {
+                    saw_matched = true;
+                    tracing::info!("[D6 Helper] MATCHED — venue state change initiated");
+                }
+                if trade.status == "CONFIRMED" && saw_matched {
+                    saw_confirmed = true;
+                    tracing::info!("[D6 Helper] CONFIRMED — venue state change verified");
+                }
+            }
+            Ok(UserEvent::Order(_)) => {}
+            Err(_) => break,
+        }
+    }
+
+    ws_client.stop();
+
+    if saw_confirmed {
+        tracing::info!("[D6 Helper] Venue state change confirmed via WS (MATCHED → CONFIRMED)");
+    } else if saw_matched {
+        tracing::warn!("[D6 Helper] Got MATCHED but not CONFIRMED — proceeding anyway");
+    } else {
+        tracing::error!("[D6 Helper] No trade signals received — D6 may fail reconciliation");
+    }
 }
