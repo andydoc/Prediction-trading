@@ -170,9 +170,24 @@ pub fn verify_cold_start(
     }
 
     // Check if the helper sold at least one position.
-    // If engine has same count as checkpoint, helper sell failed.
-    if open_count >= expected_count && expected_count > 0 {
-        tracing::warn!("[D6] Helper did not sell any positions (engine={}, checkpoint={})",
+    // The helper sells on the exchange (not in the engine), so the engine still has
+    // the checkpoint count. Evidence of helper sell = reconciliation found a quantity
+    // mismatch or missing-on-venue discrepancy.
+    let helper_sell_detected = recon.discrepancies.iter().any(|d| {
+        matches!(d.kind,
+            rust_engine::reconciliation::DiscrepancyKind::QuantityMismatch |
+            rust_engine::reconciliation::DiscrepancyKind::PositionMissingOnVenue
+        )
+    });
+
+    if open_count < expected_count {
+        tracing::info!("[D6] Helper sold {} position(s) (engine={}, checkpoint={})",
+            expected_count - open_count, open_count, expected_count);
+    } else if helper_sell_detected {
+        tracing::info!("[D6] Helper sell detected via reconciliation discrepancy (engine={}, checkpoint={})",
+            open_count, expected_count);
+    } else if expected_count > 0 {
+        tracing::warn!("[D6] Helper did not sell any positions (engine={}, checkpoint={}, no discrepancies)",
             open_count, expected_count);
         errors.push("Helper sell failed — no positions closed during cold-start cycle".into());
         exceptions.add(Exception {
@@ -180,13 +195,10 @@ pub fn verify_cold_start(
             test_id: "D6".into(),
             component: "helper_sell".into(),
             description: "D6 helper could not sell a position (balance/allowance issue)".into(),
-            expected: "At least 1 position sold by helper".into(),
-            actual: format!("{} positions unchanged", open_count),
+            expected: "At least 1 position sold by helper or reconciliation discrepancy".into(),
+            actual: format!("{} positions unchanged, no discrepancies", open_count),
             recommendation: "Check CTF token settlement and balance before helper sells".into(),
         });
-    } else if open_count < expected_count {
-        tracing::info!("[D6] Helper sold {} position(s) (engine={}, checkpoint={})",
-            expected_count - open_count, open_count, expected_count);
     }
 
     let elapsed = start.elapsed().as_millis() as u64;
