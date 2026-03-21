@@ -1435,6 +1435,8 @@ impl Orchestrator {
         }
         // Load instruments from market data (token_id → tick_size, rounding, neg_risk, etc.)
         self.engine.load_instruments(&self.market_lookup);
+        // Persist instruments to SQLite so they survive restart (B4 warm cache)
+        self.engine.instruments.save_to_db(&self.state_db);
     }
 
     // --- Constraint detection ---
@@ -1575,6 +1577,20 @@ impl Orchestrator {
         self.engine.init_positions(initial, fee_rate);
         self.engine.import_positions(&open_jsons, &closed_jsons, capital, initial);
 
+        // Restore instruments from SQLite (warm cache for gap before scanner runs)
+        self.engine.instruments.load_from_db(&self.state_db);
+
+        // Restore accounting ledger from checkpoint (overwrites the fresh one from init_positions)
+        if let Some(acct_json) = self.state_db.load_checkpoint("accounting_ledger") {
+            match rust_engine::accounting::AccountingLedger::deserialize_json(&acct_json) {
+                Ok(ledger) => {
+                    *self.engine.accounting.lock() = ledger;
+                    tracing::info!("Accounting ledger restored from checkpoint");
+                }
+                Err(e) => tracing::warn!("Failed to restore accounting ledger: {}", e),
+            }
+        }
+
         // Restore circuit breaker peak from persistence
         let total_value = self.engine.total_value();
         if let Some(peak) = self.state_db.get_scalar("cb_peak_total_value") {
@@ -1681,6 +1697,20 @@ impl Orchestrator {
             if !new_rows.is_empty() {
                 self.state_db.save_positions_bulk(&new_rows);
             }
+        }
+
+        // Checkpoint accounting ledger + flush journal entries to SQLite
+        {
+            let mut acct = self.engine.accounting.lock();
+            let unflushed = acct.unflushed_entries();
+            if !unflushed.is_empty() {
+                self.state_db.save_journal_entries(unflushed);
+                let n = unflushed.len();
+                acct.mark_flushed(n);
+            }
+            let acct_json = acct.serialize_json();
+            drop(acct); // release lock before checkpoint write
+            self.state_db.save_checkpoint("accounting_ledger", &acct_json);
         }
 
         // Save strategy tracker state + update dashboard summary

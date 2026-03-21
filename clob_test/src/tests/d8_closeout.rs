@@ -51,11 +51,15 @@ pub fn run(
         let pm = engine.positions.lock();
         pm.open_positions().iter().map(|(pid, pos)| {
             let legs: Vec<LegData> = pos.markets.iter().map(|(mid, leg)| {
-                // Look up token_id from instrument store by market_id + outcome
-                let token_id = engine.instruments.by_market(mid).iter()
-                    .find(|i| i.outcome == leg.outcome)
-                    .map(|i| i.token_id.clone())
-                    .unwrap_or_default();
+                // Prefer token_id from MarketLeg (set by fill_tracker), fallback to instrument store
+                let token_id = if !leg.token_id.is_empty() {
+                    leg.token_id.clone()
+                } else {
+                    engine.instruments.by_market(mid).iter()
+                        .find(|i| i.outcome == leg.outcome)
+                        .map(|i| i.token_id.clone())
+                        .unwrap_or_default()
+                };
                 LegData {
                     market_id: mid.clone(),
                     token_id,

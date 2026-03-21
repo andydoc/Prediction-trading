@@ -81,6 +81,10 @@ pub struct AccountingLedger {
 
     // Config
     taker_fee_rate: f64,
+
+    // Journal flush tracking: how many entries have been persisted to SQLite
+    #[serde(default)]
+    flushed_count: usize,
 }
 
 impl AccountingLedger {
@@ -98,6 +102,7 @@ impl AccountingLedger {
             opening_pol: 0.0,
             closing_pol: 0.0,
             taker_fee_rate,
+            flushed_count: 0,
         };
 
         // Opening balance: debit Cash, credit Equity
@@ -294,6 +299,16 @@ impl AccountingLedger {
     pub fn distinct_assets(&self) -> usize { self.holdings.len() }
     pub fn holdings(&self) -> &HashMap<String, AssetHolding> { &self.holdings }
     pub fn entries(&self) -> &[JournalEntry] { &self.entries }
+
+    /// Journal entries not yet flushed to SQLite.
+    pub fn unflushed_entries(&self) -> &[JournalEntry] {
+        &self.entries[self.flushed_count..]
+    }
+
+    /// Mark N additional entries as flushed.
+    pub fn mark_flushed(&mut self, count: usize) {
+        self.flushed_count += count;
+    }
 
     /// Set opening POL balance.
     pub fn set_opening_pol(&mut self, pol: f64) {
