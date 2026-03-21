@@ -23,6 +23,9 @@ pub struct Checkpoint {
     /// Serialized Position objects for cold-start recovery.
     #[serde(default)]
     pub open_positions_json: Vec<String>,
+    /// Serialized accounting ledger for checkpoint persistence.
+    #[serde(default)]
+    pub accounting_json: String,
 }
 
 /// Write the PID file.

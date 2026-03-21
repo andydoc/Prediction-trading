@@ -5,7 +5,6 @@
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Deserializer};
-use std::collections::HashMap;
 use std::time::Duration;
 
 /// Gamma API returns clobTokenIds as a stringified JSON array.
@@ -101,54 +100,74 @@ impl ClobClient {
 
     /// Find a 2-outcome market for D5 forced arb (buy YES on both sides).
     pub fn find_two_outcome_market(&self) -> Option<(TestMarket, TestMarket)> {
-        // Search Gamma for events with exactly 2 markets
-        let url = "https://gamma-api.polymarket.com/markets?limit=200&active=true&enableOrderBook=true&closed=false";
+        // Search Gamma for active negRisk markets (most have 2+ outcomes)
+        let url = "https://gamma-api.polymarket.com/markets?limit=200&active=true&enableOrderBook=true&closed=false&negRisk=true";
         let resp = self.http.get(url).send().ok()?;
         let markets: Vec<GammaMarket> = resp.json().ok()?;
 
-        // Group by condition_id prefix to find mutex pairs
-        // Actually, negRisk events with exactly 2 outcomes work best
-        // Let's find two markets from the same event
-        let mut by_group: HashMap<String, Vec<&GammaMarket>> = HashMap::new();
-        for m in &markets {
-            if m.condition_id.is_empty() || !m.enable_order_book || !m.active { continue; }
-            if m.clob_token_ids.len() < 2 { continue; }
-            if m.neg_risk {
-                let key = "neg_risk_pool".to_string();
-                by_group.entry(key).or_default().push(m);
-            }
-        }
+        // Filter and sort by volume for fast fills
+        let min_volume = 10_000.0; // $10k minimum volume
+        let mut candidates: Vec<&GammaMarket> = markets.iter()
+            .filter(|m| !m.condition_id.is_empty()
+                && m.enable_order_book
+                && m.active
+                && m.clob_token_ids.len() >= 2
+                && m.volume_num >= min_volume)
+            .collect();
+        candidates.sort_by(|a, b| b.volume_num.partial_cmp(&a.volume_num).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Take first two negRisk markets with books
-        if let Some(pool) = by_group.get("neg_risk_pool") {
-            let mut found = Vec::new();
-            for m in pool.iter().take(20) {
-                if let Some(tm) = self.enrich_market(m) {
-                    if tm.best_ask > 0.10 && tm.best_ask < 0.90 {
-                        found.push(tm);
-                        if found.len() == 2 { break; }
-                    }
-                }
-            }
-            if found.len() == 2 {
-                return Some((found.remove(0), found.remove(0)));
-            }
-        }
+        tracing::info!("[D5] {} candidate markets with volume >= ${:.0}", candidates.len(), min_volume);
 
-        // Fallback: any two markets with active books
+        // Prefer negRisk markets (sorted by volume)
+        let neg_risk_count = candidates.iter().filter(|m| m.neg_risk).count();
+        tracing::info!("[D5] {} negRisk candidates, {} total", neg_risk_count, candidates.len());
+
         let mut found = Vec::new();
-        for m in &markets {
-            if m.condition_id.is_empty() || !m.enable_order_book || !m.active || m.clob_token_ids.len() < 2 { continue; }
+        let mut checked = 0;
+        for m in candidates.iter().filter(|m| m.neg_risk).take(30) {
+            checked += 1;
+            let name = m.question.as_deref().unwrap_or("?");
+            let name_short = &name[..name.len().min(40)];
+            tracing::info!("[D5] Checking #{}: {} tokens={} ask={:.4} bid={:.4} vol={:.0}",
+                checked, name_short, m.clob_token_ids.len(), m.best_ask, m.best_bid, m.volume_num);
             if let Some(tm) = self.enrich_market(m) {
-                if tm.best_ask > 0.10 && tm.best_ask < 0.90 {
+                // Accept tradeable prices: need a bid and ask, and skip near-zero
+                // probability markets (best_ask < 0.05) where sells won't fill
+                if tm.best_ask >= 0.01 && tm.best_ask < 0.98 && tm.best_bid > 0.0 {
+                    tracing::info!("[D5] Selected: {} vol={:.0} ask={:.4} bid={:.4}",
+                        tm.question, tm.volume, tm.best_ask, tm.best_bid);
+                    found.push(tm);
+                    if found.len() == 2 { break; }
+                } else {
+                    tracing::info!("[D5] Skipped (price out of range): ask={:.4} bid={:.4}", tm.best_ask, tm.best_bid);
+                }
+            } else {
+                tracing::info!("[D5] Skipped (enrich failed): {}", name_short);
+            }
+        }
+        tracing::info!("[D5] Checked {} negRisk markets, found {}", checked, found.len());
+
+        if found.len() == 2 {
+            return Some((found.remove(0), found.remove(0)));
+        }
+
+        // Fallback: any market with volume, sorted by volume
+        found.clear();
+        for m in candidates.iter().take(30) {
+            if let Some(tm) = self.enrich_market(m) {
+                if tm.best_ask >= 0.01 && tm.best_ask < 0.98 && tm.best_bid > 0.0 {
+                    tracing::info!("[D5] Fallback selected: {} vol={:.0} ask={:.4}", tm.question, tm.volume, tm.best_ask);
                     found.push(tm);
                     if found.len() == 2 { break; }
                 }
             }
         }
+        tracing::info!("[D5] Fallback: found {} markets", found.len());
+
         if found.len() == 2 {
             Some((found.remove(0), found.remove(0)))
         } else {
+            tracing::error!("[D5] Could not find 2 suitable markets out of {} candidates", candidates.len());
             None
         }
     }
@@ -183,11 +202,17 @@ impl ClobClient {
 
         tracing::info!("Gamma API returned {} markets (neg_risk={})", markets.len(), want_neg_risk);
 
-        // Sort by volume descending for liquidity
+        // Sort by volume descending for liquidity, require $1M+ volume for deep books
+        let min_volume = 1_000_000.0;
         let mut sorted: Vec<&GammaMarket> = markets.iter()
-            .filter(|m| !m.condition_id.is_empty() && m.clob_token_ids.len() >= 2)
+            .filter(|m| !m.condition_id.is_empty()
+                && m.clob_token_ids.len() >= 2
+                && m.volume_num >= min_volume)
             .collect();
         sorted.sort_by(|a, b| b.volume_num.partial_cmp(&a.volume_num).unwrap_or(std::cmp::Ordering::Equal));
+
+        tracing::info!("Found {} markets with volume >= ${:.0} (neg_risk={})",
+            sorted.len(), min_volume, want_neg_risk);
 
         // Try top markets by volume, check for actual book depth
         for m in sorted.iter().take(30) {
@@ -220,15 +245,17 @@ impl ClobClient {
             if !resp.status().is_success() { return None; }
             let book: ClobBook = resp.json().ok()?;
 
+            // Best ask = lowest price in asks array
             let ask = book.asks.as_ref()
-                .and_then(|a| a.first())
-                .and_then(|o| o.price.as_ref())
-                .and_then(|p| p.parse::<f64>().ok())
+                .and_then(|asks| asks.iter()
+                    .filter_map(|o| o.price.as_ref().and_then(|p| p.parse::<f64>().ok()))
+                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)))
                 .unwrap_or(0.0);
+            // Best bid = highest price in bids array
             let bid = book.bids.as_ref()
-                .and_then(|b| b.first())
-                .and_then(|o| o.price.as_ref())
-                .and_then(|p| p.parse::<f64>().ok())
+                .and_then(|bids| bids.iter()
+                    .filter_map(|o| o.price.as_ref().and_then(|p| p.parse::<f64>().ok()))
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)))
                 .unwrap_or(0.0);
             (ask, bid)
         };
@@ -247,15 +274,15 @@ impl ClobClient {
         })
     }
 
-    /// Get current best ask for a token.
+    /// Get current best ask (lowest price) for a token.
     pub fn get_best_ask(&self, token_id: &str) -> f64 {
         let url = format!("{}/book?token_id={}", self.clob_host, token_id);
         self.http.get(&url).send().ok()
             .and_then(|r| r.json::<ClobBook>().ok())
             .and_then(|b| b.asks)
-            .and_then(|a| a.first().cloned())
-            .and_then(|o| o.price)
-            .and_then(|p| p.parse::<f64>().ok())
+            .and_then(|asks| asks.iter()
+                .filter_map(|o| o.price.as_ref().and_then(|p| p.parse::<f64>().ok()))
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)))
             .unwrap_or(0.0)
     }
 

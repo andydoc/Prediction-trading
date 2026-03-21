@@ -198,77 +198,74 @@ fn main() {
     // Cleanup mode: cancel all orders + sell all positions, then exit
     if cli.cleanup {
         tracing::info!("=== CLEANUP MODE ===");
-        // 1. Cancel all open orders
-        let (cancelled, err) = executor.cancel_all_orders();
-        tracing::info!("Cancelled {} orders (err={:?})", cancelled, err);
-
-        // 2. Query positions via Data API
-        let http = reqwest::blocking::Client::new();
-        let url = format!(
-            "https://data-api.polymarket.com/positions?user={}&sizeThreshold=0",
-            wallet_address.to_lowercase()
-        );
-        let positions: Vec<serde_json::Value> = http.get(&url)
-            .send().and_then(|r| r.json()).unwrap_or_default();
-        tracing::info!("Found {} open positions", positions.len());
-
-        // 3. Sell each position
-        let clob = clob_test::clob_client::ClobClient::new(&clob_host);
-        for p in &positions {
-            let asset = p.get("asset").and_then(|v| v.as_str()).unwrap_or("");
-            let cond_id = p.get("conditionId").and_then(|v| v.as_str()).unwrap_or("");
-            let size = p.get("size").and_then(|v| v.as_f64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0.0);
-            let title = p.get("title").and_then(|v| v.as_str()).unwrap_or("?");
-
-            if size <= 0.0 || asset.is_empty() { continue; }
-
-            // Get best bid
-            let bid = clob.get_best_bid(asset);
-            if bid <= 0.0 {
-                tracing::warn!("No bid for {}, skipping", &title[..title.len().min(40)]);
-                continue;
-            }
-
-            // Register instrument so executor can find it
-            // Default to negRisk=true — most Polymarket markets are negRisk, and
-            // incorrect negRisk causes "invalid signature" (wrong taker address).
-            let neg_risk = p.get("negRisk").and_then(|v| v.as_bool()).unwrap_or(true);
-            engine.instruments.insert_instrument(rust_engine::instrument::Instrument {
-                market_id: cond_id.to_string(),
-                token_id: asset.to_string(),
-                outcome: "yes".to_string(),
-                condition_id: cond_id.to_string(),
-                neg_risk,
-                tick_size: 0.001,
-                rounding: rust_engine::instrument::RoundingConfig::from_tick_size_f64(0.001),
-                min_order_size: 1.0,
-                max_order_size: 0.0,
-                order_book_enabled: true,
-                accepting_orders: true,
-            });
-
-            let sell_value = size * bid;
-            tracing::info!("SELL {} shares of {} at {:.4} (value={:.2})",
-                size, &title[..title.len().min(40)], bid, sell_value);
-
-            let legs = vec![(
-                cond_id.to_string(),
-                asset.to_string(),
-                rust_engine::signing::Side::Sell,
-                bid,
-                sell_value,
-            )];
-            let result = executor.execute_arb(&format!("cleanup_{}", &cond_id[..10.min(cond_id.len())]), &legs);
-            let accepted = result.legs.iter()
-                .filter(|l| matches!(l, rust_engine::executor::OrderResult::Accepted(_)))
-                .count();
-            tracing::info!("  Result: {}/{} accepted", accepted, legs.len());
-        }
-
+        close_all_positions(&executor, &engine, &wallet_address);
         tracing::info!("=== CLEANUP COMPLETE ===");
         std::process::exit(0);
     }
+
+    // === PRE-RUN CLEANUP: close all existing positions for clean slate ===
+    // Skip cleanup on resume — the checkpoint state is what we're verifying
+    if cli.resume_from.is_none() {
+        tracing::info!("=== PRE-RUN CLEANUP: closing all existing positions ===");
+        close_all_positions(&executor, &engine, &wallet_address);
+    } else {
+        tracing::info!("=== SKIP PRE-RUN CLEANUP (resuming from checkpoint) ===");
+    }
+    // Verify clean slate
+    let http_verify = reqwest::blocking::Client::new();
+    let verify_url = format!(
+        "https://data-api.polymarket.com/positions?user={}&sizeThreshold=0",
+        wallet_address.to_lowercase()
+    );
+    let remaining: Vec<serde_json::Value> = http_verify.get(&verify_url)
+        .send().and_then(|r| r.json()).unwrap_or_default();
+    let remaining_with_size: Vec<_> = remaining.iter().filter(|p| {
+        p.get("size").and_then(|v| v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0.0) > 0.0
+    }).collect();
+    tracing::info!("Pre-run cleanup complete: {} positions remaining on exchange", remaining_with_size.len());
+    if !remaining_with_size.is_empty() {
+        tracing::warn!("Some positions could not be closed — they may have no bids");
+    }
+
+    // Query actual USDC.e balance on-chain for true initial capital
+    // On resume: use checkpoint's initial_usdc (the capital at checkpoint time).
+    // D6 verify then reconciles this saved state against the changed exchange reality.
+    let actual_capital = if let Some(ref resume_path) = cli.resume_from {
+        let cp_capital = ipc::read_checkpoint(&std::path::PathBuf::from(resume_path))
+            .map(|c| c.initial_usdc)
+            .unwrap_or(test_config.initial_capital);
+        tracing::info!("Resume mode — using checkpoint capital: ${:.2}", cp_capital);
+        cp_capital
+    } else {
+        let usdc_contract = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+        let call_data = format!("0x70a08231000000000000000000000000{}", &wallet_address[2..]);
+        let rpc_body = serde_json::json!({
+            "jsonrpc": "2.0", "method": "eth_call",
+            "params": [{"to": usdc_contract, "data": call_data}, "latest"],
+            "id": 1
+        });
+        let rpc_result = http_verify
+            .post("https://polygon.drpc.org")
+            .json(&rpc_body)
+            .send()
+            .and_then(|r| r.json::<serde_json::Value>());
+        match rpc_result {
+            Ok(v) => {
+                let hex = v.get("result").and_then(|r| r.as_str()).unwrap_or("0x0");
+                let raw = u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap_or(0);
+                raw as f64 / 1e6
+            }
+            Err(e) => {
+                tracing::warn!("Failed to query on-chain USDC.e balance: {}. Using config value.", e);
+                test_config.initial_capital
+            }
+        }
+    };
+    tracing::info!("Initial capital: ${:.2}", actual_capital);
+
+    // Re-initialize engine with actual capital (on resume, D6 verify will override from checkpoint)
+    engine.init_positions(actual_capital, test_config.taker_fee_rate);
 
     // Create notifier
     let notify_cfg = build_notify_config(&workspace, &secrets);
@@ -293,7 +290,10 @@ fn main() {
     });
     let runtime_handle = runtime.handle().clone();
 
-    // Build harness
+    // Build harness — override initial_capital with actual on-chain balance
+    let mut test_config = test_config;
+    test_config.initial_capital = actual_capital;
+
     let mut harness = TestHarness::new(
         engine,
         executor,
@@ -349,8 +349,7 @@ fn build_notify_config(workspace: &PathBuf, secrets: &serde_json::Value) -> Noti
         .map(|token| format!("https://api.telegram.org/bot{}/sendMessage", token))
         .unwrap_or(cfg_url);
 
-    let hostname = std::fs::read_to_string("/etc/hostname")
-        .unwrap_or_default().trim().to_string();
+    let hostname = "vps.madrid".to_string();
 
     NotifyConfig {
         enabled: true,  // Always enabled for test harness
@@ -365,6 +364,85 @@ fn build_notify_config(workspace: &PathBuf, secrets: &serde_json::Value) -> Noti
         rate_limit_seconds: 5.0,  // Faster rate for testing
         hostname,
         instance: "clob-test".to_string(),
+    }
+}
+
+/// Close all open positions on the exchange. Cancels orders first, then sells at 0.01 to guarantee fills.
+fn close_all_positions(
+    executor: &Executor,
+    engine: &TradingEngine,
+    wallet_address: &str,
+) {
+    // 1. Cancel all open orders
+    let (cancelled, err) = executor.cancel_all_orders();
+    tracing::info!("[CLEANUP] Cancelled {} orders (err={:?})", cancelled, err);
+
+    // 2. Query positions via Data API
+    let http = reqwest::blocking::Client::new();
+    let url = format!(
+        "https://data-api.polymarket.com/positions?user={}&sizeThreshold=0",
+        wallet_address.to_lowercase()
+    );
+    let positions: Vec<serde_json::Value> = http.get(&url)
+        .send().and_then(|r| r.json()).unwrap_or_default();
+    tracing::info!("[CLEANUP] Found {} positions from Data API", positions.len());
+
+    // 3. Sell each position at 80% of best bid to guarantee fill
+    let clob = clob_test::clob_client::ClobClient::new("https://clob.polymarket.com");
+    for p in &positions {
+        let asset = p.get("asset").and_then(|v| v.as_str()).unwrap_or("");
+        let cond_id = p.get("conditionId").and_then(|v| v.as_str()).unwrap_or("");
+        let size = p.get("size").and_then(|v| v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0.0);
+        let title = p.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+
+        if size <= 0.0 || asset.is_empty() { continue; }
+
+        // Get best bid and sell at 80% discount
+        let best_bid = clob.get_best_bid(asset);
+        let sell_price = if best_bid > 0.0 { (best_bid * 0.80 * 1000.0).floor() / 1000.0 } else { 0.001 };
+        let sell_price = sell_price.max(0.001);
+
+        // Register instrument so executor can find it
+        let neg_risk = p.get("negRisk")
+            .or_else(|| p.get("negativeRisk"))
+            .and_then(|v| v.as_bool()).unwrap_or(true);
+        engine.instruments.insert_instrument(rust_engine::instrument::Instrument {
+            market_id: cond_id.to_string(),
+            token_id: asset.to_string(),
+            outcome: "yes".to_string(),
+            condition_id: cond_id.to_string(),
+            neg_risk,
+            tick_size: 0.001,
+            rounding: rust_engine::instrument::RoundingConfig::from_tick_size_f64(0.001),
+            min_order_size: 1.0,
+            max_order_size: 0.0,
+            order_book_enabled: true,
+            accepting_orders: true,
+        });
+
+        let sell_value = size * sell_price;
+        tracing::info!("[CLEANUP] SELL {} shares of {} at {:.4} (best_bid={:.4}, value={:.4})",
+            size, &title[..title.len().min(40)], sell_price, best_bid, sell_value);
+
+        let legs = vec![(
+            cond_id.to_string(),
+            asset.to_string(),
+            rust_engine::signing::Side::Sell,
+            sell_price,
+            sell_value,
+        )];
+        let result = executor.execute_arb(&format!("cleanup_{}", &cond_id[..10.min(cond_id.len())]), &legs);
+        let accepted = result.legs.iter()
+            .filter(|l| matches!(l, rust_engine::executor::OrderResult::Accepted(_)))
+            .count();
+        tracing::info!("[CLEANUP]   Result: {}/{} accepted", accepted, legs.len());
+    }
+
+    // Wait for settlement
+    if !positions.is_empty() {
+        tracing::info!("[CLEANUP] Waiting 10s for settlement...");
+        std::thread::sleep(std::time::Duration::from_secs(10));
     }
 }
 

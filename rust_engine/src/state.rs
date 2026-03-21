@@ -67,6 +67,16 @@ const STATE_SCHEMA: &str = "
         is_win INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_strat_closed_ts ON strategy_closed_positions(close_ts);
+    CREATE TABLE IF NOT EXISTS journal (
+        id INTEGER PRIMARY KEY,
+        timestamp REAL NOT NULL,
+        account TEXT NOT NULL,
+        debit REAL NOT NULL DEFAULT 0.0,
+        credit REAL NOT NULL DEFAULT 0.0,
+        position_id TEXT,
+        description TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_journal_ts ON journal(timestamp);
 ";
 
 pub struct StateDB {

@@ -163,6 +163,10 @@ impl PositionManager {
         self.current_capital
     }
 
+    pub fn taker_fee(&self) -> f64 {
+        self.taker_fee
+    }
+
     /// Total portfolio value: free cash + deployed capital in open positions.
     pub fn total_value(&self) -> f64 {
         let deployed: f64 = self.open_positions.values()

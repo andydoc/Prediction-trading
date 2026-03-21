@@ -25,7 +25,8 @@ pub struct SubmittedLeg {
 
 /// Confirm fills via WS User Channel and enter positions in the engine.
 ///
-/// Returns the engine position_id on success, or an error description.
+/// Returns (engine_position_id, confirmed_fills) on success, or an error description.
+/// The confirmed fills are returned so the caller can log them on the accounting ledger.
 pub fn confirm_and_enter(
     engine: &TradingEngine,
     _clob: &ClobClient,
@@ -35,7 +36,7 @@ pub fn confirm_and_enter(
     is_sell: bool,
     runtime: &tokio::runtime::Handle,
     _wallet_address: &str,
-) -> Result<String, String> {
+) -> Result<(String, Vec<TradeEvent>), String> {
     let market_ids: Vec<String> = legs.iter().map(|l| l.market.market_id.clone()).collect();
     let asset_ids: Vec<String> = legs.iter().map(|l| {
         if is_sell { l.market.no_token_id.clone() } else { l.market.yes_token_id.clone() }
@@ -60,7 +61,9 @@ pub fn confirm_and_enter(
     tracing::info!("[FillTracker] Got {} confirmed fills", fills.len());
 
     // Build enter_position params from fills
-    enter_position_from_fills(engine, position_id, legs, &fills, is_sell)
+    let fills_clone = fills.clone();
+    let pid = enter_position_from_fills(engine, position_id, legs, &fills, is_sell)?;
+    Ok((pid, fills_clone))
 }
 
 /// Enter a position in the engine from confirmed fill data.

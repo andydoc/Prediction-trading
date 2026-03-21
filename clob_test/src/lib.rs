@@ -14,7 +14,20 @@ pub mod fill_tracker;
 
 /// Convenience wrapper: send a Telegram notification via the Notifier.
 /// Uses NotifyEvent::Error variant to carry custom test messages.
+/// Buffer a message for batched Telegram delivery.
+/// Messages accumulate and are sent as one combined message when flush_notify() is called.
 pub fn notify(notifier: &rust_engine::notify::Notifier, msg: &str) {
+    notifier.buffer_message(msg);
+}
+
+/// Flush the message buffer — sends all buffered messages as one Telegram message.
+/// Only sends if buffer is non-empty.
+pub fn flush_notify(notifier: &rust_engine::notify::Notifier) {
+    notifier.flush_buffer();
+}
+
+/// Send a message immediately (bypasses buffer). Use for critical alerts only.
+pub fn notify_immediate(notifier: &rust_engine::notify::Notifier, msg: &str) {
     let _ = notifier.send(&rust_engine::notify::NotifyEvent::Error {
         message: msg.to_string(),
     });

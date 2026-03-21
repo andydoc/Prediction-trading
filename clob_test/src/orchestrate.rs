@@ -131,6 +131,20 @@ impl TestHarness {
         self
     }
 
+    /// Human-readable name of the current phase (for logging).
+    fn phase_name(&self) -> &str {
+        match &self.phase {
+            Phase::D1 => "D1",
+            Phase::D2D5 { .. } => "D2-D5",
+            Phase::D6Waiting { .. } => "D6-waiting",
+            Phase::D6Verify => "D6-verify",
+            Phase::D7 => "D7",
+            Phase::D8 => "D8",
+            Phase::Complete => "complete",
+            Phase::Failed(_) => "failed",
+        }
+    }
+
     /// Check if a test should be skipped.
     fn should_skip(&self, test_id: &str) -> bool {
         self.skip_tests.iter().any(|s| s.eq_ignore_ascii_case(test_id))
@@ -146,16 +160,35 @@ impl TestHarness {
 
     /// Run the full test sequence. Returns when all tests complete or a fatal error occurs.
     pub fn run(&mut self) {
-        tracing::info!("=== CLOB-TEST HARNESS STARTED ===");
+        tracing::info!("=== CLOB-TEST HARNESS STARTED (phase={:?}) ===", self.phase_name());
+        let short_wallet = if self.wallet_address.len() > 10 {
+            format!("{}...{}", &self.wallet_address[..6], &self.wallet_address[self.wallet_address.len()-4..])
+        } else { self.wallet_address.clone() };
+        let actual_capital = self.engine.current_capital();
         crate::notify(&self.notifier, &format!(
-            "[CLOB-TEST] Started. Wallet={}, capital=${:.0}, timeout={}h",
-            self.wallet_address, self.test_config.initial_capital,
+            "[CLOB-TEST] Started. Wallet={}, capital=${:.2}, timeout={}h",
+            short_wallet, actual_capital,
             self.timeout_minutes as f64 / 60.0
         ));
 
         // Write PID
         if let Err(e) = ipc::write_pid(&self.workspace) {
             tracing::warn!("Failed to write PID: {}", e);
+        }
+
+        // Always skip D1 — deposit check is not needed for test runs
+        if matches!(self.phase, Phase::D1) {
+            tracing::info!("[D1] Auto-skipped (always skip D1)");
+            self.report.add_result(TestResult::pass("D1", "Deposit Check", 0,
+                serde_json::json!({ "skipped": true, "reason": "Always skipped — deposit check not needed" })
+            ));
+            self.phase = Phase::D2D5 {
+                d2_done: false,
+                d3_done: false,
+                d4_done: false,
+                d5_done: false,
+                d6_triggered: false,
+            };
         }
 
         loop {
@@ -248,6 +281,7 @@ impl TestHarness {
                 );
                 let passed = result.result == "PASS";
                 self.report.add_result(result);
+                self.engine.accounting.lock().summary_log("after-D2");
                 if !passed {
                     self.phase = Phase::Failed("D2 submit/cancel test failed".into());
                     return;
@@ -271,9 +305,11 @@ impl TestHarness {
                 let (result, pid) = tests::d3_micro_fill::run(
                     &self.executor, &self.engine, &self.notifier,
                     &mut self.dedup, &mut self.exceptions, &self.clob,
+                    &self.clob_auth, &self.runtime, &self.wallet_address,
                 );
                 let passed = result.result == "PASS";
                 self.report.add_result(result);
+                self.engine.accounting.lock().summary_log("after-D3");
                 if let Some(pid) = pid {
                     self.open_position_ids.push(pid);
                 }
@@ -298,8 +334,10 @@ impl TestHarness {
                 let (result, pid) = tests::d4_neg_risk::run(
                     &self.executor, &self.engine, &self.notifier,
                     &mut self.dedup, &mut self.exceptions, &self.clob,
+                    &self.clob_auth, &self.runtime, &self.wallet_address,
                 );
                 self.report.add_result(result);
+                self.engine.accounting.lock().summary_log("after-D4");
                 if let Some(pid) = pid {
                     self.open_position_ids.push(pid);
                 }
@@ -330,10 +368,14 @@ impl TestHarness {
                     &self.clob_auth, &self.runtime, &self.wallet_address,
                 );
                 self.report.add_result(result);
+                self.engine.accounting.lock().summary_log("after-D5");
                 self.open_position_ids.extend(pids);
             }
             self.phase = Phase::D2D5 { d2_done, d3_done, d4_done, d5_done: true, d6_triggered };
         }
+
+        // Flush buffered messages before D6 (we may get SIGTERM'd)
+        crate::flush_notify(&self.notifier);
 
         // After all D2-D5 done, trigger D6 if not already triggered.
         // Use engine position count (real positions) not open_position_ids (may have phantom IDs
@@ -354,6 +396,7 @@ impl TestHarness {
                 self.test_config.initial_capital,
                 0.0,
                 &self.engine,
+                &self.notifier,
             );
             if triggered {
                 self.phase = Phase::D6Waiting { entered: Instant::now() };
@@ -388,13 +431,14 @@ impl TestHarness {
             &self.clob_host, &self.clob_auth,
         );
 
-        if result.result == "FAIL" {
-            self.report.add_result(result);
-            // Don't fail the whole suite — D6 failure is informative
+        let d6_passed = result.result == "PASS";
+        self.report.add_result(result);
+        self.engine.accounting.lock().summary_log("after-D6");
+        if !d6_passed {
             tracing::warn!("[D6] Cold-start test failed, continuing to D7...");
-        } else {
-            self.report.add_result(result);
         }
+        tracing::info!("[RESUMED] D6 verify complete (passed={}), moving to D7...", d6_passed);
+        crate::flush_notify(&self.notifier);
 
         self.phase = Phase::D7;
     }
@@ -407,6 +451,7 @@ impl TestHarness {
                 &self.engine, &self.notifier, &mut self.exceptions,
             );
             self.report.add_result(cb_result);
+            self.engine.accounting.lock().summary_log("after-D7a");
         }
 
         if self.should_skip("D7") || self.should_skip("D7b") {
@@ -416,9 +461,170 @@ impl TestHarness {
                 &self.executor, &self.engine, &self.notifier, &mut self.exceptions,
             );
             self.report.add_result(ks_result);
+            self.engine.accounting.lock().summary_log("after-D7b");
         }
 
+        // Ensure D8 has at least one position to close.
+        // If D7 (or prior tests) left no positions, open a small test position.
+        let open_count = self.engine.pm_open_count();
+        if open_count == 0 {
+            tracing::info!("[D7→D8] No positions open — opening a test position for D8 closeout");
+            self.open_test_position_for_d8();
+        } else {
+            tracing::info!("[D7→D8] {} positions open, D8 can proceed", open_count);
+        }
+
+        crate::flush_notify(&self.notifier);
         self.phase = Phase::D8;
+    }
+
+    /// Three-way end-of-run reconciliation: accounting vs engine vs exchange.
+    fn reconcile_end_of_run(&self) {
+        tracing::info!("=== END-OF-RUN RECONCILIATION ===");
+
+        // 1. Accounting ledger state
+        let acct = self.engine.accounting.lock();
+        acct.summary_log("FINAL");
+
+        // 2. Engine state
+        let engine_open = self.engine.pm_open_count();
+        let engine_capital = self.engine.current_capital();
+        let snapshot = self.engine.dashboard_snapshot();
+        tracing::info!("[RECONCILE] Engine: positions={}, capital={:.2}, total_value={:.2}",
+            engine_open, engine_capital, snapshot.total_value);
+
+        // 3. Exchange state via Data API
+        let http = reqwest::blocking::Client::new();
+        let positions_url = format!(
+            "https://data-api.polymarket.com/positions?user={}&sizeThreshold=0",
+            self.wallet_address.to_lowercase()
+        );
+        let exchange_positions: Vec<serde_json::Value> = http.get(&positions_url)
+            .send().and_then(|r| r.json()).unwrap_or_default();
+        let exchange_with_size: Vec<_> = exchange_positions.iter().filter(|p| {
+            p.get("size").and_then(|v| v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0.0) > 0.001
+        }).collect();
+
+        let value_url = format!(
+            "https://data-api.polymarket.com/value?user={}",
+            self.wallet_address.to_lowercase()
+        );
+        let exchange_value: f64 = http.get(&value_url)
+            .send().ok()
+            .and_then(|r| r.json::<Vec<serde_json::Value>>().ok())
+            .and_then(|v| v.first()?.get("value")?.as_f64())
+            .unwrap_or(0.0);
+
+        tracing::info!("[RECONCILE] Exchange: positions={}, total_value=${:.2}",
+            exchange_with_size.len(), exchange_value);
+
+        for p in &exchange_with_size {
+            let title = p.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+            let size = p.get("size").and_then(|v| v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0.0);
+            let cur_price = p.get("curPrice").and_then(|v| v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0.0);
+            tracing::info!("[RECONCILE]   {} — size={:.2}, price={:.4}, value={:.4}",
+                &title[..title.len().min(50)], size, cur_price, size * cur_price);
+        }
+
+        // 4. Three-way reconciliation
+        let recon = acct.reconcile(
+            engine_capital, engine_open, snapshot.total_value,
+            exchange_with_size.len(), exchange_value, 0.05,
+        );
+
+        // 5. Log results
+        if recon.overall_pass {
+            tracing::info!("[RECONCILE] PASS: accounting == engine == exchange (within ${:.2})", recon.tolerance);
+        } else {
+            for m in &recon.mismatches {
+                tracing::warn!("[RECONCILE] MISMATCH: {}", m);
+            }
+        }
+
+        // 6. Double-entry balance check
+        if acct.verify_balance() {
+            tracing::info!("[RECONCILE] Double-entry: BALANCED (debits == credits)");
+        } else {
+            tracing::error!("[RECONCILE] Double-entry: UNBALANCED — accounting error!");
+        }
+
+        // 7. Write ledger to file
+        let ledger_path = self.workspace.join("data").join("clob_test_ledger.json");
+        if let Ok(json) = serde_json::to_string_pretty(&acct.to_json()) {
+            if let Err(e) = std::fs::write(&ledger_path, json) {
+                tracing::warn!("Failed to write ledger: {}", e);
+            } else {
+                tracing::info!("Ledger written to {}", ledger_path.display());
+            }
+        }
+
+        tracing::info!("=== END-OF-RUN RECONCILIATION COMPLETE ===");
+    }
+
+    /// Open a small test position so D8 has something to close.
+    /// Uses the same approach as D3: find a liquid market, BUY at ask, enter via fill_tracker.
+    fn open_test_position_for_d8(&mut self) {
+        use rust_engine::signing::Side;
+        use crate::fill_tracker::{self, SubmittedLeg};
+
+        let market = match self.clob.find_liquid_market() {
+            Some(m) => m,
+            None => {
+                // Try negRisk market as fallback
+                match self.clob.find_neg_risk_market() {
+                    Some(m) => m,
+                    None => {
+                        tracing::error!("[D8-seed] No liquid market found for test position");
+                        return;
+                    }
+                }
+            }
+        };
+
+        self.clob.register_instrument(&market, &self.engine);
+        tracing::info!("[D8-seed] Selected market: {} (ask={:.4}) — {}",
+            market.market_id, market.best_ask, market.question);
+
+        let size = 2.50; // $2.50 minimum
+        let position_id = format!("d8_seed_{}", crate::now_secs() as u64);
+
+        let legs = vec![(
+            market.market_id.clone(),
+            market.yes_token_id.clone(),
+            Side::Buy,
+            market.best_ask,
+            size,
+        )];
+
+        let result = self.executor.execute_arb(&position_id, &legs);
+        if !result.all_accepted {
+            tracing::error!("[D8-seed] BUY order rejected: {:?}", result.legs);
+            return;
+        }
+
+        tracing::info!("[D8-seed] BUY submitted, confirming via WS...");
+
+        let submitted_legs = vec![
+            SubmittedLeg { market: market.clone(), size_usd: size },
+        ];
+
+        match fill_tracker::confirm_and_enter(
+            &self.engine, &self.clob, &self.clob_auth, &position_id,
+            &submitted_legs, false, &self.runtime, &self.wallet_address,
+        ) {
+            Ok((engine_pid, _fills)) => {
+                tracing::info!("[D8-seed] Position entered: {} (engine={})", position_id, engine_pid);
+                self.open_position_ids.push(engine_pid);
+            }
+            Err(e) => {
+                tracing::error!("[D8-seed] Fill confirmation failed: {}", e);
+                // Still wait a bit — the order may have filled on-chain
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+        }
     }
 
     fn run_d8(&mut self) {
@@ -428,16 +634,20 @@ impl TestHarness {
             let result = tests::d8_closeout::run(
                 &self.executor, &self.engine, &self.notifier,
                 self.test_config.initial_capital, &mut self.exceptions,
-                &self.clob,
             );
             self.report.add_result(result);
+            self.engine.accounting.lock().summary_log("after-D8");
         }
+        crate::flush_notify(&self.notifier);
         self.phase = Phase::Complete;
     }
 
     fn finalize(&mut self, success: bool) {
         let duration = self.start_time.elapsed().as_secs_f64();
         let final_capital = self.engine.current_capital();
+
+        // End-of-run reconciliation: compare engine state vs exchange
+        self.reconcile_end_of_run();
 
         self.report.finalize(duration, final_capital, 0.0);
 

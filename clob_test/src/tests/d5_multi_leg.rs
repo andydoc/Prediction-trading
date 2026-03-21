@@ -102,7 +102,7 @@ pub fn run(
     ];
 
     match fill_tracker::confirm_and_enter(engine, clob, clob_auth, &position_id, &submitted_legs, false, runtime, wallet_address) {
-        Ok(engine_pid) => {
+        Ok((engine_pid, _fills)) => {
             opened_position_ids.push(engine_pid.clone());
             tracing::info!("[D5] Position entered in engine: {}", engine_pid);
 

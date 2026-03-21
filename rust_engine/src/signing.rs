@@ -406,6 +406,8 @@ pub struct ClobAuth {
 impl ClobAuth {
     /// Get the API key (UUID) for use as `owner` in order payloads.
     pub fn api_key(&self) -> &str { &self.api_key }
+    /// Get the wallet address.
+    pub fn wallet_address(&self) -> &str { &self.address }
 
     /// Raw base64url-encoded API secret for WS user channel auth.
     /// The WS subscription message wants the original secret string, NOT an HMAC signature.

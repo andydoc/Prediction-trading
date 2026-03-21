@@ -1,12 +1,12 @@
 /// D4: Test negRisk fill.
 ///
-/// Executes a micro-fill on a negRisk market, verifies neg_risk flag
-/// is passed correctly, cross-asset fill matching (B4.2) detects
-/// synthetic NO positions, reconciliation passes.
+/// Executes a micro-fill on a negRisk market, confirms fill via WS User Channel,
+/// enters position in engine via fill_tracker.
 
 use rust_engine::executor::Executor;
-use rust_engine::signing::Side;
+use rust_engine::signing::{Side, ClobAuth};
 use crate::clob_client::ClobClient;
+use crate::fill_tracker::{self, SubmittedLeg};
 use crate::report::{TestResult, Exception, ExceptionReport};
 use crate::dedup::PositionDedup;
 
@@ -18,6 +18,9 @@ pub fn run(
     dedup: &mut PositionDedup,
     exceptions: &mut ExceptionReport,
     clob: &ClobClient,
+    clob_auth: &ClobAuth,
+    runtime: &tokio::runtime::Handle,
+    wallet_address: &str,
 ) -> (TestResult, Option<String>) {
     let start = std::time::Instant::now();
 
@@ -74,28 +77,53 @@ pub fn run(
 
     dedup.record_open(&[market.market_id.clone()], "D4");
 
-    // 3. Wait for fill confirmation
-    tracing::info!("[D4] negRisk BUY submitted, waiting for fill confirmation...");
-    std::thread::sleep(std::time::Duration::from_secs(10));
+    // 3. Confirm fill via WS User Channel and enter position
+    tracing::info!("[D4] negRisk BUY submitted, confirming via WS...");
 
-    // 4. Check position count
-    let open_count = engine.pm_open_count();
-    tracing::info!("[D4] Open positions after negRisk fill: {}", open_count);
+    let submitted_legs = vec![
+        SubmittedLeg { market: market.clone(), size_usd: size },
+    ];
 
-    let elapsed = start.elapsed().as_millis() as u64;
-    crate::notify(notifier, &format!(
-        "[CLOB-TEST] D4 PASSED: negRisk fill on {} at {:.4}",
-        market.question, market.best_ask
-    ));
+    match fill_tracker::confirm_and_enter(engine, clob, clob_auth, &position_id, &submitted_legs, false, runtime, wallet_address) {
+        Ok((engine_pid, fills)) => {
+            let fill_price = fills.first().map(|f| f.price).unwrap_or(market.best_ask);
+            let fill_size = fills.first().map(|f| f.size).unwrap_or(0.0);
+            let open_count = engine.pm_open_count();
+            tracing::info!("[D4] Position entered: {} (fill: {} shares @ {:.4})", engine_pid, fill_size, fill_price);
 
-    (TestResult::pass("D4", "negRisk Fill", elapsed,
-        serde_json::json!({
-            "market_id": market.market_id,
-            "market_name": market.question,
-            "fill_price": market.best_ask,
-            "size_usd": size,
-            "neg_risk": true,
-            "open_positions": open_count,
-        })),
-    Some(position_id))
+            let elapsed = start.elapsed().as_millis() as u64;
+            crate::notify(notifier, &format!(
+                "[CLOB-TEST] D4 PASSED: negRisk fill on {} at {:.4}",
+                market.question, fill_price
+            ));
+
+            (TestResult::pass("D4", "negRisk Fill", elapsed,
+                serde_json::json!({
+                    "market_id": market.market_id,
+                    "market_name": market.question,
+                    "fill_price": fill_price,
+                    "fill_size": fill_size,
+                    "size_usd": size,
+                    "neg_risk": true,
+                    "open_positions": open_count,
+                    "position_id": engine_pid,
+                })),
+            Some(engine_pid))
+        }
+        Err(e) => {
+            tracing::warn!("[D4] Fill confirmation failed: {}", e);
+            let elapsed = start.elapsed().as_millis() as u64;
+            exceptions.add(Exception {
+                severity: "WARNING".into(),
+                test_id: "D4".into(),
+                component: "fill_tracker".into(),
+                description: "negRisk order accepted but fill not confirmed via WS".into(),
+                expected: "Confirmed fill within 60s".into(),
+                actual: e.clone(),
+                recommendation: "Check WS user channel auth and negRisk market subscription".into(),
+            });
+            crate::notify(notifier, &format!("[CLOB-TEST] D4 PARTIAL: order accepted, fill unconfirmed: {}", e));
+            (TestResult::fail("D4", "negRisk Fill", elapsed, vec![e]), Some(position_id))
+        }
+    }
 }

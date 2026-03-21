@@ -17,7 +17,6 @@ use rust_engine::rate_limiter::RateLimiter;
 use rust_engine::instrument::{Instrument, InstrumentStore, RoundingConfig};
 
 use clob_test::ipc;
-use clob_test::clob_client::ClobClient;
 
 #[derive(Parser, Debug)]
 #[command(name = "clob-test-helper", about = "Milestone D test helper for D6 restart")]
@@ -106,20 +105,22 @@ fn run_d6(workspace: &PathBuf) {
     // 7. Clean up D6 flag
     ipc::clear_d6_flag(workspace);
 
-    // 8. Restart main with --resume-from, redirect output to log file
+    // 8. Restart main
+    restart_main(workspace);
+}
+
+/// Restart the main test binary with --resume-from checkpoint.
+fn restart_main(workspace: &PathBuf) {
+    let checkpoint_path = ipc::checkpoint_path(workspace);
     let clob_test_bin = std::env::current_exe()
         .unwrap_or_else(|_| PathBuf::from("clob-test"))
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .join("clob-test");
 
-    let log_path = workspace.join("data").join("clob_test_resumed.log");
     tracing::info!("[D6 Helper] Restarting main: {} --workspace {} --resume-from {}",
         clob_test_bin.display(), workspace.display(), checkpoint_path.display());
-    tracing::info!("[D6 Helper] Resumed main log: {}", log_path.display());
 
-    // Run the resumed main and capture its stderr (tracing output) via pipe,
-    // writing to both our stdout and the log file with line buffering.
     let child = std::process::Command::new(&clob_test_bin)
         .arg("--workspace")
         .arg(workspace.to_str().unwrap_or("."))
@@ -127,41 +128,17 @@ fn run_d6(workspace: &PathBuf) {
         .arg(checkpoint_path.to_str().unwrap_or(""))
         .arg("--skip-deposit-check")
         .env("RUST_LOG", "clob_test=info,rust_engine=info")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
         .spawn();
 
     match child {
         Ok(mut c) => {
-            tracing::info!("[D6 Helper] Main restarted as PID {}. Tailing output...", c.id());
-
-            // Read stderr (tracing output) line by line and write to both our stdout and log file
-            let stderr = c.stderr.take();
-            let log_path_clone = log_path.clone();
-            let reader_thread = std::thread::spawn(move || {
-                use std::io::{BufRead, Write};
-                let mut log_file = std::fs::File::create(&log_path_clone).unwrap();
-                if let Some(stderr) = stderr {
-                    let reader = std::io::BufReader::new(stderr);
-                    for line in reader.lines() {
-                        if let Ok(line) = line {
-                            let _ = writeln!(log_file, "{}", line);
-                            let _ = log_file.flush();
-                            eprintln!("[RESUMED] {}", line);
-                        }
-                    }
-                }
-            });
-
+            tracing::info!("[D6 Helper] Main restarted as PID {}. Output inherited to helper stderr.", c.id());
             match c.wait() {
-                Ok(status) => {
-                    tracing::info!("[D6 Helper] Main exited with: {}", status);
-                }
-                Err(e) => {
-                    tracing::error!("[D6 Helper] Failed to wait for main: {}", e);
-                }
+                Ok(status) => tracing::info!("[D6 Helper] Main exited with: {}", status),
+                Err(e) => tracing::error!("[D6 Helper] Failed to wait for main: {}", e),
             }
-            let _ = reader_thread.join();
         }
         Err(e) => {
             tracing::error!("[D6 Helper] Failed to restart main: {}", e);
@@ -275,6 +252,67 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
     let (cancelled, err) = executor.cancel_all_orders();
     tracing::info!("[D6 Helper] Cancelled {} orders (err={:?})", cancelled, err);
 
+    // Wait for on-chain confirmation: poll Data API until positions show confirmed shares.
+    // The main process bought shares via GTC orders — they need to settle on-chain
+    // before the helper can sell them.
+    let http = reqwest::blocking::Client::new();
+    let positions_url = format!(
+        "https://data-api.polymarket.com/positions?user={}&sizeThreshold=0",
+        wallet_address.to_lowercase()
+    );
+
+    // Extract the token_id of the position we want to sell
+    let target_token_id = {
+        let markets = pos.get("markets").and_then(|v| v.as_object());
+        markets.and_then(|m| m.values().next())
+            .and_then(|leg| leg.get("token_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    tracing::info!("[D6 Helper] Waiting for on-chain confirmation of token {}...", &target_token_id[..target_token_id.len().min(20)]);
+
+    let mut confirmed_shares = 0.0f64;
+    for attempt in 1..=12 {  // Max 60s (12 × 5s)
+        let data_api_positions: Vec<serde_json::Value> = http.get(&positions_url)
+            .send().and_then(|r| r.json()).unwrap_or_default();
+
+        confirmed_shares = data_api_positions.iter()
+            .filter(|dp| dp.get("asset").and_then(|v| v.as_str()) == Some(&target_token_id))
+            .filter_map(|dp| dp.get("size").and_then(|v| v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))))
+            .sum();
+
+        if confirmed_shares > 0.0 {
+            tracing::info!("[D6 Helper] Confirmed: {:.2} shares on-chain (attempt {})", confirmed_shares, attempt);
+            break;
+        }
+        tracing::info!("[D6 Helper] Waiting for confirmed shares... (attempt {}/12)", attempt);
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+
+    if confirmed_shares <= 0.0 {
+        tracing::error!("[D6 Helper] No confirmed shares after 60s — cannot sell. Proceeding to restart.");
+        // Clear D6 flag and restart main without selling
+        ipc::clear_d6_flag(workspace);
+        // Still restart main so the test can continue (D6 will fail)
+        restart_main(workspace);
+        return;
+    }
+
+    // Log all confirmed positions
+    let data_api_positions: Vec<serde_json::Value> = http.get(&positions_url)
+        .send().and_then(|r| r.json()).unwrap_or_default();
+    tracing::info!("[D6 Helper] Data API shows {} positions:", data_api_positions.len());
+    for dp in &data_api_positions {
+        let title = dp.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+        let size = dp.get("size").and_then(|v| v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0.0);
+        let asset = dp.get("asset").and_then(|v| v.as_str()).unwrap_or("");
+        tracing::info!("[D6 Helper]   {} size={:.2} asset={}...", &title[..title.len().min(40)], size, &asset[..asset.len().min(20)]);
+    }
+
     // Extract market legs from the position JSON
     let markets = pos.get("markets").and_then(|v| v.as_object());
     let markets = match markets {
@@ -285,17 +323,24 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
         }
     };
 
-    let clob = ClobClient::new(clob_host);
-
     // Sell each leg of the first position
     let mut sell_legs = Vec::new();
     for (market_id, leg) in markets {
         let outcome = leg.get("outcome").and_then(|v| v.as_str()).unwrap_or("yes");
-        let shares = leg.get("shares").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        if shares <= 0.0 { continue; }
+        let checkpoint_shares = leg.get("shares").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if checkpoint_shares <= 0.0 { continue; }
 
         // Read token_id from serialized MarketLeg (populated by fill_tracker)
         let token_id = leg.get("token_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        // Use confirmed share count from Data API (already verified above)
+        let shares = data_api_positions.iter()
+            .find(|dp| dp.get("asset").and_then(|v| v.as_str()) == Some(&token_id))
+            .and_then(|dp| dp.get("size").and_then(|v| v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))))
+            .unwrap_or(checkpoint_shares);
+        tracing::info!("[D6 Helper] Shares: checkpoint={:.2}, confirmed={:.2}, selling={:.2}",
+            checkpoint_shares, shares, shares);
         if token_id.is_empty() {
             tracing::warn!("[D6 Helper] No token_id for market {} in checkpoint. \
                 Was fill_tracker used to enter this position?", market_id);
@@ -319,18 +364,23 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) {
             accepting_orders: true,
         });
 
-        // Get best bid
-        let bid = clob.get_best_bid(&token_id);
-        if bid <= 0.0 {
-            tracing::warn!("[D6 Helper] No bid for token {} in market {}", token_id, market_id);
-            continue;
-        }
+        // Sell at 80% of best bid — fills quickly without giving away value
+        let best_bid = {
+            let book_url = format!("{}/book?token_id={}", clob_host, token_id);
+            reqwest::blocking::Client::new().get(&book_url).send().ok()
+                .and_then(|r| r.json::<serde_json::Value>().ok())
+                .and_then(|b| b.get("bids")?.as_array()?.iter()
+                    .filter_map(|o| o.get("price")?.as_str()?.parse::<f64>().ok())
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)))
+                .unwrap_or(0.0)
+        };
+        let sell_price = if best_bid > 0.0 { (best_bid * 0.80 * 1000.0).floor() / 1000.0 } else { 0.001 };
+        let sell_price = sell_price.max(0.001);
+        let sell_value = shares * sell_price;
+        tracing::info!("[D6 Helper] SELL leg: market={} shares={:.2} best_bid={:.4} price={:.4} value={:.4}",
+            market_id, shares, best_bid, sell_price, sell_value);
 
-        let sell_value = shares * bid;
-        tracing::info!("[D6 Helper] SELL leg: market={} shares={:.2} bid={:.4} value={:.2}",
-            market_id, shares, bid, sell_value);
-
-        sell_legs.push((market_id.clone(), token_id.to_string(), Side::Sell, bid, sell_value));
+        sell_legs.push((market_id.clone(), token_id.to_string(), Side::Sell, sell_price, sell_value));
     }
 
     if sell_legs.is_empty() {

@@ -15,6 +15,9 @@ pub fn run_circuit_breaker(
 ) -> TestResult {
     let start = std::time::Instant::now();
 
+    // Debug: verify notifier is active before sending
+    tracing::info!("[D7a] Notifier active: {}", notifier.is_active());
+
     let total_value = engine.total_value();
     let now = crate::now_secs();
 
@@ -67,11 +70,16 @@ pub fn run_circuit_breaker(
     tracing::info!("[D7a] Circuit breaker tripped: {}", trip_result.as_ref().unwrap());
 
     // 5. Send Telegram notification (test that notification mechanism works)
-    let _ = notifier.send(&rust_engine::notify::NotifyEvent::CircuitBreaker {
-        reason: format!("[D7a TEST] {}", trip_result.unwrap()),
-    });
+    let cb_reason = format!("[D7a TEST] {}", trip_result.unwrap());
+    match notifier.send(&rust_engine::notify::NotifyEvent::CircuitBreaker {
+        reason: cb_reason.clone(),
+    }) {
+        Ok(()) => tracing::info!("[D7a] CircuitBreaker notification sent successfully"),
+        Err(e) => tracing::error!("[D7a] CircuitBreaker notification FAILED: {}", e),
+    }
 
     let elapsed = start.elapsed().as_millis() as u64;
+    // Buffer the PASS message (will be sent with next flush)
     crate::notify(notifier, "[CLOB-TEST] D7a PASSED: circuit breaker tripped correctly");
 
     TestResult::pass("D7a", "Circuit Breaker", elapsed,
@@ -119,10 +127,7 @@ pub fn run_kill_switch(
     engine.kill_switch.store(false, std::sync::atomic::Ordering::SeqCst);
 
     let elapsed = start.elapsed().as_millis() as u64;
-    crate::notify(notifier, &format!(
-        "[CLOB-TEST] D7b PASSED: kill switch cancelled {} orders",
-        cancelled
-    ));
+    crate::notify(notifier, &format!("[CLOB-TEST] D7b PASSED: kill switch cancelled {} orders", cancelled));
 
     TestResult::pass("D7b", "Kill Switch", elapsed,
         serde_json::json!({
