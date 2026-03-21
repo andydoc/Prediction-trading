@@ -55,14 +55,13 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 
 ---
 
-## Milestone D: CLOB Integration Test — 🔧 In Progress
+## Milestone D: CLOB Integration Test — ✅ Complete
 
 **Goal**: Prove full execution path works against real Polymarket CLOB. Place, fill, cancel, and reconcile real micro-orders. Target: 1 week.
 
 | Status | Count |
 |--------|-------|
-| ✅ Complete | 7/8 |
-| 🔧 In Progress | 1/8 |
+| ✅ Complete | 8/8 |
 
 **VPS**: is*hosting Madrid (176.97.72.199). Interim location — Dublin (Interxion DC, 0.83ms latency) planned when capacity available.
 **Funds**: ~$50 USDC.e deposited, wallet 0x21f1...fb1.
@@ -75,7 +74,7 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 | D3: Real micro-fill | ✅ | FAK BUY at market price |
 | D4: negRisk market fill | ✅ | negRisk-specific signing |
 | D5: Multi-leg arb execution | ✅ | WS User Channel fill tracking confirmed. Auth fix: WS uses raw creds (not HMAC). |
-| D6: Cold-start reconciliation | 🔧 | B4 persistence: instruments + accounting checkpoint + journal survive restart. Needs clean D1-D8 run. |
+| D6: Cold-start reconciliation | ✅ | B4 persistence + checkpoint restore + reconciliation detects helper sell via QuantityMismatch. |
 | D7a: Circuit breaker | ✅ | Engine state validation |
 | D7b: Kill switch | ✅ | Executor cancel-all |
 | D8: Closeout positions | ✅ | Real SELL orders + accounting verification |
