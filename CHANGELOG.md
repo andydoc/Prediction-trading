@@ -7,6 +7,21 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.15.2] — 2026-03-21 — B4 Startup Persistence + Merge to Main
+
+### Added
+- **Instrument SQLite persistence**: New `instruments` table stores token_id, market_id, outcome, condition_id, neg_risk, tick_size. InstrumentStore loads from SQLite on startup (warm cache before scanner runs), persists after each scanner ingest.
+- **Accounting checkpoint persistence**: New `checkpoints` table stores AccountingLedger JSON blob. Orchestrator saves checkpoint in `save_state()`, restores in `load_state()`. Double-entry ledger now survives restarts.
+- **Journal table wiring**: Production orchestrator flushes unflushed journal entries to SQLite each save cycle. `flushed_count` field tracks flush watermark.
+
+### Fixed
+- **D8 closeout token_id lookup**: Now prefers `MarketLeg.token_id` (set by fill_tracker) over instrument store lookup. Fixes closeout after restart when instrument store hasn't been populated by scanner yet.
+
+### Changed
+- **Merged test/milestone-d-integration to main**: All production modules (accounting.rs, clob_test harness, WS auth fix, Data API reconciliation) now on main branch.
+
+---
+
 ## [0.15.1] — 2026-03-20 — WS User Channel Auth Fix + D5/D6/D8 Progress
 
 ### Fixed

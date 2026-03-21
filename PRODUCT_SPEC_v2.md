@@ -399,9 +399,9 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | ✅ **D3: Execute a real micro-fill** | PASS | FAK BUY at market price. Fill received, order accepted by CLOB. |
 | ✅ **D4: Test negRisk fill** | PASS | negRisk market fill with correct signing. |
 | ✅ **D5: Test multi-leg arb execution** | PASS | 2-leg forced BUY with WS User Channel fill tracking. Auth fix: WS uses raw creds (not HMAC). |
-| 🔧 **D6: Test reconciliation cold-start** | IN PROGRESS | Orchestrator reordered (D5 before D6 trigger). Position count check replaces phantom ID list. |
+| 🔧 **D6: Test reconciliation cold-start** | IN PROGRESS | B4 persistence added: instruments + accounting checkpoint + journal survive restart. Needs clean D1-D8 verification. |
 | ✅ **D7: Test circuit breaker + kill switch** | PASS | (a) Circuit breaker state validated. (b) Kill switch cancel-all executed. |
-| ✅ **D8: Resolve or sell test positions** | PASS | Real SELL orders at best bid. Accounting verified. |
+| ✅ **D8: Resolve or sell test positions** | PASS | Real SELL orders at best bid. Accounting verified. Token_id lookup fixed: prefer MarketLeg.token_id over instrument store. |
 
 **Exit criteria**: All 8 tasks pass. Zero unexplained discrepancies between internal state and CLOB. All funds accounted for. Ready to proceed to 14-day shadow validation.
 

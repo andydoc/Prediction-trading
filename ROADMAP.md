@@ -75,7 +75,7 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 | D3: Real micro-fill | ✅ | FAK BUY at market price |
 | D4: negRisk market fill | ✅ | negRisk-specific signing |
 | D5: Multi-leg arb execution | ✅ | WS User Channel fill tracking confirmed. Auth fix: WS uses raw creds (not HMAC). |
-| D6: Cold-start reconciliation | 🔧 | Orchestrator reordered (D5 before D6 trigger). Position count check replaces phantom ID list. |
+| D6: Cold-start reconciliation | 🔧 | B4 persistence: instruments + accounting checkpoint + journal survive restart. Needs clean D1-D8 run. |
 | D7a: Circuit breaker | ✅ | Engine state validation |
 | D7b: Kill switch | ✅ | Executor cancel-all |
 | D8: Closeout positions | ✅ | Real SELL orders + accounting verification |

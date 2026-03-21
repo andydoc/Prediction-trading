@@ -141,8 +141,9 @@ Telegram (auto-detected) or generic webhook notifications. Bot token from `secre
 rust_engine/src/
 ├── lib.rs              # TradingEngine: root of all shared state
 ├── types.rs            # Core types: OrderBook, OrderedFloat, EngineConfig
-├── state.rs            # SQLite state persistence (positions, scalars)
+├── state.rs            # SQLite state persistence (positions, scalars, instruments, checkpoints, journal)
 ├── cached_db.rs        # Generic in-memory SQLite with disk backup
+├── accounting.rs       # Double-entry accounting ledger (journal entries, dedup, reconciliation)
 ├── book.rs             # BookMirror: concurrent order book cache
 ├── queue.rs            # EvalQueue: two-tier eval task queue
 ├── eval.rs             # Batch constraint evaluator + ConstraintStore
@@ -150,7 +151,8 @@ rust_engine/src/
 ├── position.rs         # PositionManager: lifecycle, capital accounting
 ├── detect.rs           # Constraint detector
 ├── scanner.rs          # Polymarket Gamma API market scanner
-├── instrument.rs       # Instrument model (tick_size, rounding)
+├── instrument.rs       # Instrument model (tick_size, rounding, SQLite persistence)
+├── ws_user.rs          # Authenticated WS User Channel (fill tracking)
 ├── ws.rs               # Legacy flat WS manager (deprecated)
 ├── ws_pool.rs          # ConnectionPool: long-lived WS connections
 ├── ws_tiered.rs        # TieredWsManager: Tier B + C facade
@@ -361,6 +363,25 @@ Standalone binary (`clob-test`) exercising the full execution path against real 
 - `--skip-tests` flag for selective reruns
 
 **Crate**: `clob_test/` — depends on `rust_engine`
+
+---
+
+## Persistence Layer (B4)
+
+SQLite in-memory DB with periodic disk backup (`state.rs` + `cached_db.rs`). Tables:
+
+| Table | Purpose | Save trigger |
+|-------|---------|-------------|
+| `scalars` | Capital, metrics, CB peak | Every save cycle |
+| `positions` | Position JSON (open/closed) | Every save cycle |
+| `instruments` | Token IDs, tick sizes, rounding | After scanner ingest |
+| `checkpoints` | Accounting ledger JSON blob | Every save cycle |
+| `journal` | Double-entry journal entries | Incremental flush each save cycle |
+| `strategy_*` | Virtual portfolio state | Every save cycle |
+
+**Startup sequence**: `load_from_disk()` → restore instruments → restore positions → restore accounting ledger → B4.1 reconciliation.
+
+**Accounting ledger** (`accounting.rs`): Independent double-entry record of all cash movements. Dedup via `recorded_trade_ids` prevents double-counting from WS + REST. Serialized/deserialized as JSON checkpoint. Journal entries flushed incrementally to `journal` table for audit trail.
 
 ---
 
