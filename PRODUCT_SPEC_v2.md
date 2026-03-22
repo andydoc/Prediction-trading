@@ -147,16 +147,15 @@ The following inconsistencies were identified. These will be addressed by the do
 ```
 ✅ Milestone A: Complete Rust Port + parameterise config + docs (CHANGELOG, INCIDENT_LOG)
     |
-✅ Milestone B: Build Execution Infrastructure + docs (ARCHITECTURE, ROADMAP)
-    |                Complete. 27/27 tasks. 44/44 tests. Shadow-verified on VPS.
-    |                No funded account required.
+🔧 Milestone B: Build Execution Infrastructure + docs (ARCHITECTURE, ROADMAP)
+    |                🔧 Rework: B2.3 (rounding), B3.2 (trade lifecycle), B4.0/B4.1 (enhanced recon)
+    |                24/27 complete, 3 in rework + 2 new (B4.5, B4.6).
     |
 ✅ Milestone C: Safety Infrastructure + docs (OPS_RUNBOOK, USER_GUIDE) + retire PROGRESS_ROADMAP
     |                Complete. 10/10 tasks. No funded account required.
     |
-🔧 Milestone D: CLOB Integration Test (small deposit: ~$50 USDC + POL gas) — 7/8 PASS
-    |                Prove the execution path works against the real CLOB.
-    |                Place, fill, cancel, and reconcile real micro-orders.
+✅ Milestone D: CLOB Integration Test (small deposit: ~$50 USDC + POL gas) — 8/8 PASS
+    |                Complete. All tests passing on VPS.
     |
 ⬚ Milestone E: Shadow Validation (14 days, 6× shadow accounts, parameter optimisation)
     |                No additional funds required. Shadow trades only.
@@ -292,7 +291,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 ---
 
-### ✅ Milestone B: Build Execution Infrastructure
+### 🔧 Milestone B: Build Execution Infrastructure
 
 **Status**: **COMPLETE** — All 27/27 tasks done (B1–B5). 44/44 unit tests pass. Shadow mode verified on VPS. ARCHITECTURE.md and ROADMAP.md written.
 
@@ -323,7 +322,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | Task | Acceptance Criteria |
 |------|-------------------|
 | ✅ **B2.0: Rust EIP-712 order signing** | Pure Rust implementation using `alloy` (or `ethers-rs`). Covers: (a) EIP-712 domain separator with Polymarket CLOB Exchange contract address and Polygon chain ID 137, (b) Order struct hashing per Polymarket typed data schema (`salt`, `maker`, `signer`, `taker`, `tokenId`, `makerAmount`, `takerAmount`, `expiration`, `nonce`, `feeRateBps`, `side`, `signatureType`), (c) ECDSA signing with private key from `secrets.yaml`, (d) signature type 0 (EOA) output. **Verified by**: construct 5 test orders, sign in both Rust and py-clob-client, assert identical signatures. No CLOB submission needed — signature comparison is sufficient. **Pre-req**: read py-clob-client `order_builder/` source and Polymarket CLOB API signing docs. |
-| ✅ **B2.3: Formal instrument model** | Typed Rust struct: `tick_size`, `price_increment`, `size_increment`, `min_order_size`, `max_order_size`, `neg_risk`, `condition_id`, `token_id`, `signature_type`. Encode py-clob-client `ROUNDING_CONFIG` rules (tick size → price/size/amount decimal precision hierarchy). `neg_risk` flag determines exchange contract routing (CLOB Exchange vs Neg Risk Exchange). Instruments loaded from MarketScanner data at startup. **Pre-req**: study NT `BinaryOption` type and py-clob-client `ROUNDING_CONFIG`. |
+| 🔧 **B2.3: Formal instrument model** | Typed Rust struct: `tick_size`, `price_increment`, `size_increment`, `min_order_size`, `max_order_size`, `neg_risk`, `condition_id`, `token_id`, `signature_type`. Encode py-clob-client `ROUNDING_CONFIG` rules (tick size → price/size/amount decimal precision hierarchy). `neg_risk` flag determines exchange contract routing (CLOB Exchange vs Neg Risk Exchange). Instruments loaded from MarketScanner data at startup. **Rework needed**: FAK vs GTC have different precision rules (market orders swap decimal limits). `compute_amounts_for_order_type()` added but rounding must be verified against all tick sizes and order types. |
 | ✅ **B2.4: Dynamic tick size handling** | Tier C WebSocket parses `tick_size_change` events. On receipt: update instrument's tick/price/size/amount precision per `ROUNDING_CONFIG`. In-flight order validation uses current tick size at submission time. Log all changes. Recalculate precision for pending orders on affected instruments. |
 
 #### B-Part 3: Executor, Pipeline & Rate Limiting (no funds needed — built in dry-run / shadow mode)
@@ -332,22 +331,24 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 |------|-------------------|
 | ✅ **B3.0: Market BUY quantity guard** | Enforced at executor boundary: (a) Market BUY → quantity = USDC notional (quote). (b) Market SELL → quantity = token count (base). (c) Limit/FAK → quantity = token count (base). (d) Base-denominated market BUY rejected with error log, never submitted. Prevents oversized fills. Unit test covers all 4 cases. |
 | ✅ **B3.1: Wire LiveExecutor (dry-run)** | CLOB `create_order()` calls for all legs of an arb. Uses B2.0 signing, B2.3 instrument model, B3.0 quantity guard. Passes `neg_risk: true` for negRisk markets. Uses FAK (Fill And Kill) order type. In `--dry-run` mode: constructs and signs orders, logs full details, but does not submit to CLOB. Handles: success, partial fill, rejection, timeout as state transitions. **Design decision**: signature type 0 (EOA). Document in ARCHITECTURE.md. **Fast-market note**: For short-lived markets (Shadow-F), FAK limit orders placed 1 tick into the book provide the best fill-rate vs price tradeoff. Market orders guarantee fill but sacrifice spread; passive limit orders risk non-fill on a 5-min market. Config key `live_trading.order_aggression` (values: `passive`, `at_market`, `aggressive`) controls tick offset per instance. |
-| ✅ **B3.2: Trade status pipeline** | After MATCHED, track status via Tier C WebSocket: MATCHED → MINED → CONFIRMED → RETRYING → FAILED. (a) CONFIRMED: finalise position entry. (b) RETRYING: log warning, hold in "pending" state, exclude from replacement queue. (c) FAILED: roll back entry, restore capital, Telegram alert. (d) No update within `live_trading.trade_confirmation_timeout_seconds` (default 120s): query CLOB API, reconcile. Position not "open" until CONFIRMED. Dedup on `trade_id`. |
+| 🔧 **B3.2: Trade status pipeline** | After MATCHED, track status via WS User Channel: MATCHED → MINED → CONFIRMED → RETRYING → FAILED. (a) MATCHED: enter suspense immediately (production speed). (b) CONFIRMED: promote to real position. (c) RETRYING: log warning, hold in suspense. (d) FAILED: roll back entry, restore capital, sell opposing arb legs, Telegram alert. (e) No WS update within timeout: Data API fallback (parallel race). `id` (trade UUID) is lifecycle correlation key. Dedup duplicate CONFIRMED by `id`. ~20% of trades never get CONFIRMED via WS — Data API fallback mandatory. |
 | ✅ **B3.3: Execution rate limiting** | Token-bucket rate limiter: 60 orders/min trading, 100 req/min public, 300 req/min auth, 3,000 req/10min global. Logs when throttled. Prevents 429 bans. **Pre-req**: study NT rate limit implementation and Polymarket API docs for current limits. |
 | ✅ **B3.4: Timestamp normalisation** | Robust parsing across all API responses: ISO8601 with/without timezone, Unix seconds vs milliseconds, missing/null timestamps. Single `parse_polymarket_timestamp()` function used everywhere. **Pre-req**: study NT issue #3273 and fix for edge cases. |
 | ✅ **B3.5: Error handling matrix** | Defined behaviour for: CLOB API timeout (retry once, then abort + unwind), CLOB rejection (log + skip), network failure (pause trading, alert, retry connection), insufficient balance (pause trading, alert), rate limit 429 (back off per token bucket). |
 | ✅ **B3.6: Partial fill handling** | After submitting all legs: check actual fills via order status. Compute arb score of filled position. If score ≥ threshold: accept. If score < threshold: compute minimum unwind. If no acceptable partial: full unwind. Log all partial fill events. **Note**: code-complete at this point; real partial fills tested in Milestone D. |
 | ✅ **B3.7: Batch order submission** | Submit all legs of a multi-leg arb as a single batch request. Reduces latency window for partial-fill exposure on 3+ leg positions. **Pre-req**: study NT PR #3506 source before building. |
 
-#### B-Part 4: Reconciliation & Tracking (no funds needed — code-complete, tested in Milestone D)
+#### B-Part 4: Reconciliation & Tracking (🔧 rework in progress — enhanced reconciliation from D6 findings)
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| ✅ **B4.0: Position reconciliation (periodic)** | Every `live_trading.reconciliation_interval_seconds`: query CLOB for actual positions. Compare with internal record. Alert on discrepancy. Log results. Source of truth: CLOB API contract balances (same as NT Gamma API approach). On-chain `balanceOf` query as escalation when CLOB/internal differ by > `live_trading.reconciliation_escalation_threshold` (default $1.00). If `umaResolutionStatus == "disputed"` on a market: flag position as `disputed`, exclude from replacement queue, Telegram alert. Resume normal lifecycle when dispute resolves. **Shadow mode**: when no venue credentials are configured, reconciliation skips CLOB comparison and reports positions as checked (no false alarms). |
-| ✅ **B4.1: Venue-side reconciliation on startup** | On every startup: query CLOB for contract balances and open orders. Compare against SQLite state. Report discrepancies before resuming trading. **Pre-req**: study NT `generate_order_status_reports` pattern. |
+| 🔧 **B4.0: Position reconciliation (periodic)** | Every `live_trading.reconciliation_interval_seconds`: query Data API for actual positions (CLOB has no /positions endpoint). Compare quantities per market. Alert on discrepancy. Source of truth: venue (Data API, with on-chain `balanceOf` escalation when delta > threshold). `apply_reconciliation()` updates internal state to match venue. Data API has indexer lag — poll until stable (two identical successive reads). **Shadow mode**: skip CLOB comparison, no false alarms. **Rework needed**: ensure periodic reconciliation uses same enhanced flow as D6 startup (freshness polling, apply_reconciliation, accounting adjustments). |
+| 🔧 **B4.1: Venue-side reconciliation on startup** | On startup: 1) load state from SQLite (instruments + positions + accounting), 2) load venue state (Data API positions, open orders, USDC.e balance, POL balance), 3) poll Data API until stable, 4) reconcile — detect discrepancies (QuantityMismatch, MissingOnVenue, MissingInternal), 5) report + notify, 6) `apply_reconciliation()` updates internal state to match venue. Cancel stale orders. Compare USDC on-chain vs accounting cash. **Rework needed**: ensure production orchestrator startup uses same enhanced flow as D6 verify. |
 | ✅ **B4.2: Cross-asset fill matching** | When a YES fill executes on a negRisk market, Polymarket implicitly creates corresponding NO positions on complementary outcomes. Detect and reconcile these synthetic fills against internal position state. **Pre-req**: study NT PR #3345/#3357 source. |
 | ✅ **B4.3: FOK/FAK overfill handling** | Detect when FAK limit orders receive more fill than expected. Adjust internal position state, log discrepancy. **Pre-req**: study NT issue #3221 and fix. |
 | ✅ **B4.4: Live P&L tracking** | Dashboard shows: realised P&L (closed), unrealised P&L (open, marked to market via BookMirror best bids), fees paid, net return %. Portfolio chart plots 5 time-series: Total Value ($), Unrealized P&L ($, yellow filled), Realized P&L ($, magenta dashed), Deployed (%), Drawdown (%). Stats bar: Total Value → Deployed % → Win % → Drawdown (now/max) → Profit Factor → Recovery → Sharpe → Sortino → Avg Hold. Updated via SSE every 5s (full snapshot + delta). |
+| 🔧 **B4.5: Parallel trade confirmation** | WS User Channel drops ~20% of CONFIRMED events (D investigation 2026-03-22). Run WS listener + Data API poller in async parallel, take first confirmation. Integrate across: fill_tracker, D6 helper, D8 closeout, production executor. `id` (trade UUID) is the reliable WS lifecycle correlation key. MATCHED trades enter suspense account; CONFIRMED promotes to real position; FAILED reverses + sells opposing arb legs. |
+| 🔧 **B4.6: USDC.e balance monitor** | Periodic on-chain USDC.e balance check in production engine (like gas_monitor for POL). Alert if drift from accounting cash exceeds threshold (default $1.00). |
 
 #### B-Part 5: Documentation
 
@@ -381,7 +382,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 ---
 
-### 🔧 Milestone D: CLOB Integration Test
+### ✅ Milestone D: CLOB Integration Test
 
 **Goal**: Prove the full execution path works against the real Polymarket CLOB. Place, fill, cancel, and reconcile real micro-orders. This is a focused, short milestone (target: 1 week) that validates everything built in Milestone B before committing to the 14-day shadow validation.
 
@@ -399,7 +400,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | ✅ **D3: Execute a real micro-fill** | PASS | FAK BUY at market price. Fill received, order accepted by CLOB. |
 | ✅ **D4: Test negRisk fill** | PASS | negRisk market fill with correct signing. |
 | ✅ **D5: Test multi-leg arb execution** | PASS | 2-leg forced BUY with WS User Channel fill tracking. Auth fix: WS uses raw creds (not HMAC). |
-| 🔧 **D6: Test reconciliation cold-start** | IN PROGRESS | GTC sell at best bid placed, helper waiting for WS MATCHED→CONFIRMED before restart. Requires real venue state change. |
+| ✅ **D6: Test reconciliation cold-start** | PASS | Data API freshness polling, venue state change detection, `apply_reconciliation` (venue is source of truth). FAK/GTC amount precision fix. |
 | ✅ **D7: Test circuit breaker + kill switch** | PASS | (a) Circuit breaker state validated. (b) Kill switch cancel-all executed. |
 | ✅ **D8: Resolve or sell test positions** | PASS | Real SELL orders at best bid. Accounting verified. Token_id lookup fixed: prefer MarketLeg.token_id over instrument store. |
 

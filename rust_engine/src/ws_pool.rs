@@ -80,6 +80,10 @@ pub struct PoolStats {
     pub connections_active: Arc<AtomicU32>,
     pub assets_subscribed: Arc<AtomicU64>,
     pub msgs_received: Arc<AtomicU64>,
+    /// E2.5: Counters for stress test failure signal detection.
+    pub reconnects: Arc<AtomicU64>,
+    pub pong_timeouts: Arc<AtomicU64>,
+    pub heartbeat_send_failures: Arc<AtomicU64>,
 }
 
 /// A pool of long-lived WebSocket connections with dynamic subscription management.
@@ -505,6 +509,7 @@ async fn connection_loop(
                 if lived_secs > 30 {
                     backoff_ms = 1000;
                 }
+                stats.reconnects.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("{}: error after {}s: {}, reconnecting in {}ms",
                     label, lived_secs, e, backoff_ms);
             }
@@ -598,10 +603,12 @@ async fn connection_session(
                 if last_pong.elapsed() > pong_timeout {
                     tracing::warn!("{}: no PONG for {}s, treating as dead",
                         label, last_pong.elapsed().as_secs());
+                    stats.pong_timeouts.fetch_add(1, Ordering::Relaxed);
                     return Err("pong timeout".into());
                 }
                 if let Err(e) = sink.send(WsMessage::Text("PING".to_string())).await {
                     tracing::warn!("{}: heartbeat send failed: {}", label, e);
+                    stats.heartbeat_send_failures.fetch_add(1, Ordering::Relaxed);
                     return Err(Box::new(e));
                 }
             }

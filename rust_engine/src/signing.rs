@@ -495,35 +495,50 @@ pub fn random_salt() -> U256 {
 ///
 /// Returns (maker_amount, taker_amount) in raw token units.
 ///
-/// Rounding follows Polymarket's precision rules:
-/// - BUY: makerAmount (USDC) rounded to `amount_decimals`, takerAmount (shares) rounded down
-/// - SELL: makerAmount (shares), takerAmount (USDC) similarly rounded
+/// Polymarket CLOB has different precision rules for GTC (limit) vs FAK (market) orders:
 ///
-/// `amount_decimals` comes from the tick size rounding config (e.g., 4 for 0.001 tick).
+/// **GTC (limit) orders:**
+///   BUY:  makerAmount = USDC (max `amount_decimals`), takerAmount = shares (max 2 decimals)
+///   SELL: makerAmount = shares (max 2 decimals), takerAmount = USDC (max `amount_decimals`)
+///
+/// **FAK (market) orders — precision is swapped:**
+///   BUY:  makerAmount = USDC (max 2 decimals), takerAmount = shares (max `amount_decimals`)
+///   SELL: makerAmount = shares (max `amount_decimals`), takerAmount = USDC (max 2 decimals)
+///
+/// `amount_decimals` comes from the tick size rounding config (e.g., 5 for 0.001 tick).
 pub fn compute_amounts(price: f64, size_usd: f64, side: Side, amount_decimals: u32) -> (U256, U256) {
-    let scale = 10f64.powi(6); // Always 6 decimal raw units (USDC = 6 decimals, CTF = 6 decimals)
-    let round_scale = 10f64.powi(amount_decimals as i32);
+    compute_amounts_for_order_type(price, size_usd, side, amount_decimals, false)
+}
 
-    // Polymarket precision: shares always use 2 decimal places (size_decimals),
-    // USDC uses amount_decimals from the tick size config.
-    let shares_round = 100.0f64;  // Always 2 decimal places for shares
-    let amount_round = 10f64.powi(amount_decimals as i32);
+/// Like compute_amounts but with explicit market order flag.
+pub fn compute_amounts_for_order_type(
+    price: f64, size_usd: f64, side: Side, amount_decimals: u32, is_market_order: bool,
+) -> (U256, U256) {
+    let scale = 10f64.powi(6); // 6 decimal raw units (USDC = 6 decimals, CTF = 6 decimals)
+    let size_round = 100.0f64;  // 2 decimal places
+    let amt_round = 10f64.powi(amount_decimals as i32);
+
+    // For market (FAK) orders, the precision rules are swapped vs limit (GTC).
+    let (usdc_round, shares_round) = if is_market_order {
+        (size_round, amt_round)   // FAK: USDC=2dec, shares=amount_decimals
+    } else {
+        (amt_round, size_round)   // GTC: USDC=amount_decimals, shares=2dec
+    };
 
     match side {
         Side::Buy => {
-            // Round shares first, then derive USDC from shares × price
+            // BUY: maker=USDC, taker=shares
             let shares_human = (size_usd / price * shares_round).floor() / shares_round;
             let taker = (shares_human * scale).round() as u128;
-            // makerAmount must equal shares × price (internally consistent)
-            let maker_human = (shares_human * price * amount_round).round() / amount_round;
+            let maker_human = (shares_human * price * usdc_round).round() / usdc_round;
             let maker = (maker_human * scale).round() as u128;
             (U256::from(maker), U256::from(taker))
         }
         Side::Sell => {
-            // Round shares first, then derive USDC from shares × price
+            // SELL: maker=shares, taker=USDC
             let shares_human = (size_usd / price * shares_round).floor() / shares_round;
             let maker = (shares_human * scale).round() as u128;
-            let taker_human = (shares_human * price * amount_round).round() / amount_round;
+            let taker_human = (shares_human * price * usdc_round).round() / usdc_round;
             let taker = (taker_human * scale).round() as u128;
             (U256::from(maker), U256::from(taker))
         }
@@ -545,7 +560,7 @@ pub fn build_order(
     build_order_with_precision(maker, token_id, price, size_usd, side, neg_risk, fee_rate_bps, amount_decimals)
 }
 
-/// Build order with explicit amount precision.
+/// Build order with explicit amount precision and order type awareness.
 pub fn build_order_with_precision(
     maker: Address,
     token_id: &str,
@@ -556,13 +571,32 @@ pub fn build_order_with_precision(
     fee_rate_bps: u64,
     amount_decimals: u32,
 ) -> Result<OrderData, String> {
+    build_order_with_precision_and_type(
+        maker, token_id, price, size_usd, side, neg_risk, fee_rate_bps, amount_decimals, false,
+    )
+}
+
+/// Build order with explicit amount precision and market order flag.
+pub fn build_order_with_precision_and_type(
+    maker: Address,
+    token_id: &str,
+    price: f64,
+    size_usd: f64,
+    side: Side,
+    neg_risk: bool,
+    fee_rate_bps: u64,
+    amount_decimals: u32,
+    is_market_order: bool,
+) -> Result<OrderData, String> {
     let token_id_u256 = U256::from_str_radix(token_id, 10)
         .map_err(|e| format!("Invalid token_id '{}': {}", token_id, e))?;
 
     // Taker is always 0x0 — neg risk routing is handled server-side by the CLOB.
     let taker = Address::ZERO;
 
-    let (maker_amount, taker_amount) = compute_amounts(price, size_usd, side, amount_decimals);
+    let (maker_amount, taker_amount) = compute_amounts_for_order_type(
+        price, size_usd, side, amount_decimals, is_market_order,
+    );
 
     Ok(OrderData {
         salt: random_salt(),

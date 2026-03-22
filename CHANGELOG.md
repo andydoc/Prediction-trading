@@ -7,6 +7,22 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.16.0] — 2026-03-22 — Milestone D Complete: 8/8 PASS
+
+### Added
+- **D6 cold-start reconciliation**: Data API freshness polling (poll until stable before reconciling), venue state change detection, `apply_reconciliation` (state → venue truth). Internal state updated to match venue as source of truth.
+- **B4 startup reconciliation**: Compare internal vs venue quantities on startup, detect + report + adjust discrepancies automatically.
+- **WS User Channel full lifecycle tracking**: MATCHED → MINED → CONFIRMED trade events. Multi-thread runtime fix for concurrent event handling.
+- **Helper**: Micro FAK buy at cheapest ask across all positions, Data API fallback for CONFIRMED status.
+
+### Fixed
+- **FAK/GTC amount precision**: Market orders (FAK) have different rounding rules than limit orders (GTC). Amount precision now varies by order type.
+
+### Status
+- **Milestone D: 8/8 PASS** (D1-D8 all passing on VPS). All acceptance criteria met. Zero unexplained discrepancies. Ready for Milestone E shadow validation.
+
+---
+
 ## [0.15.2] — 2026-03-21 — B4 Startup Persistence + Merge to Main
 
 ### Added

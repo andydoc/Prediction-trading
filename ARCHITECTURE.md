@@ -124,6 +124,12 @@ EIP-712 order signing for Polymarket CLOB Exchange. Pure Rust using `alloy-primi
 ### Reconciliation (`reconciliation.rs`)
 Compares internal position state against CLOB API venue state. Runs on startup and periodically (every 5 min). Detects: quantity mismatch, missing positions (both directions), orphan orders, negRisk synthetic fills. In shadow mode (no venue credentials): skips CLOB comparison, no false alarms.
 
+**Data API freshness polling**: Before reconciling, polls the Data API until position quantities stabilise (consecutive reads return same values). Prevents reconciling against stale venue data during fill settlement.
+
+**`apply_reconciliation`**: Venue is source of truth. When discrepancies are detected, internal state is updated to match venue quantities. Adjusts position sizes, creates missing positions, marks orphans.
+
+**FAK vs GTC amount precision**: Market orders (FAK) and limit orders (GTC) use different rounding rules for the `amount` field. FAK amounts are rounded to fewer decimals than GTC amounts for the same tick size. The executor selects the correct precision based on order type.
+
 ### Executor (`executor.rs`)
 Order execution: dry-run signing, live submission, trade status pipeline (MATCHED → MINED → CONFIRMED → FAILED), partial fill evaluation, batch order submission. Overfill detection clamps fill quantity and tracks excess.
 

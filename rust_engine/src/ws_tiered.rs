@@ -35,6 +35,10 @@ pub struct TieredWsStats {
     pub total_msgs: u64,
     pub total_connections: u32,
     pub total_assets: u64,
+    /// E2.5: Failure signal counters (aggregated across all tiers).
+    pub reconnects: u64,
+    pub pong_timeouts: u64,
+    pub heartbeat_failures: u64,
 }
 
 /// Configuration for the tiered WS manager.
@@ -209,6 +213,12 @@ impl TieredWsManager {
             total_msgs: b_msgs + c_msgs,
             total_connections: b_conns + c_conns,
             total_assets: b_assets + c_assets,
+            reconnects: b.reconnects.load(Ordering::Relaxed)
+                + c.reconnects.load(Ordering::Relaxed),
+            pong_timeouts: b.pong_timeouts.load(Ordering::Relaxed)
+                + c.pong_timeouts.load(Ordering::Relaxed),
+            heartbeat_failures: b.heartbeat_send_failures.load(Ordering::Relaxed)
+                + c.heartbeat_send_failures.load(Ordering::Relaxed),
         }
     }
 }

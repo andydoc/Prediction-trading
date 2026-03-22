@@ -559,6 +559,12 @@ pub struct Orchestrator {
     iteration: u64,
     recent_latencies: std::collections::VecDeque<f64>,
 
+    // E2.5: Cumulative counters for stress test metrics
+    evals_total: u64,
+    opps_found: u64,
+    stale_sweeps: u64,
+    stale_assets_swept: u64,
+
     // Delay table
     p95_table: HashMap<String, f64>,
     p95_default: f64,
@@ -760,6 +766,10 @@ impl Orchestrator {
             last_reconciliation: 0.0,
             iteration: 0,
             recent_latencies: std::collections::VecDeque::with_capacity(MAX_LATENCY_SAMPLES),
+            evals_total: 0,
+            opps_found: 0,
+            stale_sweeps: 0,
+            stale_assets_swept: 0,
             p95_table, p95_default,
             disk_save_handle: None,
             notifier,
@@ -1008,6 +1018,10 @@ impl Orchestrator {
             )
         };
         let batch_us = t0.elapsed().as_micros() as f64;
+
+        // E2.5: Accumulate eval/opp counters for stress test metrics
+        self.evals_total += result.n_evaluated as u64;
+        self.opps_found += result.opportunities.len() as u64;
 
         if result.n_evaluated > 0 {
             // Segment 4: eval batch duration
@@ -1272,6 +1286,8 @@ impl Orchestrator {
         // --- Stale sweep ---
         if (now - self.last_stale_sweep) >= self.cfg.stale_sweep_interval {
             let stale = self.engine.get_stale_assets(self.cfg.stale_asset_threshold);
+            self.stale_sweeps += 1;
+            self.stale_assets_swept += stale.len() as u64;
             if !stale.is_empty() {
                 tracing::trace!("Stale assets: {} > {:.0}s old", stale.len(), self.cfg.stale_asset_threshold);
             }
@@ -2249,6 +2265,10 @@ impl Orchestrator {
             "running", &chrono::Utc::now().format("%d/%m/%Y %H:%M:%S").to_string(),
             engine_status, &chrono::Utc::now().format("%d/%m/%Y %H:%M:%S").to_string(),
             self.gas_monitor.last_balance(),
+        );
+        self.engine.update_stress_counters(
+            self.evals_total, self.opps_found,
+            self.stale_sweeps, self.stale_assets_swept,
         );
 
         // Log circuit breaker state if tripped

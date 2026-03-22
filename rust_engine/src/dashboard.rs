@@ -72,6 +72,14 @@ pub struct EngineMetrics {
     pub ws_connections: u32,
     // Gas monitor (C1.1)
     pub pol_balance: Option<f64>,
+    // E2.5: Stress test failure signal counters
+    pub ws_reconnects: u64,
+    pub ws_pong_timeouts: u64,
+    pub ws_heartbeat_failures: u64,
+    pub evals_total: u64,
+    pub opps_found: u64,
+    pub stale_sweeps: u64,
+    pub stale_assets_swept: u64,
 }
 
 /// Static HTML — loaded at compile time from the extracted template.
@@ -84,6 +92,7 @@ pub async fn start(state: DashboardState, port: u16, bind_addr: &str) {
         .route("/", axum::routing::get(handle_html))
         .route("/stream", axum::routing::get(handle_sse))
         .route("/state", axum::routing::get(handle_state))
+        .route("/metrics", axum::routing::get(handle_metrics))
         .route("/api/kill-switch", axum::routing::post(handle_kill_switch))
         .with_state(Arc::new(state));
 
@@ -115,6 +124,11 @@ async fn handle_html(State(s): State<Arc<DashboardState>>) -> Html<String> {
 
 async fn handle_state(State(s): State<Arc<DashboardState>>) -> Json<Value> {
     Json(build_state_snapshot(&s))
+}
+
+/// E2.5: Flat metrics endpoint for stress test harness.
+async fn handle_metrics(State(s): State<Arc<DashboardState>>) -> Json<Value> {
+    Json(build_metrics(&s))
 }
 
 /// C2: Kill switch endpoint — POST /api/kill-switch
@@ -246,6 +260,74 @@ fn build_state_snapshot(s: &DashboardState) -> Value {
         "closed_positions": pm.closed_positions(),
         "performance": perf,
         "recent_opps": s.recent_opps.lock().clone(),
+    })
+}
+
+/// E2.5: Flat metrics snapshot for the stress test harness.
+/// Returns all metrics needed to evaluate failure signals for each parameter.
+fn build_metrics(s: &DashboardState) -> Value {
+    let m = s.engine_metrics.lock().clone();
+    let (q_urg, q_bg) = s.eval_queue.depths();
+    let n_constraints = s.constraints.len();
+    let n_markets = s.book.live_count();
+    let lat_snap = s.latency.snapshot();
+
+    // System + app metrics from monitor (collect both so ws_msg_rate gets updated)
+    let mut mon = s.monitor.lock();
+    mon.collect_system_metrics();
+    mon.collect_app_metrics(
+        m.ws_subscribed, m.ws_total_msgs, m.ws_live_books,
+        n_constraints, n_markets,
+        m.lat_p50_us, m.lat_p95_us,
+        q_urg, q_bg,
+    );
+    let cpu_pct = mon.cpu_pct.latest().unwrap_or(0.0);
+    let mem_mb = mon.mem_used_mb.latest().unwrap_or(0.0);
+    let disk_used_gb = mon.disk_used_gb.latest().unwrap_or(0.0);
+    let disk_total_gb = mon.disk_total_gb;
+    let ws_msg_rate = mon.ws_msg_rate.latest().unwrap_or(0.0);
+    drop(mon);
+
+    // Stale book counts at two thresholds (failure signals for stale_sweep/stale_asset params)
+    let stale_30 = s.book.get_stale_assets(30.0).len();
+    let stale_60 = s.book.get_stale_assets(60.0).len();
+
+    json!({
+        "iteration": m.iteration,
+        "cpu_pct": (cpu_pct * 10.0).round() / 10.0,
+        "mem_mb": (mem_mb * 10.0).round() / 10.0,
+        "disk_used_gb": (disk_used_gb * 100.0).round() / 100.0,
+        "disk_total_gb": (disk_total_gb * 100.0).round() / 100.0,
+        "queue_urgent": q_urg,
+        "queue_background": q_bg,
+        "queue_total": q_urg + q_bg,
+        "lat_p50": m.lat_p50_us,
+        "lat_p95": m.lat_p95_us,
+        "lat_max": m.lat_max_us,
+        "lat_e2e_p50": lat_snap.e2e.p50 as u64,
+        "lat_e2e_p95": lat_snap.e2e.p95 as u64,
+        "lat_eval_p50": lat_snap.eval_batch.p50 as u64,
+        "lat_eval_p95": lat_snap.eval_batch.p95 as u64,
+        "lat_queue_wait_p50": lat_snap.queue_wait.p50 as u64,
+        "lat_queue_wait_p95": lat_snap.queue_wait.p95 as u64,
+        "lat_ws_net_p50": lat_snap.ws_network.p50 as u64,
+        "lat_ws_net_p95": lat_snap.ws_network.p95 as u64,
+        "ws_msgs": m.ws_total_msgs,
+        "ws_live": m.ws_live_books,
+        "ws_connections": m.ws_connections,
+        "ws_subscribed": m.ws_subscribed,
+        "ws_msg_rate": (ws_msg_rate * 10.0).round() / 10.0,
+        "ws_reconnects": m.ws_reconnects,
+        "ws_pong_timeouts": m.ws_pong_timeouts,
+        "ws_heartbeat_failures": m.ws_heartbeat_failures,
+        "constraints": n_constraints,
+        "markets": n_markets,
+        "stale_books_30s": stale_30,
+        "stale_books_60s": stale_60,
+        "evals_total": m.evals_total,
+        "opps_found": m.opps_found,
+        "stale_sweeps": m.stale_sweeps,
+        "stale_assets_swept": m.stale_assets_swept,
     })
 }
 

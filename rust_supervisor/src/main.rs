@@ -239,6 +239,9 @@ impl SupervisorConfig {
             "arbitrage.min_resolution_time_secs",
             "engine.state_save_interval_seconds", "engine.monitor_interval_seconds",
             "engine.constraint_rebuild_interval_seconds",
+            "engine.max_evals_per_batch", "engine.efp_drift_threshold",
+            "engine.efp_staleness_seconds", "engine.stale_sweep_interval_seconds",
+            "engine.stale_asset_threshold_seconds",
             "monitoring.logging.level",
         ];
 
@@ -314,10 +317,22 @@ fn validate_override_value(key: &str, value: &str) -> Option<&'static str> {
             Some("must be in [0, 100000]"),
         "arbitrage.max_position_size" if f < 0.0 || f > 100000.0 =>
             Some("must be in [0, 100000]"),
-        "engine.state_save_interval_seconds" if f < 1.0 || f > 3600.0 =>
-            Some("must be in [1, 3600]"),
+        "engine.state_save_interval_seconds" if f < 5.0 || f > 120.0 =>
+            Some("must be in [5, 120]"),
         "engine.monitor_interval_seconds" if f < 1.0 || f > 3600.0 =>
             Some("must be in [1, 3600]"),
+        "engine.constraint_rebuild_interval_seconds" if f < 60.0 || f > 1800.0 =>
+            Some("must be in [60, 1800]"),
+        "engine.max_evals_per_batch" if f < 100.0 || f > 2000.0 =>
+            Some("must be in [100, 2000]"),
+        "engine.efp_drift_threshold" if f < 0.001 || f > 0.020 =>
+            Some("must be in [0.001, 0.020]"),
+        "engine.efp_staleness_seconds" if f < 1.0 || f > 30.0 =>
+            Some("must be in [1, 30]"),
+        "engine.stale_sweep_interval_seconds" if f < 10.0 || f > 300.0 =>
+            Some("must be in [10, 300]"),
+        "engine.stale_asset_threshold_seconds" if f < 5.0 || f > 120.0 =>
+            Some("must be in [5, 120]"),
         "dashboard.port" if f < 1.0 || f > 65535.0 =>
             Some("must be in [1, 65535]"),
         _ => None,

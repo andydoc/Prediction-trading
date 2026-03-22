@@ -423,6 +423,59 @@ impl AccountingLedger {
         }
     }
 
+    /// Record a reconciliation adjustment — venue state differs from internal state.
+    ///
+    /// Positive shares_delta = venue has more than internal (extra buy during shutdown).
+    /// Negative shares_delta = venue has less than internal (sell/resolution during shutdown).
+    ///
+    /// Double-entry: adjusts Position + Cash accounts to match venue reality.
+    pub fn record_reconciliation_adjustment(
+        &mut self,
+        position_id: &str,
+        asset_id: &str,
+        market_id: &str,
+        shares_delta: f64,
+        price: f64,
+        description: &str,
+    ) {
+        let now = now_secs();
+        let value = (shares_delta * price).abs();
+        let pid = Some(position_id.to_string());
+
+        if shares_delta > 0.0 {
+            // Venue has MORE shares — record as synthetic buy (cash → position)
+            self.add_entry(now, &format!("Position:{}", position_id),
+                value, 0.0, pid.clone(), description);
+            self.add_entry(now, "Cash", 0.0, value, pid, description);
+            self.cash -= value;
+            self.positions_deployed += value;
+
+            let holding = self.holdings.entry(asset_id.to_string()).or_insert(AssetHolding {
+                asset_id: asset_id.to_string(),
+                market_id: market_id.to_string(),
+                shares: 0.0,
+                cost_basis: 0.0,
+            });
+            holding.shares += shares_delta;
+            holding.cost_basis += value;
+        } else if shares_delta < 0.0 {
+            // Venue has FEWER shares — record as synthetic sell (position → cash)
+            let cost_basis = value; // approximate
+            self.add_entry(now, "Cash", value, 0.0, pid.clone(), description);
+            self.add_entry(now, &format!("Position:{}", position_id),
+                0.0, cost_basis, pid, description);
+            self.cash += value;
+            self.positions_deployed -= cost_basis.min(self.positions_deployed);
+
+            if let Some(holding) = self.holdings.get_mut(asset_id) {
+                holding.shares = (holding.shares + shares_delta).max(0.0);
+            }
+        }
+
+        tracing::info!("[ACCT] RECON ADJ: {} shares @ {:.4} = ${:.4} | {}",
+            shares_delta, price, value, description);
+    }
+
     /// Serialize the entire ledger to JSON string (for checkpoint persistence).
     pub fn serialize_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()

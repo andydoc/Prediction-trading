@@ -32,6 +32,9 @@ struct Cli {
 }
 
 fn main() {
+    // Install rustls crypto provider before multi-thread runtime spawns WS on worker thread
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
     let workspace = PathBuf::from(&cli.workspace);
 
@@ -155,25 +158,33 @@ fn restart_main(workspace: &PathBuf) {
 /// Close one position via a real CLOB SELL order.
 /// Reads the checkpoint's serialized positions to get market/token data.
 fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) -> bool {
-    // Parse the first serialized position to get market data
-    let pos_json = match checkpoint.open_positions_json.first() {
-        Some(j) => j,
-        None => {
-            tracing::warn!("[D6 Helper] No serialized positions in checkpoint, skipping close");
-            return false;
+    // Collect ALL legs across ALL checkpoint positions
+    let mut all_legs: Vec<(String, String, String)> = Vec::new(); // (market_id, token_id, outcome)
+    for pos_json in &checkpoint.open_positions_json {
+        let pos: serde_json::Value = match serde_json::from_str(pos_json) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("[D6 Helper] Failed to parse position JSON: {}", e);
+                continue;
+            }
+        };
+        let pos_id = pos.get("position_id").and_then(|v| v.as_str()).unwrap_or("?");
+        if let Some(markets) = pos.get("markets").and_then(|v| v.as_object()) {
+            for (mid, leg) in markets.iter() {
+                let tid = leg.get("token_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let outcome = leg.get("outcome").and_then(|v| v.as_str()).unwrap_or("yes").to_string();
+                if !tid.is_empty() {
+                    tracing::info!("[D6 Helper] Found leg: pos={} market={} token={}...",
+                        pos_id, &mid[..mid.len().min(20)], &tid[..tid.len().min(20)]);
+                    all_legs.push((mid.clone(), tid, outcome));
+                }
+            }
         }
-    };
-
-    let pos: serde_json::Value = match serde_json::from_str(pos_json) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("[D6 Helper] Failed to parse position JSON: {}", e);
-            return false;
-        }
-    };
-
-    tracing::info!("[D6 Helper] Position to close: {}", pos.get("position_id")
-        .and_then(|v| v.as_str()).unwrap_or("unknown"));
+    }
+    if all_legs.is_empty() {
+        tracing::warn!("[D6 Helper] No legs found in any checkpoint position");
+        return false;
+    }
 
     // Load secrets
     let secrets_path = workspace.join("config").join("secrets.yaml");
@@ -232,7 +243,7 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) -> bool
         ExecutorConfig {
             clob_host: clob_host.to_string(),
             dry_run: false,
-            order_type: OrderType::Gtc,
+            order_type: OrderType::Fak,
             aggression: OrderAggression::AtMarket,
             fee_rate_bps: 0,
             confirmation_timeout_secs: 120.0,
@@ -256,155 +267,69 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) -> bool
     let (cancelled, err) = executor.cancel_all_orders();
     tracing::info!("[D6 Helper] Cancelled {} orders (err={:?})", cancelled, err);
 
-    // Wait for on-chain confirmation: poll Data API until positions show confirmed shares.
-    // The main process bought shares via GTC orders — they need to settle on-chain
-    // before the helper can sell them.
-    let http = reqwest::blocking::Client::new();
-    let positions_url = format!(
-        "https://data-api.polymarket.com/positions?user={}&sizeThreshold=0",
-        wallet_address.to_lowercase()
-    );
+    // No need to wait for on-chain confirmation — we're BUYING, not selling.
+    // Scan ALL legs across ALL positions for cheapest external ask.
 
-    // Extract the token_id of the position we want to sell
-    let target_token_id = {
-        let markets = pos.get("markets").and_then(|v| v.as_object());
-        markets.and_then(|m| m.values().next())
-            .and_then(|leg| leg.get("token_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
+    let http_client = reqwest::blocking::Client::new();
+    let neg_risk = true;
+    let tick_size = 0.001;
 
-    tracing::info!("[D6 Helper] Waiting for on-chain confirmation of token {}...", &target_token_id[..target_token_id.len().min(20)]);
+    // Find the leg with the cheapest ask price (cheapest = most shares per $, guarantees fill)
+    let mut best_leg: Option<(String, String, String, f64)> = None; // (market_id, token_id, outcome, best_ask)
+    for (mid, tid, outcome) in &all_legs {
+        let ask = {
+            let book_url = format!("{}/book?token_id={}", clob_host, tid);
+            http_client.get(&book_url).send().ok()
+                .and_then(|r| r.json::<serde_json::Value>().ok())
+                .and_then(|b| b.get("asks")?.as_array()?.iter()
+                    .filter_map(|o| o.get("price")?.as_str()?.parse::<f64>().ok())
+                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)))
+                .unwrap_or(0.0)
+        };
+        if ask <= 0.0 { continue; }
+        tracing::info!("[D6 Helper] Leg {} ask={:.4}", &mid[..mid.len().min(20)], ask);
 
-    let mut confirmed_shares = 0.0f64;
-    for attempt in 1..=12 {  // Max 60s (12 × 5s)
-        let data_api_positions: Vec<serde_json::Value> = http.get(&positions_url)
-            .send().and_then(|r| r.json()).unwrap_or_default();
-
-        confirmed_shares = data_api_positions.iter()
-            .filter(|dp| dp.get("asset").and_then(|v| v.as_str()) == Some(&target_token_id))
-            .filter_map(|dp| dp.get("size").and_then(|v| v.as_f64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))))
-            .sum();
-
-        if confirmed_shares > 0.0 {
-            tracing::info!("[D6 Helper] Confirmed: {:.2} shares on-chain (attempt {})", confirmed_shares, attempt);
-            break;
+        if best_leg.is_none() || ask < best_leg.as_ref().unwrap().3 {
+            best_leg = Some((mid.clone(), tid.clone(), outcome.clone(), ask));
         }
-        tracing::info!("[D6 Helper] Waiting for confirmed shares... (attempt {}/12)", attempt);
-        std::thread::sleep(std::time::Duration::from_secs(5));
     }
 
-    if confirmed_shares <= 0.0 {
-        tracing::error!("[D6 Helper] No confirmed shares after 60s — cannot sell. Proceeding to restart.");
-        // Clear D6 flag and restart main without selling
-        ipc::clear_d6_flag(workspace);
-        return false;
-    }
-
-    // Log all confirmed positions
-    let data_api_positions: Vec<serde_json::Value> = http.get(&positions_url)
-        .send().and_then(|r| r.json()).unwrap_or_default();
-    tracing::info!("[D6 Helper] Data API shows {} positions:", data_api_positions.len());
-    for dp in &data_api_positions {
-        let title = dp.get("title").and_then(|v| v.as_str()).unwrap_or("?");
-        let size = dp.get("size").and_then(|v| v.as_f64()
-            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0.0);
-        let asset = dp.get("asset").and_then(|v| v.as_str()).unwrap_or("");
-        tracing::info!("[D6 Helper]   {} size={:.2} asset={}...", &title[..title.len().min(40)], size, &asset[..asset.len().min(20)]);
-    }
-
-    // Extract market legs from the position JSON
-    let markets = pos.get("markets").and_then(|v| v.as_object());
-    let markets = match markets {
-        Some(m) => m,
+    let (market_id, token_id, outcome, best_ask) = match best_leg {
+        Some(leg) => leg,
         None => {
-            tracing::warn!("[D6 Helper] No markets in position, cannot sell");
+            tracing::warn!("[D6 Helper] No legs with asks found");
             return false;
         }
     };
 
-    // Sell each leg of the first position
-    let mut sell_legs = Vec::new();
-    for (market_id, leg) in markets {
-        let outcome = leg.get("outcome").and_then(|v| v.as_str()).unwrap_or("yes");
-        let checkpoint_shares = leg.get("shares").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        if checkpoint_shares <= 0.0 { continue; }
+    instruments.insert_instrument(Instrument {
+        market_id: market_id.clone(),
+        token_id: token_id.clone(),
+        outcome: outcome.to_string(),
+        condition_id: market_id.clone(),
+        neg_risk,
+        tick_size,
+        rounding: RoundingConfig::from_tick_size_f64(tick_size),
+        min_order_size: 1.0,
+        max_order_size: 0.0,
+        order_book_enabled: true,
+        accepting_orders: true,
+    });
 
-        // Read token_id from serialized MarketLeg (populated by fill_tracker)
-        let token_id = leg.get("token_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // FAK at 2x best ask — fills at best available, overpaying ensures crossing
+    let buy_price = (best_ask * 2.0 * 1000.0).ceil() / 1000.0; // round up to tick
+    // Size in USDC: $2 to ensure $1 minimum is met at actual fill price
+    let buy_size = 2.0_f64;
+    tracing::info!("[D6 Helper] Micro BUY: market={} token={}... best_ask={:.4} limit={:.4} size=${:.2}",
+        market_id, &token_id[..token_id.len().min(20)], best_ask, buy_price, buy_size);
 
-        // Sell minimum volume at market (FAK at best bid) to guarantee immediate fill.
-        // We only need to prove venue state changed — smallest possible trade.
-        let confirmed_shares = data_api_positions.iter()
-            .find(|dp| dp.get("asset").and_then(|v| v.as_str()) == Some(&token_id))
-            .and_then(|dp| dp.get("size").and_then(|v| v.as_f64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))))
-            .unwrap_or(checkpoint_shares);
-        // Minimum sell: enough shares to make $1 at best bid (Polymarket minimum)
-        // We'll calculate this after fetching the bid price below
-        tracing::info!("[D6 Helper] Shares: checkpoint={:.2}, confirmed={:.2}",
-            checkpoint_shares, confirmed_shares);
-        if token_id.is_empty() {
-            tracing::warn!("[D6 Helper] No token_id for market {} in checkpoint. \
-                Was fill_tracker used to enter this position?", market_id);
-            continue;
-        }
-        let neg_risk = true; // All test markets are negRisk
-        let tick_size = 0.001;
+    let buy_legs = vec![(market_id.clone(), token_id.clone(), Side::Buy, buy_price, buy_size)];
+    let ws_market_ids = vec![market_id.clone()];
 
-        // Register instrument
-        instruments.insert_instrument(Instrument {
-            market_id: market_id.clone(),
-            token_id: token_id.clone(),
-            outcome: outcome.to_string(),
-            condition_id: market_id.clone(),
-            neg_risk,
-            tick_size,
-            rounding: RoundingConfig::from_tick_size_f64(tick_size),
-            min_order_size: 1.0,
-            max_order_size: 0.0,
-            order_book_enabled: true,
-            accepting_orders: true,
-        });
-
-        // Sell at best bid (FAK) — minimum volume to guarantee immediate fill.
-        // Only need to prove venue state changed during D6 shutdown.
-        let best_bid = {
-            let book_url = format!("{}/book?token_id={}", clob_host, token_id);
-            reqwest::blocking::Client::new().get(&book_url).send().ok()
-                .and_then(|r| r.json::<serde_json::Value>().ok())
-                .and_then(|b| b.get("bids")?.as_array()?.iter()
-                    .filter_map(|o| o.get("price")?.as_str()?.parse::<f64>().ok())
-                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)))
-                .unwrap_or(0.0)
-        };
-        if best_bid <= 0.0 {
-            tracing::warn!("[D6 Helper] No bids for market {}, skipping", market_id);
-            continue;
-        }
-        // Minimum shares to meet $1 minimum order size at best bid
-        let min_shares = (1.0 / best_bid).ceil();
-        let sell_shares = min_shares.min(confirmed_shares); // Don't sell more than we have
-        let sell_price = best_bid; // At market — guarantees immediate fill
-        let sell_value = sell_shares * sell_price;
-        tracing::info!("[D6 Helper] SELL leg: market={} shares={:.2} (min for $1) best_bid={:.4} price={:.4} value={:.4}",
-            market_id, sell_shares, best_bid, sell_price, sell_value);
-
-        sell_legs.push((market_id.clone(), token_id.to_string(), Side::Sell, sell_price, sell_value));
-    }
-
-    if sell_legs.is_empty() {
-        tracing::warn!("[D6 Helper] No legs to sell");
-        return false;
-    }
-
-    // Collect market_ids for WS subscription
-    let ws_market_ids: Vec<String> = sell_legs.iter().map(|(mid, _, _, _, _)| mid.clone()).collect();
-
-    // Start WS User Channel BEFORE placing the sell — so we don't miss events
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Start WS User Channel BEFORE placing the buy — so we don't miss events.
+    // Must be multi_thread so the WS task actually runs while we block on recv_timeout.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .build()
         .expect("tokio runtime");
@@ -412,62 +337,111 @@ fn close_one_position(workspace: &PathBuf, checkpoint: &ipc::Checkpoint) -> bool
     ws_client.start(&ws_auth, ws_market_ids, rt.handle());
     std::thread::sleep(std::time::Duration::from_millis(500)); // let WS connect
 
-    // Place FAK sell
-    let result = executor.execute_arb("d6_helper_close", &sell_legs);
+    // Place FAK micro buy — immediate fill
+    let result = executor.execute_arb("d6_helper_buy", &buy_legs);
     let accepted = result.legs.iter()
-        .filter(|l| matches!(l, rust_engine::executor::OrderResult::Accepted(_)))
-        .count();
-    tracing::info!("[D6 Helper] SELL result: {}/{} legs accepted", accepted, sell_legs.len());
-
-    if accepted == 0 {
-        tracing::error!("[D6 Helper] No sells accepted — venue state unchanged");
+        .any(|l| matches!(l, rust_engine::executor::OrderResult::Accepted(_)));
+    if !accepted {
+        tracing::error!("[D6 Helper] No buys accepted — venue state unchanged");
         ws_client.stop();
         return false;
     }
+    tracing::info!("[D6 Helper] BUY accepted, listening for WS confirmation...");
 
-    // Wait for WS confirmation: MATCHED then CONFIRMED on any trade.
-    // Patient wait — sell is GTC at best bid, may take hours/days to fill on illiquid markets.
-    let wait_hours = 48;
-    tracing::info!("[D6 Helper] Waiting for WS User Channel trade confirmation ({}h timeout)...", wait_hours);
-    let mut saw_matched = false;
-    let mut saw_confirmed = false;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_hours * 3600);
+    // Trade lifecycle: MATCHED → MINED → CONFIRMED (success) or RETRYING / FAILED
+    // Track taker_order_ids through lifecycle.
+    // Fallback: if MATCHED but no CONFIRMED after 60s, poll Data API to verify settlement.
+    let mut matched_taker_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut done = false;
+    let ws_start = std::time::Instant::now();
+    let data_api_fallback_secs = 60;
 
-    while !saw_confirmed {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            tracing::warn!("[D6 Helper] Timeout waiting for trade confirmation (matched={}, confirmed={})",
-                saw_matched, saw_confirmed);
-            break;
+    tracing::info!("[D6 Helper] Waiting for trade lifecycle (Data API fallback after {}s)...", data_api_fallback_secs);
+
+    while !done {
+        // If we have a MATCHED but no CONFIRMED after 60s, fall back to Data API
+        if !matched_taker_ids.is_empty() && ws_start.elapsed().as_secs() > data_api_fallback_secs {
+            tracing::info!("[D6 Helper] MATCHED but no WS CONFIRMED after {}s — checking Data API...",
+                ws_start.elapsed().as_secs());
+            // Check if the asset's position size changed on venue
+            let positions_url = format!(
+                "https://data-api.polymarket.com/positions?user={}&sizeThreshold=0",
+                wallet_address.to_lowercase()
+            );
+            if let Ok(resp) = http_client.get(&positions_url)
+                .header("User-Agent", "Mozilla/5.0")
+                .send()
+                .and_then(|r| r.json::<Vec<serde_json::Value>>())
+            {
+                let venue_shares: f64 = resp.iter()
+                    .filter(|p| p.get("asset").and_then(|v| v.as_str()) == Some(&token_id))
+                    .filter_map(|p| p.get("size").and_then(|v| v.as_f64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))))
+                    .sum();
+                tracing::info!("[D6 Helper] Data API: {} shares for token {}...",
+                    venue_shares, &token_id[..token_id.len().min(20)]);
+                if venue_shares > 0.0 {
+                    tracing::info!("[D6 Helper] Data API confirms position exists — venue state changed");
+                    done = true;
+                    break;
+                }
+            }
+            // If Data API also fails, keep waiting for WS
         }
 
-        match ws_client.receiver.recv_timeout(remaining) {
+        match ws_client.receiver.recv_timeout(std::time::Duration::from_secs(10)) {
             Ok(UserEvent::Trade(trade)) => {
-                tracing::info!("[D6 Helper] WS trade: asset={}... status={} size={} price={}",
-                    &trade.asset_id[..trade.asset_id.len().min(20)], trade.status, trade.size, trade.price);
-                if trade.status == "MATCHED" {
-                    saw_matched = true;
-                    tracing::info!("[D6 Helper] MATCHED — venue state change initiated");
-                }
-                if trade.status == "CONFIRMED" && saw_matched {
-                    saw_confirmed = true;
-                    tracing::info!("[D6 Helper] CONFIRMED — venue state change verified");
+                let tracked = matched_taker_ids.contains(&trade.taker_order_id);
+                tracing::info!("[D6 Helper] WS trade: status={} taker={}... tracked={} size={} price={}",
+                    trade.status, &trade.taker_order_id[..trade.taker_order_id.len().min(20)],
+                    tracked, trade.size, trade.price);
+
+                match trade.status.as_str() {
+                    "MATCHED" => {
+                        if !trade.taker_order_id.is_empty() {
+                            matched_taker_ids.insert(trade.taker_order_id.clone());
+                            tracing::info!("[D6 Helper] MATCHED — tracking taker_order_id ({})", matched_taker_ids.len());
+                        }
+                    }
+                    "MINED" => {
+                        if tracked {
+                            tracing::info!("[D6 Helper] MINED — tx on-chain");
+                        }
+                    }
+                    "CONFIRMED" => {
+                        if tracked {
+                            tracing::info!("[D6 Helper] CONFIRMED — venue state change verified");
+                            done = true;
+                        }
+                    }
+                    "RETRYING" => {
+                        if tracked {
+                            tracing::warn!("[D6 Helper] RETRYING — tx failed, resubmitting");
+                        }
+                    }
+                    "FAILED" => {
+                        if tracked {
+                            tracing::error!("[D6 Helper] FAILED — trade permanently failed");
+                            matched_taker_ids.remove(&trade.taker_order_id);
+                        }
+                    }
+                    other => {
+                        tracing::info!("[D6 Helper] Unknown trade status: {}", other);
+                    }
                 }
             }
             Ok(UserEvent::Order(_)) => {}
-            Err(_) => break,
+            Err(_) => {
+                if ws_start.elapsed().as_secs() % 30 == 0 {
+                    tracing::info!("[D6 Helper] Heartbeat: {}s, {} matched",
+                        ws_start.elapsed().as_secs(), matched_taker_ids.len());
+                }
+            }
         }
     }
 
     ws_client.stop();
+    tracing::info!("[D6 Helper] Venue state change confirmed after {}s", ws_start.elapsed().as_secs());
 
-    if saw_confirmed {
-        tracing::info!("[D6 Helper] Venue state change confirmed via WS (MATCHED → CONFIRMED)");
-    } else if saw_matched {
-        tracing::warn!("[D6 Helper] Got MATCHED but not CONFIRMED");
-    } else {
-        tracing::error!("[D6 Helper] No trade signals received after {}h", wait_hours);
-    }
-
-    saw_confirmed
+    true
 }

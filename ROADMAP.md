@@ -16,30 +16,32 @@ All core modules ported: WebSocket, order book mirror, arb math, position manage
 
 ---
 
-## Milestone B: Build Execution Infrastructure — ✅ Complete
+## Milestone B: Build Execution Infrastructure — 🔧 Rework In Progress
 
 **Goal**: Code-complete execution path — all modules built, unit-tested, and shadow-testable. No funded account required.
 
 | Status | Count |
 |--------|-------|
-| ✅ Complete | 27/27 |
+| ✅ Complete | 24/29 |
+| 🔧 Rework | 3/29 (B2.3, B3.2, B4.0, B4.1) |
+| 🔧 New | 2/29 (B4.5, B4.6) |
 
 ### B-Part 1: Liquidity & Position Management (3/3 ✅)
 Depth gating, replacement chain analytics, closed position retention.
 
-### B-Part 2: Signing & Instrument Model (4/4 ✅)
-EIP-712 order signing (pure Rust, alloy stack), formal instrument model, dynamic tick size handling.
+### B-Part 2: Signing & Instrument Model (3/4 ✅, 1 🔧)
+EIP-712 order signing, dynamic tick size handling. **B2.3 rework**: FAK vs GTC have different amount precision rules — verify rounding across all tick sizes and order types.
 
-### B-Part 3: Executor, Pipeline & Rate Limiting (8/8 ✅)
-Market BUY quantity guard, LiveExecutor (dry-run), trade status pipeline, rate limiting, timestamp normalisation, error handling matrix, partial fill handling, batch order submission.
+### B-Part 3: Executor, Pipeline & Rate Limiting (7/8 ✅, 1 🔧)
+Market BUY quantity guard, LiveExecutor, rate limiting, timestamp normalisation, error handling, partial fills, batch orders. **B3.2 rework**: Trade lifecycle must use WS `id` as correlation key, accept MATCHED for suspense entry, handle ~20% WS CONFIRMED drop rate with Data API fallback.
 
-### B-Part 4: Reconciliation & Tracking (4/4 ✅)
-Periodic + startup reconciliation, cross-asset fill matching, FOK/FAK overfill handling, live P&L tracking (unrealized + realized on dashboard).
+### B-Part 4: Reconciliation & Tracking (3/6 ✅, 3 🔧)
+Cross-asset fill matching, FOK/FAK overfill handling, live P&L tracking. **B4.0/B4.1 rework**: enhanced reconciliation (Data API freshness polling, apply_reconciliation, venue = source of truth). **B4.5 new**: parallel WS + Data API trade confirmation. **B4.6 new**: USDC.e balance monitor.
 
 ### B-Part 5: Documentation (2/2 ✅)
 ARCHITECTURE.md, ROADMAP.md (this file).
 
-**Verification**: 44/44 unit tests pass. Shadow mode verified on VPS. Reconciliation runs cleanly. Dashboard P&L charts and stats bar confirmed. Tier B WS stable at 16 connections.
+**Verification**: 44/44 unit tests pass. Milestone D 8/8 PASS validates execution path end-to-end.
 
 ---
 
@@ -55,14 +57,13 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 
 ---
 
-## Milestone D: CLOB Integration Test — 🔧 In Progress
+## Milestone D: CLOB Integration Test — ✅ Complete
 
 **Goal**: Prove full execution path works against real Polymarket CLOB. Place, fill, cancel, and reconcile real micro-orders. Target: 1 week.
 
 | Status | Count |
 |--------|-------|
-| ✅ Complete | 7/8 |
-| 🔧 In Progress | 1/8 |
+| ✅ Complete | 8/8 |
 
 **VPS**: is*hosting Madrid (176.97.72.199). Interim location — Dublin (Interxion DC, 0.83ms latency) planned when capacity available.
 **Funds**: ~$50 USDC.e deposited, wallet 0x21f1...fb1.
@@ -75,10 +76,16 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 | D3: Real micro-fill | ✅ | FAK BUY at market price |
 | D4: negRisk market fill | ✅ | negRisk-specific signing |
 | D5: Multi-leg arb execution | ✅ | WS User Channel fill tracking confirmed. Auth fix: WS uses raw creds (not HMAC). |
-| D6: Cold-start reconciliation | 🔧 | GTC sell placed, waiting for WS MATCHED→CONFIRMED (48h patience). Helper restarts main on venue change. |
+| D6: Cold-start reconciliation | ✅ | Data API freshness polling, venue state change detection, apply_reconciliation (venue source of truth). FAK/GTC amount precision fix. |
 | D7a: Circuit breaker | ✅ | Engine state validation |
 | D7b: Kill switch | ✅ | Executor cancel-all |
 | D8: Closeout positions | ✅ | Real SELL orders + accounting verification |
+
+### Known Issues / Next Steps (from D)
+
+- **Trade confirmation reliability**: WS User Channel drops ~20% of CONFIRMED events. Current mitigation: accept MATCHED, fall back to Data API. **Next**: run WS + Data API poll in async parallel, take first confirmation. Needs integration in: fill_tracker, D6 helper, D8 closeout, production executor.
+- **USDC balance monitor**: Add periodic on-chain USDC.e balance check to production engine (like gas_monitor for POL).
+- **Suspense accounting**: MATCHED trades should go to suspense account, CONFIRMED promotes to real position. Failed matches reverse + sell opposing arb legs.
 
 ---
 
@@ -135,7 +142,7 @@ Tasks: deposit funds, configure winning parameters, switch to live mode, supervi
 | A: Rust Port | 13/13 | ✅ Complete |
 | B: Execution Infrastructure | 27/27 | ✅ Complete |
 | C: Safety | 10/10 | ✅ Complete |
-| D: CLOB Integration Test | 7/8 | 🔧 In Progress |
+| D: CLOB Integration Test | 8/8 | ✅ Complete |
 | E: Shadow Validation | 1/10 | 🔧 In Progress |
 | F: Go Live | 0/6 | ⬚ Planned |
 | G: Scale | 0/4 | ⬚ Future |

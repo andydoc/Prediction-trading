@@ -79,10 +79,10 @@ constraint_detection:
   rebuild_interval: 300
 engine:
   max_evals_per_batch: 500
-  constraint_rebuild_interval_seconds: 600
+  constraint_rebuild_interval_seconds: 495
   efp_drift_threshold: 0.005
   efp_staleness_seconds: 5.0
-  state_save_interval_seconds: 30
+  state_save_interval_seconds: 10
   monitor_interval_seconds: 30
   stats_log_interval_seconds: 30
   stale_sweep_interval_seconds: 60
@@ -111,15 +111,14 @@ websocket:
   reconnect_max_delay: 60.0
   assets_per_shard: 400
   max_book_staleness_secs: 30
-  # Tiered WS architecture (Tier B + C)
-  use_tiered_ws: true               # Tiered WS enabled (replaces flat sharding)
-  max_assets_per_connection: 490    # Hard limit per connection (Polymarket max ~500)
-  stagger_ms: 150                   # Delay between connection starts
-  tier_b_max_connections: 17        # Max Tier B connections (17 — jitter v2 + biased heartbeat provides sufficient spread)
-  tier_b_hysteresis_scans: 3        # Scans a constraint must be cold before unsubscribing
-  tier_b_consolidation_threshold: 300  # Assets/conn below which hourly consolidation triggers
-  tier_b_top_n_constraints: 500        # Only subscribe to top N constraints by spread/time_to_resolve (0 = no limit)
-  tier_c_new_market_buffer_secs: 2.5   # Buffer time for new market event bursts
+  use_tiered_ws: true
+  max_assets_per_connection: 490
+  stagger_ms: 150
+  tier_b_max_connections: 17
+  tier_b_hysteresis_scans: 3
+  tier_b_consolidation_threshold: 300
+  tier_b_top_n_constraints: 500
+  tier_c_new_market_buffer_secs: 2.5
 execution_control:
   enabled: true
   url: http://localhost:5557
@@ -189,24 +188,24 @@ ollama:
 safety:
   circuit_breaker:
     enabled: true
-    max_drawdown_pct: 0.10              # 10% drawdown from peak triggers halt
-    max_consecutive_errors: 3           # 3 errors within window triggers halt
-    error_window_seconds: 300           # 5-minute sliding window for errors
-    api_timeout_seconds: 600            # API unreachable for 10min triggers halt (must exceed 300s API resolution interval)
+    max_drawdown_pct: 0.1
+    max_consecutive_errors: 3
+    error_window_seconds: 300
+    api_timeout_seconds: 600
   gas_monitor:
     enabled: true
-    rpc_url: 'https://polygon-bor-rpc.publicnode.com'
-    check_interval_seconds: 3600       # Check every hour
-    min_pol_balance: 1.0               # Warning threshold (Telegram alert)
-    critical_pol_balance: 0.0          # Critical threshold (trips circuit breaker) — set to 0 until POL deposited for Milestone D
+    rpc_url: https://polygon-bor-rpc.publicnode.com
+    check_interval_seconds: 3600
+    min_pol_balance: 1.0
+    critical_pol_balance: 0.0
 dashboard:
-  port: 5558
-  bind_addr: '127.0.0.1'
+  port: 5559
+  bind_addr: 127.0.0.1
 notifications:
   enabled: true
-  webhook_url: ''                       # Auto-built from secrets.yaml telegram_bot_token
+  webhook_url: ''
   api_key: ''
-  phone_number: '688371419'             # Telegram chat_id
+  phone_number: '688371419'
   rate_limit_seconds: 10
   on_entry: true
   on_resolution: true

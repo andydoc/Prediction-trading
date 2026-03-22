@@ -31,6 +31,7 @@ const USER_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeEvent {
     pub id: String,
+    pub taker_order_id: String,  // Our order ID when we're the taker (FAK)
     pub market: String,
     pub asset_id: String,
     pub outcome: String,
@@ -110,47 +111,108 @@ impl UserChannelClient {
         self.shutdown.notify_waiters();
     }
 
-    /// Wait for a trade event matching the given asset_ids to reach CONFIRMED status.
-    /// Returns the matching TradeEvent, or None on timeout.
+    /// Wait for trade fills matching the given asset_ids.
+    ///
+    /// Tracks the full lifecycle: MATCHED → MINED → CONFIRMED.
+    /// Uses `id` (trade event UUID) as correlation key — consistent across lifecycle.
+    /// Uses `taker_order_id` to identify our orders.
+    ///
+    /// Accepts MATCHED as sufficient (CONFIRMED may never arrive for ~20% of trades
+    /// per WS investigation 2026-03-22). Deduplicates by trade `id`.
     pub fn wait_for_confirmed_fills(
         &self,
         asset_ids: &[String],
         timeout: Duration,
     ) -> Vec<TradeEvent> {
         let deadline = std::time::Instant::now() + timeout;
-        let mut confirmed = Vec::new();
+        let mut fills: Vec<TradeEvent> = Vec::new();
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut pending: std::collections::HashSet<String> = asset_ids.iter().cloned().collect();
+
+        // Phase 1: collect MATCHED events for all assets (fast — usually <1s)
+        // Phase 2: wait for MINED/CONFIRMED to upgrade them (may not arrive for all)
+        let mut matched_assets: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut matched_events: std::collections::HashMap<String, TradeEvent> = std::collections::HashMap::new(); // asset_id → MATCHED event
 
         while !pending.is_empty() {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                tracing::warn!("UserChannel: timeout waiting for fills. Got {}/{}, missing: {:?}",
-                    confirmed.len(), asset_ids.len(), pending);
+                tracing::warn!("UserChannel: timeout. confirmed={}/{}, matched_only={}, missing={:?}",
+                    fills.len(), asset_ids.len(), matched_assets.len(), pending);
                 break;
             }
 
-            match self.receiver.recv_timeout(remaining) {
+            match self.receiver.recv_timeout(remaining.min(Duration::from_secs(5))) {
                 Ok(UserEvent::Trade(trade)) => {
-                    tracing::info!("UserChannel trade: asset={} status={} size={} price={}",
-                        trade.asset_id, trade.status, trade.size, trade.price);
+                    let dominated = trade.status == "MATCHED"
+                        || trade.status == "MINED"
+                        || trade.status == "CONFIRMED";
 
-                    if (trade.status == "CONFIRMED" || trade.status == "MINED")
-                        && pending.contains(&trade.asset_id)
-                    {
-                        pending.remove(&trade.asset_id);
-                        confirmed.push(trade);
+                    if !dominated { continue; }
+
+                    let is_our_asset = pending.contains(&trade.asset_id)
+                        || matched_assets.contains(&trade.asset_id);
+
+                    tracing::info!("UserChannel trade: id={}... status={} taker={}... asset={}... size={} price={} ours={}",
+                        &trade.id[..trade.id.len().min(12)],
+                        trade.status,
+                        &trade.taker_order_id[..trade.taker_order_id.len().min(12)],
+                        &trade.asset_id[..trade.asset_id.len().min(12)],
+                        trade.size, trade.price, is_our_asset);
+
+                    if !is_our_asset { continue; }
+
+                    match trade.status.as_str() {
+                        "MATCHED" => {
+                            if !seen_ids.contains(&trade.id) {
+                                seen_ids.insert(trade.id.clone());
+                                matched_assets.insert(trade.asset_id.clone());
+                                matched_events.insert(trade.asset_id.clone(), trade);
+                                // Don't remove from pending yet — wait for MINED/CONFIRMED
+                            }
+                        }
+                        "MINED" | "CONFIRMED" => {
+                            // Dedup: only record first MINED or CONFIRMED per trade id
+                            if !seen_ids.contains(&trade.id) || !fills.iter().any(|f| f.id == trade.id) {
+                                seen_ids.insert(trade.id.clone());
+                                pending.remove(&trade.asset_id);
+                                matched_assets.remove(&trade.asset_id);
+                                // Dedup: replace any existing fill for same asset
+                                fills.retain(|f| f.asset_id != trade.asset_id);
+                                fills.push(trade);
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Ok(UserEvent::Order(order)) => {
                     tracing::debug!("UserChannel order: id={} type={} matched={}",
                         order.id, order.event_subtype, order.size_matched);
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    // If all assets have been MATCHED but not CONFIRMED, accept MATCHED as fills.
+                    // ~20% of trades never get CONFIRMED via WS (investigation 2026-03-22).
+                    if pending.is_subset(&matched_assets) && !matched_assets.is_empty() {
+                        tracing::info!("UserChannel: all {} assets MATCHED but not yet CONFIRMED — promoting to fills",
+                            matched_assets.len());
+                        for asset in matched_assets.drain() {
+                            pending.remove(&asset);
+                            if let Some(evt) = matched_events.remove(&asset) {
+                                fills.retain(|f| f.asset_id != evt.asset_id);
+                                fills.push(evt);
+                            }
+                        }
+                        break;
+                    }
+                    continue;
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
 
-        confirmed
+        tracing::info!("UserChannel: {} fills confirmed, {} matched-only",
+            fills.len(), matched_assets.len());
+        fills
     }
 
     /// Check if the client is currently running.
@@ -327,6 +389,7 @@ fn parse_str(v: &serde_json::Value, key: &str) -> String {
 fn parse_trade_event(msg: &serde_json::Value) -> Option<TradeEvent> {
     Some(TradeEvent {
         id: parse_str(msg, "id"),
+        taker_order_id: parse_str(msg, "taker_order_id"),
         market: parse_str(msg, "market"),
         asset_id: parse_str(msg, "asset_id"),
         outcome: parse_str(msg, "outcome"),

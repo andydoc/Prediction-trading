@@ -971,13 +971,16 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
+ "futures-util",
  "parking_lot",
  "reqwest",
  "rust_engine",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
 ]

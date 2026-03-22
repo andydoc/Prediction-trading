@@ -587,7 +587,8 @@ impl Executor {
         let rounded_price = self.apply_aggression(price, side, &instrument);
 
         // 4. Build and sign order (use instrument's amount_decimals for precision)
-        let order = match signing::build_order_with_precision(
+        let is_market = matches!(self.config.order_type, OrderType::Fak);
+        let order = match signing::build_order_with_precision_and_type(
             self.signer.address(),
             token_id,
             rounded_price,
@@ -596,6 +597,7 @@ impl Executor {
             instrument.neg_risk,
             self.config.fee_rate_bps,
             instrument.rounding.amount_decimals,
+            is_market,
         ) {
             Ok(o) => o,
             Err(msg) => return OrderResult::Rejected(ExecutionError::SigningError {
@@ -1058,7 +1060,8 @@ impl Executor {
 
             let rounded_price = self.apply_aggression(*price, *side, &instrument);
 
-            let order = match signing::build_order(
+            let is_market = matches!(self.config.order_type, OrderType::Fak);
+            let order = match signing::build_order_with_precision_and_type(
                 self.signer.address(),
                 token_id,
                 rounded_price,
@@ -1066,6 +1069,8 @@ impl Executor {
                 *side,
                 instrument.neg_risk,
                 self.config.fee_rate_bps,
+                instrument.rounding.amount_decimals,
+                is_market,
             ) {
                 Ok(o) => o,
                 Err(msg) => {

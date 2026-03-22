@@ -3,9 +3,15 @@
 /// This module handles the main binary's side of D6:
 /// - On first run: writes checkpoint + D6 flag when 2+ positions exist
 /// - On resume: verifies cold-start reconciliation detects all positions
+///   1. Restore state from checkpoint (positions + accounting)
+///   2. Poll Data API until indexer stabilises (two successive identical reads)
+///   3. Reconcile checkpoint state vs venue state — detect discrepancies
+///   4. Apply reconciliation: update internal state to match venue (source of truth)
+///   5. Report discrepancies
 
 use crate::ipc::{self, Checkpoint};
 use crate::report::{TestResult, Exception, ExceptionReport};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Check if we should trigger D6 (2+ positions open).
@@ -33,10 +39,9 @@ pub fn maybe_trigger(
     tracing::info!("[D6] {} engine positions open, writing checkpoint for cold-start test",
         engine_open);
 
-    // Write PID
+    // Write PID (best-effort — not critical for D6)
     if let Err(e) = ipc::write_pid(workspace) {
-        tracing::error!("[D6] Failed to write PID: {}", e);
-        return false;
+        tracing::warn!("[D6] Failed to write PID (non-fatal): {}", e);
     }
 
     // Serialize open positions for cold-start recovery
@@ -84,8 +89,64 @@ pub fn maybe_trigger(
     true
 }
 
+/// Poll Data API until the indexer stabilises (two successive identical reads).
+/// Returns the final venue positions.
+fn poll_data_api_until_stable(
+    http: &reqwest::blocking::Client,
+    clob_host: &str,
+    auth: &rust_engine::signing::ClobAuth,
+) -> Vec<rust_engine::reconciliation::VenuePosition> {
+    use rust_engine::reconciliation::query_clob_positions;
+
+    let poll_interval = std::time::Duration::from_secs(30);
+    let max_wait = std::time::Duration::from_secs(300); // 5 min
+    let start = std::time::Instant::now();
+
+    let mut prev_shares: HashMap<String, f64> = HashMap::new();
+    let mut last_venue = Vec::new();
+
+    loop {
+        match query_clob_positions(http, clob_host, Some(auth)) {
+            Ok(venue) => {
+                let mut current_shares: HashMap<String, f64> = HashMap::new();
+                for vp in &venue {
+                    *current_shares.entry(vp.market_id.clone()).or_default() += vp.size;
+                }
+
+                tracing::info!("[D6] Data API poll ({:.0}s): {} positions, shares={:?}",
+                    start.elapsed().as_secs_f64(), venue.len(),
+                    current_shares.iter().map(|(k, v)| format!("{}..={:.2}", &k[..k.len().min(12)], v)).collect::<Vec<_>>());
+
+                if !prev_shares.is_empty() && current_shares == prev_shares {
+                    tracing::info!("[D6] Data API stabilised after {:.0}s (two successive identical reads)",
+                        start.elapsed().as_secs_f64());
+                    return venue;
+                }
+
+                prev_shares = current_shares;
+                last_venue = venue;
+            }
+            Err(e) => {
+                tracing::warn!("[D6] Data API poll failed: {}", e);
+            }
+        }
+
+        if start.elapsed() > max_wait {
+            tracing::warn!("[D6] Data API poll timeout after {:.0}s — using last read", start.elapsed().as_secs_f64());
+            return last_venue;
+        }
+
+        std::thread::sleep(poll_interval);
+    }
+}
+
 /// Run D6 verification after resume from checkpoint.
-/// Checks that cold-start reconciliation detects the expected positions.
+///
+/// 1. Restore state from checkpoint (positions + accounting)
+/// 2. Poll Data API until indexer stabilises
+/// 3. Reconcile checkpoint vs venue — detect discrepancies
+/// 4. Apply reconciliation: update internal state to match venue
+/// 5. Report
 pub fn verify_cold_start(
     engine: &rust_engine::TradingEngine,
     checkpoint: &Checkpoint,
@@ -97,25 +158,25 @@ pub fn verify_cold_start(
     let start = std::time::Instant::now();
     crate::notify(notifier, "[CLOB-TEST] D6: verifying cold-start reconciliation...");
 
-    // Restore accounting ledger from checkpoint
+    // === STEP 1: Restore state from checkpoint ===
+
     if !checkpoint.accounting_json.is_empty() {
         match rust_engine::accounting::AccountingLedger::deserialize_json(&checkpoint.accounting_json) {
             Ok(restored) => {
                 let mut acct = engine.accounting.lock();
                 *acct = restored;
-                tracing::info!("[D6] Accounting ledger restored from checkpoint (cash=${:.2}, {} entries)",
+                tracing::info!("[D6] Accounting restored (cash=${:.2}, {} entries)",
                     acct.cash_balance(), acct.entries().len());
             }
             Err(e) => {
-                tracing::warn!("[D6] Failed to restore accounting ledger: {}", e);
+                tracing::warn!("[D6] Failed to restore accounting: {}", e);
             }
         }
     }
 
-    // Import positions from checkpoint into engine, using accounting cash as capital
     if !checkpoint.open_positions_json.is_empty() {
         let acct_cash = engine.accounting.lock().cash_balance();
-        tracing::info!("[D6] Importing {} positions into engine (capital=${:.2} from accounting)...",
+        tracing::info!("[D6] Importing {} positions (capital=${:.2})...",
             checkpoint.open_positions_json.len(), acct_cash);
         {
             let mut pm = engine.positions.lock();
@@ -124,40 +185,44 @@ pub fn verify_cold_start(
                 acct_cash, checkpoint.initial_usdc,
             );
         }
-        let imported = engine.pm_open_count();
-        tracing::info!("[D6] Import complete: {} open positions in engine", imported);
+        tracing::info!("[D6] Import complete: {} open positions", engine.pm_open_count());
     }
 
     let expected_count = checkpoint.open_positions_json.len();
 
-    tracing::info!("[D6] Verifying cold-start. Checkpoint had {} positions", expected_count);
+    // === STEP 2: Poll Data API until indexer stabilises ===
 
-    // Run startup reconciliation via Data API
+    tracing::info!("[D6] Waiting for Data API indexer to stabilise...");
+    let venue_positions = poll_data_api_until_stable(
+        &engine.http_client, clob_host, clob_auth,
+    );
 
-    tracing::info!("[D6] Running position reconciliation via Data API...");
+    // === STEP 3: Reconcile checkpoint vs venue ===
+
+    tracing::info!("[D6] Running startup reconciliation against stable venue data...");
     let recon = engine.reconcile_startup_with_auth(clob_host, Some(clob_auth), 0.1);
 
-    tracing::info!("[D6] Reconciliation complete: passed={}, checked={}, matched={}",
-        recon.passed, recon.positions_checked, recon.positions_matched);
+    tracing::info!("[D6] Reconciliation: passed={}, checked={}, matched={}, discrepancies={}",
+        recon.passed, recon.positions_checked, recon.positions_matched, recon.discrepancies.len());
     for d in &recon.discrepancies {
-        tracing::info!("[D6] Discrepancy: {:?} — {}", d.kind, d.description);
+        tracing::info!("[D6]   {:?} — {}", d.kind, d.description);
     }
 
-    // Verify internal state
-    let open_count = engine.pm_open_count();
-    tracing::info!("[D6] Open positions in engine: {}", open_count);
-    crate::notify(notifier, &format!("[CLOB-TEST] D6: restored {} positions, recon passed={}", open_count, recon.passed));
+    // === STEP 4: Apply reconciliation — update state to venue truth ===
 
-    // Key checks:
-    // 1. Did we restore positions from checkpoint? (must have at least 1)
-    // 2. Did the helper sell at least partially? (prefer yes, but fail gracefully if not)
+    let adjustments = engine.apply_reconciliation(&recon, &venue_positions);
+    for adj in &adjustments {
+        tracing::info!("[D6] Adjustment: {}", adj);
+    }
+
+    // === STEP 5: Report ===
+
+    let open_count = engine.pm_open_count();
     let mut errors = Vec::new();
 
+    // Check 1: Did positions restore from checkpoint?
     if open_count == 0 && expected_count > 0 {
-        errors.push(format!(
-            "No positions loaded on restart (expected {})",
-            expected_count
-        ));
+        errors.push(format!("No positions loaded on restart (expected {})", expected_count));
         exceptions.add(Exception {
             severity: "CRITICAL".into(),
             test_id: "D6".into(),
@@ -169,50 +234,56 @@ pub fn verify_cold_start(
         });
     }
 
-    // Check if the helper sold at least one position.
-    // The helper sells on the exchange (not in the engine), so the engine still has
-    // the checkpoint count. Evidence of helper sell = reconciliation found a quantity
-    // mismatch or missing-on-venue discrepancy.
-    let helper_sell_detected = recon.discrepancies.iter().any(|d| {
+    // Check 2: Did the helper change venue state during shutdown?
+    // Evidence = reconciliation found any discrepancy (quantity mismatch, missing position, etc.)
+    let venue_change_detected = recon.discrepancies.iter().any(|d| {
         matches!(d.kind,
             rust_engine::reconciliation::DiscrepancyKind::QuantityMismatch |
-            rust_engine::reconciliation::DiscrepancyKind::PositionMissingOnVenue
+            rust_engine::reconciliation::DiscrepancyKind::PositionMissingOnVenue |
+            rust_engine::reconciliation::DiscrepancyKind::PositionMissingInternal
         )
     });
 
-    if open_count < expected_count {
-        tracing::info!("[D6] Helper sold {} position(s) (engine={}, checkpoint={})",
-            expected_count - open_count, open_count, expected_count);
-    } else if helper_sell_detected {
-        tracing::info!("[D6] Helper sell detected via reconciliation discrepancy (engine={}, checkpoint={})",
-            open_count, expected_count);
+    if venue_change_detected {
+        tracing::info!("[D6] Venue state change detected ({} discrepancies, {} adjustments applied)",
+            recon.discrepancies.len(), adjustments.len());
+        crate::notify(notifier, &format!(
+            "[CLOB-TEST] D6: {} discrepancies found, {} adjustments applied",
+            recon.discrepancies.len(), adjustments.len()
+        ));
     } else if expected_count > 0 {
-        tracing::warn!("[D6] Helper did not sell any positions (engine={}, checkpoint={}, no discrepancies)",
+        tracing::warn!("[D6] No venue state change detected (engine={}, checkpoint={}, 0 discrepancies)",
             open_count, expected_count);
-        errors.push("Helper sell failed — no positions closed during cold-start cycle".into());
+        errors.push("No venue state change during shutdown — reconciliation found no discrepancies".into());
         exceptions.add(Exception {
             severity: "WARNING".into(),
             test_id: "D6".into(),
-            component: "helper_sell".into(),
-            description: "D6 helper could not sell a position (balance/allowance issue)".into(),
-            expected: "At least 1 position sold by helper or reconciliation discrepancy".into(),
-            actual: format!("{} positions unchanged, no discrepancies", open_count),
-            recommendation: "Check CTF token settlement and balance before helper sells".into(),
+            component: "venue_change".into(),
+            description: "No venue state change detected during D6 shutdown cycle".into(),
+            expected: "At least 1 reconciliation discrepancy (helper should have traded)".into(),
+            actual: format!("{} positions, 0 discrepancies", open_count),
+            recommendation: "Verify helper FAK order filled (check WS MATCHED → CONFIRMED)".into(),
         });
     }
+
+    // Accounting summary after reconciliation adjustments
+    engine.accounting.lock().summary_log("after-D6");
 
     let elapsed = start.elapsed().as_millis() as u64;
 
     if errors.is_empty() {
         crate::notify(notifier, &format!(
-            "[CLOB-TEST] D6 PASSED: cold-start reconciliation detected {} positions",
-            open_count
+            "[CLOB-TEST] D6 PASSED: cold-start reconciliation OK ({} positions, {} discrepancies)",
+            open_count, recon.discrepancies.len()
         ));
         TestResult::pass("D6", "Cold-Start Reconciliation", elapsed,
             serde_json::json!({
                 "checkpoint_positions": expected_count,
                 "loaded_positions": open_count,
                 "accounting_restored": !checkpoint.accounting_json.is_empty(),
+                "venue_change_detected": venue_change_detected,
+                "discrepancies": recon.discrepancies.len(),
+                "adjustments": adjustments.len(),
                 "reconciliation_passed": recon.passed,
             }))
     } else {
