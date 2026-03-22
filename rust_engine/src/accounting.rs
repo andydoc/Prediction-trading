@@ -5,11 +5,12 @@
 /// PositionManager and exchange state at any time.
 ///
 /// Chart of accounts:
-///   Cash           — USDC.e available for trading
-///   Position:{pid} — Capital deployed in a specific position
-///   Fees           — Cumulative trading fees paid (expense)
-///   RealizedPnL    — Cumulative realized profit/loss
-///   Equity         — Opening equity (balancing entry)
+///   Cash              — USDC.e available for trading
+///   Position:{pid}    — Capital deployed in a confirmed position
+///   Suspense:{tid}    — Capital locked pending trade confirmation (B3.2)
+///   Fees              — Cumulative trading fees paid (expense)
+///   RealizedPnL       — Cumulative realized profit/loss
+///   Equity            — Opening equity (balancing entry)
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -33,6 +34,37 @@ pub struct AssetHolding {
     pub market_id: String,
     pub shares: f64,
     pub cost_basis: f64, // Total USDC spent acquiring these shares
+}
+
+/// Status of a trade in the suspense account (B3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SuspenseStatus {
+    /// Trade matched on CLOB, pending on-chain confirmation.
+    Matched,
+    /// On-chain transaction retrying — still in suspense.
+    Retrying,
+    /// Confirmed on-chain — promoted to real position.
+    Confirmed,
+    /// Failed on-chain — capital reversed back to cash.
+    Failed,
+}
+
+/// A trade held in suspense pending confirmation (B3.2).
+///
+/// When a WS MATCHED event arrives, capital moves from Cash to Suspense.
+/// On CONFIRMED, it promotes to a real Position. On FAILED, it reverses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuspenseEntry {
+    pub trade_id: String,
+    pub position_id: String,
+    pub asset_id: String,
+    pub market_id: String,
+    pub shares: f64,
+    pub price: f64,
+    pub capital: f64,
+    pub fees: f64,
+    pub status: SuspenseStatus,
+    pub entered_at: f64,
 }
 
 /// Result of reconciliation between accounting, engine, and exchange.
@@ -75,6 +107,10 @@ pub struct AccountingLedger {
     // when a fill is recorded by both active process and WS event)
     recorded_trade_ids: HashSet<String>,
 
+    // Suspense: trades pending on-chain confirmation (B3.2)
+    #[serde(default)]
+    suspense_entries: HashMap<String, SuspenseEntry>,
+
     // Gas tracking
     opening_pol: f64,
     closing_pol: f64,
@@ -99,6 +135,7 @@ impl AccountingLedger {
             realized_pnl: 0.0,
             holdings: HashMap::new(),
             recorded_trade_ids: HashSet::new(),
+            suspense_entries: HashMap::new(),
             opening_pol: 0.0,
             closing_pol: 0.0,
             taker_fee_rate,
@@ -476,6 +513,162 @@ impl AccountingLedger {
             shares_delta, price, value, description);
     }
 
+    // --- Suspense account (B3.2) ---
+
+    /// MATCHED: move capital from Cash to Suspense account.
+    ///
+    /// Returns false if this trade_id is already in suspense (dedup).
+    /// Double-entry: Debit Suspense:{trade_id}, Credit Cash.
+    pub fn enter_suspense(
+        &mut self,
+        trade_id: &str,
+        position_id: &str,
+        asset_id: &str,
+        market_id: &str,
+        shares: f64,
+        price: f64,
+        capital: f64,
+        fees: f64,
+    ) -> bool {
+        if self.suspense_entries.contains_key(trade_id) {
+            tracing::debug!("[ACCT] Suspense dedup: trade {} already in suspense", trade_id);
+            return false;
+        }
+
+        let now = now_secs();
+        let total = capital + fees;
+
+        // Double-entry: Cash → Suspense
+        self.add_entry(now, &format!("Suspense:{}", trade_id),
+            total, 0.0, Some(position_id.to_string()),
+            &format!("MATCHED: suspense entry for trade {}", trade_id));
+        self.add_entry(now, "Cash", 0.0, total, Some(position_id.to_string()),
+            &format!("MATCHED: cash to suspense for trade {}", trade_id));
+
+        self.cash -= total;
+
+        self.suspense_entries.insert(trade_id.to_string(), SuspenseEntry {
+            trade_id: trade_id.to_string(),
+            position_id: position_id.to_string(),
+            asset_id: asset_id.to_string(),
+            market_id: market_id.to_string(),
+            shares,
+            price,
+            capital,
+            fees,
+            status: SuspenseStatus::Matched,
+            entered_at: now,
+        });
+
+        // Mark trade as recorded to prevent double-counting via record_buy_dedup
+        self.recorded_trade_ids.insert(trade_id.to_string());
+
+        tracing::info!("[ACCT] SUSPENSE ENTER: trade={} {} shares @ {:.4} = ${:.4} + ${:.4} fee | cash=${:.2}",
+            trade_id, shares, price, capital, fees, self.cash);
+        true
+    }
+
+    /// CONFIRMED: promote from suspense to real position.
+    ///
+    /// Double-entry: Debit Position:{pid} + Fees, Credit Suspense:{trade_id}.
+    /// Returns the entry if found and promoted, None if not in suspense.
+    pub fn confirm_from_suspense(&mut self, trade_id: &str) -> Option<SuspenseEntry> {
+        let entry = self.suspense_entries.get_mut(trade_id)?;
+        if entry.status == SuspenseStatus::Confirmed || entry.status == SuspenseStatus::Failed {
+            return None; // Already terminal
+        }
+        entry.status = SuspenseStatus::Confirmed;
+        let entry = entry.clone();
+
+        let now = now_secs();
+        let total = entry.capital + entry.fees;
+        let pid = Some(entry.position_id.clone());
+
+        // Double-entry: Suspense → Position + Fees
+        self.add_entry(now, &format!("Position:{}", entry.position_id),
+            entry.capital, 0.0, pid.clone(),
+            &format!("CONFIRMED: promote trade {} to position", trade_id));
+        if entry.fees > 0.0 {
+            self.add_entry(now, "Fees", entry.fees, 0.0, pid.clone(),
+                &format!("CONFIRMED: fee for trade {}", trade_id));
+        }
+        self.add_entry(now, &format!("Suspense:{}", trade_id),
+            0.0, total, pid,
+            &format!("CONFIRMED: clear suspense for trade {}", trade_id));
+
+        // Update running balances
+        self.positions_deployed += entry.capital;
+        self.fees_total += entry.fees;
+
+        // Track asset holding
+        let holding = self.holdings.entry(entry.asset_id.clone()).or_insert(AssetHolding {
+            asset_id: entry.asset_id.clone(),
+            market_id: entry.market_id.clone(),
+            shares: 0.0,
+            cost_basis: 0.0,
+        });
+        holding.shares += entry.shares;
+        holding.cost_basis += entry.capital;
+
+        tracing::info!("[ACCT] SUSPENSE CONFIRM: trade={} → position={} | deployed=${:.2} cash=${:.2}",
+            trade_id, entry.position_id, self.positions_deployed, self.cash);
+
+        Some(entry)
+    }
+
+    /// RETRYING: update status but keep in suspense.
+    pub fn mark_suspense_retrying(&mut self, trade_id: &str) {
+        if let Some(entry) = self.suspense_entries.get_mut(trade_id) {
+            if entry.status == SuspenseStatus::Matched {
+                entry.status = SuspenseStatus::Retrying;
+                tracing::warn!("[ACCT] SUSPENSE RETRYING: trade={} — on-chain retry, holding in suspense", trade_id);
+            }
+        }
+    }
+
+    /// FAILED: reverse suspense entry, restore capital to Cash.
+    ///
+    /// Double-entry: Debit Cash, Credit Suspense:{trade_id}.
+    /// Returns the entry if found and reversed, None if not in suspense.
+    pub fn reverse_suspense(&mut self, trade_id: &str) -> Option<SuspenseEntry> {
+        let entry = self.suspense_entries.get_mut(trade_id)?;
+        if entry.status == SuspenseStatus::Confirmed || entry.status == SuspenseStatus::Failed {
+            return None; // Already terminal
+        }
+        entry.status = SuspenseStatus::Failed;
+        let entry = entry.clone();
+
+        let now = now_secs();
+        let total = entry.capital + entry.fees;
+
+        // Double-entry: Suspense → Cash (full reversal)
+        self.add_entry(now, "Cash", total, 0.0, Some(entry.position_id.clone()),
+            &format!("FAILED: reverse suspense for trade {}", trade_id));
+        self.add_entry(now, &format!("Suspense:{}", trade_id),
+            0.0, total, Some(entry.position_id.clone()),
+            &format!("FAILED: clear suspense for trade {}", trade_id));
+
+        self.cash += total;
+
+        tracing::warn!("[ACCT] SUSPENSE FAILED: trade={} — ${:.4} restored to cash | cash=${:.2}",
+            trade_id, total, self.cash);
+
+        Some(entry)
+    }
+
+    /// Get all entries currently in suspense.
+    pub fn suspense_entries(&self) -> &HashMap<String, SuspenseEntry> {
+        &self.suspense_entries
+    }
+
+    /// Total capital locked in suspense (Matched + Retrying only).
+    pub fn suspense_total(&self) -> f64 {
+        self.suspense_entries.values()
+            .filter(|e| e.status == SuspenseStatus::Matched || e.status == SuspenseStatus::Retrying)
+            .map(|e| e.capital + e.fees)
+            .sum()
+    }
+
     /// Serialize the entire ledger to JSON string (for checkpoint persistence).
     pub fn serialize_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
@@ -646,5 +839,111 @@ mod tests {
         assert!((restored.total_deployed() - ledger.total_deployed()).abs() < 0.001);
         assert_eq!(restored.position_count(), ledger.position_count());
         assert!(restored.verify_balance());
+    }
+
+    // --- B3.2: Suspense accounting tests ---
+
+    #[test]
+    fn test_suspense_enter_confirm_flow() {
+        let mut ledger = AccountingLedger::new(100.0, 0.02);
+
+        // MATCHED: enter suspense
+        let ok = ledger.enter_suspense("t1", "pos1", "token_a", "mkt_1", 10.0, 0.50, 5.0, 0.10);
+        assert!(ok);
+        assert!((ledger.cash_balance() - 94.90).abs() < 0.001); // 100 - 5.10
+        assert!((ledger.total_deployed() - 0.0).abs() < 0.001); // not yet deployed
+        assert!((ledger.suspense_total() - 5.10).abs() < 0.001);
+        assert_eq!(ledger.position_count(), 0); // no real position yet
+        assert!(ledger.verify_balance());
+
+        // CONFIRMED: promote to real position
+        let entry = ledger.confirm_from_suspense("t1");
+        assert!(entry.is_some());
+        assert!((ledger.cash_balance() - 94.90).abs() < 0.001); // unchanged
+        assert!((ledger.total_deployed() - 5.0).abs() < 0.001); // capital deployed
+        assert!((ledger.total_fees() - 0.10).abs() < 0.001);
+        assert!((ledger.suspense_total() - 0.0).abs() < 0.001); // suspense cleared
+        assert_eq!(ledger.position_count(), 1); // real position exists
+        let h = ledger.holdings().get("token_a").unwrap();
+        assert!((h.shares - 10.0).abs() < 0.001);
+        assert!(ledger.verify_balance());
+    }
+
+    #[test]
+    fn test_suspense_enter_fail_reverse() {
+        let mut ledger = AccountingLedger::new(100.0, 0.02);
+
+        ledger.enter_suspense("t1", "pos1", "token_a", "mkt_1", 10.0, 0.50, 5.0, 0.10);
+        assert!((ledger.cash_balance() - 94.90).abs() < 0.001);
+
+        // FAILED: reverse — capital restored
+        let entry = ledger.reverse_suspense("t1");
+        assert!(entry.is_some());
+        assert!((ledger.cash_balance() - 100.0).abs() < 0.001); // fully restored
+        assert!((ledger.total_deployed() - 0.0).abs() < 0.001);
+        assert!((ledger.suspense_total() - 0.0).abs() < 0.001);
+        assert_eq!(ledger.position_count(), 0);
+        assert!(ledger.verify_balance());
+    }
+
+    #[test]
+    fn test_suspense_dedup() {
+        let mut ledger = AccountingLedger::new(100.0, 0.02);
+
+        let ok1 = ledger.enter_suspense("t1", "pos1", "token_a", "mkt_1", 10.0, 0.50, 5.0, 0.10);
+        assert!(ok1);
+
+        // Same trade_id rejected
+        let ok2 = ledger.enter_suspense("t1", "pos1", "token_a", "mkt_1", 10.0, 0.50, 5.0, 0.10);
+        assert!(!ok2);
+
+        // Cash only deducted once
+        assert!((ledger.cash_balance() - 94.90).abs() < 0.001);
+
+        // Also blocked by record_buy_dedup (trade was already marked recorded)
+        let ok3 = ledger.record_buy_dedup("t1", "pos1", 5.0, 0.10, "token_a", "mkt_1", 10.0, 0.50, "dup");
+        assert!(!ok3);
+
+        assert!(ledger.verify_balance());
+    }
+
+    #[test]
+    fn test_suspense_retrying_then_confirmed() {
+        let mut ledger = AccountingLedger::new(100.0, 0.02);
+
+        ledger.enter_suspense("t1", "pos1", "token_a", "mkt_1", 10.0, 0.50, 5.0, 0.10);
+
+        // RETRYING
+        ledger.mark_suspense_retrying("t1");
+        assert_eq!(ledger.suspense_entries().get("t1").unwrap().status, SuspenseStatus::Retrying);
+        assert!((ledger.suspense_total() - 5.10).abs() < 0.001); // still in suspense
+
+        // CONFIRMED after retry
+        let entry = ledger.confirm_from_suspense("t1");
+        assert!(entry.is_some());
+        assert!((ledger.suspense_total() - 0.0).abs() < 0.001);
+        assert_eq!(ledger.position_count(), 1);
+        assert!(ledger.verify_balance());
+    }
+
+    #[test]
+    fn test_suspense_total() {
+        let mut ledger = AccountingLedger::new(100.0, 0.02);
+
+        ledger.enter_suspense("t1", "pos1", "token_a", "mkt_1", 10.0, 0.50, 5.0, 0.10);
+        ledger.enter_suspense("t2", "pos2", "token_b", "mkt_2", 5.0, 0.30, 3.0, 0.06);
+
+        // Two entries in suspense
+        assert!((ledger.suspense_total() - 8.16).abs() < 0.001); // 5.10 + 3.06
+
+        // Confirm one
+        ledger.confirm_from_suspense("t1");
+        assert!((ledger.suspense_total() - 3.06).abs() < 0.001); // only t2
+
+        // Fail the other
+        ledger.reverse_suspense("t2");
+        assert!((ledger.suspense_total() - 0.0).abs() < 0.001);
+
+        assert!(ledger.verify_balance());
     }
 }

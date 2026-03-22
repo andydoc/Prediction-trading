@@ -53,6 +53,14 @@ pub enum NotifyEvent {
         positions: usize,
         capital: f64,
     },
+    /// B3.2: Trade failed on-chain — suspense reversed, opposing legs may need selling.
+    TradeFailed {
+        trade_id: String,
+        position_id: String,
+        market_id: String,
+        reason: String,
+        opposing_legs_sold: bool,
+    },
 }
 
 /// Configuration for notifications.
@@ -306,6 +314,7 @@ impl Notifier {
             NotifyEvent::CircuitBreaker { .. } => self.config.on_circuit_breaker,
             NotifyEvent::DailySummary { .. } => self.config.on_daily_summary,
             NotifyEvent::Startup { .. } => true, // always send
+            NotifyEvent::TradeFailed { .. } => self.config.on_error, // always alert on trade failures
         }
     }
 
@@ -389,6 +398,23 @@ impl Notifier {
                 format!(
                     "{}[STARTUP] Engine started\nMode: {}\nOpen positions: {}\nCapital: ${:.2}",
                     pfx, mode, positions, capital
+                )
+            }
+            NotifyEvent::TradeFailed {
+                trade_id,
+                position_id,
+                market_id,
+                reason,
+                opposing_legs_sold,
+            } => {
+                let legs_msg = if *opposing_legs_sold {
+                    "Opposing arb legs queued for sell"
+                } else {
+                    "No opposing legs to unwind"
+                };
+                format!(
+                    "{}[TRADE FAILED] Trade {} on position {}\nMarket: {}\nReason: {}\n{}",
+                    pfx, trade_id, position_id, market_id, reason, legs_msg
                 )
             }
         }

@@ -334,24 +334,79 @@ pub fn query_clob_positions(
     Ok(result)
 }
 
+/// Query venue positions with freshness guarantee (B4.0/B4.1 enhanced).
+///
+/// Makes two successive Data API reads; if the position snapshots differ,
+/// retries up to `max_retries` times with `poll_interval` between attempts.
+/// Returns positions only when two identical successive reads are obtained.
+///
+/// This ensures the Data API indexer has caught up with on-chain state
+/// before reconciliation decisions are made.
+pub fn query_clob_positions_fresh(
+    http_client: &reqwest::blocking::Client,
+    clob_host: &str,
+    auth: Option<&crate::signing::ClobAuth>,
+    poll_interval: std::time::Duration,
+    max_retries: u32,
+) -> Result<Vec<VenuePosition>, String> {
+    let mut prev_snapshot: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut last_positions = Vec::new();
+
+    for attempt in 0..=max_retries {
+        let venue = query_clob_positions(http_client, clob_host, auth)?;
+
+        let mut current_snapshot: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for vp in &venue {
+            *current_snapshot.entry(vp.asset_id.clone()).or_default() += vp.size;
+        }
+
+        if !prev_snapshot.is_empty() && current_snapshot == prev_snapshot {
+            tracing::info!("B4.0/B4.1: Data API stabilised after {} reads ({} positions)",
+                attempt + 1, venue.len());
+            return Ok(venue);
+        }
+
+        if attempt < max_retries {
+            tracing::debug!("B4.0/B4.1: Data API read {} — {} positions, waiting for stable...",
+                attempt + 1, venue.len());
+            prev_snapshot = current_snapshot;
+            last_positions = venue;
+            std::thread::sleep(poll_interval);
+        } else {
+            tracing::warn!("B4.0/B4.1: Data API not stable after {} reads — using last read ({} positions)",
+                max_retries + 1, venue.len());
+            last_positions = venue;
+        }
+    }
+
+    Ok(last_positions)
+}
+
 /// Run startup reconciliation (B4.1).
 ///
 /// Called once at engine startup after state is loaded from SQLite.
 /// Compares loaded positions against CLOB API state.
+/// Returns both the report AND the venue positions so the caller can
+/// pass them to `apply_reconciliation()`.
 pub fn reconcile_startup(
     open_positions: &[(String, String, f64)], // (position_id, market_id, shares)
     http_client: &reqwest::blocking::Client,
     clob_host: &str,
     auth: Option<&crate::signing::ClobAuth>,
     escalation_threshold: f64,
-) -> ReconciliationReport {
-    let venue = match query_clob_positions(http_client, clob_host, auth) {
+) -> (ReconciliationReport, Vec<VenuePosition>) {
+    // B4.1 enhanced: use freshness polling (two identical successive reads)
+    let venue = match query_clob_positions_fresh(
+        http_client, clob_host, auth,
+        std::time::Duration::from_secs(5), // poll interval
+        6, // max retries (up to 30s total)
+    ) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("B4.1 startup reconciliation: CLOB query failed: {}", e);
             let mut report = ReconciliationReport::new(true);
             report.passed = true; // Don't block startup on query failure
-            return report;
+            return (report, Vec::new());
         }
     };
 
@@ -363,7 +418,7 @@ pub fn reconcile_startup(
         );
         let mut report = ReconciliationReport::new(true);
         report.positions_checked = open_positions.len();
-        return report;
+        return (report, Vec::new());
     }
 
     let report = compare_positions(open_positions, &venue, escalation_threshold, true);
@@ -385,7 +440,7 @@ pub fn reconcile_startup(
         }
     }
 
-    report
+    (report, venue)
 }
 
 /// Run periodic reconciliation (B4.0).
@@ -398,14 +453,19 @@ pub fn reconcile_periodic(
     clob_host: &str,
     auth: Option<&crate::signing::ClobAuth>,
     escalation_threshold: f64,
-) -> ReconciliationReport {
-    let venue = match query_clob_positions(http_client, clob_host, auth) {
+) -> (ReconciliationReport, Vec<VenuePosition>) {
+    // B4.0 enhanced: use freshness polling (two identical successive reads)
+    let venue = match query_clob_positions_fresh(
+        http_client, clob_host, auth,
+        std::time::Duration::from_secs(5), // poll interval
+        3, // max retries (shorter for periodic — up to 15s)
+    ) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("B4.0 periodic reconciliation: CLOB query failed: {}", e);
             let mut report = ReconciliationReport::new(false);
             report.passed = true;
-            return report;
+            return (report, Vec::new());
         }
     };
 
@@ -414,7 +474,7 @@ pub fn reconcile_periodic(
         tracing::debug!("B4.0 periodic reconciliation: skipped (no venue credentials)");
         let mut report = ReconciliationReport::new(false);
         report.positions_checked = open_positions.len();
-        return report;
+        return (report, Vec::new());
     }
 
     let report = compare_positions(open_positions, &venue, escalation_threshold, false);
@@ -426,7 +486,7 @@ pub fn reconcile_periodic(
         report.critical_count(), report.warning_count()
     );
 
-    report
+    (report, venue)
 }
 
 // ---------------------------------------------------------------------------

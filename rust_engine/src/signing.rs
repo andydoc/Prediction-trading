@@ -722,4 +722,187 @@ mod tests {
         assert_eq!(maker, U256::from(100_000_000u64)); // 100 shares
         assert_eq!(taker, U256::from(50_000_000u64));  // $50 USDC
     }
+
+    // -----------------------------------------------------------------------
+    // B2.3: Comprehensive rounding verification (16 core + 4 edge cases)
+    // -----------------------------------------------------------------------
+
+    /// Check that a raw 6-decimal value has at most `max_decimals` human-readable decimal places.
+    fn check_decimals(raw: U256, max_decimals: u32) -> bool {
+        let val = raw.as_limbs()[0] as f64;
+        let human = val / 1_000_000.0;
+        let scale = 10f64.powi(max_decimals as i32);
+        let rounded = (human * scale).round() / scale;
+        (human - rounded).abs() < 1e-9
+    }
+
+    /// Helper: run a single rounding test case and assert precision rules.
+    ///
+    /// For BUY: maker=USDC, taker=shares
+    ///   GTC: USDC ≤ amount_decimals, shares ≤ 2
+    ///   FAK: USDC ≤ 2, shares ≤ amount_decimals
+    ///
+    /// For SELL: maker=shares, taker=USDC
+    ///   GTC: shares ≤ 2, USDC ≤ amount_decimals
+    ///   FAK: shares ≤ amount_decimals, USDC ≤ 2
+    fn assert_precision(
+        price: f64, size_usd: f64, side: Side, amount_decimals: u32,
+        is_market: bool, label: &str,
+    ) {
+        let (maker, taker) = compute_amounts_for_order_type(
+            price, size_usd, side, amount_decimals, is_market,
+        );
+        assert!(!maker.is_zero(), "{label}: maker is zero");
+        assert!(!taker.is_zero(), "{label}: taker is zero");
+
+        let (usdc_max_dec, shares_max_dec) = if is_market {
+            (2, amount_decimals) // FAK: USDC=2, shares=amount_decimals
+        } else {
+            (amount_decimals, 2) // GTC: USDC=amount_decimals, shares=2
+        };
+
+        match side {
+            Side::Buy => {
+                // maker=USDC, taker=shares
+                assert!(check_decimals(maker, usdc_max_dec),
+                    "{label}: maker (USDC) exceeds {usdc_max_dec} decimals, raw={maker}");
+                assert!(check_decimals(taker, shares_max_dec),
+                    "{label}: taker (shares) exceeds {shares_max_dec} decimals, raw={taker}");
+            }
+            Side::Sell => {
+                // maker=shares, taker=USDC
+                assert!(check_decimals(maker, shares_max_dec),
+                    "{label}: maker (shares) exceeds {shares_max_dec} decimals, raw={maker}");
+                assert!(check_decimals(taker, usdc_max_dec),
+                    "{label}: taker (USDC) exceeds {usdc_max_dec} decimals, raw={taker}");
+            }
+        }
+    }
+
+    // --- Tick 0.1 (amount_decimals=3) ---
+
+    #[test]
+    fn test_amounts_tick01_gtc_buy() {
+        assert_precision(0.3, 15.0, Side::Buy, 3, false, "tick0.1/GTC/BUY");
+    }
+    #[test]
+    fn test_amounts_tick01_gtc_sell() {
+        assert_precision(0.3, 15.0, Side::Sell, 3, false, "tick0.1/GTC/SELL");
+    }
+    #[test]
+    fn test_amounts_tick01_fak_buy() {
+        assert_precision(0.3, 15.0, Side::Buy, 3, true, "tick0.1/FAK/BUY");
+    }
+    #[test]
+    fn test_amounts_tick01_fak_sell() {
+        assert_precision(0.3, 15.0, Side::Sell, 3, true, "tick0.1/FAK/SELL");
+    }
+
+    // --- Tick 0.01 (amount_decimals=4) ---
+
+    #[test]
+    fn test_amounts_tick001_gtc_buy() {
+        assert_precision(0.45, 22.50, Side::Buy, 4, false, "tick0.01/GTC/BUY");
+    }
+    #[test]
+    fn test_amounts_tick001_gtc_sell() {
+        assert_precision(0.45, 22.50, Side::Sell, 4, false, "tick0.01/GTC/SELL");
+    }
+    #[test]
+    fn test_amounts_tick001_fak_buy() {
+        assert_precision(0.45, 22.50, Side::Buy, 4, true, "tick0.01/FAK/BUY");
+    }
+    #[test]
+    fn test_amounts_tick001_fak_sell() {
+        assert_precision(0.45, 22.50, Side::Sell, 4, true, "tick0.01/FAK/SELL");
+    }
+
+    // --- Tick 0.001 (amount_decimals=5) ---
+
+    #[test]
+    fn test_amounts_tick0001_gtc_buy() {
+        assert_precision(0.123, 50.0, Side::Buy, 5, false, "tick0.001/GTC/BUY");
+    }
+    #[test]
+    fn test_amounts_tick0001_gtc_sell() {
+        assert_precision(0.123, 50.0, Side::Sell, 5, false, "tick0.001/GTC/SELL");
+    }
+    #[test]
+    fn test_amounts_tick0001_fak_buy() {
+        assert_precision(0.123, 50.0, Side::Buy, 5, true, "tick0.001/FAK/BUY");
+    }
+    #[test]
+    fn test_amounts_tick0001_fak_sell() {
+        assert_precision(0.123, 50.0, Side::Sell, 5, true, "tick0.001/FAK/SELL");
+    }
+
+    // --- Tick 0.0001 (amount_decimals=6) ---
+
+    #[test]
+    fn test_amounts_tick00001_gtc_buy() {
+        assert_precision(0.0567, 100.0, Side::Buy, 6, false, "tick0.0001/GTC/BUY");
+    }
+    #[test]
+    fn test_amounts_tick00001_gtc_sell() {
+        assert_precision(0.0567, 100.0, Side::Sell, 6, false, "tick0.0001/GTC/SELL");
+    }
+    #[test]
+    fn test_amounts_tick00001_fak_buy() {
+        assert_precision(0.0567, 100.0, Side::Buy, 6, true, "tick0.0001/FAK/BUY");
+    }
+    #[test]
+    fn test_amounts_tick00001_fak_sell() {
+        assert_precision(0.0567, 100.0, Side::Sell, 6, true, "tick0.0001/FAK/SELL");
+    }
+
+    // --- Edge cases ---
+
+    #[test]
+    fn test_amounts_minimum_size() {
+        // Smallest plausible order: ~$0.50 at price 0.99
+        assert_precision(0.99, 0.50, Side::Buy, 4, true, "min_size/FAK/BUY");
+        assert_precision(0.99, 0.50, Side::Sell, 4, false, "min_size/GTC/SELL");
+    }
+
+    #[test]
+    fn test_amounts_large_size() {
+        // $10,000 order — should not overflow U256
+        assert_precision(0.50, 10_000.0, Side::Buy, 4, false, "large/GTC/BUY");
+        assert_precision(0.50, 10_000.0, Side::Sell, 4, true, "large/FAK/SELL");
+    }
+
+    #[test]
+    fn test_amounts_extreme_price_low() {
+        // Near-zero price: 0.01
+        assert_precision(0.01, 5.0, Side::Buy, 4, true, "low_price/FAK/BUY");
+        assert_precision(0.01, 5.0, Side::Sell, 4, false, "low_price/GTC/SELL");
+    }
+
+    #[test]
+    fn test_amounts_extreme_price_high() {
+        // Near-one price: 0.99
+        assert_precision(0.99, 50.0, Side::Buy, 6, false, "high_price/GTC/BUY");
+        assert_precision(0.99, 50.0, Side::Sell, 6, true, "high_price/FAK/SELL");
+    }
+
+    /// Parametric test: all 16 core combos in one test for regression coverage.
+    #[test]
+    fn test_amounts_all_combos_parametric() {
+        let combos: Vec<(f64, f64, u32, &str)> = vec![
+            (0.3,    15.0,  3, "tick0.1"),
+            (0.45,   22.50, 4, "tick0.01"),
+            (0.123,  50.0,  5, "tick0.001"),
+            (0.0567, 100.0, 6, "tick0.0001"),
+        ];
+        for (price, size, amt_dec, tick_label) in &combos {
+            for is_market in [false, true] {
+                let order_type = if is_market { "FAK" } else { "GTC" };
+                for side in [Side::Buy, Side::Sell] {
+                    let side_label = match side { Side::Buy => "BUY", Side::Sell => "SELL" };
+                    let label = format!("{tick_label}/{order_type}/{side_label}");
+                    assert_precision(*price, *size, side, *amt_dec, is_market, &label);
+                }
+            }
+        }
+    }
 }

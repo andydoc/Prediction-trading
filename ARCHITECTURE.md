@@ -173,7 +173,12 @@ rust_engine/src/
 ├── postponement.rs     # Postponement detector (Anthropic API)
 ├── rate_limiter.rs     # Token bucket rate limiter
 ├── latency.rs          # Latency percentile tracking
-└── notify.rs           # Telegram / webhook notifications
+├── notify.rs           # Telegram / webhook notifications
+├── fill_confirmation.rs # B4.5: Parallel WS + Data API fill confirmation
+├── usdc_monitor.rs     # B4.6: USDC.e on-chain balance monitor
+├── gas_monitor.rs      # C1.1: POL gas balance monitor
+├── circuit_breaker.rs  # C1: Circuit breaker
+└── strategy_tracker.rs # E: Virtual portfolio strategy tracking
 
 rust_supervisor/src/
 ├── main.rs             # Binary entry: PID lock, signal handling
@@ -388,6 +393,12 @@ SQLite in-memory DB with periodic disk backup (`state.rs` + `cached_db.rs`). Tab
 **Startup sequence**: `load_from_disk()` → restore instruments → restore positions → restore accounting ledger → B4.1 reconciliation.
 
 **Accounting ledger** (`accounting.rs`): Independent double-entry record of all cash movements. Dedup via `recorded_trade_ids` prevents double-counting from WS + REST. Serialized/deserialized as JSON checkpoint. Journal entries flushed incrementally to `journal` table for audit trail.
+
+**Suspense accounting** (B3.2): MATCHED trades enter suspense (`Cash → Suspense:{trade_id}`). On CONFIRMED, promoted to real position (`Suspense → Position + Fees`). On FAILED, reversed (`Suspense → Cash`). `suspense_total()` tracks outstanding capital. Prevents committing to positions until on-chain confirmation.
+
+**Parallel fill confirmation** (B4.5, `fill_confirmation.rs`): Races WS User Channel (fast, ~80% reliable) with Data API position polling (slower, reliable) via concurrent threads. WS MATCHED events trigger suspense entry immediately. First source to detect fills wins; partial fills handled per B3.6.
+
+**USDC.e monitor** (B4.6, `usdc_monitor.rs`): Periodically queries Polygon RPC for ERC-20 `balanceOf` on USDC.e contract. Compares on-chain vs accounting cash — alerts on drift > threshold. Dashboard `live_balance` field shows on-chain balance. Critical balance trips circuit breaker.
 
 ---
 

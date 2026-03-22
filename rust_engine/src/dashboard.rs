@@ -72,6 +72,8 @@ pub struct EngineMetrics {
     pub ws_connections: u32,
     // Gas monitor (C1.1)
     pub pol_balance: Option<f64>,
+    // USDC monitor (B4.6) — on-chain USDC.e balance
+    pub usdc_balance: Option<f64>,
     // E2.5: Stress test failure signal counters
     pub ws_reconnects: u64,
     pub ws_pong_timeouts: u64,
@@ -495,6 +497,7 @@ fn build_stats(s: &DashboardState) -> Value {
     } else { "N/A".into() };
     let now_str = chrono::Utc::now().format("%d/%m/%Y %H:%M:%S").to_string();
     let start_str = s.start_time.format("%d/%m/%Y %H:%M").to_string();
+    let usdc_balance = s.engine_metrics.lock().usdc_balance;
 
     json!({
         "cash": cap, "deployed": deployed, "total_value": total_value,
@@ -505,7 +508,7 @@ fn build_stats(s: &DashboardState) -> Value {
         "annualized": annualized_str, "annualized_ret": annualized_ret,
         "mode_label": s.mode.to_uppercase(), "mode_class": format!("mode-{}", s.mode),
         "first_trade": first_trade_str, "start_time": start_str,
-        "live_balance": null,
+        "live_balance": usdc_balance,
         "timestamp": now_str,
         // Engine metrics (passed through from Python via update_metrics)
         "ws_subs": 0, "ws_msgs": 0, "ws_live": 0, "ws_total": 0, "ws_pct": 0,

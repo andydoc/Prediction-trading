@@ -44,6 +44,8 @@ pub mod executor;
 pub mod reconciliation;
 pub mod circuit_breaker;
 pub mod gas_monitor;
+pub mod usdc_monitor;
+pub mod fill_confirmation;
 pub mod strategy_tracker;
 pub mod accounting;
 
@@ -892,32 +894,150 @@ impl TradingEngine {
     /// Pass `clob_auth` for live CLOB position query, or None for shadow mode.
     pub fn reconcile_startup_with_auth(
         &self, clob_host: &str, auth: Option<&signing::ClobAuth>, escalation_threshold: f64,
-    ) -> reconciliation::ReconciliationReport {
+    ) -> (reconciliation::ReconciliationReport, Vec<reconciliation::VenuePosition>) {
         let positions = self.extract_position_data();
         reconciliation::reconcile_startup(
             &positions, &self.http_client, clob_host, auth, escalation_threshold,
         )
     }
 
-    /// Legacy: startup reconciliation without auth (shadow mode).
+    /// Startup reconciliation without auth (shadow mode).
+    /// Automatically applies reconciliation adjustments when discrepancies found.
     pub fn reconcile_startup(&self, escalation_threshold: f64) -> reconciliation::ReconciliationReport {
-        self.reconcile_startup_with_auth("https://clob.polymarket.com", None, escalation_threshold)
+        let (report, venue) = self.reconcile_startup_with_auth(
+            "https://clob.polymarket.com", None, escalation_threshold,
+        );
+        if !report.passed && !venue.is_empty() {
+            let adjustments = self.apply_reconciliation(&report, &venue);
+            for adj in &adjustments {
+                tracing::info!("B4.1 startup auto-adjustment: {}", adj);
+            }
+        }
+        report
     }
 
     /// Run periodic reconciliation (B4.0).
     /// Called on interval from the orchestrator tick loop.
     pub fn reconcile_periodic_with_auth(
         &self, clob_host: &str, auth: Option<&signing::ClobAuth>, escalation_threshold: f64,
-    ) -> reconciliation::ReconciliationReport {
+    ) -> (reconciliation::ReconciliationReport, Vec<reconciliation::VenuePosition>) {
         let positions = self.extract_position_data();
         reconciliation::reconcile_periodic(
             &positions, &self.http_client, clob_host, auth, escalation_threshold,
         )
     }
 
-    /// Legacy: periodic reconciliation without auth (shadow mode).
+    /// Periodic reconciliation without auth (shadow mode).
+    /// Automatically applies reconciliation adjustments when discrepancies found.
     pub fn reconcile_periodic(&self, escalation_threshold: f64) -> reconciliation::ReconciliationReport {
-        self.reconcile_periodic_with_auth("https://clob.polymarket.com", None, escalation_threshold)
+        let (report, venue) = self.reconcile_periodic_with_auth(
+            "https://clob.polymarket.com", None, escalation_threshold,
+        );
+        if !report.passed && !venue.is_empty() {
+            let adjustments = self.apply_reconciliation(&report, &venue);
+            for adj in &adjustments {
+                tracing::info!("B4.0 periodic auto-adjustment: {}", adj);
+            }
+        }
+        report
+    }
+
+    /// Apply reconciliation results: update internal state to match venue (source of truth).
+    ///
+    /// For each discrepancy:
+    /// - QuantityMismatch: adjust MarketLeg.shares + accounting
+    /// - PositionMissingOnVenue: mark position stale
+    /// - PositionMissingInternal: log orphan (venue has it, we don't)
+    ///
+    /// Returns descriptions of adjustments made.
+    pub fn apply_reconciliation(
+        &self,
+        report: &reconciliation::ReconciliationReport,
+        venue_positions: &[reconciliation::VenuePosition],
+    ) -> Vec<String> {
+        let mut adjustments = Vec::new();
+
+        // Build venue lookup: market_id → (total_size, avg_price, asset_id)
+        let mut venue_by_market: std::collections::HashMap<String, (f64, f64, String)> =
+            std::collections::HashMap::new();
+        for vp in venue_positions {
+            let entry = venue_by_market.entry(vp.market_id.clone())
+                .or_insert((0.0, vp.avg_price, vp.asset_id.clone()));
+            entry.0 += vp.size;
+        }
+
+        for d in &report.discrepancies {
+            match d.kind {
+                reconciliation::DiscrepancyKind::QuantityMismatch => {
+                    let market_id = match &d.market_id {
+                        Some(m) => m.clone(),
+                        None => continue,
+                    };
+                    let internal = d.internal_value.unwrap_or(0.0);
+                    let venue = d.venue_value.unwrap_or(0.0);
+                    let delta = venue - internal;
+
+                    // Get venue price and asset_id for accounting
+                    let (_, price, asset_id) = venue_by_market.get(&market_id)
+                        .cloned()
+                        .unwrap_or((0.0, 0.0, String::new()));
+
+                    // Update position shares in PositionManager
+                    let position_id = d.position_id.clone().unwrap_or_default();
+                    {
+                        let mut pm = self.positions.lock();
+                        if let Some(pos) = pm.open_positions_mut().get_mut(&position_id) {
+                            if let Some(leg) = pos.markets.get_mut(&market_id) {
+                                let old = leg.shares;
+                                leg.shares = venue;
+                                adjustments.push(format!(
+                                    "QuantityMismatch {}: shares {:.2} → {:.2} (delta={:+.2})",
+                                    &market_id[..market_id.len().min(20)], old, venue, delta
+                                ));
+                            }
+                        }
+                    }
+
+                    // Record accounting adjustment
+                    if delta.abs() > 0.001 {
+                        let mut acct = self.accounting.lock();
+                        acct.record_reconciliation_adjustment(
+                            &position_id, &asset_id, &market_id,
+                            delta, price,
+                            &format!("Recon: {}{:.2} shares @ {:.4} ({})",
+                                if delta > 0.0 { "+" } else { "" }, delta, price,
+                                &market_id[..market_id.len().min(20)]),
+                        );
+                    }
+                }
+                reconciliation::DiscrepancyKind::PositionMissingOnVenue => {
+                    let market_id = d.market_id.clone().unwrap_or_default();
+                    adjustments.push(format!(
+                        "MissingOnVenue {}: position exists internally but not on exchange (stale)",
+                        &market_id[..market_id.len().min(20)]
+                    ));
+                    // Don't auto-close — flag for manual review
+                }
+                reconciliation::DiscrepancyKind::PositionMissingInternal => {
+                    let market_id = d.market_id.clone().unwrap_or_default();
+                    let venue_shares = d.venue_value.unwrap_or(0.0);
+                    adjustments.push(format!(
+                        "MissingInternal {}: venue has {:.2} shares, engine doesn't track it (orphan)",
+                        &market_id[..market_id.len().min(20)], venue_shares
+                    ));
+                    // Don't auto-adopt — flag for manual review
+                }
+                _ => {}
+            }
+        }
+
+        if adjustments.is_empty() {
+            tracing::info!("[RECON] No adjustments needed — internal state matches venue");
+        } else {
+            tracing::info!("[RECON] Applied {} adjustments to match venue state", adjustments.len());
+        }
+
+        adjustments
     }
 
     // === Dashboard helpers ===
@@ -928,6 +1048,7 @@ impl TradingEngine {
         scanner_status: &str, scanner_ts: &str,
         engine_status: &str, engine_ts: &str,
         pol_balance: Option<f64>,
+        usdc_balance: Option<f64>,
     ) {
         let mut m = self.engine_metrics.lock();
         m.iteration = iteration;
@@ -945,6 +1066,9 @@ impl TradingEngine {
             m.ws_total_msgs = ts.total_msgs;
             m.ws_live_books = self.book.live_count() as u64;
             m.ws_connections = ts.total_connections;
+            m.ws_reconnects = ts.reconnects;
+            m.ws_pong_timeouts = ts.pong_timeouts;
+            m.ws_heartbeat_failures = ts.heartbeat_failures;
         } else {
             let ws = self.ws.stats();
             m.ws_subscribed = ws.subscribed;
@@ -953,6 +1077,19 @@ impl TradingEngine {
             m.ws_connections = 0;
         }
         m.pol_balance = pol_balance;
+        m.usdc_balance = usdc_balance;
+    }
+
+    /// E2.5: Update eval/opp/stale counters for stress test metrics.
+    pub fn update_stress_counters(
+        &self, evals_total: u64, opps_found: u64,
+        stale_sweeps: u64, stale_assets_swept: u64,
+    ) {
+        let mut m = self.engine_metrics.lock();
+        m.evals_total = evals_total;
+        m.opps_found = opps_found;
+        m.stale_sweeps = stale_sweeps;
+        m.stale_assets_swept = stale_assets_swept;
     }
 
     pub fn set_recent_opps(&self, opps_json: &[String]) {
@@ -981,4 +1118,3 @@ pub struct ApiResolution {
     pub payout: f64,
     pub profit: f64,
 }
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       

@@ -200,7 +200,7 @@ pub fn verify_cold_start(
     // === STEP 3: Reconcile checkpoint vs venue ===
 
     tracing::info!("[D6] Running startup reconciliation against stable venue data...");
-    let recon = engine.reconcile_startup_with_auth(clob_host, Some(clob_auth), 0.1);
+    let (recon, recon_venue) = engine.reconcile_startup_with_auth(clob_host, Some(clob_auth), 0.1);
 
     tracing::info!("[D6] Reconciliation: passed={}, checked={}, matched={}, discrepancies={}",
         recon.passed, recon.positions_checked, recon.positions_matched, recon.discrepancies.len());
@@ -209,8 +209,9 @@ pub fn verify_cold_start(
     }
 
     // === STEP 4: Apply reconciliation — update state to venue truth ===
-
-    let adjustments = engine.apply_reconciliation(&recon, &venue_positions);
+    // Use venue positions from reconciliation (which already did freshness polling)
+    let venue_to_apply = if recon_venue.is_empty() { &venue_positions } else { &recon_venue };
+    let adjustments = engine.apply_reconciliation(&recon, venue_to_apply);
     for adj in &adjustments {
         tracing::info!("[D6] Adjustment: {}", adj);
     }

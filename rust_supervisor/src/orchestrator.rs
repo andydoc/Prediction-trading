@@ -25,6 +25,7 @@ use rust_engine::state::StateDB;
 use rust_engine::ws_tiered::TieredWsConfig;
 use rust_engine::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use rust_engine::gas_monitor::{GasMonitor, GasMonitorConfig, GasCheckResult};
+use rust_engine::usdc_monitor::{UsdcMonitor, UsdcMonitorConfig, UsdcCheckResult};
 use rust_engine::strategy_tracker::{self, StrategyTracker};
 use rust_engine::TradingEngine;
 
@@ -223,6 +224,8 @@ struct SafetyYaml {
     circuit_breaker: CircuitBreakerYaml,
     #[serde(default)]
     gas_monitor: GasMonitorYaml,
+    #[serde(default)]
+    usdc_monitor: UsdcMonitorYaml,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -251,6 +254,22 @@ struct GasMonitorYaml {
     min_pol_balance: f64,
     #[serde(default = "default_01f")]
     critical_pol_balance: f64,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct UsdcMonitorYaml {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_rpc_url")]
+    rpc_url: String,
+    #[serde(default = "default_3600f")]
+    check_interval_seconds: f64,
+    #[serde(default = "default_1f")]
+    drift_threshold: f64,
+    #[serde(default = "default_10f")]
+    warning_balance: f64,
+    #[serde(default = "default_1f")]
+    critical_balance: f64,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -406,6 +425,14 @@ pub struct OrchestratorConfig {
     pub gas_check_interval_seconds: f64,
     pub gas_min_pol_balance: f64,
     pub gas_critical_pol_balance: f64,
+
+    // USDC monitor (B4.6)
+    pub usdc_enabled: bool,
+    pub usdc_rpc_url: String,
+    pub usdc_check_interval_seconds: f64,
+    pub usdc_drift_threshold: f64,
+    pub usdc_warning_balance: f64,
+    pub usdc_critical_balance: f64,
 }
 
 impl OrchestratorConfig {
@@ -523,6 +550,13 @@ impl OrchestratorConfig {
             gas_check_interval_seconds: cfg.safety.gas_monitor.check_interval_seconds,
             gas_min_pol_balance: cfg.safety.gas_monitor.min_pol_balance,
             gas_critical_pol_balance: cfg.safety.gas_monitor.critical_pol_balance,
+
+            usdc_enabled: cfg.safety.usdc_monitor.enabled,
+            usdc_rpc_url: cfg.safety.usdc_monitor.rpc_url,
+            usdc_check_interval_seconds: cfg.safety.usdc_monitor.check_interval_seconds,
+            usdc_drift_threshold: cfg.safety.usdc_monitor.drift_threshold,
+            usdc_warning_balance: cfg.safety.usdc_monitor.warning_balance,
+            usdc_critical_balance: cfg.safety.usdc_monitor.critical_balance,
         }
     }
 }
@@ -581,6 +615,10 @@ pub struct Orchestrator {
     // Gas monitor (C1.1)
     gas_monitor: GasMonitor,
     last_gas_check: f64,
+
+    // USDC monitor (B4.6)
+    usdc_monitor: UsdcMonitor,
+    last_usdc_check: f64,
 
     // P1: Cached held IDs (invalidated on position entry/exit/resolution)
     held_ids_cache: Option<(HashSet<String>, HashSet<String>)>,
@@ -746,6 +784,22 @@ impl Orchestrator {
                 cfg.gas_wallet_address, cfg.gas_min_pol_balance, cfg.gas_critical_pol_balance);
         }
 
+        // Build USDC monitor (B4.6)
+        let usdc_monitor = UsdcMonitor::new(UsdcMonitorConfig {
+            enabled: cfg.usdc_enabled,
+            rpc_url: cfg.usdc_rpc_url.clone(),
+            wallet_address: cfg.gas_wallet_address.clone(), // same wallet as gas
+            check_interval_seconds: cfg.usdc_check_interval_seconds,
+            drift_threshold: cfg.usdc_drift_threshold,
+            warning_balance: cfg.usdc_warning_balance,
+            critical_balance: cfg.usdc_critical_balance,
+        });
+
+        if usdc_monitor.is_enabled() {
+            tracing::info!("USDC monitor enabled: drift>{}, warn<${}, critical<${}",
+                cfg.usdc_drift_threshold, cfg.usdc_warning_balance, cfg.usdc_critical_balance);
+        }
+
         Ok(Self {
             cfg, engine,
             scanner: Arc::new(scanner),
@@ -776,6 +830,8 @@ impl Orchestrator {
             circuit_breaker,
             gas_monitor,
             last_gas_check: 0.0,
+            usdc_monitor,
+            last_usdc_check: 0.0,
             held_ids_cache: None,
             last_constraint_to_assets: HashMap::new(),
             kill_switch_activated: false,
@@ -1422,6 +1478,44 @@ impl Orchestrator {
                 }
             }
             self.last_gas_check = now;
+        }
+
+        // --- B4.6: USDC.e balance check ---
+        if self.usdc_monitor.is_enabled()
+            && (now - self.last_usdc_check) >= self.usdc_monitor.check_interval()
+        {
+            let accounting_cash = self.engine.accounting.lock().cash_balance();
+            match self.usdc_monitor.check_balance(&self.engine.http_client, accounting_cash) {
+                UsdcCheckResult::Ok { on_chain, .. } => {
+                    tracing::info!("USDC.e balance: ${:.2} (accounting: ${:.2})", on_chain, accounting_cash);
+                }
+                UsdcCheckResult::DriftWarning { on_chain, accounting, drift } => {
+                    tracing::warn!("USDC.e drift: on-chain=${:.2} vs accounting=${:.2} (${:.2} drift)",
+                        on_chain, accounting, drift);
+                    let _ = self.notifier.send(&NotifyEvent::Error {
+                        message: format!("USDC drift: on-chain=${:.2} vs accounting=${:.2} (${:.2} drift)",
+                            on_chain, accounting, drift),
+                    });
+                }
+                UsdcCheckResult::LowBalance(bal) => {
+                    tracing::warn!("USDC.e balance LOW: ${:.2}", bal);
+                    let _ = self.notifier.send(&NotifyEvent::Error {
+                        message: format!("USDC.e balance low: ${:.2}", bal),
+                    });
+                }
+                UsdcCheckResult::CriticalBalance(bal) => {
+                    tracing::error!("USDC.e balance CRITICAL: ${:.2}", bal);
+                    let reason = format!("USDC.e critically low: ${:.2}", bal);
+                    if let Some(trip_msg) = self.circuit_breaker.check_gas_critical(&reason, now) {
+                        tracing::error!("CIRCUIT BREAKER TRIPPED: {}", trip_msg);
+                        let _ = self.notifier.send(&NotifyEvent::CircuitBreaker { reason: trip_msg });
+                    }
+                }
+                UsdcCheckResult::Error(e) => {
+                    tracing::warn!("USDC balance check failed: {}", e);
+                }
+            }
+            self.last_usdc_check = now;
         }
 
         // --- Stats ---
@@ -2213,6 +2307,10 @@ impl Orchestrator {
         let gas_str = self.gas_monitor.last_balance()
             .map(|b| format!(" POL={:.4}", b))
             .unwrap_or_default();
+        let usdc_str = self.usdc_monitor.last_on_chain_balance()
+            .map(|b| format!(" USDC={:.2}", b))
+            .unwrap_or_default();
+        let gas_str = format!("{}{}", gas_str, usdc_str);
 
         let (lat_p50, lat_p95, lat_max) = if !self.recent_latencies.is_empty() {
             let mut lats: Vec<f64> = self.recent_latencies.iter().copied().collect();
@@ -2265,6 +2363,7 @@ impl Orchestrator {
             "running", &chrono::Utc::now().format("%d/%m/%Y %H:%M:%S").to_string(),
             engine_status, &chrono::Utc::now().format("%d/%m/%Y %H:%M:%S").to_string(),
             self.gas_monitor.last_balance(),
+            self.usdc_monitor.last_on_chain_balance(),
         );
         self.engine.update_stress_counters(
             self.evals_total, self.opps_found,

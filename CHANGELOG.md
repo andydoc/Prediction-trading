@@ -7,6 +7,23 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.17.0] — 2026-03-22 — Milestone B Rework: Suspense Accounting, Parallel Confirmation, USDC Monitor
+
+### Added
+- **B3.2 Suspense accounting**: Trade lifecycle enters suspense on MATCHED, promotes on CONFIRMED, reverses on FAILED. Double-entry bookkeeping with `SuspenseEntry` types and `enter_suspense`/`confirm_from_suspense`/`reverse_suspense` methods. 5 unit tests.
+- **B4.5 Parallel trade confirmation**: New `fill_confirmation.rs` module. Races WS User Channel + Data API position polling concurrently. WS provides fast MATCHED events; Data API provides reliable fallback (WS drops ~20% of CONFIRMED). `confirm_fills_parallel()` merges results with WS priority. 4 unit tests.
+- **B4.6 USDC.e balance monitor**: New `usdc_monitor.rs` module (modelled on `gas_monitor.rs`). Queries Polygon RPC for ERC-20 `balanceOf` on USDC.e contract. Detects on-chain vs accounting drift, low balance warnings, and critical balance circuit breaker trips. Dashboard `live_balance` field now populated with on-chain USDC.e balance. Stats line includes `USDC=XX.XX`. 5 unit tests.
+- **B2.3 Rounding verification**: 21 comprehensive tests covering all 4 tick sizes × FAK/GTC × buy/sell + edge cases. Validates `compute_amounts_for_order_type()` precision rules.
+- **B4.0/B4.1 Enhanced reconciliation**: `query_clob_positions_fresh()` — freshness polling wrapper (two identical successive Data API reads). Both startup and periodic reconciliation now use freshness polling and automatically call `apply_reconciliation()` on discrepancies.
+- **B3.2 Executor integration**: `FillAction` enum and `process_fill_event()` route trade lifecycle events to suspense accounting.
+- **B3.2 TradeFailed notification**: New `NotifyEvent::TradeFailed` variant with Telegram formatting for failed trade alerts.
+
+### Changed
+- `reconcile_startup()` / `reconcile_periodic()` now return `(ReconciliationReport, Vec<VenuePosition>)` — callers can pass venue data to `apply_reconciliation()`.
+- `update_dashboard_metrics()` accepts optional `usdc_balance` parameter.
+
+---
+
 ## [0.16.0] — 2026-03-22 — Milestone D Complete: 8/8 PASS
 
 ### Added

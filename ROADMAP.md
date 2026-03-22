@@ -16,32 +16,30 @@ All core modules ported: WebSocket, order book mirror, arb math, position manage
 
 ---
 
-## Milestone B: Build Execution Infrastructure — 🔧 Rework In Progress
+## Milestone B: Build Execution Infrastructure — ✅ Complete
 
 **Goal**: Code-complete execution path — all modules built, unit-tested, and shadow-testable. No funded account required.
 
 | Status | Count |
 |--------|-------|
-| ✅ Complete | 24/29 |
-| 🔧 Rework | 3/29 (B2.3, B3.2, B4.0, B4.1) |
-| 🔧 New | 2/29 (B4.5, B4.6) |
+| ✅ Complete | 29/29 |
 
 ### B-Part 1: Liquidity & Position Management (3/3 ✅)
 Depth gating, replacement chain analytics, closed position retention.
 
-### B-Part 2: Signing & Instrument Model (3/4 ✅, 1 🔧)
-EIP-712 order signing, dynamic tick size handling. **B2.3 rework**: FAK vs GTC have different amount precision rules — verify rounding across all tick sizes and order types.
+### B-Part 2: Signing & Instrument Model (4/4 ✅)
+EIP-712 order signing, dynamic tick size handling. B2.3: FAK vs GTC precision verified with 21 comprehensive tests across all tick sizes and order types.
 
-### B-Part 3: Executor, Pipeline & Rate Limiting (7/8 ✅, 1 🔧)
-Market BUY quantity guard, LiveExecutor, rate limiting, timestamp normalisation, error handling, partial fills, batch orders. **B3.2 rework**: Trade lifecycle must use WS `id` as correlation key, accept MATCHED for suspense entry, handle ~20% WS CONFIRMED drop rate with Data API fallback.
+### B-Part 3: Executor, Pipeline & Rate Limiting (8/8 ✅)
+Market BUY quantity guard, LiveExecutor, rate limiting, timestamp normalisation, error handling, partial fills, batch orders. B3.2: Suspense accounting (MATCHED → suspense, CONFIRMED → real, FAILED → reverse + sell opposing legs). `FillAction` enum + `process_fill_event()`.
 
-### B-Part 4: Reconciliation & Tracking (3/6 ✅, 3 🔧)
-Cross-asset fill matching, FOK/FAK overfill handling, live P&L tracking. **B4.0/B4.1 rework**: enhanced reconciliation (Data API freshness polling, apply_reconciliation, venue = source of truth). **B4.5 new**: parallel WS + Data API trade confirmation. **B4.6 new**: USDC.e balance monitor.
+### B-Part 4: Reconciliation & Tracking (6/6 ✅)
+Cross-asset fill matching, FOK/FAK overfill handling, live P&L tracking. B4.0/B4.1: Enhanced reconciliation with Data API freshness polling (`query_clob_positions_fresh`) + auto `apply_reconciliation`. B4.5: Parallel WS + Data API trade confirmation (`fill_confirmation.rs`). B4.6: USDC.e balance monitor (`usdc_monitor.rs`) with dashboard integration.
 
 ### B-Part 5: Documentation (2/2 ✅)
 ARCHITECTURE.md, ROADMAP.md (this file).
 
-**Verification**: 44/44 unit tests pass. Milestone D 8/8 PASS validates execution path end-to-end.
+**Verification**: 100/101 unit tests pass (1 pre-existing neg_risk test failure). Milestone D 8/8 PASS validates execution path end-to-end.
 
 ---
 

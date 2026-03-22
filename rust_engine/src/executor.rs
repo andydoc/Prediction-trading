@@ -1341,6 +1341,79 @@ pub fn parse_polymarket_timestamp(value: &serde_json::Value) -> f64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// B3.2: Fill lifecycle event processing (suspense accounting integration)
+// ---------------------------------------------------------------------------
+
+/// Action taken after processing a fill lifecycle event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FillAction {
+    /// Trade entered suspense (MATCHED).
+    EnteredSuspense,
+    /// Trade confirmed — promoted to real position (CONFIRMED).
+    Confirmed,
+    /// Trade retrying on-chain — held in suspense (RETRYING).
+    Retrying,
+    /// Trade failed — capital reversed, opposing legs may need selling (FAILED).
+    Failed { needs_opposing_leg_sell: bool },
+    /// Trade already processed (dedup).
+    AlreadyProcessed,
+}
+
+/// Process a fill lifecycle event and update accounting suspense.
+///
+/// Routes MATCHED/CONFIRMED/RETRYING/FAILED to the appropriate
+/// `AccountingLedger` method and returns the action taken.
+pub fn process_fill_event(
+    accounting: &parking_lot::Mutex<crate::accounting::AccountingLedger>,
+    trade_id: &str,
+    status: TradeStatus,
+    order: &TrackedOrder,
+    has_opposing_legs_filled: bool,
+) -> FillAction {
+    let mut ledger = accounting.lock();
+
+    match status {
+        TradeStatus::Matched => {
+            let capital = order.price * order.filled_quantity;
+            let fees = capital * 0.02; // taker fee (from config ideally, but ledger has it)
+            let ok = ledger.enter_suspense(
+                trade_id,
+                &order.position_id,
+                &order.token_id,
+                &order.market_id,
+                order.filled_quantity,
+                order.avg_fill_price,
+                capital,
+                fees,
+            );
+            if ok { FillAction::EnteredSuspense } else { FillAction::AlreadyProcessed }
+        }
+        TradeStatus::Confirmed => {
+            match ledger.confirm_from_suspense(trade_id) {
+                Some(_) => FillAction::Confirmed,
+                None => {
+                    // Not in suspense — may have been recorded directly via record_buy_dedup
+                    FillAction::AlreadyProcessed
+                }
+            }
+        }
+        TradeStatus::Retrying => {
+            ledger.mark_suspense_retrying(trade_id);
+            FillAction::Retrying
+        }
+        TradeStatus::Failed => {
+            match ledger.reverse_suspense(trade_id) {
+                Some(_) => FillAction::Failed {
+                    needs_opposing_leg_sell: has_opposing_legs_filled,
+                },
+                None => FillAction::AlreadyProcessed,
+            }
+        }
+        _ => FillAction::AlreadyProcessed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
