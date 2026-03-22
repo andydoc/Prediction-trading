@@ -187,6 +187,28 @@ impl PositionManager {
         self.open_positions.values().map(|p| p.total_capital).sum()
     }
 
+    /// NT-1: Update a position's market leg with actual fill data (price & shares).
+    /// Called after fill confirmation to close the gap between estimated and actual execution.
+    pub fn update_leg_with_fill(&mut self, position_id: &str, asset_id: &str, fill_price: f64, fill_shares: f64) {
+        if let Some(pos) = self.open_positions.get_mut(position_id) {
+            for leg in pos.markets.values_mut() {
+                if leg.token_id == asset_id {
+                    let old_price = leg.entry_price;
+                    let old_shares = leg.shares;
+                    leg.entry_price = fill_price;
+                    leg.shares = fill_shares;
+                    tracing::debug!("NT-1: {} leg {} updated: price {:.4}→{:.4}, shares {:.2}→{:.2}",
+                        position_id, asset_id, old_price, fill_price, old_shares, fill_shares);
+                    return;
+                }
+            }
+            // R3: Warn when no leg matches the fill asset
+            tracing::warn!("NT-1: No matching leg for fill: pos={} asset={}", position_id, asset_id);
+        } else {
+            tracing::warn!("NT-1: Position not found for fill update: pos={}", position_id);
+        }
+    }
+
     pub fn closed_count(&self) -> usize {
         self.closed_positions.len()
     }

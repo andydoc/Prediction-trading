@@ -566,3 +566,87 @@ mod tests {
         assert_eq!(report.positions_checked, 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// NT-3: Orphan order sweep
+// ---------------------------------------------------------------------------
+
+/// Query the CLOB for all live orders and cancel any not in our tracked set.
+/// Call at startup after state load to clean up orders from a previous crash.
+pub fn sweep_orphan_orders(
+    http_client: &reqwest::blocking::Client,
+    clob_host: &str,
+    auth: Option<&crate::signing::ClobAuth>,
+    tracked_order_ids: &std::collections::HashSet<String>,
+) -> (usize, usize) {
+    // Query live orders
+    let url = format!("{}/orders?status=LIVE", clob_host);
+    let mut req = http_client.get(&url);
+    if let Some(auth) = auth {
+        let headers = auth.build_headers("GET", "/orders?status=LIVE", None);
+        for (k, v) in headers {
+            req = req.header(&k, &v);
+        }
+    }
+    let resp = match req.send() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("NT-3: Failed to query live orders: {}", e);
+            return (0, 0);
+        }
+    };
+
+    if !resp.status().is_success() {
+        tracing::warn!("NT-3: GET /orders returned {}", resp.status());
+        return (0, 0);
+    }
+
+    let body: serde_json::Value = match resp.json() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("NT-3: Failed to parse live orders response: {}", e);
+            return (0, 0);
+        }
+    };
+    let orders = match body.as_array() {
+        Some(arr) => arr,
+        None => {
+            tracing::debug!("NT-3: No live orders found");
+            return (0, 0);
+        }
+    };
+
+    let mut found = 0usize;
+    let mut cancelled = 0usize;
+    for order in orders {
+        found += 1;
+        let order_id = order["id"].as_str().unwrap_or("");
+        if order_id.is_empty() { continue; }
+
+        if !tracked_order_ids.contains(order_id) {
+            tracing::warn!("NT-3: Orphan order detected: {} — cancelling", order_id);
+            // Cancel single order
+            let cancel_url = format!("{}/order/{}", clob_host, order_id);
+            let mut cancel_req = http_client.delete(&cancel_url);
+            if let Some(auth) = auth {
+                let headers = auth.build_headers("DELETE", &format!("/order/{}", order_id), None);
+                for (k, v) in headers {
+                    cancel_req = cancel_req.header(&k, &v);
+                }
+            }
+            match cancel_req.send() {
+                Ok(r) if r.status().is_success() => {
+                    cancelled += 1;
+                    tracing::info!("NT-3: Cancelled orphan order {}", order_id);
+                }
+                Ok(r) => tracing::warn!("NT-3: Cancel {} returned {}", order_id, r.status()),
+                Err(e) => tracing::warn!("NT-3: Cancel {} failed: {}", order_id, e),
+            }
+        }
+    }
+
+    if found > 0 {
+        tracing::info!("NT-3: Orphan order sweep: {} live orders, {} orphans cancelled", found, cancelled);
+    }
+    (found, cancelled)
+}

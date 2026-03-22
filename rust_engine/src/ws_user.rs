@@ -154,10 +154,10 @@ impl UserChannelClient {
                         || matched_assets.contains(&trade.asset_id);
 
                     tracing::info!("UserChannel trade: id={}... status={} taker={}... asset={}... size={} price={} ours={}",
-                        &trade.id[..trade.id.len().min(12)],
+                        trade.id.get(..12).unwrap_or(&trade.id),
                         trade.status,
-                        &trade.taker_order_id[..trade.taker_order_id.len().min(12)],
-                        &trade.asset_id[..trade.asset_id.len().min(12)],
+                        trade.taker_order_id.get(..12).unwrap_or(&trade.taker_order_id),
+                        trade.asset_id.get(..12).unwrap_or(&trade.asset_id),
                         trade.size, trade.price, is_our_asset);
 
                     if !is_our_asset { continue; }
@@ -300,12 +300,20 @@ async fn user_channel_connect(
     tracing::info!("UserChannel: subscribed to {} markets", market_ids.len());
 
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    let mut last_pong = std::time::Instant::now();
+    let pong_timeout = Duration::from_secs(30); // API-6: detect stale connections
 
     loop {
         tokio::select! {
             biased;
 
             _ = heartbeat.tick() => {
+                // API-6: Check for missed PONGs before sending next PING
+                if last_pong.elapsed() > pong_timeout {
+                    tracing::warn!("UserChannel: no PONG for {}s, treating as dead",
+                        last_pong.elapsed().as_secs());
+                    return Err("pong timeout".into());
+                }
                 if let Err(e) = sink.send(WsMessage::Text("PING".to_string())).await {
                     return Err(Box::new(e));
                 }
@@ -315,12 +323,17 @@ async fn user_channel_connect(
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         if crate::ws::is_pong(&text) {
+                            last_pong = std::time::Instant::now();
                             continue;
                         }
                         parse_and_dispatch(&text, sender);
                     }
                     Some(Ok(WsMessage::Ping(data))) => {
                         let _ = sink.send(WsMessage::Pong(data)).await;
+                        last_pong = std::time::Instant::now();
+                    }
+                    Some(Ok(WsMessage::Pong(_))) => {
+                        last_pong = std::time::Instant::now();
                     }
                     Some(Ok(WsMessage::Close(_))) => return Ok(()),
                     Some(Err(e)) => return Err(Box::new(e)),

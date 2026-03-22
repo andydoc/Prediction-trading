@@ -210,6 +210,9 @@ pub fn evaluate_batch(
         }
         if !all_live { continue; }
 
+        // M1: Verify price arrays match market count (built in same loop, should always hold)
+        debug_assert_eq!(yes_prices.len(), market_ids.len(), "price array length mismatch");
+
         // Try direct mutex arb first
         let mut result: Option<ArbResult> = arb::check_mutex_arb(
             &market_ids, &yes_prices, &no_prices,

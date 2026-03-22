@@ -486,14 +486,14 @@ Before building the comparison dashboard, stress-test the engine to determine ac
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| ⬚ **E2.5: Stress test harness** | Script that runs the engine with parameter overrides, collects latency/CPU/queue metrics for 1 hour, writes results to `data/stress_test.db`. Accepts `--param <n> --values <v1,v2,...>` args. |
-| ⬚ **E2.6: Run stress tests** | All 7 parameters tested. Results table produced with recommended production values. Any parameter where current default is outside the safe zone gets updated in config.yaml. |
+| ✅ **E2.5: Stress test harness** | Script that runs the engine with parameter overrides, collects latency/CPU/queue metrics for 1 hour, writes results to `data/stress_test.db`. Accepts `--param <n> --values <v1,v2,...>` args. |
+| 🔄 **E2.6: Run stress tests** | All 7 parameters tested. Results table produced with recommended production values. Any parameter where current default is outside the safe zone gets updated in config.yaml. |
 
 #### E-Part 1 (continued): Comparison
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| ⬚ **E3: Comparison dashboard** | A summary page (or tab on main dashboard) showing side-by-side: P&L, capital utilisation, position count, replacement rate, arb detection rate, average position size, depth-limited trade count for all 6 instances. Shadow-F additionally shows: average hold duration, turnover rate, and markets-per-hour. |
+| 🔄 **E3: Comparison dashboard** | A summary page (or tab on main dashboard) showing side-by-side: P&L, capital utilisation, position count, replacement rate, arb detection rate, average position size, depth-limited trade count for all 6 instances. Shadow-F additionally shows: average hold duration, turnover rate, and markets-per-hour. |
 
 #### E-Part 2: Validation Gate
 
@@ -506,6 +506,22 @@ Before building the comparison dashboard, stress-test the engine to determine ac
 | ✅ **E8: Remove latest_markets.json** | Removed `write_json_file()` and `json_output_path` field. All consumers read from SQLite. |
 | ⬚ **E9: Parameter selection** | After 14 days, analyse all 6 instances across: risk-adjusted return (Sharpe-like: return / max drawdown), capital utilisation %, replacement success rate, depth-limited trade count, average hold duration vs expected. Engine parameters already determined by E2.6 stress tests. Select winning **strategy** parameter set(s) for live trading — may select different params for fast vs standard markets. Document rationale. |
 | ⬚ **E10: CTO sign-off** | CTO reviews: 14-day comparison report across all 6 instances, selected parameters with rationale, error log, reconciliation report. Written approval to proceed to live. |
+
+#### Deferred Audit Items (pre-F1, post-E4)
+
+From independent code audit v5. Deferred because they are low-risk or complex — not blocking 14-day validation.
+
+| # | Issue | Rationale for deferral |
+|---|-------|----------------------|
+| ACC-2 | Suspense-to-PositionManager sync on `reverse_suspense()` | Rare path — only fires if trade fails on-chain. Low probability during shadow validation. |
+| NT-2 | Add `PendingCancel` and `PartiallyFilled` to `TradeStatus` | Defensive — prevents double-cancel in unwind flows. No active unwind logic uses this path yet. |
+| NT-4 | Per-condition-group exposure cap | Complex — requires Gamma API joins for event slug mapping. Important for live but not shadow. |
+| ACC-6 | Archive closed positions before pruning | Low risk — closed positions already in SQLite. Pruning only removes from in-memory vec. |
+| ACC-7 | Standardize profit % denominator (resolution vs liquidation) | Display-only inconsistency. Does not affect actual P&L. |
+| API-8 | Rate limiter ~100x more conservative than Polymarket allows | Deliberate for early-live safety. Increase when throughput becomes a bottleneck. |
+| API-9 | Pool WS connections missing `initial_dump: true` | May cause stale book baseline. Monitor stale_books metrics during E4 to decide priority. |
+| PERF-1/2/3 | HashMap sort, asset ID caching, double deserialization | Micro-optimizations. Eval loop runs in <100μs. Not bottleneck. |
+| STY-1–5 | Style fixes (prepare helper, EIP-712 comment, O(n²) lookup, redundant import, overflow) | Low impact. Address in routine cleanup. |
 
 ---
 

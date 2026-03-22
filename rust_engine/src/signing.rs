@@ -692,9 +692,8 @@ mod tests {
             100,
         ).unwrap();
 
-        // Taker should be the Neg Risk Adapter
-        let adapter: Address = NEG_RISK_ADAPTER.parse().unwrap();
-        assert_eq!(order.taker, adapter);
+        // API-7: Taker is always Address::ZERO — negRisk routing is server-side
+        assert_eq!(order.taker, Address::ZERO);
 
         // Sign with neg_risk domain
         let signed = signer.sign_order(&order, true).unwrap();

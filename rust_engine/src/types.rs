@@ -68,6 +68,8 @@ impl OrderBook {
         let mut total_cost = 0.0;
 
         for (&OrderedFloat(price), &size) in &self.asks {
+            // M2: Guard against NaN/Inf from corrupt book entries
+            if !price.is_finite() || !size.is_finite() { continue; }
             let level_usd = price * size;
             if level_usd <= 0.0 {
                 continue;

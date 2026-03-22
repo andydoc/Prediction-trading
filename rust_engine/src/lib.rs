@@ -628,7 +628,11 @@ impl TradingEngine {
             let payout = event.payout;
             let mut acct = self.accounting.lock();
             for (mid, asset_id, shares, cost_basis) in &legs {
-                let leg_payout = payout * (cost_basis / total_capital.max(0.01));
+                // R4: Skip empty legs (unfilled or zero-capital) to avoid spurious journal entries
+                if *shares <= 0.0 && *cost_basis <= 0.0 { continue; }
+                // ACC-1: Allocate full payout to winning leg, zero to losers.
+                // Only the winning market pays out; losing legs receive nothing.
+                let leg_payout = if mid == winning_market_id { payout } else { 0.0 };
                 let trade_key = format!("resolve_{}_{}", position_id, mid);
                 acct.record_sell_dedup(
                     &trade_key, position_id, leg_payout, *cost_basis, 0.0,

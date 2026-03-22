@@ -715,7 +715,7 @@ impl Executor {
 
         let order_payload = serde_json::json!({
             "order": {
-                "salt": signed.order.salt.saturating_to::<u64>(),
+                "salt": signed.order.salt.to_string(),
                 "maker": format!("{}", signed.order.maker),
                 "signer": format!("{}", signed.order.signer),
                 "taker": "0x0000000000000000000000000000000000000000",
@@ -980,12 +980,15 @@ impl Executor {
 
         let url = format!("{}/cancel-all", self.config.clob_host);
 
-        // TODO(D): Add L2 HMAC auth headers when API credentials are configured.
-        // For now, attempt the call — it will fail with 401 if no auth headers,
-        // which is expected in shadow mode.
-        let resp = self.http_client
-            .delete(&url)
-            .send()
+        // API-3: L2 HMAC auth headers for cancel-all (safety-critical path for kill switch)
+        let mut req = self.http_client.delete(&url);
+        if let Some(ref auth) = self.clob_auth {
+            let headers = auth.build_headers("DELETE", "/cancel-all", None);
+            for (k, v) in headers {
+                req = req.header(&k, &v);
+            }
+        }
+        let resp = req.send()
             .map_err(|e| format!("cancel-all request failed: {}", e))?;
 
         let status = resp.status();
@@ -1178,9 +1181,9 @@ impl Executor {
             order_payloads.push(serde_json::json!({
                 "order": {
                     "salt": signed.order.salt.to_string(),
-                    "maker": format!("{:?}", signed.order.maker),
-                    "signer": format!("{:?}", signed.order.signer),
-                    "taker": format!("{:?}", signed.order.taker),
+                    "maker": format!("{}", signed.order.maker),
+                    "signer": format!("{}", signed.order.signer),
+                    "taker": "0x0000000000000000000000000000000000000000",
                     "tokenId": signed.order.token_id.to_string(),
                     "makerAmount": signed.order.maker_amount.to_string(),
                     "takerAmount": signed.order.taker_amount.to_string(),
@@ -1191,16 +1194,28 @@ impl Executor {
                     "signatureType": signed.order.signature_type,
                     "signature": &signed.signature,
                 },
+                "owner": self.clob_auth.as_ref().map(|a| a.api_key()).unwrap_or_default(),
                 "orderType": self.config.order_type.as_str(),
                 "negRisk": instrument.neg_risk,
+                "tickSize": format_tick_size(instrument.tick_size),
             }));
         }
 
+        // API-1: Serialize once for both HMAC signing and HTTP body (matches single-order path)
         let url = format!("{}/orders", self.config.clob_host);
-        let response = self.http_client
-            .post(&url)
-            .json(&order_payloads)
-            .send();
+        let body_str = serde_json::to_string(&order_payloads).unwrap_or_default();
+        tracing::debug!("[BATCH SUBMIT] POST {} ({} orders)", url, order_payloads.len());
+
+        let mut req = self.http_client.post(&url)
+            .header("Content-Type", "application/json")
+            .body(body_str.clone());
+        if let Some(ref auth) = self.clob_auth {
+            let headers = auth.build_headers("POST", "/orders", Some(&body_str));
+            for (k, v) in headers {
+                req = req.header(&k, &v);
+            }
+        }
+        let response = req.send();
 
         match response {
             Ok(resp) => {
@@ -1215,7 +1230,22 @@ impl Executor {
                     };
                 }
 
-                let body: serde_json::Value = resp.json().unwrap_or_default();
+                // R1: Fail explicitly on malformed JSON instead of silently treating as empty
+                let body: serde_json::Value = match resp.json() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!("[BATCH] Failed to parse CLOB response: {}", e);
+                        return ArbExecutionResult {
+                            legs: prepared.into_iter().map(|(t, _, _)| {
+                                OrderResult::Rejected(ExecutionError::NetworkFailure {
+                                    message: format!("batch response parse error: {}", e),
+                                })
+                            }).collect(),
+                            all_accepted: false,
+                            dry_run: false,
+                        };
+                    }
+                };
 
                 if status.is_success() {
                     // Parse batch response: array of per-order results
@@ -1226,11 +1256,11 @@ impl Executor {
                     for (i, (mut tracked, _signed, _inst)) in prepared.into_iter().enumerate() {
                         let entry = response_arr.and_then(|arr| arr.get(i));
 
-                        // Check per-order success field (NT lesson: don't just check for orderID)
+                        // M3: Default to false — require explicit success from CLOB
                         let success = entry
                             .and_then(|v| v.get("success"))
                             .and_then(|v| v.as_bool())
-                            .unwrap_or(true); // default true for backwards compat
+                            .unwrap_or(false);
 
                         let order_id = entry
                             .and_then(|v| v.get("orderID").or_else(|| v.get("order_id")))
