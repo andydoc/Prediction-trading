@@ -4,6 +4,18 @@ Operational incidents for the Prediction Market Arbitrage System. Most recent fi
 
 ---
 
+### INC-014: Strategy Gate Double-Division — Zero Virtual Positions (2026-03-22)
+
+**Severity**: HIGH
+**Impact**: All 6 virtual strategy portfolios (Shadow A-F) showed zero positions for the entire runtime. Strategy comparison data from the 350% shadow trading run was empty — all trades were main engine only, no virtual portfolio tracking occurred.
+**Root cause**: `strategy_tracker.rs:passes_gates()` divided `expected_profit_pct` by 100, treating it as a percentage. But `arb.rs` already stores it as a decimal ratio (0.02 = 2%). The double division produced 0.0002, which is below every strategy's `min_profit_threshold` (0.01-0.05). Every opportunity was silently rejected.
+**Detection**: Dashboard screenshot showed main engine with 1 open position but all 6 strategies at 0/0.
+**Fix**: Removed `/100.0` division in `passes_gates()`. Profit threshold now compared directly against the decimal ratio.
+**E2.6 impact**: Stress test restarted on VPS — prior run's strategy load was unrealistically low (no virtual positions = less eval queue pressure). Results would have underestimated worst-case load.
+**Lessons**: Unit mismatches between modules need explicit documentation. The `expected_profit_pct` field name suggests percentage but stores decimal — consider renaming to `expected_profit_ratio` in future cleanup.
+
+---
+
 ### INC-013: WS User Channel Auth — HMAC Sent Instead of Raw Secret (2026-03-20)
 
 **Severity**: MEDIUM

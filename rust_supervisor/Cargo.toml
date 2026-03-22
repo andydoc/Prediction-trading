@@ -1,6 +1,6 @@
 [package]
 name = "prediction-trader"
-version = "0.14.7"
+version = "0.15.0"
 edition = "2021"
 description = "Single-binary prediction market trading system"
 
