@@ -82,6 +82,8 @@ pub struct EngineMetrics {
     pub opps_found: u64,
     pub stale_sweeps: u64,
     pub stale_assets_swept: u64,
+    // E3: Test period countdown (0 = disabled)
+    pub test_period_end_ts: f64,
 }
 
 /// Static HTML — loaded at compile time from the extracted template.
@@ -168,8 +170,10 @@ async fn handle_sse(
             serde_json::to_string(&build_monitor(&s, true)).unwrap_or_default()));
         // Strategies: initial snapshot
         {
-            let strat = s.strategy_summary.lock().clone();
+            let mut strat = s.strategy_summary.lock().clone();
             if !strat.is_null() {
+                let end_ts = s.engine_metrics.lock().test_period_end_ts;
+                if end_ts > 0.0 { strat["test_period_end_ts"] = json!(end_ts); }
                 yield Ok(sse::Event::default().event("strategies").data(
                     serde_json::to_string(&strat).unwrap_or_default()));
             }
@@ -200,8 +204,13 @@ async fn handle_sse(
             if tick % 3 == 0 {
                 yield Ok(sse::Event::default().event("opportunities").data(
                     serde_json::to_string(&build_opportunities(&s)).unwrap_or_default()));
-                let strat = s.strategy_summary.lock().clone();
+                let mut strat = s.strategy_summary.lock().clone();
                 if !strat.is_null() {
+                    // E3: Inject test period end timestamp for dashboard countdown
+                    let end_ts = s.engine_metrics.lock().test_period_end_ts;
+                    if end_ts > 0.0 {
+                        strat["test_period_end_ts"] = json!(end_ts);
+                    }
                     yield Ok(sse::Event::default().event("strategies").data(
                         serde_json::to_string(&strat).unwrap_or_default()));
                 }

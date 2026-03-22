@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # E2.6: Run stress tests for all 7 parameters serially.
-# Usage: bash scripts/stress_test_all.sh [--cycle 3600] [--workspace /path]
+# Usage: bash scripts/stress_test_all.sh [cycle] [workspace] [profile]
+#   e.g.: bash scripts/stress_test_all.sh 3600 /home/ubuntu/prediction-trader worst-case
 #
 # Writes combined results to data/stress_test.db.
 # Each parameter's output is logged to logs/stress_<param>.log.
@@ -9,6 +10,7 @@ set -e
 
 CYCLE="${1:-3600}"
 WORKSPACE="${2:-/home/ubuntu/prediction-trader}"
+PROFILE="${3:-}"
 PORT=5559
 SETTLE=60
 POLL=10
@@ -23,12 +25,20 @@ PARAMS=(
     state_save_interval_seconds
 )
 
+PROFILE_ARG=""
+PROFILE_LABEL="baseline"
+if [ -n "$PROFILE" ]; then
+    PROFILE_ARG="--profile $PROFILE"
+    PROFILE_LABEL="$PROFILE"
+fi
+
 cd "$WORKSPACE"
 mkdir -p logs
 
 echo "======================================"
 echo " E2.6: Stress test all 7 parameters"
 echo " Cycle: ${CYCLE}s  Settle: ${SETTLE}s"
+echo " Profile: ${PROFILE_LABEL}"
 echo " Workspace: ${WORKSPACE}"
 echo " Estimated time: $(( ${#PARAMS[@]} * 5 * (CYCLE + SETTLE + 20) / 3600 )) hours"
 echo "======================================"
@@ -45,6 +55,7 @@ for param in "${PARAMS[@]}"; do
         --poll "$POLL" \
         --port "$PORT" \
         --workspace "$WORKSPACE" \
+        $PROFILE_ARG \
         2>&1 | tee "$logfile"
 
     echo "[$(date '+%H:%M:%S')] Completed: ${param}"

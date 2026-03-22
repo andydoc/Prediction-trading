@@ -493,7 +493,7 @@ Before building the comparison dashboard, stress-test the engine to determine ac
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| 🔄 **E3: Comparison dashboard** | A summary page (or tab on main dashboard) showing side-by-side: P&L, capital utilisation, position count, replacement rate, arb detection rate, average position size, depth-limited trade count for all 6 instances. Shadow-F additionally shows: average hold duration, turnover rate, and markets-per-hour. |
+| ✅ **E3: Comparison dashboard** | A summary page (or tab on main dashboard) showing side-by-side: P&L, capital utilisation, position count, replacement rate, arb detection rate, average position size, depth-limited trade count for all 6 instances. Shadow-F additionally shows: average hold duration, turnover rate, and markets-per-hour. |
 
 #### E-Part 2: Validation Gate
 

@@ -95,7 +95,7 @@ Hot constraint monitoring. 5-16 connections, ~2k-3k assets. Hysteresis: constrai
 Single dedicated connection for open position assets + new market detection. Buffers new market events for 2.5s to collect full bursts.
 
 ### Dashboard (`dashboard.rs`)
-Axum HTTP server: `GET /` (HTML), `/stream` (SSE), `/state` (JSON). HTML embedded via `include_str!`. SSE pushes full snapshots on connect, then deltas every 5s.
+Axum HTTP server: `GET /` (HTML), `/stream` (SSE), `/state` (JSON), `/metrics` (E2.5: 35-field flat JSON for stress test harness). HTML embedded via `include_str!`. SSE pushes full snapshots on connect, then deltas every 5s. E3 Strategies tab: transposed comparison table (Sharpe, Sortino, Recovery Factor, Profit Factor, Max Drawdown, Capital Utilisation per strategy). Test period countdown banner when `--test-period` active.
 
 ### MonitorState (`monitor.rs`)
 TimeSeries ring buffers for system metrics (CPU, memory, disk, latency) and financial metrics (total value, deployed %, drawdown, realized P&L, unrealized P&L). Log ring buffer for dashboard log viewer.
@@ -181,8 +181,12 @@ rust_engine/src/
 └── strategy_tracker.rs # E: Virtual portfolio strategy tracking
 
 rust_supervisor/src/
-├── main.rs             # Binary entry: PID lock, signal handling
+├── main.rs             # Binary entry: PID lock, signal handling, --test-period
 └── orchestrator.rs     # Event loop, market loading, position management
+
+scripts/
+├── stress_test.py      # E2.5: Stress test harness (--param, --profile worst-case)
+└── stress_test_all.sh  # E2.6: Run all 7 params serially
 
 rust_engine/static/
 └── dashboard.html      # Embedded via include_str! at compile time

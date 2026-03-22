@@ -39,7 +39,7 @@ Cross-asset fill matching, FOK/FAK overfill handling, live P&L tracking. B4.0/B4
 ### B-Part 5: Documentation (2/2 ✅)
 ARCHITECTURE.md, ROADMAP.md (this file).
 
-**Verification**: 100/101 unit tests pass (1 pre-existing neg_risk test failure). Milestone D 8/8 PASS validates execution path end-to-end.
+**Verification**: 101/101 unit tests pass. Milestone D 8/8 PASS validates execution path end-to-end.
 
 ---
 
@@ -93,12 +93,21 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 
 | Status | Count |
 |--------|-------|
-| ✅ Complete | 1/10 |
-| ⬚ Remaining | 9/10 |
+| ✅ Complete | 4/10 |
+| 🔄 In Progress | 1/10 |
+| ⬚ Remaining | 5/10 |
 
-**Done**: Multi-instance support (E1) — `--instance <n>` flag, per-instance config overlays.
+### Completed
+- **E1**: Multi-instance support — `--instance <n>` flag, per-instance config overlays.
+- **E2.5**: Stress test harness — `scripts/stress_test.py` with `--profile worst-case`, crash simulation, safe-zone analysis, config auto-update. `/metrics` endpoint (35 fields).
+- **E3**: Comparison dashboard — Strategies tab with Sharpe/Sortino/Recovery Factor/Profit Factor/Max Drawdown/Capital Utilisation. `--test-period` auto-stop. Test period countdown banner.
+- **Audit v5-v7**: 22 findings fixed (API auth, accounting, robustness, fill validation). 101/101 tests pass.
 
-**Remaining**: Deploy 6 instances (Shadow-A through Shadow-F), stress tests, comparison dashboard, 14-day continuous run, parameter selection, CTO sign-off.
+### In Progress
+- **E2.6**: Running on VPS (~35hrs, worst-case profile, target-cpu=native). **CRITICAL: Review results and update config.yaml parameters BEFORE starting E4.**
+
+### Remaining
+E4 (14-day run), E5 (execution validation), E6 (reconciliation clean), E7 (performance baseline), E9 (parameter selection), E10 (CTO sign-off).
 
 Shadow-F targets short-lived crypto price markets (5-15 min resolution) with fast rebuild intervals (60s) and low replacement cooldown (10s).
 

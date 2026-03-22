@@ -433,6 +433,9 @@ pub struct OrchestratorConfig {
     pub usdc_drift_threshold: f64,
     pub usdc_warning_balance: f64,
     pub usdc_critical_balance: f64,
+
+    // Test period (E3/E4)
+    pub test_period_secs: f64,
 }
 
 impl OrchestratorConfig {
@@ -557,6 +560,7 @@ impl OrchestratorConfig {
             usdc_drift_threshold: cfg.safety.usdc_monitor.drift_threshold,
             usdc_warning_balance: cfg.safety.usdc_monitor.warning_balance,
             usdc_critical_balance: cfg.safety.usdc_monitor.critical_balance,
+            test_period_secs: 0.0, // Set by CLI --test-period
         }
     }
 }
@@ -948,10 +952,35 @@ impl Orchestrator {
             capital: self.engine.current_capital(),
         });
 
+        // E3: Record test period end time for dashboard countdown
+        let start_time = now_secs();
+        let test_period_end = if self.cfg.test_period_secs > 0.0 {
+            let end = start_time + self.cfg.test_period_secs;
+            self.engine.engine_metrics.lock().test_period_end_ts = end;
+            tracing::info!("Test period ends at {} ({:.0}s from now)",
+                chrono::DateTime::from_timestamp(end as i64, 0)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                    .unwrap_or_default(),
+                self.cfg.test_period_secs);
+            end
+        } else { 0.0 };
+        let mut test_period_stop_sent = false;
+
         // 7. Event loop
         while running.load(Ordering::Relaxed) {
             self.iteration += 1;
             let now = now_secs();
+
+            // E3: Test period auto-stop
+            if test_period_end > 0.0 && now >= test_period_end && !test_period_stop_sent {
+                tracing::info!("TEST PERIOD EXPIRED after {:.0}s — stopping",
+                    now - start_time);
+                let _ = self.notifier.send(&NotifyEvent::CircuitBreaker {
+                    reason: format!("Test period expired ({:.0}h)", self.cfg.test_period_secs / 3600.0),
+                });
+                running.store(false, Ordering::Relaxed);
+                test_period_stop_sent = true;
+            }
 
             if let Err(e) = self.tick(now) {
                 tracing::error!("[iter {}] Error: {}", self.iteration, e);

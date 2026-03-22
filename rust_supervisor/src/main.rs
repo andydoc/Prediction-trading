@@ -66,6 +66,11 @@ struct Cli {
     /// Auto-configures DB, logs, PID, and dashboard port per instance.
     #[arg(short = 'i', long)]
     instance: Option<String>,
+
+    /// Test period duration (e.g., "14d", "48h", "300s"). Engine auto-stops after
+    /// this duration. Default: 0 (disabled, normal production use).
+    #[arg(long, default_value = "0")]
+    test_period: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +87,7 @@ struct SupervisorConfig {
     dashboard_port: Option<u16>,
     config_overrides: Vec<(String, String)>,
     instance: Option<String>,
+    test_period_secs: f64,
     log_prefix: String,
 }
 
@@ -164,6 +170,8 @@ impl SupervisorConfig {
             .collect();
         merged_overrides.extend(config_overrides);
 
+        let test_period_secs = parse_duration_str(&cli.test_period);
+
         Self {
             log_dir,
             pid_file,
@@ -175,6 +183,7 @@ impl SupervisorConfig {
             workspace,
             instance: cli.instance.clone(),
             log_prefix,
+            test_period_secs,
         }
     }
 
@@ -274,6 +283,24 @@ impl SupervisorConfig {
             }
         }
     }
+}
+
+/// Parse a human-readable duration string: "14d", "48h", "300s", "5m", or "0" (disabled).
+fn parse_duration_str(s: &str) -> f64 {
+    let s = s.trim();
+    if s == "0" || s.is_empty() { return 0.0; }
+    let (num_str, suffix) = if s.ends_with('d') {
+        (&s[..s.len()-1], 86400.0)
+    } else if s.ends_with('h') {
+        (&s[..s.len()-1], 3600.0)
+    } else if s.ends_with('m') {
+        (&s[..s.len()-1], 60.0)
+    } else if s.ends_with('s') {
+        (&s[..s.len()-1], 1.0)
+    } else {
+        (s, 1.0) // assume seconds
+    };
+    num_str.parse::<f64>().unwrap_or(0.0) * suffix
 }
 
 fn parse_yaml_value(s: &str) -> serde_yaml_ng::Value {
@@ -603,7 +630,12 @@ fn main() {
     tracing::info!("{}", "=".repeat(60));
 
     // Load orchestrator config
-    let orch_cfg = OrchestratorConfig::load(&cfg.workspace);
+    let mut orch_cfg = OrchestratorConfig::load(&cfg.workspace);
+    orch_cfg.test_period_secs = cfg.test_period_secs;
+    if cfg.test_period_secs > 0.0 {
+        tracing::info!("TEST PERIOD: engine will auto-stop after {:.0}s ({:.1}h)",
+            cfg.test_period_secs, cfg.test_period_secs / 3600.0);
+    }
 
     // Create and run orchestrator
     match Orchestrator::new(orch_cfg, log_ring) {

@@ -7,6 +7,42 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.18.0] — 2026-03-22 — E2.5/E3: Stress Test Harness, Comparison Dashboard, Audit v5-v7
+
+### Added
+- **E2.5 Stress test harness**: `scripts/stress_test.py` — runs engine with parameter overrides, collects 35 metrics via `/metrics` endpoint, writes to `data/stress_test.db`. Supports `--cycle`, `--profile worst-case`, crash simulation for `state_save_interval_seconds`, safe-zone analysis with auto config update. `scripts/stress_test_all.sh` runner for all 7 parameters.
+- **E3 Comparison dashboard**: Strategies tab redesigned as transposed comparison table. Metrics per strategy: Sharpe, Sortino, Recovery Factor, Profit Factor, Max Drawdown, Capital Utilisation, Turnover Rate, Win Rate. Best values highlighted. Test period countdown banner.
+- **`--test-period` CLI flag**: `--test-period 14d` (or `48h`, `300s`, `5m`). Engine auto-stops after duration. Default `0` (disabled).
+- **`/metrics` endpoint**: 35-field flat JSON for machine consumption. Includes latency breakdown, WS reconnect/pong timeout counters, stale book counts, eval/opp counters.
+- **WS PoolStats counters**: `reconnects`, `pong_timeouts`, `heartbeat_send_failures` — atomic counters propagated through TieredWsStats.
+- **strategy_tracker.rs**: 6 new metrics — `sortino()`, `recovery_factor()`, `profit_factor()`, `capital_utilisation_pct()`, `turnover_rate()`, `max_drawdown()`.
+
+### Fixed (Audit v5-v7, 22 findings)
+- **API-1/2**: Batch orders now include L2 HMAC auth headers, `owner`, and `tickSize` fields.
+- **API-3**: Cancel-all (`/cancel-all`) now sends L2 HMAC auth (kill switch works in live mode).
+- **API-4/5**: Salt serialized as string (not u64), address format standardized to lowercase.
+- **API-6**: User WS channel now tracks PONG with 30s timeout and reconnects on stale connections.
+- **API-7**: negRisk test assertion fixed (`Address::ZERO`, not `NEG_RISK_ADAPTER`).
+- **ACC-1**: Resolution payout allocated to winning leg only (was pro-rated across all legs).
+- **NT-1**: `update_leg_with_fill()` method for actual fill data position updates.
+- **NT-3**: Orphan order sweep at startup — queries live orders, cancels untracked.
+- **BUG-1**: UTF-8 safe string slicing (`.get(..12)` replaces byte indexing).
+- **BUG-2/R2**: Fill price/size validation on both WS and Data API paths.
+- **R1**: Batch JSON parse fails explicitly instead of silently swallowing.
+- **M1**: `debug_assert` on eval price array bounds.
+- **M2**: NaN/Inf guard in book price iteration.
+- **M3**: Batch success defaults to `false` (require explicit confirmation from CLOB).
+- **R3-R5**: Warning logs on no-match fills, empty journal legs skipped, JSON parse error logging.
+- **V7-1/V7-2**: Remaining unsafe byte slicing fixed, thread panic logging added.
+- All 101 tests pass.
+
+### Changed
+- `--set` allowlist expanded: 5 new engine params with validation bounds matching spec test ranges.
+- `validate_override_value()` bounds tightened for `state_save_interval_seconds` (5-120) and added for `constraint_rebuild_interval_seconds` (60-1800).
+- VPS build uses `target-cpu=native` for CPU-specific optimizations.
+
+---
+
 ## [0.17.0] — 2026-03-22 — Milestone B Rework: Suspense Accounting, Parallel Confirmation, USDC Monitor
 
 ### Added

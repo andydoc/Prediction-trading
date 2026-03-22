@@ -152,7 +152,8 @@ impl VirtualPortfolio {
         let cfg = &self.config;
 
         // Gate 1: Profit threshold
-        let pct = opp.expected_profit_pct / 100.0; // Opportunity stores as percentage
+        // expected_profit_pct is already a decimal ratio (0.02 = 2%), matching config thresholds
+        let pct = opp.expected_profit_pct;
         if pct < cfg.min_profit_threshold || pct > cfg.max_profit_threshold {
             return false;
         }
@@ -357,6 +358,120 @@ impl VirtualPortfolio {
         if std_dev < 1e-10 { return 0.0; }
         mean / std_dev
     }
+
+    /// Sortino ratio: like Sharpe but only penalises downside deviation.
+    fn sortino(&self, days: u32) -> f64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let cutoff = now - (days as f64 * 86400.0);
+        let returns: Vec<f64> = self.closed_positions.iter()
+            .filter(|p| p.close_ts >= cutoff)
+            .map(|p| p.actual_profit_pct)
+            .collect();
+        if returns.len() < 2 { return 0.0; }
+        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+        let downside_var = returns.iter()
+            .map(|r| if *r < mean { (r - mean).powi(2) } else { 0.0 })
+            .sum::<f64>() / (returns.len() - 1) as f64;
+        let downside_dev = downside_var.sqrt();
+        if downside_dev < 1e-10 { return 0.0; }
+        mean / downside_dev
+    }
+
+    /// Recovery factor: cumulative return / max drawdown.
+    fn recovery_factor(&self, days: u32) -> f64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let cutoff = now - (days as f64 * 86400.0);
+        let mut sorted: Vec<&ClosedVirtualPosition> = self.closed_positions.iter()
+            .filter(|p| p.close_ts >= cutoff)
+            .collect();
+        if sorted.is_empty() { return 0.0; }
+        sorted.sort_by(|a, b| a.close_ts.total_cmp(&b.close_ts));
+
+        let mut cumulative = 0.0f64;
+        let mut peak = 0.0f64;
+        let mut max_drawdown = 0.0f64;
+        for p in &sorted {
+            cumulative += p.actual_profit;
+            if cumulative > peak { peak = cumulative; }
+            let dd = peak - cumulative;
+            if dd > max_drawdown { max_drawdown = dd; }
+        }
+        if max_drawdown < 0.01 {
+            if cumulative > 0.0 { return 99.0; } // no drawdown, positive return
+            return 0.0;
+        }
+        cumulative / max_drawdown
+    }
+
+    /// Profit factor: gross wins / gross losses.
+    fn profit_factor(&self, days: u32) -> f64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let cutoff = now - (days as f64 * 86400.0);
+        let mut gross_wins = 0.0f64;
+        let mut gross_losses = 0.0f64;
+        for p in &self.closed_positions {
+            if p.close_ts < cutoff { continue; }
+            if p.actual_profit > 0.0 {
+                gross_wins += p.actual_profit;
+            } else {
+                gross_losses += p.actual_profit.abs();
+            }
+        }
+        if gross_losses < 0.01 {
+            if gross_wins > 0.0 { return 99.0; }
+            return 0.0;
+        }
+        gross_wins / gross_losses
+    }
+
+    /// Capital utilisation: deployed / initial * 100.
+    fn capital_utilisation_pct(&self) -> f64 {
+        if self.config.initial_capital <= 0.0 { return 0.0; }
+        let deployed: f64 = self.open_positions.values().map(|p| p.capital_deployed).sum();
+        deployed / self.config.initial_capital * 100.0
+    }
+
+    /// Turnover rate: resolved trades per day.
+    fn turnover_rate(&self, days: u32) -> f64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let cutoff = now - (days as f64 * 86400.0);
+        let count = self.closed_positions.iter()
+            .filter(|p| p.close_ts >= cutoff)
+            .count();
+        count as f64 / days as f64
+    }
+
+    /// Max drawdown (absolute $) over a period.
+    fn max_drawdown(&self, days: u32) -> f64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let cutoff = now - (days as f64 * 86400.0);
+        let mut sorted: Vec<&ClosedVirtualPosition> = self.closed_positions.iter()
+            .filter(|p| p.close_ts >= cutoff)
+            .collect();
+        if sorted.is_empty() { return 0.0; }
+        sorted.sort_by(|a, b| a.close_ts.total_cmp(&b.close_ts));
+
+        let mut cumulative = 0.0f64;
+        let mut peak = 0.0f64;
+        let mut max_dd = 0.0f64;
+        for p in &sorted {
+            cumulative += p.actual_profit;
+            if cumulative > peak { peak = cumulative; }
+            let dd = peak - cumulative;
+            if dd > max_dd { max_dd = dd; }
+        }
+        max_dd
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -472,12 +587,21 @@ impl StrategyTracker {
                 "total_value": (p.total_value() * 100.0).round() / 100.0,
                 "open_count": p.open_positions.len(),
                 "max_positions": p.config.max_concurrent_positions,
+                // Rolling P&L
                 "pnl_7d": (p.rolling_pnl_pct(7) * 100.0).round() / 100.0,
                 "pnl_14d": (p.rolling_pnl_pct(14) * 100.0).round() / 100.0,
                 "pnl_28d": (p.rolling_pnl_pct(28) * 100.0).round() / 100.0,
+                // Core ratios
+                "sharpe_28d": (p.sharpe(28) * 100.0).round() / 100.0,
+                "sortino_28d": (p.sortino(28) * 100.0).round() / 100.0,
+                "recovery_factor_28d": (p.recovery_factor(28) * 100.0).round() / 100.0,
+                "profit_factor_28d": (p.profit_factor(28) * 100.0).round() / 100.0,
+                "max_drawdown_28d": (p.max_drawdown(28) * 100.0).round() / 100.0,
+                // Operational
                 "win_rate": (p.win_rate() * 10.0).round() / 10.0,
                 "avg_hold_hours": (p.avg_hold_hours() * 10.0).round() / 10.0,
-                "sharpe_28d": (p.sharpe(28) * 100.0).round() / 100.0,
+                "capital_util_pct": (p.capital_utilisation_pct() * 10.0).round() / 10.0,
+                "turnover_rate_14d": (p.turnover_rate(14) * 100.0).round() / 100.0,
                 "total_entered": p.total_entered,
                 "total_resolved": p.total_wins + p.total_losses,
                 "positions": positions,

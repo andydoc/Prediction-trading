@@ -697,8 +697,17 @@ function renderClosed(d) {
   restoreExpanded('closed-container', expanded, 'cl');
 }
 
-// === Strategies tab renderer ===
+// === Strategies / Comparison tab renderer (E3) ===
 var _stratExpanded = {};
+function pnlColor(v) { return v > 0 ? 'color:#0f0' : v < 0 ? 'color:#f44' : 'color:#666'; }
+function fmtPnl(v) { return (v >= 0 ? '+' : '') + v.toFixed(2) + '%'; }
+function fmtHold(h) {
+  if (h < 1) return (h*60).toFixed(0)+'m';
+  if (h < 48) return h.toFixed(0)+'h';
+  return (h/24).toFixed(1)+'d';
+}
+function fmtRatio(v) { return v >= 99 ? 'Inf' : v.toFixed(2); }
+
 function renderStrategies(d) {
   var el = document.getElementById('tab-strategies');
   if (!el) return;
@@ -706,46 +715,103 @@ function renderStrategies(d) {
     el.innerHTML = '<p class="color-muted">No strategy configs found. Place shadow-a.yaml through shadow-f.yaml in config/instances/.</p>';
     return;
   }
-  // Find best 28d P&L for highlighting
-  var best28 = -Infinity;
-  d.strategies.forEach(function(s) { if (s.pnl_28d > best28) best28 = s.pnl_28d; });
+  var ss = d.strategies;
 
-  var h = '<h2 style="color:#0af;margin:0 0 10px">Virtual Portfolio Comparison</h2>';
-  h += '<table style="width:100%;border-collapse:collapse">';
-  h += '<tr style="border-bottom:2px solid #333">';
-  h += '<th style="text-align:left;padding:6px 8px">Strategy</th>';
-  h += '<th style="text-align:right;padding:6px 8px">Capital</th>';
-  h += '<th style="text-align:right;padding:6px 8px">Open</th>';
-  h += '<th style="text-align:right;padding:6px 8px">7d P&L%</th>';
-  h += '<th style="text-align:right;padding:6px 8px">14d P&L%</th>';
-  h += '<th style="text-align:right;padding:6px 8px">28d P&L%</th>';
-  h += '<th style="text-align:right;padding:6px 8px">Win%</th>';
-  h += '<th style="text-align:right;padding:6px 8px">Avg Hold</th>';
-  h += '<th style="text-align:right;padding:6px 8px">Sharpe</th>';
-  h += '<th style="text-align:right;padding:6px 8px">Trades</th>';
+  // Find best values per metric for highlighting
+  function bestOf(key, higher) {
+    var best = higher ? -Infinity : Infinity;
+    ss.forEach(function(s) {
+      var v = s[key]; if (v === undefined || v === null) return;
+      if (higher ? v > best : v < best) best = v;
+    });
+    return best;
+  }
+  var bests = {
+    pnl_14d: bestOf('pnl_14d', true), sharpe_28d: bestOf('sharpe_28d', true),
+    sortino_28d: bestOf('sortino_28d', true), recovery_factor_28d: bestOf('recovery_factor_28d', true),
+    profit_factor_28d: bestOf('profit_factor_28d', true), win_rate: bestOf('win_rate', true),
+    capital_util_pct: bestOf('capital_util_pct', true), turnover_rate_14d: bestOf('turnover_rate_14d', true),
+  };
+
+  function bestCell(val, bestVal, fmt, higher) {
+    var isBest = val === bestVal && (higher ? val > 0 : true);
+    var style = isBest ? 'color:#0f0;font-weight:bold' : 'color:#ccc';
+    return '<td style="text-align:right;padding:5px 8px;'+style+'">'+fmt(val)+'</td>';
+  }
+
+  var h = '';
+
+  // --- Test period countdown banner ---
+  if (d.test_period_end_ts && d.test_period_end_ts > 0) {
+    var remaining = d.test_period_end_ts - Date.now()/1000;
+    if (remaining > 0) {
+      var dd = Math.floor(remaining/86400), hh = Math.floor((remaining%86400)/3600), mm = Math.floor((remaining%3600)/60);
+      h += '<div style="background:#1a0a00;border:1px solid #f80;padding:8px 12px;margin-bottom:12px;border-radius:4px;color:#f80;font-weight:bold">';
+      h += 'TEST MODE: '+dd+'d '+hh+'h '+mm+'m remaining</div>';
+    } else {
+      h += '<div style="background:#0a1a00;border:1px solid #0f0;padding:8px 12px;margin-bottom:12px;border-radius:4px;color:#0f0;font-weight:bold">';
+      h += 'TEST COMPLETE</div>';
+    }
+  }
+
+  // --- Comparison table (transposed: metrics as rows, strategies as columns) ---
+  h += '<h2 style="color:#0af;margin:0 0 10px">Strategy Comparison (E3)</h2>';
+  h += '<table style="width:100%;border-collapse:collapse;font-size:13px">';
+
+  // Header: metric name | A | B | C | D | E | F
+  h += '<tr style="border-bottom:2px solid #333"><th style="text-align:left;padding:5px 8px;color:#888">Metric</th>';
+  ss.forEach(function(s) {
+    h += '<th style="text-align:right;padding:5px 8px;color:#0af;min-width:70px">'+esc(s.name)+'</th>';
+  });
   h += '</tr>';
 
-  d.strategies.forEach(function(s, idx) {
-    var isBest = s.pnl_28d === best28 && best28 > 0;
-    var rowStyle = isBest ? 'border-left:3px solid #0f0;background:#0a1a0a' : '';
-    h += '<tr style="border-bottom:1px solid #222;cursor:pointer;'+rowStyle+'" onclick="toggleStratRow('+idx+')">';
-    h += '<td style="padding:6px 8px"><span style="color:#0af;font-weight:bold">'+esc(s.name)+'</span>';
-    h += ' <span style="color:#666;font-size:11px">'+esc(s.label)+'</span></td>';
-    h += '<td style="text-align:right;padding:6px 8px;color:#ccc">$'+s.capital.toFixed(0)+'</td>';
-    h += '<td style="text-align:right;padding:6px 8px;color:#aaa">'+s.open_count+'/'+s.max_positions+'</td>';
-    h += '<td style="text-align:right;padding:6px 8px;'+pnlColor(s.pnl_7d)+'">'+fmtPnl(s.pnl_7d)+'</td>';
-    h += '<td style="text-align:right;padding:6px 8px;'+pnlColor(s.pnl_14d)+'">'+fmtPnl(s.pnl_14d)+'</td>';
-    h += '<td style="text-align:right;padding:6px 8px;'+pnlColor(s.pnl_28d)+'">'+fmtPnl(s.pnl_28d)+'</td>';
-    h += '<td style="text-align:right;padding:6px 8px;color:#aaa">'+s.win_rate.toFixed(0)+'%</td>';
-    h += '<td style="text-align:right;padding:6px 8px;color:#aaa">'+fmtHold(s.avg_hold_hours)+'</td>';
-    h += '<td style="text-align:right;padding:6px 8px;color:#aaa">'+s.sharpe_28d.toFixed(2)+'</td>';
-    h += '<td style="text-align:right;padding:6px 8px;color:#666">'+s.total_entered+'</td>';
-    h += '</tr>';
+  // Row helper
+  function metricRow(label, key, fmt, higher) {
+    var best = bestOf(key, higher);
+    var r = '<tr style="border-bottom:1px solid #1a1a1a"><td style="padding:5px 8px;color:#888">'+label+'</td>';
+    ss.forEach(function(s) { r += bestCell(s[key]||0, best, fmt, higher); });
+    return r + '</tr>';
+  }
 
-    // Expandable position details
-    var show = _stratExpanded[idx] ? '' : 'display:none;';
-    h += '<tr id="strat-detail-'+idx+'" style="'+show+'">';
-    h += '<td colspan="10" style="padding:4px 20px 10px;background:#0a0a0a">';
+  // Section: Financial
+  h += '<tr><td colspan="'+(ss.length+1)+'" style="padding:8px 8px 3px;color:#555;font-size:11px;font-weight:bold;border-bottom:1px solid #222">FINANCIAL</td></tr>';
+  h += metricRow('P&L 14d', 'pnl_14d', fmtPnl, true);
+  h += metricRow('P&L 28d', 'pnl_28d', fmtPnl, true);
+  h += metricRow('Max Drawdown', 'max_drawdown_28d', function(v){return '$'+v.toFixed(2);}, false);
+
+  // Section: Risk-Adjusted
+  h += '<tr><td colspan="'+(ss.length+1)+'" style="padding:8px 8px 3px;color:#555;font-size:11px;font-weight:bold;border-bottom:1px solid #222">RISK-ADJUSTED</td></tr>';
+  h += metricRow('Sharpe', 'sharpe_28d', fmtRatio, true);
+  h += metricRow('Sortino', 'sortino_28d', fmtRatio, true);
+  h += metricRow('Recovery Factor', 'recovery_factor_28d', fmtRatio, true);
+  h += metricRow('Profit Factor', 'profit_factor_28d', fmtRatio, true);
+
+  // Section: Operational
+  h += '<tr><td colspan="'+(ss.length+1)+'" style="padding:8px 8px 3px;color:#555;font-size:11px;font-weight:bold;border-bottom:1px solid #222">OPERATIONAL</td></tr>';
+  h += metricRow('Win Rate', 'win_rate', function(v){return v.toFixed(0)+'%';}, true);
+  h += metricRow('Capital Util.', 'capital_util_pct', function(v){return v.toFixed(0)+'%';}, true);
+  h += metricRow('Avg Hold', 'avg_hold_hours', fmtHold, false);
+  h += metricRow('Turnover/day', 'turnover_rate_14d', function(v){return v.toFixed(1);}, true);
+
+  // Section: Volume
+  h += '<tr><td colspan="'+(ss.length+1)+'" style="padding:8px 8px 3px;color:#555;font-size:11px;font-weight:bold;border-bottom:1px solid #222">VOLUME</td></tr>';
+  var r = '<tr style="border-bottom:1px solid #1a1a1a"><td style="padding:5px 8px;color:#888">Open Positions</td>';
+  ss.forEach(function(s) { r += '<td style="text-align:right;padding:5px 8px;color:#ccc">'+s.open_count+'/'+s.max_positions+'</td>'; });
+  h += r + '</tr>';
+  h += metricRow('Total Trades', 'total_entered', function(v){return v.toFixed(0);}, true);
+  h += metricRow('Resolved', 'total_resolved', function(v){return v.toFixed(0);}, true);
+
+  h += '</table>';
+
+  // --- Expandable per-strategy position details ---
+  h += '<div style="margin-top:15px">';
+  ss.forEach(function(s, idx) {
+    var show = _stratExpanded[idx];
+    var arrow = show ? '&#9660;' : '&#9654;';
+    h += '<div style="cursor:pointer;padding:4px 8px;color:#0af;font-size:12px;border-bottom:1px solid #1a1a1a" onclick="toggleStratRow('+idx+')">';
+    h += arrow+' '+esc(s.name)+' — '+esc(s.label)+' ('+s.open_count+' open, $'+s.capital.toFixed(0)+' capital)</div>';
+    var vis = show ? '' : 'display:none;';
+    h += '<div id="strat-detail-'+idx+'" style="'+vis+'padding:4px 20px 10px;background:#0a0a0a">';
     if (s.positions && s.positions.length > 0) {
       h += '<table style="width:100%;font-size:12px"><tr style="color:#666">';
       h += '<th style="text-align:left">Market</th><th style="text-align:right">Capital</th>';
@@ -762,24 +828,17 @@ function renderStrategies(d) {
     } else {
       h += '<span style="color:#666;font-size:12px">No open virtual positions</span>';
     }
-    h += '</td></tr>';
+    h += '</div>';
   });
+  h += '</div>';
 
-  h += '</table>';
-  h += '<p style="color:#444;font-size:11px;margin-top:10px">Virtual portfolios — $1,000 initial capital each. Click row to expand positions.</p>';
+  h += '<p style="color:#444;font-size:11px;margin-top:10px">E3 Comparison Dashboard — $1,000 initial capital each. Best values highlighted green. Click strategy to expand positions.</p>';
   el.innerHTML = h;
 }
 function toggleStratRow(idx) {
   _stratExpanded[idx] = !_stratExpanded[idx];
   var el = document.getElementById('strat-detail-'+idx);
   if (el) el.style.display = _stratExpanded[idx] ? '' : 'none';
-}
-function pnlColor(v) { return v > 0 ? 'color:#0f0' : v < 0 ? 'color:#f44' : 'color:#666'; }
-function fmtPnl(v) { return (v >= 0 ? '+' : '') + v.toFixed(2) + '%'; }
-function fmtHold(h) {
-  if (h < 1) return (h*60).toFixed(0)+'m';
-  if (h < 48) return h.toFixed(0)+'h';
-  return (h/24).toFixed(1)+'d';
 }
 
 // === Live tab renderer ===

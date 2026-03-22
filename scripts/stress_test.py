@@ -286,7 +286,20 @@ def compute_summary(db_path, run_id, param_name, param_value, samples):
 # Engine management
 # ---------------------------------------------------------------------------
 
-def start_engine(binary, workspace, port, mode, param, value):
+# Worst-case strategy profile: derived from most aggressive settings across all 6 instances
+WORST_CASE_OVERRIDES = [
+    "arbitrage.max_concurrent_positions=50",
+    "arbitrage.capital_per_trade_pct=0.05",
+    "arbitrage.min_profit_threshold=0.01",
+    "arbitrage.min_resolution_time_secs=60",
+    "arbitrage.max_days_to_resolution=90",
+    "arbitrage.replacement_cooldown_seconds=10",
+    "engine.constraint_rebuild_interval_seconds=60",
+    "arbitrage.max_exposure_per_market=250",
+]
+
+
+def start_engine(binary, workspace, port, mode, param, value, profile=None):
     cmd = [
         binary,
         "--workspace", workspace,
@@ -295,7 +308,17 @@ def start_engine(binary, workspace, port, mode, param, value):
         "--no-pid-lock",
         "--set", f"engine.{param}={value}",
     ]
-    print(f"  Starting engine: --set engine.{param}={value}")
+    # Apply profile overrides (skip if the param being tested is also in the profile)
+    if profile == "worst-case":
+        test_key = f"engine.{param}"
+        for override in WORST_CASE_OVERRIDES:
+            key = override.split("=")[0]
+            if key != test_key:
+                cmd.extend(["--set", override])
+    label = f"engine.{param}={value}"
+    if profile:
+        label += f" [profile={profile}]"
+    print(f"  Starting engine: {label}")
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -336,7 +359,7 @@ def measure_state_loss(workspace, crash_time):
     return max(0, crash_time - db_mtime)
 
 
-def run_crash_test(binary, workspace, port, mode, param, value, cycle, settle, db_path, run_id):
+def run_crash_test(binary, workspace, port, mode, param, value, cycle, settle, db_path, run_id, profile=None):
     """Special test for state_save_interval_seconds: measures actual state loss from crashes.
 
     Runs the engine, waits for it to stabilize, then performs 3 crash+restart cycles
@@ -351,7 +374,7 @@ def run_crash_test(binary, workspace, port, mode, param, value, cycle, settle, d
 
     for crash_num in range(3):
         # Start engine
-        proc = start_engine(binary, workspace, port, mode, param, value)
+        proc = start_engine(binary, workspace, port, mode, param, value, profile)
         try:
             wait_for_dashboard(port)
         except RuntimeError as e:
@@ -676,6 +699,7 @@ def main():
     parser.add_argument("--db", default="data/stress_test.db", help="Output SQLite path")
     parser.add_argument("--binary", default="target/release/prediction-trader", help="Engine binary")
     parser.add_argument("--mode", default="shadow", help="Engine mode (default: shadow)")
+    parser.add_argument("--profile", choices=["worst-case"], help="Strategy load profile (worst-case = max stress)")
     args = parser.parse_args()
 
     param = args.param
@@ -721,7 +745,7 @@ def main():
 
             insert_run(db_path, run_id, param, float(value), args.cycle)
 
-            proc = start_engine(args.binary, args.workspace, args.port, args.mode, param, value)
+            proc = start_engine(args.binary, args.workspace, args.port, args.mode, param, value, args.profile)
             current_proc[0] = proc
 
             try:
@@ -764,6 +788,7 @@ def main():
                 run_crash_test(
                     args.binary, args.workspace, args.port, args.mode,
                     param, value, args.cycle, args.settle, db_path, run_id,
+                    args.profile,
                 )
 
             print(f"  Done.\n")
