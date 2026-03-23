@@ -468,6 +468,9 @@ pub struct OrchestratorConfig {
     // Test period (E3/E4)
     pub test_period_secs: f64,
 
+    // CLOB L2 auth (for balance queries, geoblock checks)
+    pub clob_auth: Option<rust_engine::signing::ClobAuth>,
+
     // Sports WS
     pub sports_ws_enabled: bool,
     pub sports_ws_url: String,
@@ -525,6 +528,33 @@ impl OrchestratorConfig {
                         String::new()
                     }
                 }
+            }
+        };
+
+        // Build CLOB L2 auth if credentials available in secrets
+        let clob_auth = {
+            let key = secrets.pointer("/polymarket/clob_api_key").and_then(|v| v.as_str()).unwrap_or("");
+            let secret = secrets.pointer("/polymarket/clob_api_secret").and_then(|v| v.as_str()).unwrap_or("");
+            let pass = secrets.pointer("/polymarket/clob_passphrase").and_then(|v| v.as_str()).unwrap_or("");
+            if !key.is_empty() && !secret.is_empty() && !pass.is_empty() {
+                let creds = rust_engine::signing::ClobApiCreds {
+                    api_key: key.to_string(),
+                    secret: secret.to_string(),
+                    passphrase: pass.to_string(),
+                };
+                match rust_engine::signing::ClobAuth::new(&creds, &gas_wallet_address) {
+                    Ok(auth) => {
+                        tracing::info!("CLOB L2 auth loaded (key={}...)", &key[..8.min(key.len())]);
+                        Some(auth)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to build CLOB auth: {}", e);
+                        None
+                    }
+                }
+            } else {
+                tracing::debug!("No CLOB API credentials in secrets.yaml — balance queries will use on-chain fallback");
+                None
             }
         };
 
@@ -601,6 +631,7 @@ impl OrchestratorConfig {
             usdc_warning_balance: cfg.safety.usdc_monitor.warning_balance,
             usdc_critical_balance: cfg.safety.usdc_monitor.critical_balance,
             test_period_secs: 0.0, // Set by CLI --test-period
+            clob_auth,
 
             sports_ws_enabled: cfg.sports_ws.enabled,
             sports_ws_url: cfg.sports_ws.url,
@@ -847,6 +878,7 @@ impl Orchestrator {
             drift_threshold: cfg.usdc_drift_threshold,
             warning_balance: cfg.usdc_warning_balance,
             critical_balance: cfg.usdc_critical_balance,
+            clob_host: "https://clob.polymarket.com".to_string(),
         });
 
         if usdc_monitor.is_enabled() {
@@ -1612,7 +1644,9 @@ impl Orchestrator {
             && (now - self.last_usdc_check) >= self.usdc_monitor.check_interval()
         {
             let accounting_cash = self.engine.accounting.lock().cash_balance();
-            match self.usdc_monitor.check_balance(&self.engine.http_client, accounting_cash) {
+            match self.usdc_monitor.check_balance_with_auth(
+                &self.engine.http_client, accounting_cash, self.cfg.clob_auth.as_ref(),
+            ) {
                 UsdcCheckResult::Ok { on_chain, .. } => {
                     tracing::info!("USDC.e balance: ${:.2} (accounting: ${:.2})", on_chain, accounting_cash);
                 }
@@ -1643,6 +1677,29 @@ impl Orchestrator {
                 }
             }
             self.last_usdc_check = now;
+
+            // R4: Geoblock check — piggyback on USDC check interval
+            match self.engine.http_client.get("https://clob.polymarket.com/time")
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+            {
+                Ok(resp) if resp.status().as_u16() == 403 => {
+                    tracing::error!("GEOBLOCK DETECTED: CLOB API returned 403 Forbidden");
+                    let _ = self.notifier.send(&NotifyEvent::Error {
+                        message: "GEOBLOCK: CLOB API returned 403 — VPS IP may be blocked".into(),
+                    });
+                    if let Some(trip_msg) = self.circuit_breaker.check_gas_critical(
+                        "Geoblock: CLOB API 403 Forbidden", now,
+                    ) {
+                        tracing::error!("CIRCUIT BREAKER TRIPPED: {}", trip_msg);
+                        let _ = self.notifier.send(&NotifyEvent::CircuitBreaker { reason: trip_msg });
+                    }
+                }
+                Ok(_) => {} // 200 OK — not geoblocked
+                Err(e) => {
+                    tracing::debug!("CLOB geoblock check failed (network): {}", e);
+                }
+            }
         }
 
         // --- Stats ---
