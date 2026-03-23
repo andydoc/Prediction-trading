@@ -53,18 +53,19 @@ pub fn run(
     clob.register_instrument(&m1, engine);
     clob.register_instrument(&m2, engine);
 
-    tracing::info!("[D9] Leg 1 (will fill): {} ask={:.4} — {}", m1.market_id, m1.best_ask, m1.question);
-    tracing::info!("[D9] Leg 2 (won't fill): {} ask={:.4} — {}", m2.market_id, m2.best_ask, m2.question);
+    tracing::info!("[D9] Leg 1 (BUY at ask, will fill): {} ask={:.4} — {}", m1.market_id, m1.best_ask, m1.question);
+    tracing::info!("[D9] Leg 2 (SELL at 0.99, won't fill): {} bid={:.4} — {}", m2.market_id, m2.best_bid, m2.question);
 
     let size = 2.50;
     let position_id = format!("d9_partial_{}", crate::now_secs() as u64);
 
-    // 2. Submit leg 1 at best ask (should fill), leg 2 at 1 cent (won't fill via FAK)
-    let unfillable_price = 0.01; // 1 cent — well below any realistic ask
+    // 2. Leg 1: BUY at best ask (fills normally)
+    //    Leg 2: SELL at 0.99 (no buyer at that price on a cheap market — FAK kills it)
+    let unfillable_sell_price = 0.99;
 
     let legs = vec![
         (m1.market_id.clone(), m1.yes_token_id.clone(), Side::Buy, m1.best_ask, size),
-        (m2.market_id.clone(), m2.yes_token_id.clone(), Side::Buy, unfillable_price, size),
+        (m2.market_id.clone(), m2.yes_token_id.clone(), Side::Sell, unfillable_sell_price, size),
     ];
 
     let result = executor.execute_arb(&position_id, &legs);
@@ -87,10 +88,10 @@ pub fn run(
             severity: "WARNING".into(),
             test_id: "D9".into(),
             component: "test_design".into(),
-            description: "Both legs filled, even at 1 cent. Cannot test partial fill.".into(),
-            expected: "Leg 2 to be unfilled at 1 cent".into(),
+            description: "Both legs filled, even SELL at 0.99. Cannot test partial fill.".into(),
+            expected: "Leg 2 SELL at 0.99 to be unfilled (no buyer at that price)".into(),
             actual: "Both legs filled".into(),
-            recommendation: "Market has unusual depth at 1 cent. Try a different market.".into(),
+            recommendation: "Market has unexpected depth. Try a different market pair.".into(),
         });
         let elapsed = start.elapsed().as_millis() as u64;
         crate::notify(notifier, "[CLOB-TEST] D9 INCONCLUSIVE: both legs filled at 1c");
@@ -152,9 +153,9 @@ pub fn run(
             position_id: position_id.clone(),
             market_id: m2.market_id.clone(),
             token_id: m2.yes_token_id.clone(),
-            side: Side::Buy,
-            price: unfillable_price,
-            quantity: size / unfillable_price,
+            side: Side::Sell,
+            price: unfillable_sell_price,
+            quantity: size / unfillable_sell_price,
             status: TradeStatus::Cancelled, // FAK killed unfilled portion
             filled_quantity: 0.0,
             avg_fill_price: 0.0,
