@@ -93,15 +93,23 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 
 | Status | Count |
 |--------|-------|
-| ✅ Complete | 4/10 |
-| 🔄 In Progress | 1/10 |
-| ⬚ Remaining | 5/10 |
+| ✅ Complete | 6/12 |
+| 🔄 In Progress | 1/12 |
+| ⬚ Remaining | 5/12 |
 
 ### Completed
 - **E1**: Multi-instance support — `--instance <n>` flag, per-instance config overlays.
 - **E2.5**: Stress test harness — `scripts/stress_test.py` with `--profile worst-case`, crash simulation, safe-zone analysis, config auto-update. `/metrics` endpoint (35 fields).
 - **E3**: Comparison dashboard — Strategies tab with Sharpe/Sortino/Recovery Factor/Profit Factor/Max Drawdown/Capital Utilisation. `--test-period` auto-stop. Test period countdown banner.
 - **Audit v5-v7**: 22 findings fixed (API auth, accounting, robustness, fill validation). 101/101 tests pass.
+- **Risk mitigations** (external risk analysis, 2026-03-23):
+  - P1: Geoblock health check (`scripts/geoblock_check.sh`) — 15-min cron, CLOB + Gamma 403 detection.
+  - P2: Risk register expanded 14 → 19 risks, corrected ratings (INC-001, INC-012).
+  - P3: Dashboard security documented (SSH tunnel, kill switch exposure).
+  - P4: Suspicious arb flagging — arbs > 20% profit flagged WARN + dashboard `[!]`.
+  - P5: negRisk correlated exposure cap — proportional scaling to 50% max.
+  - P6: UMA dispute active monitoring — detects `proposed`/`disputed` status, excludes from replacement.
+- **Sports WebSocket** (`sports_ws.rs`): Persistent connection to Polymarket Sports WS. Pre-screens postponement detection before AI calls. SQLite persistence. 6 unit tests. 107/107 tests pass.
 
 ### In Progress
 - **E2.6**: Running on VPS (~35hrs, worst-case profile, target-cpu=native). **CRITICAL: Review results and update config.yaml parameters BEFORE starting E4.**
@@ -147,9 +155,9 @@ Tasks: deposit funds, configure winning parameters, switch to live mode, supervi
 | Milestone | Tasks | Status |
 |-----------|-------|--------|
 | A: Rust Port | 13/13 | ✅ Complete |
-| B: Execution Infrastructure | 27/27 | ✅ Complete |
+| B: Execution Infrastructure | 29/29 | ✅ Complete |
 | C: Safety | 10/10 | ✅ Complete |
 | D: CLOB Integration Test | 8/8 | ✅ Complete |
-| E: Shadow Validation | 1/10 | 🔧 In Progress |
+| E: Shadow Validation | 6/12 | 🔧 In Progress |
 | F: Go Live | 0/6 | ⬚ Planned |
 | G: Scale | 0/4 | ⬚ Future |

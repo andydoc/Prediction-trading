@@ -526,15 +526,16 @@ function renderOpportunities(d) {
   var h = '';
   d.opportunities.forEach(function(o) {
     var key = o.short_name;
-    var css = o.is_held ? 'dup-opp' : (o.is_past ? 'bad' : '');
+    var css = o.is_held ? 'dup-opp' : (o.suspicious ? 'bad' : (o.is_past ? 'bad' : ''));
     var held = o.is_held ? ' [HELD]' : '';
+    var suspTag = o.suspicious ? ' <span title="Profit >20% — unusually high, may indicate detection error" style="color:#f44;font-weight:bold">[!]</span>' : '';
     var valTag = o.validated ? '<span class="val-tag vtick">&#10003;</span>' : '<span class="val-tag vapi">[API]</span>';
     var resolveHtml = (o.resolve === 'PAST' ? '<span class="bad">PAST</span>' : esc(o.resolve)) + valTag;
     h += '<tr id="opp-row-'+o.idx+'" class="pos-row '+css+'" data-key="'+esc(key)+'" onclick="toggleRow(\'opp\','+o.idx+')">';
     h += '<td>'+o.idx+'</td><td>'+o.profit_pct.toFixed(1)+'%</td>';
     h += '<td>'+resolveHtml+'</td><td>'+esc(o.strategy)+'</td>';
     h += '<td>'+o.score.toFixed(2)+'</td>';
-    h += '<td title="'+esc(o.full_names.join(' | '))+'">'+esc(o.short_name)+held+'</td></tr>';
+    h += '<td title="'+esc(o.full_names.join(' | '))+'">'+esc(o.short_name)+held+suspTag+'</td></tr>';
     // Detail row
     h += '<tr id="opp-detail-'+o.idx+'" class="detail-row" data-key="'+esc(key)+'"><td colspan="6">';
     o.legs.forEach(function(l) {

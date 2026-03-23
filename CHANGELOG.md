@@ -7,6 +7,39 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.19.0] — 2026-03-23 — Risk Mitigations + Sports WebSocket
+
+### Added
+- **Sports WebSocket** (`sports_ws.rs`): Persistent connection to `wss://sports-api.polymarket.com/ws` for real-time game status. Pre-screens postponement detection before expensive AI calls — games with `Postponed`/`Canceled`/`Forfeit`/`Suspended`/`Delayed` status detected instantly. SQLite persistence via `CachedSqliteDB` (survives restarts). 6 unit tests.
+- **Geoblock health check** (`scripts/geoblock_check.sh`): Checks CLOB + Gamma API for 403 responses, alerts on geoblock. 15-min cron entry for VPS. Dedup suppression via `/tmp/geoblock_alert_sent`.
+- **Suspicious arb flagging** (R2): Arbs with profit > `suspicious_profit_threshold` (default 20%) logged at WARN level and marked with `[!]` in dashboard. Config: `arbitrage.suspicious_profit_threshold`.
+- **negRisk correlated exposure cap** (R16): Limits total capital in negRisk positions to `max_neg_risk_exposure_pct` (default 50%). Scales back position size proportionally instead of skipping. Dashboard shows negRisk deployed/count/pct. Config: `arbitrage.max_neg_risk_exposure_pct`.
+- **UMA dispute active monitoring** (R14): Detects non-resolved UMA statuses (`proposed`, `disputed`) during resolution scan. Flags positions with `uma_disputed: true` in metadata. Excludes disputed positions from replacement. Dashboard shows dispute status.
+- **Dashboard stats**: negRisk exposure metrics, Sports WS connection/games/messages/postponed counts.
+
+### Changed
+- **Risk register** (PRODUCT_SPEC_v2.md Section 7): Expanded 14 → 19 risks. Corrected ratings: R2 (arb false positive) Low→Medium (INC-001), R4 (geoblock) Low→Medium (INC-012), R5 (illiquidity) Low→Medium impact. Added: R15 (execution slippage), R16 (negRisk correlated), R17 (key security), R18 (WS auth fragility), R19 (capital illiquidity).
+- **Dashboard security docs** (ARCHITECTURE.md): Documented SSH tunnel access pattern, kill switch exposure note, `bind_addr` warning.
+- `check_api_resolutions()` now returns `(Vec<ApiResolution>, Vec<DisputeInfo>)`.
+- `check_postponements()` pre-screens via Sports WS before falling through to AI.
+
+### Fixed
+- negRisk exposure cap uses proportional scaling (not binary skip) — positions sized to fit remaining allowance.
+
+### Config
+- `arbitrage.suspicious_profit_threshold: 0.20`
+- `arbitrage.max_neg_risk_exposure_pct: 0.50`
+- `sports_ws.enabled: true`
+- `sports_ws.url: wss://sports-api.polymarket.com/ws`
+- `sports_ws.reconnect_base_delay: 1.0`
+- `sports_ws.reconnect_max_delay: 60.0`
+- `sports_ws.prune_interval_days: 7`
+
+### Tests
+- 107/107 pass (101 existing + 6 new sports_ws tests).
+
+---
+
 ## [0.18.0] — 2026-03-22 — E2.5/E3: Stress Test Harness, Comparison Dashboard, Audit v5-v7
 
 ### Added

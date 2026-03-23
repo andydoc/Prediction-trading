@@ -24,6 +24,8 @@ arbitrage:
   max_concurrent_positions: 20
   min_profit_threshold: 0.03
   max_profit_threshold: 0.3
+  suspicious_profit_threshold: 0.20
+  max_neg_risk_exposure_pct: 0.50
   min_resolution_time_secs: 300
   max_days_to_resolution: 60
   max_days_to_replacement: 30
@@ -199,7 +201,7 @@ safety:
     min_pol_balance: 1.0
     critical_pol_balance: 0.0
 dashboard:
-  port: 5559
+  port: 5558
   bind_addr: 127.0.0.1
 notifications:
   enabled: true
@@ -212,5 +214,11 @@ notifications:
   on_error: true
   on_circuit_breaker: true
   on_daily_summary: true
+sports_ws:
+  enabled: true
+  url: wss://sports-api.polymarket.com/ws
+  reconnect_base_delay: 1.0
+  reconnect_max_delay: 60.0
+  prune_interval_days: 7
 state:
   db_path: data/state_rust.db

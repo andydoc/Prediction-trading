@@ -715,6 +715,14 @@ impl PositionManager {
         self.open_positions.keys().cloned().collect()
     }
 
+    /// Total capital deployed in negRisk positions (R16 risk mitigation).
+    pub fn neg_risk_exposure(&self) -> f64 {
+        self.open_positions.values()
+            .filter(|p| p.metadata.get("is_neg_risk").and_then(|v| v.as_bool()).unwrap_or(false))
+            .map(|p| p.total_capital)
+            .sum()
+    }
+
     pub fn get_held_constraint_ids(&self) -> std::collections::HashSet<String> {
         self.open_positions.values()
             .filter_map(|p| p.metadata.get("constraint_id")?.as_str().map(|s| s.to_string()))

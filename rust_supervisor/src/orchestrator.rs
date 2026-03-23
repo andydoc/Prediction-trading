@@ -138,6 +138,10 @@ struct ArbitrageYaml {
     min_resolution_time_secs: f64,
     #[serde(default = "default_60f")]
     replacement_cooldown_seconds: f64,
+    #[serde(default = "default_020")]
+    suspicious_profit_threshold: f64,
+    #[serde(default = "default_050")]
+    max_neg_risk_exposure_pct: f64,
     #[serde(default)]
     resolution_validation: ResolutionValidationYaml,
 }
@@ -289,6 +293,20 @@ struct PostponementYaml {
 }
 
 #[derive(serde::Deserialize, Default)]
+struct SportsWsYaml {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_sports_ws_url")]
+    url: String,
+    #[serde(default = "default_1f")]
+    reconnect_base_delay: f64,
+    #[serde(default = "default_60f")]
+    reconnect_max_delay: f64,
+    #[serde(default = "default_7u64")]
+    prune_interval_days: u64,
+}
+
+#[derive(serde::Deserialize, Default)]
 struct StateYaml {
     #[serde(default)]
     db_path: Option<String>,
@@ -315,11 +333,15 @@ struct ConfigYaml {
     ai: AiYaml,
     #[serde(default)]
     state: StateYaml,
+    #[serde(default)]
+    sports_ws: SportsWsYaml,
 }
 
 // Default value functions for serde
 fn default_true() -> bool { true }
 fn default_010() -> f64 { 0.10 }
+fn default_020() -> f64 { 0.20 }
+fn default_050() -> f64 { 0.50 }
 fn default_070() -> f64 { 0.70 }
 fn default_080() -> f64 { 0.80 }
 fn default_01f() -> f64 { 0.1 }
@@ -347,6 +369,8 @@ fn default_5556u64() -> u64 { 5556 }
 fn default_localhost() -> String { "127.0.0.1".into() }
 fn default_ws_url() -> String { "wss://ws-subscriptions-clob.polymarket.com/ws/market".into() }
 fn default_rpc_url() -> String { "https://polygon-rpc.com".into() }
+fn default_7u64() -> u64 { 7 }
+fn default_sports_ws_url() -> String { "wss://sports-api.polymarket.com/ws".into() }
 
 // ---------------------------------------------------------------------------
 // Config — public struct
@@ -378,6 +402,13 @@ pub struct OrchestratorConfig {
     pub stale_sweep_interval: f64,
     pub stale_asset_threshold: f64,
     pub api_resolution_interval: f64,
+
+    // Suspicious arb detection (R2 risk mitigation)
+    pub suspicious_profit_threshold: f64,
+
+    // negRisk correlated exposure cap (R16 risk mitigation)
+    // Max fraction of total capital that can be deployed in negRisk positions (default 0.50 = 50%)
+    pub max_neg_risk_exposure_pct: f64,
 
     // Pre-trade validation (B1.3)
     pub min_depth_per_leg: f64,
@@ -436,6 +467,13 @@ pub struct OrchestratorConfig {
 
     // Test period (E3/E4)
     pub test_period_secs: f64,
+
+    // Sports WS
+    pub sports_ws_enabled: bool,
+    pub sports_ws_url: String,
+    pub sports_ws_reconnect_base: f64,
+    pub sports_ws_reconnect_max: f64,
+    pub sports_ws_prune_interval_days: u64,
 }
 
 impl OrchestratorConfig {
@@ -504,6 +542,8 @@ impl OrchestratorConfig {
             min_trade_size: cfg.arbitrage.min_trade_size,
             min_resolution_secs: cfg.arbitrage.min_resolution_time_secs,
             replacement_cooldown_secs: cfg.arbitrage.replacement_cooldown_seconds,
+            suspicious_profit_threshold: cfg.arbitrage.suspicious_profit_threshold,
+            max_neg_risk_exposure_pct: cfg.arbitrage.max_neg_risk_exposure_pct,
 
             state_save_interval: cfg.engine.state_save_interval_seconds,
             monitor_interval: cfg.engine.monitor_interval_seconds,
@@ -561,6 +601,12 @@ impl OrchestratorConfig {
             usdc_warning_balance: cfg.safety.usdc_monitor.warning_balance,
             usdc_critical_balance: cfg.safety.usdc_monitor.critical_balance,
             test_period_secs: 0.0, // Set by CLI --test-period
+
+            sports_ws_enabled: cfg.sports_ws.enabled,
+            sports_ws_url: cfg.sports_ws.url,
+            sports_ws_reconnect_base: cfg.sports_ws.reconnect_base_delay,
+            sports_ws_reconnect_max: cfg.sports_ws.reconnect_max_delay,
+            sports_ws_prune_interval_days: cfg.sports_ws.prune_interval_days,
         }
     }
 }
@@ -638,6 +684,10 @@ pub struct Orchestrator {
 
     /// Strategy tracker for virtual portfolios (Shadow A-F).
     strategy_tracker: Option<StrategyTracker>,
+
+    /// Sports WebSocket manager — real-time game status for postponement pre-screening.
+    sports_ws: Option<Arc<rust_engine::sports_ws::SportsWsManager>>,
+    last_sports_prune: f64,
 }
 
 impl Orchestrator {
@@ -842,6 +892,8 @@ impl Orchestrator {
             // C4: Start at current UTC day so we don't fire immediately on startup
             last_daily_report_day: (now_secs() / 86400.0).floor() as i64,
             strategy_tracker: None,
+            sports_ws: None,
+            last_sports_prune: 0.0,
         })
     }
 
@@ -919,12 +971,16 @@ impl Orchestrator {
 
         // 6. Check API for missed resolutions
         if self.cfg.shadow_only {
-            let results = self.engine.check_api_resolutions();
+            let (results, disputes) = self.engine.check_api_resolutions();
             if !results.is_empty() {
                 for r in &results {
                     tracing::info!("API resolution: {} → winner={}, profit=${:.4}",
                         r.position_id, r.winning_market_id, r.profit);
                 }
+            }
+            for d in &disputes {
+                tracing::warn!("UMA DISPUTE: position={} market={} status={}",
+                    d.position_id, d.market_id, d.uma_status);
             }
         }
 
@@ -940,6 +996,23 @@ impl Orchestrator {
             // Initial summary for dashboard
             *self.engine.strategy_summary.lock() = tracker.build_summary();
             self.strategy_tracker = Some(tracker);
+        }
+
+        // 6c. Start Sports WebSocket for postponement pre-screening
+        if self.cfg.sports_ws_enabled {
+            let sports_cfg = rust_engine::sports_ws::SportsWsConfig {
+                enabled: true,
+                url: self.cfg.sports_ws_url.clone(),
+                reconnect_base_delay: self.cfg.sports_ws_reconnect_base,
+                reconnect_max_delay: self.cfg.sports_ws_reconnect_max,
+            };
+            let db_path = self.cfg.workspace.join("data").join("sports_ws.db");
+            let mgr = Arc::new(rust_engine::sports_ws::SportsWsManager::new(
+                sports_cfg, db_path.to_str().unwrap_or("data/sports_ws.db"),
+            ));
+            mgr.start(self.engine.runtime.handle());
+            self.sports_ws = Some(mgr);
+            tracing::info!("Sports WS: started for postponement pre-screening");
         }
 
         let mode_str = if self.cfg.shadow_only { "SHADOW" } else { "LIVE" };
@@ -1338,6 +1411,19 @@ impl Orchestrator {
             self.last_postponement_check = now;
         }
 
+        // --- Sports WS: prune ended games periodically ---
+        let prune_interval = self.cfg.sports_ws_prune_interval_days as f64 * 86400.0;
+        if prune_interval > 0.0 && (now - self.last_sports_prune) >= prune_interval {
+            if let Some(ref sports) = self.sports_ws {
+                let pruned = sports.prune_ended(prune_interval);
+                if pruned > 0 {
+                    tracing::info!("Sports WS: pruned {} ended games, {} remaining",
+                        pruned, sports.game_count());
+                }
+            }
+            self.last_sports_prune = now;
+        }
+
         // --- Constraint rebuild ---
         if (now - self.last_constraint_rebuild) >= self.cfg.constraint_rebuild_interval {
             match self.scanner.scan() {
@@ -1411,7 +1497,7 @@ impl Orchestrator {
                         .collect()
                 } else { HashMap::new() };
 
-                let results = self.engine.check_api_resolutions();
+                let (results, disputes) = self.engine.check_api_resolutions();
                 if !results.is_empty() {
                     self.held_ids_cache = None;
                     self.circuit_breaker.record_api_success(now);
@@ -1437,6 +1523,18 @@ impl Orchestrator {
                 } else {
                     // No resolutions but API was reachable
                     self.circuit_breaker.record_api_success(now);
+                }
+
+                // R14: Log and flag disputed positions
+                for d in &disputes {
+                    tracing::warn!("UMA DISPUTE: position={} market={} status={} — excluding from replacement",
+                        d.position_id, d.market_id, d.uma_status);
+                    // Store dispute flag in position metadata
+                    let mut pm = self.engine.positions.lock();
+                    if let Some(p) = pm.open_positions_mut().get_mut(&d.position_id) {
+                        p.metadata.insert("uma_disputed".into(), serde_json::json!(true));
+                        p.metadata.insert("uma_status".into(), serde_json::json!(d.uma_status));
+                    }
                 }
             } else {
                 // No positions to check, but mark API as reachable
@@ -1866,12 +1964,14 @@ impl Orchestrator {
             let rv = self.resolution_validator.as_ref().map(Arc::clone);
             let pd = self.postponement_detector.as_ref().map(Arc::clone);
             let sc = Arc::clone(&self.scanner);
+            let sw = self.sports_ws.as_ref().map(Arc::clone);
             let n_open = open_rows.len();
             self.disk_save_handle = Some(std::thread::spawn(move || {
                 db.mirror_to_disk();
                 if let Some(ref rv) = rv { rv.mirror_to_disk(); }
                 if let Some(ref pd) = pd { pd.mirror_to_disk(); }
                 sc.mirror_to_disk();
+                if let Some(ref sw) = sw { sw.mirror_to_disk(); }
                 let ms = t0.elapsed().as_millis();
                 tracing::info!("State saved: {} open, {} closed [{ms}ms]",
                     n_open, n_closed_total);
@@ -1904,13 +2004,41 @@ impl Orchestrator {
 
             if !self.validate_opportunity(opp, held_cids, held_mids) { continue; }
 
+            // R2 risk mitigation: flag suspiciously large arbs
+            if opp.expected_profit_pct >= self.cfg.suspicious_profit_threshold {
+                tracing::warn!(
+                    "SUSPICIOUS ARB: {:.1}% profit on {}... — large arbs are rare in liquid markets, may indicate detection error",
+                    opp.expected_profit_pct * 100.0, truncate(&opp.constraint_id, 30),
+                );
+            }
+
+            // R16: negRisk correlated exposure cap — scale back position size to fit
+            let effective_cap = if opp.neg_risk && self.cfg.max_neg_risk_exposure_pct > 0.0 {
+                let total_val = self.engine.total_value();
+                let nr_exposure = self.engine.positions.lock().neg_risk_exposure();
+                if total_val > 0.0 {
+                    let available_nr = (total_val * self.cfg.max_neg_risk_exposure_pct) - nr_exposure;
+                    if available_nr < self.cfg.min_trade_size {
+                        tracing::debug!("SKIP (negRisk cap full): {}... ${:.2} available < ${:.2} min",
+                            truncate(&opp.constraint_id, 30), available_nr, self.cfg.min_trade_size);
+                        continue;
+                    }
+                    let capped = cap.min(available_nr);
+                    if capped < cap {
+                        tracing::debug!("negRisk cap: scaling {}... from ${:.2} to ${:.2} (nr_exposure=${:.2})",
+                            truncate(&opp.constraint_id, 30), cap, capped, nr_exposure);
+                    }
+                    capped
+                } else { cap }
+            } else { cap };
+
             // B3: negRisk capital efficiency — for sell arbs on negRisk markets,
             // collateral = $1.00/unit instead of sum(NO prices), so we can size larger
             let is_sell = opp.is_sell;
 
-            // Scale to dynamic capital
+            // Scale to dynamic capital (using effective_cap which may be reduced by negRisk limit)
             let old_cap = opp.optimal_bets.values().sum::<f64>();
-            let scale = if old_cap > 0.0 { cap / old_cap } else { 1.0 };
+            let scale = if old_cap > 0.0 { effective_cap / old_cap } else { 1.0 };
             let scaled_bets: HashMap<String, f64> = opp.optimal_bets.iter()
                 .map(|(k, v)| (k.clone(), v * scale))
                 .collect();
@@ -1961,7 +2089,7 @@ impl Orchestrator {
                     }
                     tracing::info!("ENTER: {}... | ${:.2} | exp ${:.2} | {:.1}h | score={:.6} | depth=${:.0}",
                         truncate(&opp.constraint_id, 30),
-                        cap, scaled_profit, hours, score, opp.min_leg_depth_usd);
+                        effective_cap, scaled_profit, hours, score, opp.min_leg_depth_usd);
                     let _ = self.notifier.send(&NotifyEvent::PositionEntry {
                         position_id: pos.position_id.clone(),
                         strategy: opp.method.clone(),
@@ -2002,6 +2130,11 @@ impl Orchestrator {
                 {
                     let pm = self.engine.positions.lock();
                     for (pid, pos) in pm.open_positions() {
+                        // R14: Skip disputed positions — don't replace while UMA dispute active
+                        if pos.metadata.get("uma_disputed").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            tracing::debug!("SKIP replacement for {} — UMA dispute active", truncate(pid, 20));
+                            continue;
+                        }
                         let bids = self.get_position_bids_typed(pos);
                         let repl_profit = best_opp.expected_profit;
 
@@ -2308,6 +2441,30 @@ impl Orchestrator {
                 continue;
             }
 
+            // Sports WS pre-screen: check if we already know the game status
+            if let Some(ref sports) = self.sports_ws {
+                use rust_engine::sports_ws::SportsCheckResult;
+                match sports.check_postponement(market_names) {
+                    SportsCheckResult::Postponed { game_id, status, league } => {
+                        let display_name = market_names.first()
+                            .map(|n| truncate(n, 40))
+                            .unwrap_or("?");
+                        tracing::info!("Sports WS postponement: {}... | {} ({}) game={}",
+                            display_name, status, league, game_id);
+                        checked += 1;
+                        continue; // Skip AI call — Sports WS already confirmed
+                    }
+                    SportsCheckResult::Active { game_id, status } => {
+                        tracing::debug!("Sports WS active: {}... status={} game={} — skipping AI",
+                            truncate(pid, 20), status, game_id);
+                        continue; // Skip AI call — game is live or finished
+                    }
+                    SportsCheckResult::NoMatch => {
+                        // Fall through to AI call below
+                    }
+                }
+            }
+
             if let Some(result) = pd.check(pid, market_names, &expected_date) {
                 if result.effective_resolution_date.is_some() {
                     let display_name = market_names.first()
@@ -2398,6 +2555,15 @@ impl Orchestrator {
             self.evals_total, self.opps_found,
             self.stale_sweeps, self.stale_assets_swept,
         );
+
+        // Update Sports WS metrics
+        if let Some(ref sports) = self.sports_ws {
+            let mut m = self.engine.engine_metrics.lock();
+            m.sports_ws_connected = sports.is_connected();
+            m.sports_ws_games = sports.game_count() as u64;
+            m.sports_ws_msgs = sports.total_messages();
+            m.sports_ws_postponed = sports.postponed_count() as u64;
+        }
 
         // Log circuit breaker state if tripped
         if let Some((reason, ts)) = self.circuit_breaker.trip_info() {

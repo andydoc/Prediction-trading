@@ -84,6 +84,11 @@ pub struct EngineMetrics {
     pub stale_assets_swept: u64,
     // E3: Test period countdown (0 = disabled)
     pub test_period_end_ts: f64,
+    // Sports WS stats
+    pub sports_ws_connected: bool,
+    pub sports_ws_games: u64,
+    pub sports_ws_msgs: u64,
+    pub sports_ws_postponed: u64,
 }
 
 /// Static HTML — loaded at compile time from the extracted template.
@@ -339,6 +344,10 @@ fn build_metrics(s: &DashboardState) -> Value {
         "opps_found": m.opps_found,
         "stale_sweeps": m.stale_sweeps,
         "stale_assets_swept": m.stale_assets_swept,
+        "sports_ws_connected": m.sports_ws_connected,
+        "sports_ws_games": m.sports_ws_games,
+        "sports_ws_msgs": m.sports_ws_msgs,
+        "sports_ws_postponed": m.sports_ws_postponed,
     })
 }
 
@@ -438,6 +447,16 @@ fn build_stats(s: &DashboardState) -> Value {
         deployed += p.total_capital;
     }
 
+    // R16: negRisk exposure tracking
+    let mut neg_risk_deployed = 0.0f64;
+    let mut neg_risk_count = 0usize;
+    for p in &open_snapshot {
+        if p.metadata.get("is_neg_risk").and_then(|v| v.as_bool()).unwrap_or(false) {
+            neg_risk_deployed += p.total_capital;
+            neg_risk_count += 1;
+        }
+    }
+
     // B4.4: Total unrealized P&L (mark-to-market across all open positions)
     let mut total_unrealized = 0.0f64;
     for p in &open_snapshot {
@@ -518,6 +537,9 @@ fn build_stats(s: &DashboardState) -> Value {
         "mode_label": s.mode.to_uppercase(), "mode_class": format!("mode-{}", s.mode),
         "first_trade": first_trade_str, "start_time": start_str,
         "live_balance": usdc_balance,
+        "neg_risk_deployed": neg_risk_deployed,
+        "neg_risk_count": neg_risk_count,
+        "neg_risk_pct": if total_value > 0.0 { (neg_risk_deployed / total_value * 100.0).round() } else { 0.0 },
         "timestamp": now_str,
         // Engine metrics (passed through from Python via update_metrics)
         "ws_subs": 0, "ws_msgs": 0, "ws_live": 0, "ws_total": 0, "ws_pct": 0,
@@ -691,6 +713,8 @@ fn build_positions(s: &DashboardState) -> Value {
             "entry_ts": entry_ts_fmt, "legs": legs,
             "guaranteed": (guaranteed * 100.0).round() / 100.0,
             "unrealized_pnl": (unrealized_pnl * 100.0).round() / 100.0,
+            "uma_disputed": p.metadata.get("uma_disputed").and_then(|v| v.as_bool()).unwrap_or(false),
+            "uma_status": p.metadata.get("uma_status").and_then(|v| v.as_str()).unwrap_or(""),
             "scenarios": [],  // TODO: compute sell-arb scenarios
         }));
     }
@@ -812,6 +836,9 @@ fn build_opportunities(s: &DashboardState) -> Value {
             (profit_pct / 100.0 / hours) * 1000.0
         } else { 0.0 };
 
+        // R2 risk mitigation: flag arbs with unusually high profit as suspicious
+        let suspicious = profit_pct >= 20.0; // 20% threshold — large arbs rare in liquid markets
+
         result.push(json!({
             "idx": idx + 1, "short_name": short_name, "full_names": market_names,
             "profit_pct": (profit_pct * 10.0).round() / 10.0,
@@ -822,6 +849,7 @@ fn build_opportunities(s: &DashboardState) -> Value {
             "net_profit": net_profit,
             "fees": fees,
             "is_held": is_held,
+            "suspicious": suspicious,
         }));
     }
     json!({ "opportunities": result, "total_found": result.len() })

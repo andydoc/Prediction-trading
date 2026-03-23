@@ -57,7 +57,7 @@ Automated detection and execution of guaranteed-profit arbitrage on Polymarket p
 
 **Pure Rust system** (single compiled binary since v0.10.0):
 - `rust_supervisor` crate: orchestrator, CLI, config loading, systemd integration
-- `rust_engine` crate: WebSocket (3-tier), order book mirror (DashMap), EFP queue (parking_lot), arb math, position manager, state persistence (rusqlite), constraint detection, market scanner, resolution validator (Anthropic API), postponement detector (Anthropic API + web search), dashboard (Axum HTTP + SSE), notifications (Telegram / webhook)
+- `rust_engine` crate: WebSocket (3-tier), order book mirror (DashMap), EFP queue (parking_lot), arb math, position manager, state persistence (rusqlite), constraint detection, market scanner, resolution validator (Anthropic API), postponement detector (Anthropic API + web search, with Sports WS pre-screen), Sports WS (real-time game status for postponement/cancellation), dashboard (Axum HTTP + SSE), notifications (Telegram / webhook)
 
 **Target state (pre go-live)**: Add LiveExecutor with Rust EIP-712 signing (Milestone B). No Python runtime dependency.
 
@@ -108,7 +108,9 @@ The following inconsistencies were identified. These will be addressed by the do
 - State persistence (rusqlite in-memory + WAL, survives restarts)
 - Dashboard (Rust axum + SSE, zero disk reads, live updates)
 - AI resolution validator (Anthropic API, 1-week cache)
-- AI postponement detector (web search for rescheduled events)
+- AI postponement detector (web search for rescheduled events, pre-screened by Sports WS)
+- Sports WebSocket (real-time game status: postponed/cancelled/forfeited/delayed detection)
+- Geoblock health monitoring (`scripts/geoblock_check.sh`, 15-min cron)
 - Shadow mode validation (paper trades cross-checked against live books)
 - Telegram/webhook notifications (rate-limited, per-event toggles, exponential backoff, hostname/instance prefix)
 - Multi-instance support (6 shadow configs incl. fast-market, systemd template)
@@ -571,22 +573,27 @@ The following should be noted but NOT implemented now:
 
 ## 7. Risk Register
 
-| Risk | Likelihood | Impact | Mitigation |
-|------|-----------|--------|------------|
-| CLOB API changes break execution | Medium | High | Version-pin API client. Monitor Polymarket changelog. |
-| Arb math edge case causes loss | Low | High | 100% win rate on 3 resolved arbs. Polytope completeness guards in place. |
-| VPS goes down | Low | Medium | Systemd auto-restart. ZAP 3-month login reminder. |
-| Polymarket blocks automated trading | Low | High | ToS review. FAK orders look like normal trading. No market manipulation. |
-| Capital locked in postponed events | Medium | Low | AI postponement detector identifies and rescores. Capital velocity impact only. |
-| Thin order books at scale | High | Medium | Depth gating (B1.0). Start with $1k, not $10k. |
-| 6 shadow instances overwhelm VPS | Low | Low | 8 GB RAM is ample. Per-instance resource limits. Monitor with `htop`. |
-| EIP-712 signing incompatible with CLOB | Low | Critical | B2.0: verify against py-clob-client output before any live use. Use Polymarket sandbox for integration test (Milestone D). |
-| Market BUY with base quantity causes oversized fill | Low | High | B3.0: explicit guard at executor boundary rejects base-denominated market BUYs. |
-| POL gas exhaustion blocks settlement | Low | High | C1.1: gas balance monitoring + circuit breaker trigger. Maintain ≥ 5 POL buffer. |
-| 6 shadow instances exceed per-IP WS connection limit | Medium | Medium | Shadow-A–E: 2 Tier B each, Shadow-F: 1 Tier B (11 Tier B + 6 Tier C = 17 total). Stagger startup by 30s. |
-| Trade CONFIRMED after RETRYING creates duplicate position | Low | Medium | B3.2: position state machine prevents double-entry. Dedup on `trade_id`. |
-| Tick size change mid-position invalidates order precision | Low | Medium | B2.4: dynamic tick size handling via WS event. Recalculate precision for pending orders. |
-| UMA dispute locks capital with volatile prices | Low | Medium | B4.0: flag disputed positions, exclude from replacement, alert operator. |
+| # | Risk | Likelihood | Impact | Mitigation | Notes |
+|---|------|-----------|--------|------------|-------|
+| R1 | CLOB API changes break execution | Medium | High | Version-pin API client. Monitor Polymarket changelog. | |
+| R2 | Arb math edge case causes loss | **Medium** | High | Polytope completeness guards (0.90 sum). AI resolution validator. Pre-trade Gamma API freshness check (F-gate 6). | **Upgraded from Low**: INC-001 — $10 loss from incomplete mutex group. Already happened once. |
+| R3 | VPS goes down | Low | Medium | Systemd auto-restart. ZAP 3-month login reminder. | |
+| R4 | VPS geoblocked by Polymarket | **Medium** | High | Geoblock health check script (`scripts/geoblock_check.sh`, 15-min cron). Tested runbook for jurisdiction migration (F-gate 5). Allowed: Ireland, Spain, Czech Republic. | **Upgraded from Low**: INC-012 — German VPS 403'd. Already happened. Renamed from "blocks automated trading" to focus on actual risk vector. |
+| R5 | Capital locked in postponed events | Medium | **Medium** | AI postponement detector identifies and rescores. Track capital velocity metric (F-gate 4). Max 20% exposure per event category. | **Impact upgraded from Low**: INC-006 locked 20% of capital for 55 days. Duration risk is structural. |
+| R6 | Thin order books at scale | High | Medium | Depth gating (B1.0). Start with $1k, not $10k. Pre-go-live gate: exercise depth-gated rejection against real CLOB in acceptance tests. | |
+| R7 | 6 shadow instances overwhelm VPS | Low | Low | 8 GB RAM is ample. Per-instance resource limits (1.5GB/50% CPU). Monitor with `htop`. | |
+| R8 | EIP-712 signing incompatible with CLOB | Low | Critical | B2.0: verified against py-clob-client output. Polymarket integration test passed (Milestone D). | D1–D8 all PASS. |
+| R9 | Market BUY with base quantity causes oversized fill | Low | High | B3.0: explicit guard at executor boundary rejects base-denominated market BUYs. 4 unit tests. | |
+| R10 | POL gas exhaustion blocks settlement | Low | High | C1.1: gas balance monitoring + circuit breaker trigger. Maintain ≥ 5 POL buffer. | |
+| R11 | 6 shadow instances exceed per-IP WS connection limit | Medium | Medium | Shadow-A–E: 2 Tier B each, Shadow-F: 1 Tier B (11 Tier B + 6 Tier C = 17 total). Stagger startup by 30s. | |
+| R12 | Trade CONFIRMED after RETRYING creates duplicate position | Low | Medium | B3.2: position state machine prevents double-entry. Dedup on `trade_id`. | |
+| R13 | Tick size change mid-position invalidates order precision | Low | Medium | B2.4: dynamic tick size handling via WS event. Recalculate precision for pending orders. | |
+| R14 | UMA dispute locks capital with volatile prices | Low | Medium | B4.0: flag disputed positions, exclude from replacement, alert operator. Active dispute polling (P6). Shorter cache TTL for disputed markets. | |
+| R15 | **Execution slippage / partial fills** | **Medium** | **High** | B2 code-complete (executor.rs). Pre-trade profit abort at min_profit_ratio 0.70. Unwind logic (B3.6). Track realised vs expected profit (E5/F-gate 3). Dynamic min_profit_ratio by position size. | **New**: Multi-leg arb requires all legs filling at detected prices. FAK orders help but don't eliminate slippage. Pre-go-live gate: E5 fill quality validation. |
+| R16 | **negRisk correlated exposure** | **Medium** | **Medium** | negRisk positions tagged via `Instrument.neg_risk`. Synthetic fill reconciliation (B4.2). Per-negRisk-group exposure cap (P5). Group monitoring in dashboard. | **New**: In negRisk markets, buying YES implicitly creates NO on all other outcomes. Correlated risk means losses aren't leg-isolated. |
+| R17 | **Private key / dashboard security** | **Low** | **Medium** | Dashboard binds 127.0.0.1 only. SSH tunnel for remote access. Pre-F: implement S1 (TLS) and S2 (key zeroize). Cold wallet for reserve capital. | **New**: Deferred from code review (A13). Bounded at $1k. Must be addressed before scaling (Milestone F). |
+| R18 | **WS auth model fragility** | **Low** | **Medium** | INC-013 fix: raw credentials for WS User Channel (not HMAC). Documented dual auth model in ARCHITECTURE.md. | **New**: Polymarket's undocumented dual auth model caused silent WS failures. Fixed but worth monitoring. |
+| R19 | **Capital illiquidity / duration risk** | **Medium** | **Medium** | Track capital velocity as first-class metric (F-gate 4). Weight hold duration in parameter selection (E9). Max 20% exposure per event category. Proactive exit logic (C4.2, 1.2× multiplier). | **New**: All capital in arb positions is locked until resolution (30–60 day instruments). Selling early means accepting market price, not arb price. |
 
 ---
 

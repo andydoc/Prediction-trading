@@ -164,6 +164,11 @@ pub struct EvalCfg {
     pub fee_rate: f64,
     pub min_profit_threshold: f64,
     pub max_profit_threshold: f64,
+    /// Profit threshold above which arbs are flagged as suspicious (default 0.20 = 20%).
+    /// Genuinely large arbs are extremely rare in liquid markets and may indicate
+    /// detection errors (e.g., incomplete mutex groups). Flagged arbs are still
+    /// entered but logged at WARN level and marked in the dashboard.
+    pub suspicious_profit_threshold: f64,
     pub max_fw_iter: usize,
     pub max_hours: f64,
 }
@@ -174,6 +179,7 @@ impl Default for EvalCfg {
             fee_rate: 0.0001,
             min_profit_threshold: 0.03,
             max_profit_threshold: 0.30,
+            suspicious_profit_threshold: 0.20,
             max_fw_iter: 200,
             max_hours: 1440.0,
         }
@@ -268,6 +274,9 @@ pub fn load_engine_config(workspace: &str) -> (EngineConfig, EvalCfg, PositionCf
     let max_profit_threshold = val.pointer("/arbitrage/max_profit_threshold")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.30);
+    let suspicious_profit_threshold = val.pointer("/arbitrage/suspicious_profit_threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.20);
     let max_fw_iter = val.pointer("/arbitrage/optimization/max_iterations")
         .and_then(|v| v.as_u64())
         .unwrap_or(200) as usize;
@@ -294,6 +303,7 @@ pub fn load_engine_config(workspace: &str) -> (EngineConfig, EvalCfg, PositionCf
         fee_rate,
         min_profit_threshold,
         max_profit_threshold,
+        suspicious_profit_threshold,
         max_fw_iter,
         max_hours,
     };
@@ -328,10 +338,10 @@ pub fn load_engine_config(workspace: &str) -> (EngineConfig, EvalCfg, PositionCf
     };
 
     tracing::info!(
-        "Config loaded: ws_shard={}, efp_drift={}, fee={}, profit=[{:.2}%..{:.2}%], max_days={}, capital={}",
+        "Config loaded: ws_shard={}, efp_drift={}, fee={}, profit=[{:.2}%..{:.2}%] (suspicious>{:.0}%), max_days={}, capital={}",
         assets_per_shard, efp_drift_threshold, fee_rate,
         min_profit_threshold * 100.0, max_profit_threshold * 100.0,
-        max_days, initial_capital,
+        suspicious_profit_threshold * 100.0, max_days, initial_capital,
     );
 
     (engine_cfg, eval_cfg, pos_cfg, log_cfg)

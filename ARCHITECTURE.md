@@ -121,6 +121,9 @@ Updated dynamically on `tick_size_change` WS events via Tier C.
 ### Signing (`signing.rs`)
 EIP-712 order signing for Polymarket CLOB Exchange. Pure Rust using `alloy-primitives` + `alloy-signer-local`. Signature type 0 (EOA). Supports both regular CTF Exchange and Neg Risk CTF Exchange contracts on Polygon (chain ID 137). Also provides `ClobAuth` with dual auth: `build_headers()` for REST (HMAC-SHA256), `raw_secret_b64()` + `passphrase()` for WS User Channel (raw credentials).
 
+### Sports WebSocket (`sports_ws.rs`)
+Persistent connection to `wss://sports-api.polymarket.com/ws`. Receives real-time game status for all active sports events (no auth, no subscription required). Maintains `HashMap<game_id, GameState>` with team names, status, live/ended flags. SQLite persistence via `CachedSqliteDB` at `data/sports_ws.db` — survives restarts without waiting for WS to repopulate. Used by `check_postponements()` as a pre-screen: games with status `Postponed`/`Canceled`/`Forfeit`/`Suspended`/`Delayed` are detected instantly, skipping the expensive AI call. Heartbeat: responds to both protocol-level and text-based PING. Exponential backoff reconnection (1s → 60s). Weekly prune of ended games.
+
 ### Reconciliation (`reconciliation.rs`)
 Compares internal position state against CLOB API venue state. Runs on startup and periodically (every 5 min). Detects: quantity mismatch, missing positions (both directions), orphan orders, negRisk synthetic fills. In shadow mode (no venue credentials): skips CLOB comparison, no false alarms.
 
@@ -178,7 +181,8 @@ rust_engine/src/
 ├── usdc_monitor.rs     # B4.6: USDC.e on-chain balance monitor
 ├── gas_monitor.rs      # C1.1: POL gas balance monitor
 ├── circuit_breaker.rs  # C1: Circuit breaker
-└── strategy_tracker.rs # E: Virtual portfolio strategy tracking
+├── strategy_tracker.rs # E: Virtual portfolio strategy tracking
+└── sports_ws.rs        # Sports WS: real-time game status for postponement pre-screen
 
 rust_supervisor/src/
 ├── main.rs             # Binary entry: PID lock, signal handling, --test-period
@@ -281,7 +285,13 @@ All parameterised values in `config/config.yaml`:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `port` | `5558` | HTTP server port |
-| `bind_addr` | `127.0.0.1` | Bind address |
+| `bind_addr` | `127.0.0.1` | Bind address (localhost-only — **never** change to `0.0.0.0`) |
+
+**Security note:** The dashboard has no authentication. Access is restricted by binding to `127.0.0.1` only. Remote access via SSH tunnel:
+```bash
+ssh -L 5558:127.0.0.1:5558 madrid    # then open http://localhost:5558
+```
+The kill switch endpoint (`POST /api/kill-switch`) is also unauthenticated — localhost-only binding is the sole access control. Before Milestone F (scaling capital), implement API key auth or move kill switch to a separate admin port.
 
 ### `state`
 | Key | Default | Description |
@@ -294,6 +304,15 @@ All parameterised values in `config/config.yaml`:
 | `provider` | `anthropic` | AI provider |
 | `models.resolution_validation` | — | Model for resolution checks |
 | `models.postponement_detection` | — | Model for postponement detection |
+
+### `sports_ws`
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Enable Sports WebSocket connection |
+| `url` | `wss://sports-api.polymarket.com/ws` | Sports WS endpoint |
+| `reconnect_base_delay` | `1.0` | Initial reconnect delay (seconds) |
+| `reconnect_max_delay` | `60.0` | Maximum reconnect delay (seconds) |
+| `prune_interval_days` | `7` | Remove ended games older than this |
 
 ---
 
