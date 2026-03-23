@@ -6,3 +6,4 @@ pub mod d5_multi_leg;
 pub mod d6_cold_start;
 pub mod d7_circuit_breaker;
 pub mod d8_closeout;
+pub mod d9_partial_fill;

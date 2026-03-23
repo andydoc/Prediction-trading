@@ -715,7 +715,7 @@ impl Executor {
 
         let order_payload = serde_json::json!({
             "order": {
-                "salt": signed.order.salt.to_string(),
+                "salt": signed.order.salt.to::<u64>(),
                 "maker": format!("{}", signed.order.maker),
                 "signer": format!("{}", signed.order.signer),
                 "taker": "0x0000000000000000000000000000000000000000",
@@ -731,8 +731,6 @@ impl Executor {
             },
             "owner": self.clob_auth.as_ref().map(|a| a.api_key()).unwrap_or_default(),
             "orderType": self.config.order_type.as_str(),
-            "negRisk": instrument.neg_risk,
-            "tickSize": format_tick_size(instrument.tick_size),
         });
 
         // Serialize once — same string for HMAC signing and HTTP body
@@ -1180,7 +1178,7 @@ impl Executor {
             let side_str = if tracked.side == Side::Buy { "BUY" } else { "SELL" };
             order_payloads.push(serde_json::json!({
                 "order": {
-                    "salt": signed.order.salt.to_string(),
+                    "salt": signed.order.salt.to::<u64>(),
                     "maker": format!("{}", signed.order.maker),
                     "signer": format!("{}", signed.order.signer),
                     "taker": "0x0000000000000000000000000000000000000000",
@@ -1196,8 +1194,6 @@ impl Executor {
                 },
                 "owner": self.clob_auth.as_ref().map(|a| a.api_key()).unwrap_or_default(),
                 "orderType": self.config.order_type.as_str(),
-                "negRisk": instrument.neg_risk,
-                "tickSize": format_tick_size(instrument.tick_size),
             }));
         }
 

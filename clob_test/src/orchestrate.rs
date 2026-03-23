@@ -40,6 +40,8 @@ enum Phase {
     D7,
     /// Closeout: sell all positions, verify accounting.
     D8,
+    /// Partial fill test (B3.6 validation).
+    D9,
     /// All tests complete.
     Complete,
     /// Fatal error — ceased trading.
@@ -140,6 +142,7 @@ impl TestHarness {
             Phase::D6Verify => "D6-verify",
             Phase::D7 => "D7",
             Phase::D8 => "D8",
+            Phase::D9 => "D9",
             Phase::Complete => "complete",
             Phase::Failed(_) => "failed",
         }
@@ -219,6 +222,7 @@ impl TestHarness {
                 }
                 Phase::D6Verify => self.run_d6_verify(),
                 Phase::D7 => self.run_d7(),
+                Phase::D9 => self.run_d9(),
                 Phase::D8 => self.run_d8(),
                 Phase::Complete => {
                     self.finalize(true);
@@ -463,6 +467,23 @@ impl TestHarness {
             self.report.add_result(ks_result);
             self.engine.accounting.lock().summary_log("after-D7b");
         }
+
+        // D9 runs before D8 (partial fill test needs to buy, D8 sells everything)
+        self.phase = Phase::D9;
+    }
+
+    fn run_d9(&mut self) {
+        if self.should_skip("D9") {
+            self.skip_test("D9", "Partial Fill");
+        } else {
+            let result = tests::d9_partial_fill::run(
+                &self.executor, &self.engine, &self.notifier,
+                &mut self.dedup, &mut self.exceptions,
+                &self.clob, &self.clob_auth, &self.runtime, &self.wallet_address,
+            );
+            self.report.add_result(result);
+        }
+        crate::flush_notify(&self.notifier);
 
         // Ensure D8 has at least one position to close.
         // If D7 (or prior tests) left no positions, open a small test position.
