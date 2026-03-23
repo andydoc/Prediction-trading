@@ -198,17 +198,14 @@ Each document is produced at the point in the milestone sequence when its conten
 
 **Why before go-live**: The CTO decided real money should only flow through the cleanest possible system. The hybrid Python/Rust boundary is a source of complexity and potential bugs.
 
-**Critical files**:
-- `rust_engine/src/lib.rs` — PyO3 bindings (to be replaced with native Rust main)
-- `rust_engine/src/` — all Rust modules
-- `trading_engine.py` — Python orchestrator (to be replaced)
-- `paper_trading.py` — Python position lifecycle (already partially replaced by Rust PM)
-- `resolution_validator.py` — AI validation (to be ported)
-- `postponement_detector.py` — AI detection (to be ported)
-- `layer1_runner.py` — market scanner (to be ported)
-- `layer2_constraint_detection/constraint_detector.py` — constraint detection (to be ported)
-- `config/config.yaml` + `config/secrets.yaml` — config loading (to be ported)
-- `main.py` — supervisor (to be replaced by Rust main)
+**Critical files** (all Rust — Python fully retired in A1-A13):
+- `rust_engine/src/lib.rs` — TradingEngine: root of all shared state
+- `rust_supervisor/src/orchestrator.rs` — event loop, position management
+- `rust_engine/src/resolution.rs` — AI resolution validator (✅ ported A2)
+- `rust_engine/src/postponement.rs` — AI postponement detector (✅ ported A3)
+- `rust_engine/src/scanner.rs` — market scanner (✅ ported A4)
+- `rust_engine/src/detect.rs` — constraint detection (✅ ported A5)
+- `config/config.yaml` + `config/secrets.yaml` — config loading (✅ ported A10)
 
 | Task | Acceptance Criteria |
 |------|-------------------|
@@ -336,7 +333,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | ✅ **B3.3: Execution rate limiting** | Token-bucket rate limiter: 60 orders/min trading, 100 req/min public, 300 req/min auth, 3,000 req/10min global. Logs when throttled. Prevents 429 bans. **Pre-req**: study NT rate limit implementation and Polymarket API docs for current limits. |
 | ✅ **B3.4: Timestamp normalisation** | Robust parsing across all API responses: ISO8601 with/without timezone, Unix seconds vs milliseconds, missing/null timestamps. Single `parse_polymarket_timestamp()` function used everywhere. **Pre-req**: study NT issue #3273 and fix for edge cases. |
 | ✅ **B3.5: Error handling matrix** | Defined behaviour for: CLOB API timeout (retry once, then abort + unwind), CLOB rejection (log + skip), network failure (pause trading, alert, retry connection), insufficient balance (pause trading, alert), rate limit 429 (back off per token bucket). |
-| ✅ **B3.6: Partial fill handling** | After submitting all legs: check actual fills via order status. Compute arb score of filled position. If score ≥ threshold: accept. If score < threshold: compute minimum unwind. If no acceptable partial: full unwind. Log all partial fill events. **Note**: code-complete at this point; real partial fills tested in Milestone D. |
+| ✅ **B3.6: Partial fill handling** | After submitting all legs: check actual fills via order status. Compute arb score of filled position. If score ≥ threshold: accept. If score < threshold: compute minimum unwind. If no acceptable partial: full unwind. Log all partial fill events. **Note**: code-complete and unit-tested; ❌ real partial fills NOT tested in Milestone D (hard to trigger with micro-orders on live markets). **Scheduled: D9 (dedicated partial fill test).** |
 | ✅ **B3.7: Batch order submission** | Submit all legs of a multi-leg arb as a single batch request. Reduces latency window for partial-fill exposure on 3+ leg positions. **Pre-req**: study NT PR #3506 source before building. |
 
 #### B-Part 4: Reconciliation & Tracking (✅ rework complete — enhanced reconciliation, parallel confirmation, USDC monitor)
@@ -383,7 +380,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 ---
 
-### ✅ Milestone D: CLOB Integration Test
+### 🔧 Milestone D: CLOB Integration Test — 8/9 PASS, 1 remaining
 
 **Goal**: Prove the full execution path works against the real Polymarket CLOB. Place, fill, cancel, and reconcile real micro-orders. This is a focused, short milestone (target: 1 week) that validates everything built in Milestone B before committing to the 14-day shadow validation.
 
@@ -392,7 +389,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 **First real CLOB order**: 2026-03-20 from Madrid VPS.
 **Test harness**: `clob-test` binary with `--skip-tests` flag for selective reruns.
 
-**Why a separate milestone**: Many Milestone B tasks (partial fill handling, cross-asset fill matching, reconciliation, batch orders, FOK overfill handling) cannot be fully validated without actual CLOB fills. Dry-run mode verifies code paths and signing, but only real micro-orders confirm end-to-end correctness. Inserting this before the 14-day shadow validation ensures execution bugs are caught early with minimal capital at risk.
+**Why a separate milestone**: Many Milestone B tasks (partial fill handling, cross-asset fill matching, reconciliation, batch orders, FOK overfill handling) cannot be fully validated without actual CLOB fills. Dry-run mode verifies code paths and signing, but only real micro-orders confirm end-to-end correctness. Inserting this before the 14-day shadow validation ensures execution bugs are caught early with minimal capital at risk. **Note**: D1-D8 passed with micro-orders, but D9 (deliberate partial fill test) was not attempted — partial fills are hard to trigger reliably. D9 must pass before F-pre-9.
 
 | Task | Status | Acceptance Criteria |
 |------|--------|-------------------|
@@ -405,7 +402,9 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | ✅ **D7: Test circuit breaker + kill switch** | PASS | (a) Circuit breaker state validated. (b) Kill switch cancel-all executed. |
 | ✅ **D8: Resolve or sell test positions** | PASS | Real SELL orders at best bid. Accounting verified. Token_id lookup fixed: prefer MarketLeg.token_id over instrument store. |
 
-**Exit criteria**: All 8 tasks pass. Zero unexplained discrepancies between internal state and CLOB. All funds accounted for. Ready to proceed to 14-day shadow validation.
+| ⬚ **D9: Test partial fill handling** | Deliberately trigger a partial fill on a multi-leg arb (e.g., place legs with insufficient depth on one side, or use a large FAK order on a thin book). Verify: `evaluate_partial_fills()` runs correctly, unprofitable partials trigger unwind, profitable partials are accepted. Validates B3.6 against real CLOB. |
+
+**Exit criteria**: All 9 tasks pass. Zero unexplained discrepancies between internal state and CLOB. All funds accounted for. Ready to proceed to 14-day shadow validation.
 
 ---
 
@@ -509,27 +508,43 @@ Before building the comparison dashboard, stress-test the engine to determine ac
 | ⬚ **E9: Parameter selection** | After 14 days, analyse all 6 instances across: risk-adjusted return (Sharpe-like: return / max drawdown), capital utilisation %, replacement success rate, depth-limited trade count, average hold duration vs expected. Engine parameters already determined by E2.6 stress tests. Select winning **strategy** parameter set(s) for live trading — may select different params for fast vs standard markets. Document rationale. |
 | ⬚ **E10: CTO sign-off** | CTO reviews: 14-day comparison report across all 6 instances, selected parameters with rationale, error log, reconciliation report. Written approval to proceed to live. |
 
-#### Deferred Audit Items (pre-F1, post-E4)
+#### Deferred Audit Items — scheduled pre-F1
 
-From independent code audit v5. Deferred because they are low-risk or complex — not blocking 14-day validation.
+From independent code audit v5. Deferred from E4 because they are low-risk or complex — not blocking 14-day shadow validation. **All must be resolved before F1 (deposit real funds).**
 
-| # | Issue | Rationale for deferral |
-|---|-------|----------------------|
-| ACC-2 | Suspense-to-PositionManager sync on `reverse_suspense()` | Rare path — only fires if trade fails on-chain. Low probability during shadow validation. |
-| NT-2 | Add `PendingCancel` and `PartiallyFilled` to `TradeStatus` | Defensive — prevents double-cancel in unwind flows. No active unwind logic uses this path yet. |
-| NT-4 | Per-condition-group exposure cap | Complex — requires Gamma API joins for event slug mapping. Important for live but not shadow. |
-| ACC-6 | Archive closed positions before pruning | Low risk — closed positions already in SQLite. Pruning only removes from in-memory vec. |
-| ACC-7 | Standardize profit % denominator (resolution vs liquidation) | Display-only inconsistency. Does not affect actual P&L. |
-| API-8 | Rate limiter ~100x more conservative than Polymarket allows | Deliberate for early-live safety. Increase when throughput becomes a bottleneck. |
-| API-9 | Pool WS connections missing `initial_dump: true` | May cause stale book baseline. Monitor stale_books metrics during E4 to decide priority. |
-| PERF-1/2/3 | HashMap sort, asset ID caching, double deserialization | Micro-optimizations. Eval loop runs in <100μs. Not bottleneck. |
-| STY-1–5 | Style fixes (prepare helper, EIP-712 comment, O(n²) lookup, redundant import, overflow) | Low impact. Address in routine cleanup. |
+| # | Issue | Scheduled | Status |
+|---|-------|-----------|--------|
+| ACC-2 | Suspense-to-PositionManager sync on `reverse_suspense()` | ⬚ **E-audit** | Rare path — fires if trade fails on-chain. |
+| NT-2 | Add `PendingCancel` and `PartiallyFilled` to `TradeStatus` | ⬚ **E-audit** | Prevents double-cancel in unwind flows. |
+| NT-4 | Per-condition-group exposure cap | ⬚ **E-audit** | Requires Gamma API joins. Partially addressed by P5 (negRisk cap). |
+| ACC-6 | Archive closed positions before pruning | ⬚ **E-audit** | Closed positions in SQLite; pruning only removes from memory. |
+| ACC-7 | Standardize profit % denominator (resolution vs liquidation) | ⬚ **E-audit** | Display-only inconsistency. |
+| API-8 | Rate limiter ~100x more conservative than Polymarket allows | ⬚ **G** (post-launch) | Deliberate for early-live safety. Increase when throughput bottleneck. |
+| API-9 | Pool WS connections missing `initial_dump: true` | ⬚ **E-audit** | Monitor stale_books during E4 to decide priority. |
+| PERF-1/2/3 | HashMap sort, asset ID caching, double deserialization | ⬚ **G** (post-launch) | Not bottleneck (<100μs eval loop). |
+| STY-1–5 | Style fixes (5 items) | ⬚ **G** (post-launch) | Low impact, routine cleanup. |
 
 ---
 
 ### ⬚ Milestone F: Go Live
 
-**Goal**: First real money trades with optimised parameters.
+**Goal**: First real money trades with optimised parameters. All pre-live gates (security, validation, operational) must pass first.
+
+#### F-Pre: Pre-Live Gates (must pass before F1)
+
+| Task | Acceptance Criteria | Source |
+|------|-------------------|--------|
+| ⬚ **F-pre-1: Wire executor into orchestrator** | Instantiate `Executor` in `Orchestrator::new()`. Call `executor.execute_arb()` after `engine.enter_position()`. Add executor config block. Implement live-mode kill switch via `executor.cancel_all_orders()`. | Risk analysis |
+| ⬚ **F-pre-2: S1 — Explicit TLS verification** | CLOB and Gamma API connections verify TLS certificates explicitly (not just reqwest defaults). Log certificate details on first connection. | Code review A13 |
+| ⬚ **F-pre-3: S2 — Zeroize API keys in memory** | Private key and API secrets zeroized after use (via `zeroize` crate). Secrets not held in memory longer than necessary. | Code review A13 |
+| ⬚ **F-pre-4: Fill quality logging (E5 validation)** | Log intended vs actual book state at decision time. Compute fill quality ratio per trade. 95%+ of trades must have ratio > `min_profit_ratio`. | Risk analysis R15 |
+| ⬚ **F-pre-5: Capital velocity metric** | Track average days-deployed per dollar as first-class metric. Display on dashboard. Weight in E9 parameter selection. | Risk analysis R19 |
+| ⬚ **F-pre-6: Geoblock runbook** | Document: allowed jurisdictions, VPS provisioning steps for replacement, how long positions can sit without system running, tested migration procedure. | Risk analysis R4 |
+| ⬚ **F-pre-7: Pre-trade Gamma API freshness check** | Single REST call before live orders to verify outcome group completeness (no new outcomes added since detection). Prevents INC-001 class errors. | Risk analysis R2 |
+| ⬚ **F-pre-8: Resolve deferred E-audit items** | ACC-2, NT-2, NT-4, ACC-6, ACC-7, API-9 all resolved (see Deferred Audit Items table). | Audit v5 |
+| ⬚ **F-pre-9: D9 partial fill test** | B3.6 validated against real CLOB (see D9). | B3.6 / Risk analysis R15 |
+
+#### F-Main: Go Live
 
 | Task | Acceptance Criteria |
 |------|-------------------|
@@ -601,19 +616,20 @@ The following should be noted but NOT implemented now:
 
 The system is production-ready when ALL of these are true:
 
-1. Single Rust binary running on VPS with zero Python dependencies
-2. All hardcoded thresholds parameterised in `config.yaml` (see Parameterisation Table)
-3. EIP-712 order signing verified against py-clob-client reference (Milestone B)
-4. CLOB integration test passed with real micro-orders — zero unexplained discrepancies (Milestone D)
-5. 14 consecutive days of 6-way shadow trading at $1,000 capital with zero unhandled errors (Milestone E)
-6. Optimal parameters selected from shadow comparison (capital_per_trade_pct, max_concurrent_positions)
-7. Circuit breaker, kill switch, POL gas monitoring, and Telegram notifications all tested and working
-8. Position reconciliation passes every check for 14 days across all instances
-9. Execution price validation shows 95%+ of trades would fill at > 70% of expected profit
-10. CTO has reviewed comparison results and given written sign-off
-11. ~$1,050 USDC + POL deposited and CLOB connectivity verified
-12. Documentation split into 6 focused documents (produced within A–C), all reviewed for accuracy
-13. Scripts rationalised to 3 (start.sh, restart.sh, kill.sh)
+1. ✅ Single Rust binary running on VPS with zero Python dependencies
+2. ✅ All hardcoded thresholds parameterised in `config.yaml` (see Parameterisation Table)
+3. ✅ EIP-712 order signing verified against py-clob-client reference (Milestone B)
+4. ✅ CLOB integration test passed with real micro-orders — zero unexplained discrepancies (D1-D8). ❌ D9 (partial fill test) remaining.
+5. ⬚ 14 consecutive days of 6-way shadow trading at $1,000 capital with zero unhandled errors (E4)
+6. ⬚ Optimal parameters selected from shadow comparison (E9)
+7. ✅ Circuit breaker, kill switch, POL gas monitoring, and Telegram notifications all tested and working
+8. ⬚ Position reconciliation passes every check for 14 days across all instances (E6)
+9. ⬚ Execution price validation shows 95%+ of trades would fill at > 70% of expected profit (E5 / F-pre-4)
+10. ⬚ CTO has reviewed comparison results and given written sign-off (E10)
+11. ⬚ ~$1,050 USDC + POL deposited and CLOB connectivity verified (F1)
+12. ✅ Documentation split into 6 focused documents (produced within A–C), all reviewed for accuracy
+13. ✅ Scripts rationalised to 3 (start.sh, restart.sh, kill.sh)
+14. ⬚ F-pre gates passed: S1/S2 security, fill quality logging, geoblock runbook, deferred audit items (F-pre-1 through F-pre-9)
 
 ---
 

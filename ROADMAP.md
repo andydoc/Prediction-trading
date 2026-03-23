@@ -55,13 +55,14 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 
 ---
 
-## Milestone D: CLOB Integration Test — ✅ Complete
+## Milestone D: CLOB Integration Test — 🔧 8/9 PASS, D9 remaining
 
 **Goal**: Prove full execution path works against real Polymarket CLOB. Place, fill, cancel, and reconcile real micro-orders. Target: 1 week.
 
 | Status | Count |
 |--------|-------|
-| ✅ Complete | 8/8 |
+| ✅ Complete | 8/9 |
+| ⬚ Remaining | 1/9 |
 
 **VPS**: is*hosting Madrid (176.97.72.199). Interim location — Dublin (Interxion DC, 0.83ms latency) planned when capacity available.
 **Funds**: ~$50 USDC.e deposited, wallet 0x21f1...fb1.
@@ -78,6 +79,7 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 | D7a: Circuit breaker | ✅ | Engine state validation |
 | D7b: Kill switch | ✅ | Executor cancel-all |
 | D8: Closeout positions | ✅ | Real SELL orders + accounting verification |
+| D9: Partial fill test | ⬚ | Deliberately trigger partial fill on multi-leg arb. Validates B3.6 against real CLOB. Must pass before F-pre-9. |
 
 ### Known Issues / Next Steps (from D)
 
@@ -127,11 +129,13 @@ Shadow-F targets short-lived crypto price markets (5-15 min resolution) with fas
 
 | Status | Count |
 |--------|-------|
-| ⬚ Remaining | 6/6 |
+| ⬚ Remaining | 15/15 (9 pre-live gates + 6 go-live tasks) |
 
 **Funds required**: $1,000 USDC additional (~$1,050 total including D1 deposit).
 
-Tasks: deposit funds, configure winning parameters, switch to live mode, supervised first trades, 48h monitoring period, steady state confirmation.
+**Pre-live gates** (F-pre-1 through F-pre-9): Wire executor, S1/S2 security, fill quality logging, capital velocity metric, geoblock runbook, pre-trade Gamma freshness check, resolve deferred audit items, D9 partial fill test.
+
+**Go-live tasks** (F1-F6): deposit funds, configure winning parameters, switch to live mode, supervised first trades, 48h monitoring period, steady state confirmation.
 
 ---
 
@@ -157,7 +161,7 @@ Tasks: deposit funds, configure winning parameters, switch to live mode, supervi
 | A: Rust Port | 13/13 | ✅ Complete |
 | B: Execution Infrastructure | 29/29 | ✅ Complete |
 | C: Safety | 10/10 | ✅ Complete |
-| D: CLOB Integration Test | 8/8 | ✅ Complete |
+| D: CLOB Integration Test | 8/9 | 🔧 D9 remaining |
 | E: Shadow Validation | 6/12 | 🔧 In Progress |
-| F: Go Live | 0/6 | ⬚ Planned |
+| F: Go Live | 0/15 | ⬚ Planned (9 pre-live gates + 6 tasks) |
 | G: Scale | 0/4 | ⬚ Future |
