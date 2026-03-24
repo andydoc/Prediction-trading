@@ -204,6 +204,7 @@ dashboard:
   port: 5558
   bind_addr: 127.0.0.1
 notifications:
+  hostname: laptop
   enabled: true
   webhook_url: ''
   api_key: ''
