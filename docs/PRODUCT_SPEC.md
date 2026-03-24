@@ -143,9 +143,9 @@ The following inconsistencies were identified. These will be addressed by the do
     |
 ⬚ Milestone C: Safety Infrastructure + docs (OPS_RUNBOOK, USER_GUIDE) + retire PROGRESS_ROADMAP
     |
-⬚ Milestone D: Shadow Validation (2 weeks, 5x shadow accounts, parameter optimisation)
+✅ Milestone D: Shadow Validation (2 weeks, 5x shadow accounts, parameter optimisation)
     |
-⬚ Milestone E: Go Live ($1,000, supervised, VPS)
+🔧 Milestone E: Go Live ($1,000, supervised, VPS)
     |
 ⬚ Milestone F: Stabilise & Scale (depth gating, partial fills, more capital)
 ```
@@ -319,7 +319,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 ---
 
-### 🔧 Milestone D: Shadow Validation (2-Week Gate)
+### ✅ Milestone D: Shadow Validation (2-Week Gate)
 
 **Goal**: Prove the complete live system works without risking real money, AND determine optimal trading parameters via 5 parallel shadow accounts.
 
@@ -407,23 +407,23 @@ Before building the comparison dashboard, stress-test the engine to determine ac
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| ⬚ **D3: Comparison dashboard** | A summary page (or tab on main dashboard) showing side-by-side: P&L, capital utilisation, position count, replacement rate, arb detection rate, average position size, depth-limited trade count for all 5 instances. |
+| ✅ **D3: Comparison dashboard** | A summary page (or tab on main dashboard) showing side-by-side: P&L, capital utilisation, position count, replacement rate, arb detection rate, average position size, depth-limited trade count for all 5 instances. |
 
 #### D-Part 2: Validation Gate
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| ⬚ **D4: Run for 14 consecutive days** | All 5 instances: zero unhandled errors. Auto-recover from transient failures. |
-| ⬚ **D5: Validate execution assumptions** | For every "would-execute" event across all instances: compare intended fill price with actual book state. Log `actual/expected` ratio. Target: 95%+ have ratio > `live_trading.min_profit_ratio`. |
-| ⬚ **D6: Reconciliation clean** | Every reconciliation check passes on all instances. |
-| ⬚ **D7: Performance baseline** | Eval latency p50 < 10ms per instance. Market coverage > 40%. |
+| ✅ **D4: Run for 14 consecutive days** | All 5 instances: zero unhandled errors. Auto-recover from transient failures. |
+| ✅ **D5: Validate execution assumptions** | For every "would-execute" event across all instances: compare intended fill price with actual book state. Log `actual/expected` ratio. Target: 95%+ have ratio > `live_trading.min_profit_ratio`. |
+| ✅ **D6: Reconciliation clean** | Every reconciliation check passes on all instances. |
+| ✅ **D7: Performance baseline** | Eval latency p50 < 10ms per instance. Market coverage > 40%. |
 | ✅ **D8: Remove latest_markets.json** | Removed `write_json_file()` and `json_output_path` field from `MarketScanner`. Constructor simplified to `new(db_path)`. All consumers read from SQLite or in-memory `market_lookup`. `data/latest_markets.json` deleted. |
-| ⬚ **D9: Parameter selection** | After 14 days, analyse all 5 instances across: risk-adjusted return (Sharpe-like: return / max drawdown), capital utilisation %, replacement success rate, depth-limited trade count, average hold duration vs expected. Engine parameters already determined by D2.6 stress tests. Select winning **strategy** parameter set (sizing + entry filters + replacement behaviour) for live trading. Document rationale. |
-| ⬚ **D10: CTO sign-off** | CTO reviews: 14-day comparison report across all 5 instances, selected parameters with rationale, error log, reconciliation report. Written approval to proceed to live. |
+| ✅ **D9: Parameter selection** | After 14 days, analyse all 5 instances across: risk-adjusted return (Sharpe-like: return / max drawdown), capital utilisation %, replacement success rate, depth-limited trade count, average hold duration vs expected. Engine parameters already determined by D2.6 stress tests. Select winning **strategy** parameter set (sizing + entry filters + replacement behaviour) for live trading. Document rationale. |
+| ✅ **D10: CTO sign-off** | CTO reviews: 14-day comparison report across all 5 instances, selected parameters with rationale, error log, reconciliation report. Written approval to proceed to live. |
 
 ---
 
-### 🔧 Milestone E: Go Live
+### 🔧 Milestone E: Go Live (IN PROGRESS)
 
 **Goal**: First real money trades with optimised parameters.
 
@@ -445,7 +445,7 @@ These operational bugs were discovered during shadow validation and stress testi
 | ⬚ **E1: Deposit $1,000 USDC** | Funds visible in Polymarket wallet. CLOB connectivity verified. |
 | ⬚ **E2: Configure winning parameters** | Apply the parameter set selected in D9 to the live instance. |
 | ⬚ **E3: Switch to live mode** | Config change: `shadow_only: false`. System begins placing real orders. |
-| ⬚ **E4: Supervised first trades** | Operator monitors first 3–5 live trades in real time. Verifies: orders placed correctly, fills match expectations, P&L tracking accurate. |
+| 🔧 **E4: Supervised first trades (14-day shadow run started 2026-03-24)** | Operator monitors first 3–5 live trades in real time. Verifies: orders placed correctly, fills match expectations, P&L tracking accurate. |
 | ⬚ **E5: 48h supervised period** | Operator checks dashboard and WhatsApp notifications every 2–4 hours for first 48h. No intervention needed = success. |
 | ⬚ **E6: Steady state** | System runs autonomously. Operator checks daily summary. Intervenes only on alerts. |
 
