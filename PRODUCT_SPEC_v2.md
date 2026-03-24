@@ -155,11 +155,11 @@ The following inconsistencies were identified. These will be addressed by the do
 ✅ Milestone C: Safety Infrastructure + docs (OPS_RUNBOOK, USER_GUIDE) + retire PROGRESS_ROADMAP
     |                Complete. 10/10 tasks. No funded account required.
     |
-✅ Milestone D: CLOB Integration Test (small deposit: ~$50 USDC + POL gas) — 8/8 PASS
-    |                Complete. All tests passing on VPS.
+✅ Milestone D: CLOB Integration Test (small deposit: ~$50 USDC + POL gas) — 9/9 PASS
+    |                Complete. All tests passing on VPS (D1-D9).
     |
-⬚ Milestone E: Shadow Validation (14 days, 6× shadow accounts, parameter optimisation)
-    |                No additional funds required. Shadow trades only.
+🔧 Milestone E: Shadow Validation (14 days, 6× shadow accounts, parameter optimisation)
+    |                IN PROGRESS. 14-day shadow run started 2026-03-24.
     |
 ⬚ Milestone F: Go Live ($1,000 USDC, supervised, VPS)
     |
@@ -380,7 +380,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 
 ---
 
-### 🔧 Milestone D: CLOB Integration Test — 8/9 PASS, 1 remaining
+### ✅ Milestone D: CLOB Integration Test — 9/9 PASS
 
 **Goal**: Prove the full execution path works against the real Polymarket CLOB. Place, fill, cancel, and reconcile real micro-orders. This is a focused, short milestone (target: 1 week) that validates everything built in Milestone B before committing to the 14-day shadow validation.
 
@@ -389,7 +389,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 **First real CLOB order**: 2026-03-20 from Madrid VPS.
 **Test harness**: `clob-test` binary with `--skip-tests` flag for selective reruns.
 
-**Why a separate milestone**: Many Milestone B tasks (partial fill handling, cross-asset fill matching, reconciliation, batch orders, FOK overfill handling) cannot be fully validated without actual CLOB fills. Dry-run mode verifies code paths and signing, but only real micro-orders confirm end-to-end correctness. Inserting this before the 14-day shadow validation ensures execution bugs are caught early with minimal capital at risk. **Note**: D1-D8 passed with micro-orders, but D9 (deliberate partial fill test) was not attempted — partial fills are hard to trigger reliably. D9 must pass before F-pre-9.
+**Why a separate milestone**: Many Milestone B tasks (partial fill handling, cross-asset fill matching, reconciliation, batch orders, FOK overfill handling) cannot be fully validated without actual CLOB fills. Dry-run mode verifies code paths and signing, but only real micro-orders confirm end-to-end correctness. Inserting this before the 14-day shadow validation ensures execution bugs are caught early with minimal capital at risk. **Note**: D1-D9 all passed with micro-orders. D9 (deliberate partial fill test) completed.
 
 | Task | Status | Acceptance Criteria |
 |------|--------|-------------------|
@@ -402,13 +402,13 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | ✅ **D7: Test circuit breaker + kill switch** | PASS | (a) Circuit breaker state validated. (b) Kill switch cancel-all executed. |
 | ✅ **D8: Resolve or sell test positions** | PASS | Real SELL orders at best bid. Accounting verified. Token_id lookup fixed: prefer MarketLeg.token_id over instrument store. |
 
-| ⬚ **D9: Test partial fill handling** | Deliberately trigger a partial fill on a multi-leg arb (e.g., place legs with insufficient depth on one side, or use a large FAK order on a thin book). Verify: `evaluate_partial_fills()` runs correctly, unprofitable partials trigger unwind, profitable partials are accepted. Validates B3.6 against real CLOB. |
+| ✅ **D9: Test partial fill handling** | PASS | Deliberately trigger a partial fill on a multi-leg arb (e.g., place legs with insufficient depth on one side, or use a large FAK order on a thin book). Verify: `evaluate_partial_fills()` runs correctly, unprofitable partials trigger unwind, profitable partials are accepted. Validates B3.6 against real CLOB. |
 
-**Exit criteria**: All 9 tasks pass. Zero unexplained discrepancies between internal state and CLOB. All funds accounted for. Ready to proceed to 14-day shadow validation.
+**Exit criteria**: All 9 tasks pass. ✅ Zero unexplained discrepancies between internal state and CLOB. All funds accounted for. Ready to proceed to 14-day shadow validation.
 
 ---
 
-### ⬚ Milestone E: Shadow Validation (14-Day Gate)
+### 🔧 Milestone E: Shadow Validation (14-Day Gate)
 
 **Goal**: Prove the complete system works without risking real money, AND determine optimal trading parameters via 6 parallel shadow accounts (including a fast-market instance for 5-15 min crypto price predictions). **No additional funds required beyond Milestone D deposit** (shadow trades are paper-only).
 
@@ -488,7 +488,7 @@ Before building the comparison dashboard, stress-test the engine to determine ac
 | Task | Acceptance Criteria |
 |------|-------------------|
 | ✅ **E2.5: Stress test harness** | Script that runs the engine with parameter overrides, collects latency/CPU/queue metrics for 1 hour, writes results to `data/stress_test.db`. Accepts `--param <n> --values <v1,v2,...>` args. |
-| 🔄 **E2.6: Run stress tests** | All 7 parameters tested. Results table produced with recommended production values. Any parameter where current default is outside the safe zone gets updated in config.yaml. |
+| ✅ **E2.6: Run stress tests** | All 7 parameters tested. Results table produced with recommended production values. Any parameter where current default is outside the safe zone gets updated in config.yaml. |
 
 #### E-Part 1 (continued): Comparison
 
@@ -500,7 +500,7 @@ Before building the comparison dashboard, stress-test the engine to determine ac
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| ⬚ **E4: Run for 14 consecutive days** | All 6 instances: zero unhandled errors. Auto-recover from transient failures. |
+| 🔧 **E4: Run for 14 consecutive days** | IN PROGRESS — started 2026-03-24. All 6 instances: zero unhandled errors. Auto-recover from transient failures. |
 | ⬚ **E5: Validate execution assumptions** | For every "would-execute" event across all instances: compare intended fill price with actual book state. Log `actual/expected` ratio. Target: 95%+ have ratio > `live_trading.min_profit_ratio`. |
 | ⬚ **E6: Reconciliation clean** | Every reconciliation check passes on all instances. |
 | ⬚ **E7: Performance baseline** | Eval latency p50 < 10ms per instance. Market coverage > 40%. |
@@ -619,8 +619,8 @@ The system is production-ready when ALL of these are true:
 1. ✅ Single Rust binary running on VPS with zero Python dependencies
 2. ✅ All hardcoded thresholds parameterised in `config.yaml` (see Parameterisation Table)
 3. ✅ EIP-712 order signing verified against py-clob-client reference (Milestone B)
-4. ✅ CLOB integration test passed with real micro-orders — zero unexplained discrepancies (D1-D8). ❌ D9 (partial fill test) remaining.
-5. ⬚ 14 consecutive days of 6-way shadow trading at $1,000 capital with zero unhandled errors (E4)
+4. ✅ CLOB integration test passed with real micro-orders — zero unexplained discrepancies (D1-D9). All 9 tests PASS.
+5. 🔧 14 consecutive days of 6-way shadow trading at $1,000 capital with zero unhandled errors (E4) — started 2026-03-24
 6. ⬚ Optimal parameters selected from shadow comparison (E9)
 7. ✅ Circuit breaker, kill switch, POL gas monitoring, and Telegram notifications all tested and working
 8. ⬚ Position reconciliation passes every check for 14 days across all instances (E6)
