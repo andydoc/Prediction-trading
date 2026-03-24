@@ -4,6 +4,18 @@ Operational incidents for the Prediction Market Arbitrage System. Most recent fi
 
 ---
 
+### INC-015: Cross-Filesystem Git Blindspot — 172 Lines Uncommitted (2026-03-24)
+
+**Severity**: HIGH
+**Impact**: `rust_engine/src/lib.rs` had 172 lines of uncommitted changes (module declarations for `usdc_monitor`, `fill_confirmation`, `sports_ws`, plus reconciliation return type fixes) that were invisible to Windows git but visible to WSL git. The E3 commit deployed to VPS failed to build because the reconciliation functions returned tuples but lib.rs declared single-value returns. VPS was unable to build for ~30 minutes during the E4 launch window.
+**Root cause**: The repo lives on WSL's ext4 filesystem, mounted into Windows via `\\wsl.localhost\Ubuntu`. Windows git (`git diff HEAD`) showed no changes because it resolves paths differently than WSL git. The file was modified in WSL sessions but only WSL's `git diff` detected the delta. All prior commits were made from Windows git, silently skipping the WSL-only changes.
+**Detection**: VPS `cargo build --release` failed with `E0308: mismatched types` on `reconcile_startup` and `reconcile_periodic`. md5sum comparison between local and VPS confirmed different file content despite same git commit hash.
+**Fix**: Committed the missing changes from WSL git and pushed. VPS pull + rebuild succeeded.
+**Prevention**: Always run `git status` and `git diff` from WSL (not Windows) when working on a WSL-hosted repo. Consider adding a pre-push hook that runs `git diff HEAD` from within WSL to catch cross-filesystem blindspots.
+**Lessons**: Never trust Windows git to see changes on a WSL ext4 mount. The `P:\` drive mount is for editor convenience only — all git operations should go through WSL.
+
+---
+
 ### INC-014: Strategy Gate Double-Division — Zero Virtual Positions (2026-03-22)
 
 **Severity**: HIGH
