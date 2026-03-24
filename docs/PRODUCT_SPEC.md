@@ -386,8 +386,22 @@ Before building the comparison dashboard, stress-test the engine to determine ac
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| ⬚ **D2.5: Stress test harness** | Script that runs the engine with parameter overrides, collects latency/CPU/queue metrics for 1 hour, writes results to `data/stress_test.db`. Accepts `--param <name> --values <v1,v2,...>` args. |
-| ⬚ **D2.6: Run stress tests** | All 7 parameters tested. Results table produced with recommended production values. Any parameter where current default is outside the safe zone gets updated in config.yaml. |
+| ✅ **D2.5: Stress test harness** | Script that runs the engine with parameter overrides, collects latency/CPU/queue metrics for 1 hour, writes results to `data/stress_test.db`. Accepts `--param <name> --values <v1,v2,...>` args. |
+| ✅ **D2.6: Run stress tests** | All 7 parameters tested across 35 runs (5 values each), Mar 22–24 2026. Results below. All current defaults validated — no config changes needed. |
+
+**D2.6 Stress Test Results (35/35 runs, 7 parameters, Mar 22–24 2026):**
+
+| Parameter | Current | Tested Range | Optimal | Result |
+|-----------|---------|-------------|---------|--------|
+| `max_evals_per_batch` | 100 | 100–2000 | 100 | Best latency (p50=19ms), highest throughput |
+| `efp_drift_threshold` | 0.00575 | 0.001–0.02 | 0.00575 | Best latency (p50=17ms), stable WS |
+| `efp_staleness_seconds` | 5.0 | 1.0–30.0 | 5.0 | All values show inherent stale-book flags |
+| `constraint_rebuild_interval` | 495 | 60–1800 | 495 | Best arb detection (1.45 opps/hr), low CPU |
+| `stale_sweep_interval` | 60 | 10–300 | 60 | 300s caused WS instability |
+| `stale_asset_threshold` | 30 | 5–120 | 30 | 120s caused reconnect churn |
+| `state_save_interval` | 33 | 5–120 | 33 | Best latency, good throughput |
+
+**Conclusion**: All 7 parameters validated at current defaults — no config changes needed.
 
 #### D-Part 1 (continued): Comparison
 
@@ -409,9 +423,22 @@ Before building the comparison dashboard, stress-test the engine to determine ac
 
 ---
 
-### ⬚ Milestone E: Go Live
+### 🔧 Milestone E: Go Live
 
 **Goal**: First real money trades with optimised parameters.
+
+#### E-Pre: Operational Fixes (Pre-Go-Live)
+
+These operational bugs were discovered during shadow validation and stress testing. All fixed before go-live.
+
+| Task | Acceptance Criteria |
+|------|-------------------|
+| ✅ **E-Pre-1: Dashboard expected profit display** | Fixed rounding bug in `strategy_tracker.rs` `build_summary()` where `profit_pct` was multiplied by 10 instead of 1000 before rounding. Dashboard now displays correct expected profit percentages. |
+| ✅ **E-Pre-2: USDC balance auth refresh** | Orchestrator now derives fresh CLOB API keys at startup AND refreshes them daily (24h cycle). Fixes stale auth causing USDC balance query failures. USDC balance query now correctly queries the CLOB exchange endpoint (not self-referential). |
+| ✅ **E-Pre-3: Geoblock check in engine** | Geoblock detection integrated into orchestrator tick loop, piggybacked on USDC balance check interval. Engine detects IP-based geo-restrictions and logs/alerts without crashing. |
+| ✅ **E-Pre-4: CLOB API key daily refresh** | CLOB API keys auto-refresh every 24h during long-running sessions. Prevents auth expiry during multi-day unattended operation. (Wired as part of E-Pre-2 auth refresh cycle.) |
+
+#### E-Main: Go-Live Sequence
 
 | Task | Acceptance Criteria |
 |------|-------------------|

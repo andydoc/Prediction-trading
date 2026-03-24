@@ -531,20 +531,45 @@ impl OrchestratorConfig {
             }
         };
 
-        // Build CLOB L2 auth if credentials available in secrets
+        // Build CLOB L2 auth: derive fresh creds from wallet (like clob-test),
+        // falling back to cached creds in secrets.yaml
         let clob_auth = {
-            let key = secrets.pointer("/polymarket/clob_api_key").and_then(|v| v.as_str()).unwrap_or("");
-            let secret = secrets.pointer("/polymarket/clob_api_secret").and_then(|v| v.as_str()).unwrap_or("");
-            let pass = secrets.pointer("/polymarket/clob_passphrase").and_then(|v| v.as_str()).unwrap_or("");
-            if !key.is_empty() && !secret.is_empty() && !pass.is_empty() {
-                let creds = rust_engine::signing::ClobApiCreds {
-                    api_key: key.to_string(),
-                    secret: secret.to_string(),
-                    passphrase: pass.to_string(),
-                };
+            let pk = secrets.pointer("/polymarket/private_key")
+                .and_then(|v| v.as_str()).unwrap_or("");
+            let clob_host = "https://clob.polymarket.com";
+
+            // Try derive fresh creds from wallet private key
+            let fresh_creds = if !pk.is_empty() {
+                match rust_engine::signing::OrderSigner::new(pk) {
+                    Ok(signer) => match signer.create_or_derive_api_key(clob_host) {
+                        Ok(creds) => {
+                            tracing::info!("CLOB API key derived fresh (key={}...)", &creds.api_key[..8.min(creds.api_key.len())]);
+                            Some(creds)
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to derive fresh CLOB API key: {}", e);
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to create signer for CLOB auth: {}", e);
+                        None
+                    }
+                }
+            } else { None };
+
+            // Fall back to cached creds from secrets.yaml
+            let creds = fresh_creds.unwrap_or_else(|| {
+                let key = secrets.pointer("/polymarket/clob_api_key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let secret = secrets.pointer("/polymarket/clob_api_secret").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let pass = secrets.pointer("/polymarket/clob_passphrase").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                rust_engine::signing::ClobApiCreds { api_key: key, secret, passphrase: pass }
+            });
+
+            if !creds.api_key.is_empty() && !creds.secret.is_empty() && !creds.passphrase.is_empty() {
                 match rust_engine::signing::ClobAuth::new(&creds, &gas_wallet_address) {
                     Ok(auth) => {
-                        tracing::info!("CLOB L2 auth loaded (key={}...)", &key[..8.min(key.len())]);
+                        tracing::info!("CLOB L2 auth ready (key={}...)", &creds.api_key[..8.min(creds.api_key.len())]);
                         Some(auth)
                     }
                     Err(e) => {
@@ -553,7 +578,7 @@ impl OrchestratorConfig {
                     }
                 }
             } else {
-                tracing::debug!("No CLOB API credentials in secrets.yaml — balance queries will use on-chain fallback");
+                tracing::debug!("No CLOB API credentials available — balance queries will use on-chain fallback");
                 None
             }
         };
@@ -719,6 +744,9 @@ pub struct Orchestrator {
     /// Sports WebSocket manager — real-time game status for postponement pre-screening.
     sports_ws: Option<Arc<rust_engine::sports_ws::SportsWsManager>>,
     last_sports_prune: f64,
+
+    /// CLOB API key daily refresh — keys can expire or be revoked
+    last_clob_auth_refresh: f64,
 }
 
 impl Orchestrator {
@@ -926,6 +954,7 @@ impl Orchestrator {
             strategy_tracker: None,
             sports_ws: None,
             last_sports_prune: 0.0,
+            last_clob_auth_refresh: now_secs(),
         })
     }
 
@@ -1700,6 +1729,35 @@ impl Orchestrator {
                     tracing::debug!("CLOB geoblock check failed (network): {}", e);
                 }
             }
+        }
+
+        // --- Daily CLOB API key refresh (keys can expire) ---
+        const CLOB_AUTH_REFRESH_SECS: f64 = 86400.0; // 24 hours
+        if (now - self.last_clob_auth_refresh) >= CLOB_AUTH_REFRESH_SECS {
+            let secrets_path = self.cfg.workspace.join("config").join("secrets.yaml");
+            if let Ok(raw) = std::fs::read_to_string(&secrets_path) {
+                let secrets: serde_json::Value = serde_yaml_ng::from_str(&raw).unwrap_or_default();
+                let pk_str = secrets.pointer("/polymarket/private_key")
+                    .and_then(|v: &serde_json::Value| v.as_str()).unwrap_or("");
+                if !pk_str.is_empty() {
+                    if let Ok(signer) = rust_engine::signing::OrderSigner::new(pk_str) {
+                        match signer.create_or_derive_api_key("https://clob.polymarket.com") {
+                            Ok(creds) => {
+                                let addr = format!("{:#x}", signer.address());
+                                match rust_engine::signing::ClobAuth::new(&creds, &addr) {
+                                    Ok(auth) => {
+                                        self.cfg.clob_auth = Some(auth);
+                                        tracing::info!("CLOB API key refreshed (key={}...)", &creds.api_key[..8.min(creds.api_key.len())]);
+                                    }
+                                    Err(e) => tracing::warn!("CLOB auth rebuild failed: {}", e),
+                                }
+                            }
+                            Err(e) => tracing::warn!("CLOB API key refresh failed: {}", e),
+                        }
+                    }
+                }
+            }
+            self.last_clob_auth_refresh = now;
         }
 
         // --- Stats ---

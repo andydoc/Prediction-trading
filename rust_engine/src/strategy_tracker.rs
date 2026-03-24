@@ -574,7 +574,7 @@ impl StrategyTracker {
                 serde_json::json!({
                     "name": vp.short_name,
                     "capital": (vp.capital_deployed * 100.0).round() / 100.0,
-                    "profit_pct": (vp.expected_profit_pct * 10.0).round() / 10.0,
+                    "profit_pct": (vp.expected_profit_pct * 1000.0).round() / 10.0,
                     "hours_left": (hours_left * 10.0).round() / 10.0,
                 })
             }).collect();
