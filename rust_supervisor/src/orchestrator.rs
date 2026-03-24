@@ -2202,6 +2202,14 @@ impl Orchestrator {
                             }
                         }
                     }
+                    // E5: Store book depth at entry for fill quality analysis
+                    {
+                        let mut pm = self.engine.positions.lock();
+                        if let Some(p) = pm.open_positions_mut().get_mut(&pos.position_id) {
+                            p.metadata.insert("entry_min_depth_usd".into(), serde_json::json!(opp.min_leg_depth_usd));
+                            p.metadata.insert("entry_score".into(), serde_json::json!(score));
+                        }
+                    }
                     tracing::info!("ENTER: {}... | ${:.2} | exp ${:.2} | {:.1}h | score={:.6} | depth=${:.0}",
                         truncate(&opp.constraint_id, 30),
                         effective_cap, scaled_profit, hours, score, opp.min_leg_depth_usd);

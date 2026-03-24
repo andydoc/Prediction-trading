@@ -542,7 +542,7 @@ From independent code audit v5. Deferred from E4 because they are low-risk or co
 | ⬚ **F-pre-6: Geoblock runbook** | Document: allowed jurisdictions, VPS provisioning steps for replacement, how long positions can sit without system running, tested migration procedure. | Risk analysis R4 |
 | ⬚ **F-pre-7: Pre-trade Gamma API freshness check** | Single REST call before live orders to verify outcome group completeness (no new outcomes added since detection). Prevents INC-001 class errors. | Risk analysis R2 |
 | ⬚ **F-pre-8: Resolve deferred E-audit items** | ACC-2, NT-2, NT-4, ACC-6, ACC-7, API-9 all resolved (see Deferred Audit Items table). | Audit v5 |
-| ⬚ **F-pre-9: D9 partial fill test** | B3.6 validated against real CLOB (see D9). | B3.6 / Risk analysis R15 |
+| ✅ **F-pre-9: D9 partial fill test** | B3.6 validated against real CLOB (see D9). D9 PASS: partial fill correctly triggers Unwind decision. | B3.6 / Risk analysis R15 |
 
 #### F-Main: Go Live
 

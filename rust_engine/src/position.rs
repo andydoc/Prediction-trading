@@ -280,6 +280,12 @@ impl PositionManager {
             meta.insert("end_date_ts".into(), serde_json::json!(end_date_ts));
         }
 
+        // E5: Book snapshot at entry — for fill quality analysis (actual vs expected)
+        let no_prices_map: serde_json::Map<String, serde_json::Value> = current_no_prices.iter()
+            .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+            .collect();
+        meta.insert("entry_no_prices".into(), serde_json::Value::Object(no_prices_map));
+
         // Chain tracking: use provided chain info or start a new chain
         let (chain_id, chain_gen, parent_pid) = match chain_info {
             Some((cid, gen, ppid)) => (Some(cid.to_string()), gen, Some(ppid.to_string())),
