@@ -267,7 +267,7 @@ impl VirtualPortfolio {
             // Sell arb: we sold shares, so losers resolve to $1 (our liability)
             // and winner resolves to $1 (we keep the difference)
             // Simplified: payout ≈ capital + expected profit (approximation)
-            vp.capital_deployed * (1.0 + vp.expected_profit_pct / 100.0)
+            vp.capital_deployed * (1.0 + vp.expected_profit_pct)
         } else {
             // Buy arb: shares in winning market pay $1 each
             let winning_shares = vp.bet_amounts.get(winning_market_id).copied().unwrap_or(0.0);
@@ -721,8 +721,8 @@ impl StrategyTracker {
             if portfolio.open_positions.contains_key(constraint_id) {
                 let name = portfolio.config.name.clone();
                 if let Some(closed) = portfolio.resolve(constraint_id, winning_market_id) {
-                    tracing::debug!(
-                        "Strategy {} resolved {}: profit={:.2} ({:.1}%)",
+                    tracing::info!(
+                        "Strategy {} resolved {}: profit=${:.2} ({:.1}%)",
                         name, &constraint_id[..8.min(constraint_id.len())],
                         closed.actual_profit, closed.actual_profit_pct,
                     );

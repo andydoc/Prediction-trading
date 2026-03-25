@@ -413,18 +413,43 @@ fn fmt_strategy(strategy: &str, method: &str) -> String {
 }
 
 fn build_stats(s: &DashboardState) -> Value {
+    // When strategy tracker is active, aggregate stats across all shadow strategies
+    // for the main dashboard header. This gives the correct aggregate risk view.
+    let strat_summary = s.strategy_summary.lock().clone();
+    let has_strategies = strat_summary.get("strategies")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+
     // Lock scope: extract all needed data from PositionManager in one locked section,
     // then drop the lock before doing any further computation or accessing other locks.
     let (cap, init_cap, perf, open_count, closed_count, total_fees,
          open_snapshot, first_entry_ts, total_realized) = {
         let pm = s.positions.lock();
-        let cap = pm.current_capital();
-        let init_cap = pm.initial_capital();
+        let init_cap_pm = pm.initial_capital();
         let perf = pm.get_performance_metrics();
-        let open_count = pm.open_count();
-        let closed_count = pm.closed_count();
         let total_fees = pm.total_fees();
         let open_snapshot: Vec<crate::position::Position> = pm.open_positions().values().cloned().collect();
+
+        // When strategies active: aggregate from strategy summary
+        let (cap, init_cap, open_count, closed_count) = if has_strategies {
+            let strategies = strat_summary["strategies"].as_array().unwrap();
+            let agg_cash: f64 = strategies.iter()
+                .map(|st| st["capital"].as_f64().unwrap_or(0.0))
+                .sum();
+            let agg_init: f64 = strategies.iter()
+                .map(|st| st["initial_capital"].as_f64().unwrap_or(0.0))
+                .sum();
+            let agg_open: usize = strategies.iter()
+                .map(|st| st["open_count"].as_u64().unwrap_or(0) as usize)
+                .sum();
+            let agg_resolved: usize = strategies.iter()
+                .map(|st| st["total_resolved"].as_u64().unwrap_or(0) as usize)
+                .sum();
+            (agg_cash, agg_init, agg_open, agg_resolved)
+        } else {
+            (pm.current_capital(), init_cap_pm, pm.open_count(), pm.closed_count())
+        };
 
         let mut first_entry_ts = f64::MAX;
         for p in &open_snapshot {
@@ -441,11 +466,19 @@ fn build_stats(s: &DashboardState) -> Value {
          open_snapshot, first_entry_ts, total_realized)
     }; // pm lock dropped here
 
-    // Calculate deployed capital from snapshot (no lock held)
-    let mut deployed = 0.0f64;
-    for p in &open_snapshot {
-        deployed += p.total_capital;
-    }
+    // Calculate deployed capital: aggregate from strategies or from main PM snapshot
+    let mut deployed = if has_strategies {
+        let strategies = strat_summary["strategies"].as_array().unwrap();
+        let agg_init: f64 = strategies.iter()
+            .map(|st| st["initial_capital"].as_f64().unwrap_or(0.0))
+            .sum();
+        // deployed = total initial capital across strategies - aggregate cash
+        agg_init - cap
+    } else {
+        let mut d = 0.0f64;
+        for p in &open_snapshot { d += p.total_capital; }
+        d
+    };
 
     // R16: negRisk exposure tracking
     let mut neg_risk_deployed = 0.0f64;
@@ -476,9 +509,25 @@ fn build_stats(s: &DashboardState) -> Value {
         total_unrealized += sale_proceeds - p.total_capital;
     }
 
-    let total_value = cap + deployed;
+    let total_value = if has_strategies {
+        let strategies = strat_summary["strategies"].as_array().unwrap();
+        strategies.iter()
+            .map(|st| st["total_value"].as_f64().unwrap_or(0.0))
+            .sum()
+    } else {
+        cap + deployed
+    };
+    // Recalculate deployed from total_value - cash (more accurate for strategies)
+    if has_strategies { deployed = total_value - cap; }
     let ret_pct = if init_cap > 0.0 { (total_value - init_cap) / init_cap * 100.0 } else { 0.0 };
-    let trades = perf.get("total_trades").copied().unwrap_or(0.0) as u64;
+    let trades = if has_strategies {
+        let strategies = strat_summary["strategies"].as_array().unwrap();
+        strategies.iter()
+            .map(|st| st["total_entered"].as_u64().unwrap_or(0))
+            .sum::<u64>()
+    } else {
+        perf.get("total_trades").copied().unwrap_or(0.0) as u64
+    };
 
     // Annualized return
     let first_trade_str = if first_entry_ts < f64::MAX { fmt_ts(first_entry_ts) } else { "N/A".into() };
