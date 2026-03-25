@@ -801,6 +801,15 @@ function renderStrategies(d) {
   h += r + '</tr>';
   h += metricRow('Total Trades', 'total_entered', function(v){return v.toFixed(0);}, true);
   h += metricRow('Resolved', 'total_resolved', function(v){return v.toFixed(0);}, true);
+  h += metricRow('Evals Seen', 'evals_seen', function(v){return v.toFixed(0);}, true);
+  // Accept% needs two fields — custom row
+  var ar = '<tr style="border-bottom:1px solid #1a1a1a"><td style="padding:5px 8px;color:#888">Accept%</td>';
+  ss.forEach(function(s) {
+    var seen = s.evals_seen || 0, acc = s.evals_accepted || 0;
+    var pct = seen > 0 ? (acc/seen*100).toFixed(1)+'%' : '-';
+    ar += '<td style="text-align:right;padding:5px 8px;color:#ccc">'+pct+'</td>';
+  });
+  h += ar + '</tr>';
 
   h += '</table>';
 

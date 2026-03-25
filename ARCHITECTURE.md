@@ -412,6 +412,7 @@ SQLite in-memory DB with periodic disk backup (`state.rs` + `cached_db.rs`). Tab
 | `checkpoints` | Accounting ledger JSON blob | Every save cycle |
 | `journal` | Double-entry journal entries | Incremental flush each save cycle |
 | `strategy_*` | Virtual portfolio state | Every save cycle |
+| `evaluated_opportunities` | Every evaluated opportunity (constraint_id, method, profit_pct, hours, score, strategies accepted) | After each evaluate_batch() |
 
 **Startup sequence**: `load_from_disk()` → restore instruments → restore positions → restore accounting ledger → B4.1 reconciliation.
 

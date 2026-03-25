@@ -126,6 +126,8 @@ pub struct VirtualPortfolio {
     pub total_entered: u64,
     pub total_wins: u64,
     pub total_losses: u64,
+    pub evals_seen: u64,
+    pub evals_rejected: u64,
 }
 
 impl VirtualPortfolio {
@@ -140,6 +142,8 @@ impl VirtualPortfolio {
             total_entered: 0,
             total_wins: 0,
             total_losses: 0,
+            evals_seen: 0,
+            evals_rejected: 0,
         }
     }
 
@@ -479,7 +483,7 @@ impl VirtualPortfolio {
 // ---------------------------------------------------------------------------
 
 pub struct StrategyTracker {
-    portfolios: Vec<VirtualPortfolio>,
+    pub portfolios: Vec<VirtualPortfolio>,
 }
 
 impl StrategyTracker {
@@ -528,8 +532,11 @@ impl StrategyTracker {
     pub fn process_opportunities(&mut self, opps: &[Opportunity], _fee_rate: f64) {
         for portfolio in &mut self.portfolios {
             for opp in opps {
+                portfolio.evals_seen += 1;
                 if portfolio.passes_gates(opp) {
                     portfolio.enter(opp);
+                } else {
+                    portfolio.evals_rejected += 1;
                 }
             }
         }
@@ -604,6 +611,9 @@ impl StrategyTracker {
                 "turnover_rate_14d": (p.turnover_rate(14) * 100.0).round() / 100.0,
                 "total_entered": p.total_entered,
                 "total_resolved": p.total_wins + p.total_losses,
+                "evals_seen": p.evals_seen,
+                "evals_rejected": p.evals_rejected,
+                "evals_accepted": p.evals_seen - p.evals_rejected,
                 "positions": positions,
             })
         }).collect();

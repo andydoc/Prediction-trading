@@ -96,8 +96,8 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 | Status | Count |
 |--------|-------|
 | ✅ Complete | 6/12 |
-| 🔄 In Progress | 1/12 |
-| ⬚ Remaining | 5/12 |
+| 🔄 In Progress | 2/12 |
+| ⬚ Remaining | 4/12 |
 
 ### Completed
 - **E1**: Multi-instance support — `--instance <n>` flag, per-instance config overlays.
@@ -115,9 +115,10 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 
 ### In Progress
 - **E2.6**: Running on VPS (~35hrs, worst-case profile, target-cpu=native). **CRITICAL: Review results and update config.yaml parameters BEFORE starting E4.**
+- **E4**: 14-day shadow run started 2026-03-24 14:16 UTC. v0.20.0 added `evaluated_opportunities` SQLite table and strategy eval counters for post-run threshold calibration.
 
 ### Remaining
-E4 (14-day run), E5 (execution validation), E6 (reconciliation clean), E7 (performance baseline), E9 (parameter selection), E10 (CTO sign-off).
+E5 (execution validation), E6 (reconciliation clean), E7 (performance baseline), E9 (parameter selection), E10 (CTO sign-off).
 
 Shadow-F targets short-lived crypto price markets (5-15 min resolution) with fast rebuild intervals (60s) and low replacement cooldown (10s).
 

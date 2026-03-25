@@ -95,6 +95,23 @@ const STATE_SCHEMA: &str = "
         data TEXT NOT NULL,
         updated_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS evaluated_opportunities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,
+        constraint_id TEXT NOT NULL,
+        method TEXT NOT NULL,
+        num_legs INTEGER NOT NULL,
+        expected_profit REAL NOT NULL,
+        expected_profit_pct REAL NOT NULL,
+        total_capital_required REAL NOT NULL,
+        hours_to_resolve REAL NOT NULL,
+        score REAL NOT NULL,
+        entered INTEGER NOT NULL DEFAULT 0,
+        rejected_reason TEXT,
+        strategy_accepted TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_eo_ts ON evaluated_opportunities(ts);
+    CREATE INDEX IF NOT EXISTS idx_eo_profit ON evaluated_opportunities(expected_profit_pct);
 ";
 
 pub struct StateDB {
@@ -603,6 +620,28 @@ impl StateDB {
             params![key],
             |row| row.get(0),
         ).ok()
+    }
+
+    // --- Opportunity logging ---
+
+    /// Log an evaluated opportunity for post-run analysis.
+    pub fn log_opportunity(
+        &self, ts: f64, constraint_id: &str, method: &str, num_legs: usize,
+        expected_profit: f64, expected_profit_pct: f64, total_capital_required: f64,
+        hours_to_resolve: f64, score: f64, entered: bool,
+        rejected_reason: Option<&str>, strategy_accepted: Option<&str>,
+    ) {
+        let db = self.db.conn();
+        let _ = db.execute(
+            "INSERT INTO evaluated_opportunities \
+             (ts, constraint_id, method, num_legs, expected_profit, expected_profit_pct, \
+              total_capital_required, hours_to_resolve, score, entered, rejected_reason, strategy_accepted) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![ts, constraint_id, method, num_legs as i64,
+                    expected_profit, expected_profit_pct, total_capital_required,
+                    hours_to_resolve, score, entered as i32,
+                    rejected_reason, strategy_accepted],
+        );
     }
 
     // --- Journal persistence ---

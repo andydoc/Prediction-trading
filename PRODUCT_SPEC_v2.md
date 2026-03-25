@@ -500,7 +500,7 @@ Before building the comparison dashboard, stress-test the engine to determine ac
 
 | Task | Acceptance Criteria |
 |------|-------------------|
-| 🔧 **E4: Run for 14 consecutive days** | IN PROGRESS — started 2026-03-24. All 6 instances: zero unhandled errors. Auto-recover from transient failures. |
+| 🔧 **E4: Run for 14 consecutive days** | IN PROGRESS — started 2026-03-24 14:16 UTC (day 2 of 14). All 6 instances: zero unhandled errors. Auto-recover from transient failures. v0.20.0 added `evaluated_opportunities` SQLite table + strategy eval counters for post-run threshold calibration. After 16h: zero opportunities at 1% threshold (market quiet). |
 | ⬚ **E5: Validate execution assumptions** | For every "would-execute" event across all instances: compare intended fill price with actual book state. Log `actual/expected` ratio. Target: 95%+ have ratio > `live_trading.min_profit_ratio`. |
 | ⬚ **E6: Reconciliation clean** | Every reconciliation check passes on all instances. |
 | ⬚ **E7: Performance baseline** | Eval latency p50 < 10ms per instance. Market coverage > 40%. |

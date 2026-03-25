@@ -7,6 +7,22 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.20.0] — 2026-03-25 — E4 Day 2: Opportunity Logging + Strategy Eval Counters
+
+### Added
+- **SQLite opportunity logging** (`state.rs`): New `evaluated_opportunities` table persists every evaluated opportunity for post-run analysis — stores constraint_id, method, profit_pct, hours, score, and which strategies accepted. Enables threshold calibration for Milestone F.
+- **Strategy eval counters** (`strategy_tracker.rs`): `evals_seen` and `evals_rejected` fields on `VirtualPortfolio`, exposed in `build_summary()` JSON output.
+- **Dashboard Strategies tab** (`dashboard.html`): "Evals Seen" and "Accept%" rows added to the comparison table for per-strategy acceptance rate visibility.
+
+### Changed
+- **Orchestrator wiring** (`orchestrator.rs`): `log_opportunity()` called after every `evaluate_batch()` to persist all evaluated opportunities.
+- `VirtualPortfolio.portfolios` field made `pub` for external access.
+
+### Context
+E4 14-day shadow run started 2026-03-24 14:16 UTC. After 16 hours, zero opportunities found across all 6 strategies (market genuinely quiet at 1% threshold). These changes enable post-run analysis to calibrate thresholds.
+
+---
+
 ## [0.19.0] — 2026-03-23 — Risk Mitigations + Sports WebSocket
 
 ### Added

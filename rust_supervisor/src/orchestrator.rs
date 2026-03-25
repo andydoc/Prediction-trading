@@ -1260,6 +1260,32 @@ impl Orchestrator {
             }
         }
 
+        // Log all evaluated opportunities to SQLite for post-run analysis
+        if !result.opportunities.is_empty() {
+            let now_ts = now_secs();
+            // Collect which strategies accepted each opp
+            let strat_accepted: Vec<String> = if let Some(ref tracker) = self.strategy_tracker {
+                result.opportunities.iter().map(|opp| {
+                    let names: Vec<&str> = tracker.portfolios.iter()
+                        .filter(|p| p.open_positions.contains_key(&opp.constraint_id))
+                        .map(|p| p.config.name.as_str())
+                        .collect();
+                    names.join(",")
+                }).collect()
+            } else {
+                vec![String::new(); result.opportunities.len()]
+            };
+            for (i, opp) in result.opportunities.iter().enumerate() {
+                let accepted = if strat_accepted[i].is_empty() { None } else { Some(strat_accepted[i].as_str()) };
+                self.state_db.log_opportunity(
+                    now_ts, &opp.constraint_id, &opp.method, opp.market_ids.len(),
+                    opp.expected_profit, opp.expected_profit_pct, opp.total_capital_required,
+                    opp.hours_to_resolve, opp.expected_profit_pct / opp.hours_to_resolve.max(0.01),
+                    false, None, accepted,
+                );
+            }
+        }
+
         // Filter to non-held opportunities for the main trader
         let main_opps: Vec<Opportunity> = if self.strategy_tracker.is_some() {
             result.opportunities.iter()
