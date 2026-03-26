@@ -152,7 +152,11 @@ impl VirtualPortfolio {
     }
 
     fn total_value(&self) -> f64 {
-        self.current_capital + self.open_positions.values().map(|p| p.capital_deployed).sum::<f64>()
+        // Arb positions have guaranteed minimum payout = deployed + expected_profit
+        // Total value should never be less than initial capital for valid arbs
+        self.current_capital + self.open_positions.values()
+            .map(|p| p.capital_deployed * (1.0 + p.expected_profit_pct))
+            .sum::<f64>()
     }
 
     /// Check if an opportunity passes this strategy's gates.
