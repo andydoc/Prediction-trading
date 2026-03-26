@@ -881,6 +881,7 @@ fn build_positions_from_strategies(s: &DashboardState, strat_summary: &Value) ->
 
         // Build legs from entry_prices + bet_amounts
         let entry_prices = vp["entry_prices"].as_object();
+        let entry_no_prices = vp["entry_no_prices"].as_object();
         let bet_amounts = vp["bet_amounts"].as_object();
         let market_ids: Vec<String> = vp["market_ids"].as_array()
             .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
@@ -888,14 +889,20 @@ fn build_positions_from_strategies(s: &DashboardState, strat_summary: &Value) ->
 
         let mut legs = Vec::new();
         for (i, mid) in market_ids.iter().enumerate() {
-            let price = entry_prices.and_then(|m| m.get(mid))
-                .and_then(|v| v.as_f64()).unwrap_or(0.0);
+            // For sell_all: bets are proportional to NO prices, so shares = bet / no_price
+            // For buy_all: bets are proportional to YES prices, so shares = bet / yes_price
+            let price = if is_sell {
+                entry_no_prices.and_then(|m| m.get(mid)).and_then(|v| v.as_f64()).unwrap_or(0.0)
+            } else {
+                entry_prices.and_then(|m| m.get(mid)).and_then(|v| v.as_f64()).unwrap_or(0.0)
+            };
+            let display_price = price; // Show the price used for share calc
             let bet = bet_amounts.and_then(|m| m.get(mid))
                 .and_then(|v| v.as_f64()).unwrap_or(0.0);
             let name = market_names.get(i).map(|s| s.as_str()).unwrap_or("?");
             let side = if is_sell { "NO" } else { "YES" };
             let shares = if price > 0.0 { bet / price } else { 0.0 };
-            let payout = if is_sell { shares * 1.0 } else { shares * 1.0 };
+            let payout = shares; // Each share pays $1 on resolution
             legs.push(json!({
                 "name": name, "side": side, "price": price,
                 "bet": (bet * 100.0).round() / 100.0,

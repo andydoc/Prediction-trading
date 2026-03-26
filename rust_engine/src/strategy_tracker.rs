@@ -103,6 +103,9 @@ pub struct VirtualPosition {
     pub method: String,
     /// Entry prices per market_id (YES ask at entry).
     pub entry_prices: HashMap<String, f64>,
+    /// NO prices per market_id at entry (needed for sell_all share calc).
+    #[serde(default)]
+    pub entry_no_prices: HashMap<String, f64>,
     /// Bet amounts per market_id.
     pub bet_amounts: HashMap<String, f64>,
 }
@@ -245,6 +248,7 @@ impl VirtualPortfolio {
             is_sell: opp.is_sell,
             method: opp.method.clone(),
             entry_prices: opp.current_prices.clone(),
+            entry_no_prices: opp.current_no_prices.clone(),
             bet_amounts,
         };
 
@@ -600,6 +604,7 @@ impl StrategyTracker {
                     "market_ids": vp.market_ids,
                     "market_names": vp.market_names,
                     "entry_prices": vp.entry_prices,
+                    "entry_no_prices": vp.entry_no_prices,
                     "bet_amounts": vp.bet_amounts,
                     "is_sell": vp.is_sell,
                     "method": vp.method,
@@ -722,7 +727,7 @@ impl StrategyTracker {
 
             // Restore closed positions (last 30 days)
             let closed_rows = db.load_strategy_closed_positions(&p.config.name, since_ts);
-            for (capital, profit, profit_pct, entry_ts, close_ts, is_win) in closed_rows {
+            for (capital, profit, profit_pct, entry_ts, close_ts, is_win, short_name, method, is_sell) in closed_rows {
                 p.closed_positions.push(ClosedVirtualPosition {
                     capital_deployed: capital,
                     actual_profit: profit,
@@ -730,9 +735,9 @@ impl StrategyTracker {
                     entry_ts,
                     close_ts,
                     is_win,
-                    short_name: String::new(),
-                    method: String::new(),
-                    is_sell: false,
+                    short_name,
+                    method,
+                    is_sell,
                 });
             }
 
@@ -757,6 +762,7 @@ impl StrategyTracker {
             strategy_name, closed.capital_deployed,
             closed.actual_profit, closed.actual_profit_pct,
             closed.entry_ts, closed.close_ts, closed.is_win,
+            &closed.short_name, &closed.method, closed.is_sell,
         );
     }
 
@@ -775,6 +781,7 @@ impl StrategyTracker {
                         &name, closed.capital_deployed,
                         closed.actual_profit, closed.actual_profit_pct,
                         closed.entry_ts, closed.close_ts, closed.is_win,
+                        &closed.short_name, &closed.method, closed.is_sell,
                     );
                 }
             }
