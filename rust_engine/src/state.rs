@@ -48,7 +48,9 @@ const STATE_SCHEMA: &str = "
         current_capital REAL NOT NULL,
         total_entered INTEGER NOT NULL DEFAULT 0,
         total_wins INTEGER NOT NULL DEFAULT 0,
-        total_losses INTEGER NOT NULL DEFAULT 0
+        total_losses INTEGER NOT NULL DEFAULT 0,
+        evals_seen INTEGER NOT NULL DEFAULT 0,
+        evals_rejected INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS strategy_open_positions (
         strategy_name TEXT NOT NULL,
@@ -356,27 +358,44 @@ impl StateDB {
     // --- Strategy virtual portfolios ---
 
     /// Save a strategy portfolio summary row (upsert).
-    pub fn save_strategy_portfolio(&self, name: &str, capital: f64, entered: u64, wins: u64, losses: u64) {
+    pub fn save_strategy_portfolio(&self, name: &str, capital: f64, entered: u64, wins: u64, losses: u64,
+                                     evals_seen: u64, evals_rejected: u64) {
         let db = self.db.conn();
         let _ = db.execute(
-            "INSERT OR REPLACE INTO strategy_portfolios (name, current_capital, total_entered, total_wins, total_losses) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![name, capital, entered as i64, wins as i64, losses as i64],
+            "INSERT OR REPLACE INTO strategy_portfolios \
+             (name, current_capital, total_entered, total_wins, total_losses, evals_seen, evals_rejected) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![name, capital, entered as i64, wins as i64, losses as i64,
+                    evals_seen as i64, evals_rejected as i64],
         );
     }
 
     /// Load all strategy portfolio summaries.
-    pub fn load_strategy_portfolios(&self) -> Vec<(String, f64, i64, i64, i64)> {
+    pub fn load_strategy_portfolios(&self) -> Vec<(String, f64, i64, i64, i64, i64, i64)> {
         let db = self.db.conn();
+        // Try with new columns first, fall back to old schema
         let mut stmt = match db.prepare(
-            "SELECT name, current_capital, total_entered, total_wins, total_losses FROM strategy_portfolios"
+            "SELECT name, current_capital, total_entered, total_wins, total_losses, \
+             evals_seen, evals_rejected FROM strategy_portfolios"
         ) {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(_) => {
+                // Old schema without evals columns — add them
+                let _ = db.execute("ALTER TABLE strategy_portfolios ADD COLUMN evals_seen INTEGER NOT NULL DEFAULT 0", []);
+                let _ = db.execute("ALTER TABLE strategy_portfolios ADD COLUMN evals_rejected INTEGER NOT NULL DEFAULT 0", []);
+                match db.prepare(
+                    "SELECT name, current_capital, total_entered, total_wins, total_losses, \
+                     evals_seen, evals_rejected FROM strategy_portfolios"
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                }
+            }
         };
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?,
-                row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?))
+                row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?, row.get::<_, i64>(6)?))
         });
         match rows {
             Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
@@ -501,7 +520,9 @@ impl StateDB {
                 current_capital REAL NOT NULL,
                 total_entered INTEGER NOT NULL DEFAULT 0,
                 total_wins INTEGER NOT NULL DEFAULT 0,
-                total_losses INTEGER NOT NULL DEFAULT 0
+                total_losses INTEGER NOT NULL DEFAULT 0,
+                evals_seen INTEGER NOT NULL DEFAULT 0,
+                evals_rejected INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS strategy_open_positions (
                 strategy_name TEXT NOT NULL,

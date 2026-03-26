@@ -629,6 +629,7 @@ impl StrategyTracker {
             db.save_strategy_portfolio(
                 &p.config.name, p.current_capital,
                 p.total_entered, p.total_wins, p.total_losses,
+                p.evals_seen, p.evals_rejected,
             );
 
             // Save open positions as (constraint_id, json)
@@ -655,13 +656,15 @@ impl StrategyTracker {
 
         for p in &mut self.portfolios {
             // Restore portfolio summary
-            if let Some((_, capital, entered, wins, losses)) = portfolios_data.iter()
+            if let Some((_, capital, entered, wins, losses, evals, rejected)) = portfolios_data.iter()
                 .find(|(name, ..)| name == &p.config.name)
             {
                 p.current_capital = *capital;
                 p.total_entered = *entered as u64;
                 p.total_wins = *wins as u64;
                 p.total_losses = *losses as u64;
+                p.evals_seen = *evals as u64;
+                p.evals_rejected = *rejected as u64;
             }
 
             // Restore open positions
