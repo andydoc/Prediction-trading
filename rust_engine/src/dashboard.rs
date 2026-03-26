@@ -460,7 +460,14 @@ fn build_stats(s: &DashboardState) -> Value {
             let ts = parse_entry_ts_str(&p.entry_timestamp);
             if ts > 0.0 && ts < first_entry_ts { first_entry_ts = ts; }
         }
-        let total_realized = perf.get("total_actual_profit").copied().unwrap_or(0.0);
+        let total_realized = if has_strategies {
+            let strategies = strat_summary["strategies"].as_array().unwrap();
+            strategies.iter()
+                .map(|st| st["total_realized"].as_f64().unwrap_or(0.0))
+                .sum()
+        } else {
+            perf.get("total_actual_profit").copied().unwrap_or(0.0)
+        };
 
         (cap, init_cap, perf, open_count, closed_count, total_fees,
          open_snapshot, first_entry_ts, total_realized)
@@ -1073,8 +1080,90 @@ fn build_opportunities(s: &DashboardState) -> Value {
     json!({ "opportunities": result, "total_found": result.len() })
 }
 
+/// Build closed positions from strategy tracker data (deduplicated, correct per-strategy sizing).
+fn build_closed_from_strategies(strat_summary: &Value) -> Value {
+    let strategies = strat_summary["strategies"].as_array().unwrap();
+    let resolved: Vec<Value> = Vec::new();
+    let mut proactive_exit: Vec<Value> = Vec::new();
+
+    // Deduplicate by (name, close_ts) — show each closed trade once with aggregate capital
+    struct ClosedEntry { name: String, strategy: String, deployed: f64, profit: f64, profit_pct: f64,
+        hold_secs: f64, close_ts: f64, count: usize }
+    let mut dedup: std::collections::HashMap<String, ClosedEntry> = std::collections::HashMap::new();
+
+    for strat in strategies {
+        if let Some(closed) = strat["closed"].as_array() {
+            for c in closed {
+                let name = c["name"].as_str().unwrap_or("?").to_string();
+                let close_ts = c["close_ts"].as_f64().unwrap_or(0.0);
+                let key = format!("{}_{:.0}", name, close_ts);
+                let entry = dedup.entry(key).or_insert_with(|| ClosedEntry {
+                    name: name.clone(),
+                    strategy: fmt_strategy(
+                        if c["is_sell"].as_bool().unwrap_or(false) { "arb_sell" } else { "arb_buy" },
+                        c["method"].as_str().unwrap_or("")),
+                    deployed: 0.0, profit: 0.0, profit_pct: 0.0,
+                    hold_secs: c["hold_secs"].as_f64().unwrap_or(0.0),
+                    close_ts,
+                    count: 0,
+                });
+                entry.deployed += c["deployed"].as_f64().unwrap_or(0.0);
+                entry.profit += c["profit"].as_f64().unwrap_or(0.0);
+                entry.count += 1;
+            }
+        }
+    }
+
+    for (_key, e) in &dedup {
+        let pnl_pct = if e.deployed.abs() > 0.001 { (e.profit / e.deployed * 1000.0).round() / 10.0 } else { 0.0 };
+        let hold_str = if e.hold_secs >= 0.0 {
+            if e.hold_secs < 60.0 { format!("{:.0}s", e.hold_secs) }
+            else if e.hold_secs < 3600.0 { format!("{:.0}m", e.hold_secs / 60.0) }
+            else if e.hold_secs < 86400.0 { format!("{:.1}h", e.hold_secs / 3600.0) }
+            else { format!("{:.1}d", e.hold_secs / 86400.0) }
+        } else { "?".into() };
+        let close_dt = fmt_ts_sec(e.close_ts);
+        let strat_label = if e.count > 1 {
+            format!("{} [{}×]", e.strategy, e.count)
+        } else { e.strategy.clone() };
+
+        let row = json!({
+            "name": e.name, "deployed": (e.deployed * 100.0).round() / 100.0,
+            "pnl": (e.profit * 100.0).round() / 100.0, "pnl_pct": pnl_pct,
+            "hold": hold_str, "closed_at": close_dt,
+            "strategy": strat_label,
+            "legs": [], "full_names": [e.name],
+            "_sort_ts": e.close_ts, "_hold_secs": e.hold_secs,
+        });
+        // All strategy closes are resolutions (proactive exits only in main PM)
+        proactive_exit.push(row);
+    }
+
+    // Sort by close time descending
+    proactive_exit.sort_by(|a, b| {
+        b["_sort_ts"].as_f64().unwrap_or(0.0).total_cmp(&a["_sort_ts"].as_f64().unwrap_or(0.0))
+    });
+
+    json!({
+        "resolved": resolved, "proactive_exit": proactive_exit,
+        "replaced_profit": [], "replaced_loss": [], "replaced_even": [],
+        "total_closed": proactive_exit.len(),
+    })
+}
+
 fn build_closed(s: &DashboardState) -> Value {
-    // Clone closed positions under lock, then release
+    // When strategies active, build closed from strategy tracker aggregate
+    let strat_summary = s.strategy_summary.lock().clone();
+    let has_strategies = strat_summary.get("strategies")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+
+    if has_strategies {
+        return build_closed_from_strategies(&strat_summary);
+    }
+
+    // Fallback: clone closed positions under lock, then release
     let closed_snapshot: Vec<crate::position::Position> = {
         let pm = s.positions.lock();
         pm.closed_positions().to_vec()

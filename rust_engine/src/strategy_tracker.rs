@@ -115,6 +115,9 @@ pub struct ClosedVirtualPosition {
     pub entry_ts: f64,
     pub close_ts: f64,
     pub is_win: bool,
+    pub short_name: String,
+    pub method: String,
+    pub is_sell: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +322,9 @@ impl VirtualPortfolio {
             entry_ts: vp.entry_ts,
             close_ts: now,
             is_win,
+            short_name: vp.short_name.clone(),
+            method: vp.method.clone(),
+            is_sell: vp.is_sell,
         };
         self.closed_positions.push(closed.clone());
         Some(closed)
@@ -635,7 +641,23 @@ impl StrategyTracker {
                 "evals_seen": p.evals_seen,
                 "evals_rejected": p.evals_rejected,
                 "evals_accepted": p.evals_seen - p.evals_rejected,
+                "total_realized": p.closed_positions.iter().map(|c| c.actual_profit).sum::<f64>(),
                 "positions": positions,
+                "closed": p.closed_positions.iter().map(|c| {
+                    let hold_secs = c.close_ts - c.entry_ts;
+                    serde_json::json!({
+                        "name": c.short_name,
+                        "method": c.method,
+                        "is_sell": c.is_sell,
+                        "deployed": (c.capital_deployed * 100.0).round() / 100.0,
+                        "profit": (c.actual_profit * 100.0).round() / 100.0,
+                        "profit_pct": (c.actual_profit_pct * 1000.0).round() / 10.0,
+                        "entry_ts": c.entry_ts,
+                        "close_ts": c.close_ts,
+                        "hold_secs": hold_secs,
+                        "is_win": c.is_win,
+                    })
+                }).collect::<Vec<_>>(),
             })
         }).collect();
 
@@ -712,6 +734,9 @@ impl StrategyTracker {
                     entry_ts,
                     close_ts,
                     is_win,
+                    short_name: String::new(),
+                    method: String::new(),
+                    is_sell: false,
                 });
             }
 
