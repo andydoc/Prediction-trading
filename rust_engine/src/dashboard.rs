@@ -519,7 +519,8 @@ fn build_stats(s: &DashboardState) -> Value {
     };
     // Recalculate deployed from total_value - cash (more accurate for strategies)
     if has_strategies { deployed = total_value - cap; }
-    let ret_pct = if init_cap > 0.0 { (total_value - init_cap) / init_cap * 100.0 } else { 0.0 };
+    // Return % based on realized P&L only (not mark-to-market on open positions)
+    let ret_pct = if init_cap > 0.0 { total_realized / init_cap * 100.0 } else { 0.0 };
     let trades = if has_strategies {
         let strategies = strat_summary["strategies"].as_array().unwrap();
         strategies.iter()
@@ -536,8 +537,10 @@ fn build_stats(s: &DashboardState) -> Value {
         (now_ts - first_entry_ts) / 86400.0
     } else { 0.0 };
     let min_days = 1.0 / 24.0; // 1 hour minimum
-    let annualized_ret = if days_running > min_days {
-        ((total_value / init_cap).powf(365.0 / days_running) - 1.0) * 100.0
+    // Annualized return based on realized P&L only
+    let realized_value = init_cap + total_realized;
+    let annualized_ret = if days_running > min_days && realized_value > 0.0 {
+        ((realized_value / init_cap).powf(365.0 / days_running) - 1.0) * 100.0
     } else { 0.0 };
     // Format time period label
     let period_label = if days_running < 1.0 {
