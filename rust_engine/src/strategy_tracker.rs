@@ -91,6 +91,7 @@ pub fn load_strategy_configs(workspace: &Path) -> Vec<StrategyConfig> {
 pub struct VirtualPosition {
     pub constraint_id: String,
     pub market_ids: Vec<String>,
+    #[serde(default)]
     pub market_names: Vec<String>,
     pub short_name: String,
     pub capital_deployed: f64,
@@ -98,6 +99,7 @@ pub struct VirtualPosition {
     pub entry_ts: f64,
     pub hours_to_resolve: f64,
     pub is_sell: bool,
+    #[serde(default)]
     pub method: String,
     /// Entry prices per market_id (YES ask at entry).
     pub entry_prices: HashMap<String, f64>,
