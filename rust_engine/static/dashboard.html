@@ -674,23 +674,27 @@ function renderClosed(d) {
       var rkey = r.name;
       var pct = r.pnl_pct || 0;
       var cls2 = pct > 0.1 ? 'good' : (pct < -0.1 ? 'bad' : '');
-      h += '<tr id="cl-row-'+ridx+'" class="pos-row '+cls2+'" data-key="'+esc(rkey)+'" onclick="toggleRow(\'cl\','+ridx+')">';
+      var hasLegs = r.legs && r.legs.length > 0;
+      if (hasLegs) {
+        h += '<tr id="cl-row-'+ridx+'" class="pos-row '+cls2+'" data-key="'+esc(rkey)+'" onclick="toggleRow(\'cl\','+ridx+')">';
+      } else {
+        h += '<tr class="'+cls2+'">';
+      }
       h += '<td title="'+esc((r.full_names||[]).join(' | '))+'">'+esc(r.name)+'</td>';
       h += '<td>'+esc(r.strategy||'?')+'</td>';
       h += '<td>$'+r.deployed.toFixed(2)+'</td>';
       h += '<td>'+(pct>=0?'+':'')+pct.toFixed(1)+'%</td>';
       h += '<td>'+esc(r.hold)+'</td>';
       h += '<td>'+esc(r.closed_at||'?')+'</td></tr>';
-      // Detail row with legs
-      h += '<tr id="cl-detail-'+ridx+'" class="detail-row" data-key="'+esc(rkey)+'"><td colspan="6">';
-      if (r.legs && r.legs.length > 0) {
+      if (hasLegs) {
+        h += '<tr id="cl-detail-'+ridx+'" class="detail-row" data-key="'+esc(rkey)+'"><td colspan="6">';
         r.legs.forEach(function(l) {
           h += '<div class="leg"><span class="amt">$'+(l.bet||0).toFixed(2)+'</span> buying '+esc(l.side)+' ';
           h += '<span class="mkt">'+esc(l.name)+'</span> ('+esc(l.side)+' @ '+(l.price||0).toFixed(3)+', '+esc(l.shares)+' shares) ';
           h += '&rarr; payout <span class="win">$'+(l.payout||0).toFixed(2)+'</span></div>';
         });
+        h += '</td></tr>';
       }
-      h += '</td></tr>';
     });
     h += '</tbody></table></div>';
   });
