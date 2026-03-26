@@ -1151,10 +1151,16 @@ fn build_closed_from_strategies(strat_summary: &Value) -> Value {
         b["_sort_ts"].as_f64().unwrap_or(0.0).total_cmp(&a["_sort_ts"].as_f64().unwrap_or(0.0))
     });
 
+    let total = resolved.len() + proactive_exit.len();
     json!({
-        "resolved": resolved, "proactive_exit": proactive_exit,
-        "replaced_profit": [], "replaced_loss": [], "replaced_even": [],
-        "total_closed": proactive_exit.len(),
+        "total_closed": total,
+        "categories": {
+            "resolved": { "label": "Resolved", "rows": resolved, "collapsed": false },
+            "proactive_exit": { "label": "Proactive Exit", "rows": proactive_exit, "collapsed": false },
+            "replaced_profit": { "label": "Replaced (Profit)", "rows": Vec::<Value>::new(), "collapsed": false },
+            "replaced_loss": { "label": "Replaced (Loss)", "rows": Vec::<Value>::new(), "collapsed": false },
+            "replaced_even": { "label": "Closed Early", "rows": Vec::<Value>::new(), "collapsed": true },
+        }
     })
 }
 
@@ -1328,35 +1334,60 @@ fn build_monitor(s: &DashboardState, full: bool) -> Value {
     );
     drop(m);
 
-    // Financial metrics
-    let pm = s.positions.lock();
-    let cap = pm.current_capital();
-    let open_snapshot: Vec<crate::position::Position> = pm.open_positions().values().cloned().collect();
-    let deployed: f64 = open_snapshot.iter().map(|p| p.total_capital).sum();
-    let total_value = cap + deployed;
-    let perf = pm.get_performance_metrics();
-    let realized = perf.get("total_actual_profit").copied().unwrap_or(0.0);
-    let closed_snapshot: Vec<crate::position::Position> = pm.closed_positions().to_vec();
-    drop(pm);
+    // Financial metrics — aggregate from strategies when active
+    let strat_summary = s.strategy_summary.lock().clone();
+    let has_strategies = strat_summary.get("strategies")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
 
-    // Unrealized P&L: mark-to-market using live bids
-    let mut unrealized = 0.0f64;
-    for p in &open_snapshot {
-        let cid = p.metadata.get("constraint_id").and_then(|v| v.as_str()).unwrap_or("");
-        let constraint = s.constraints.get(cid);
-        let mut sale_proceeds = 0.0f64;
-        for (mid, leg) in &p.markets {
-            let live_bid = constraint.as_ref().and_then(|c| {
-                c.markets.iter().find(|mref| mref.market_id == *mid).and_then(|mref| {
-                    let asset_id = if leg.outcome == "no" { &mref.no_asset_id } else { &mref.yes_asset_id };
-                    let bid = s.book.get_best_bid(asset_id);
-                    if bid > 0.0 { Some(bid) } else { None }
-                })
-            });
-            sale_proceeds += leg.shares * live_bid.unwrap_or(leg.entry_price);
+    let (cap, deployed, total_value, realized, closed_snapshot) = if has_strategies {
+        let strategies = strat_summary["strategies"].as_array().unwrap();
+        let agg_cash: f64 = strategies.iter().map(|st| st["capital"].as_f64().unwrap_or(0.0)).sum();
+        let agg_tv: f64 = strategies.iter().map(|st| st["total_value"].as_f64().unwrap_or(0.0)).sum();
+        let agg_deployed = agg_tv - agg_cash;
+        let agg_realized: f64 = strategies.iter().map(|st| st["total_realized"].as_f64().unwrap_or(0.0)).sum();
+        (agg_cash, agg_deployed, agg_tv, agg_realized, Vec::new())
+    } else {
+        let pm = s.positions.lock();
+        let c = pm.current_capital();
+        let open_snapshot: Vec<crate::position::Position> = pm.open_positions().values().cloned().collect();
+        let d: f64 = open_snapshot.iter().map(|p| p.total_capital).sum();
+        let tv = c + d;
+        let perf = pm.get_performance_metrics();
+        let r = perf.get("total_actual_profit").copied().unwrap_or(0.0);
+        let cs = pm.closed_positions().to_vec();
+        drop(pm);
+        (c, d, tv, r, cs)
+    };
+
+    // Unrealized P&L: for strategies, use 0 (arb positions have guaranteed payouts,
+    // mark-to-market is misleading). For main PM, use live bids.
+    let unrealized = if has_strategies {
+        0.0  // Strategy positions use cost basis; guaranteed profit shown separately
+    } else {
+        let pm = s.positions.lock();
+        let open_snapshot: Vec<crate::position::Position> = pm.open_positions().values().cloned().collect();
+        drop(pm);
+        let mut unr = 0.0f64;
+        for p in &open_snapshot {
+            let cid = p.metadata.get("constraint_id").and_then(|v| v.as_str()).unwrap_or("");
+            let constraint = s.constraints.get(cid);
+            let mut sale_proceeds = 0.0f64;
+            for (mid, leg) in &p.markets {
+                let live_bid = constraint.as_ref().and_then(|c| {
+                    c.markets.iter().find(|mref| mref.market_id == *mid).and_then(|mref| {
+                        let asset_id = if leg.outcome == "no" { &mref.no_asset_id } else { &mref.yes_asset_id };
+                        let bid = s.book.get_best_bid(asset_id);
+                        if bid > 0.0 { Some(bid) } else { None }
+                    })
+                });
+                sale_proceeds += leg.shares * live_bid.unwrap_or(leg.entry_price);
+            }
+            unr += sale_proceeds - p.total_capital;
         }
-        unrealized += sale_proceeds - p.total_capital;
-    }
+        unr
+    };
 
     mon.collect_financial_metrics(total_value, cap, deployed, realized, unrealized);
 
