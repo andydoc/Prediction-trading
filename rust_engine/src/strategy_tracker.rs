@@ -91,12 +91,14 @@ pub fn load_strategy_configs(workspace: &Path) -> Vec<StrategyConfig> {
 pub struct VirtualPosition {
     pub constraint_id: String,
     pub market_ids: Vec<String>,
+    pub market_names: Vec<String>,
     pub short_name: String,
     pub capital_deployed: f64,
     pub expected_profit_pct: f64,
     pub entry_ts: f64,
     pub hours_to_resolve: f64,
     pub is_sell: bool,
+    pub method: String,
     /// Entry prices per market_id (YES ask at entry).
     pub entry_prices: HashMap<String, f64>,
     /// Bet amounts per market_id.
@@ -229,12 +231,14 @@ impl VirtualPortfolio {
         let vp = VirtualPosition {
             constraint_id: opp.constraint_id.clone(),
             market_ids: opp.market_ids.clone(),
+            market_names: opp.market_names.clone(),
             short_name,
             capital_deployed: trade_size,
             expected_profit_pct: opp.expected_profit_pct,
             entry_ts: now,
             hours_to_resolve: opp.hours_to_resolve,
             is_sell: opp.is_sell,
+            method: opp.method.clone(),
             entry_prices: opp.current_prices.clone(),
             bet_amounts,
         };
@@ -583,6 +587,17 @@ impl StrategyTracker {
                     "capital": (vp.capital_deployed * 100.0).round() / 100.0,
                     "profit_pct": (vp.expected_profit_pct * 1000.0).round() / 10.0,
                     "hours_left": (hours_left * 10.0).round() / 10.0,
+                    // Rich fields for positions tab
+                    "constraint_id": vp.constraint_id,
+                    "market_ids": vp.market_ids,
+                    "market_names": vp.market_names,
+                    "entry_prices": vp.entry_prices,
+                    "bet_amounts": vp.bet_amounts,
+                    "is_sell": vp.is_sell,
+                    "method": vp.method,
+                    "entry_ts": vp.entry_ts,
+                    "hours_to_resolve": vp.hours_to_resolve,
+                    "expected_profit_pct": vp.expected_profit_pct,
                 })
             }).collect();
 

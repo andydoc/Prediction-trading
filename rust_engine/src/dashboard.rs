@@ -629,7 +629,19 @@ fn resolve_with_delay(
 
 fn build_positions(s: &DashboardState) -> Value {
     let mut positions = Vec::new();
-    // Clone positions under lock, then release — avoids blocking WS resolution events
+
+    // When strategy tracker is active, build positions from all virtual portfolios
+    let strat_summary = s.strategy_summary.lock().clone();
+    let has_strategies = strat_summary.get("strategies")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+
+    if has_strategies {
+        return build_positions_from_strategies(s, &strat_summary);
+    }
+
+    // Fallback: read from main PositionManager
     let open_snapshot: Vec<crate::position::Position> = {
         let pm = s.positions.lock();
         pm.open_positions().values().cloned().collect()
@@ -798,6 +810,160 @@ fn build_positions(s: &DashboardState) -> Value {
     }).collect();
     aggregates.sort_by(|a, b| a["pos_idx"].as_u64().unwrap_or(0)
         .cmp(&b["pos_idx"].as_u64().unwrap_or(0)));
+    let agg_total: f64 = aggregates.iter().map(|a| a["total_bet"].as_f64().unwrap_or(0.0)).sum();
+
+    json!({ "positions": positions, "pos_count": positions.len(),
+            "aggregates": aggregates, "agg_market_count": aggregates.len(), "agg_total": agg_total })
+}
+
+/// Build positions list from strategy tracker virtual portfolios.
+/// Deduplicates by constraint_id — shows each position once with the strategy
+/// that deployed the most capital (avoids showing 6× duplicate rows).
+fn build_positions_from_strategies(s: &DashboardState, strat_summary: &Value) -> Value {
+    let strategies = strat_summary["strategies"].as_array().unwrap();
+    let now_ts = chrono::Utc::now().timestamp() as f64;
+
+    // Collect all virtual positions, deduplicate by constraint_id (keep largest capital)
+    struct VPos { strategy: String, capital: f64, pos: Value }
+    let mut dedup: std::collections::HashMap<String, VPos> = std::collections::HashMap::new();
+
+    for strat in strategies {
+        let strat_name = strat["name"].as_str().unwrap_or("?");
+        if let Some(positions) = strat["positions"].as_array() {
+            for vp in positions {
+                let cid = vp["constraint_id"].as_str().unwrap_or("").to_string();
+                let cap = vp["capital"].as_f64().unwrap_or(0.0);
+                if cid.is_empty() { continue; }
+                let entry = dedup.entry(cid).or_insert_with(|| VPos {
+                    strategy: strat_name.to_string(), capital: 0.0, pos: vp.clone(),
+                });
+                if cap > entry.capital {
+                    entry.strategy = strat_name.to_string();
+                    entry.capital = cap;
+                    entry.pos = vp.clone();
+                }
+            }
+        }
+    }
+
+    let mut positions = Vec::new();
+    for (idx, (_cid, vpos)) in dedup.iter().enumerate() {
+        let vp = &vpos.pos;
+        let market_names: Vec<String> = vp["market_names"].as_array()
+            .map(|a| a.iter().map(|v| v.as_str().unwrap_or("?").to_string()).collect())
+            .unwrap_or_default();
+        let short_name = market_names.first()
+            .map(|n| if n.len() > 40 { format!("{}...", &n[..37]) } else { n.clone() })
+            .unwrap_or_else(|| "?".into());
+
+        let total_cap = vp["capital"].as_f64().unwrap_or(0.0);
+        let exp_pct = vp["expected_profit_pct"].as_f64().unwrap_or(0.0) * 100.0;
+        let exp_profit = total_cap * exp_pct / 100.0;
+        let is_sell = vp["is_sell"].as_bool().unwrap_or(false);
+        let method = vp["method"].as_str().unwrap_or("");
+        let strategy_fmt = fmt_strategy(if is_sell { "arb_sell" } else { "arb_buy" }, method);
+
+        let entry_ts = vp["entry_ts"].as_f64().unwrap_or(0.0);
+        let entry_ts_fmt = fmt_ts(entry_ts);
+        let hours_to_resolve = vp["hours_to_resolve"].as_f64().unwrap_or(0.0);
+        let elapsed_hours = (now_ts - entry_ts) / 3600.0;
+        let hours_remaining = (hours_to_resolve - elapsed_hours).max(0.0);
+
+        // Build legs from entry_prices + bet_amounts
+        let entry_prices = vp["entry_prices"].as_object();
+        let bet_amounts = vp["bet_amounts"].as_object();
+        let market_ids: Vec<String> = vp["market_ids"].as_array()
+            .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
+            .unwrap_or_default();
+
+        let mut legs = Vec::new();
+        for (i, mid) in market_ids.iter().enumerate() {
+            let price = entry_prices.and_then(|m| m.get(mid))
+                .and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let bet = bet_amounts.and_then(|m| m.get(mid))
+                .and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let name = market_names.get(i).map(|s| s.as_str()).unwrap_or("?");
+            let side = if is_sell { "NO" } else { "YES" };
+            let shares = if price > 0.0 { bet / price } else { 0.0 };
+            let payout = if is_sell { shares * 1.0 } else { shares * 1.0 };
+            legs.push(json!({
+                "name": name, "side": side, "price": price,
+                "bet": (bet * 100.0).round() / 100.0,
+                "shares": format!("{:.2}", shares),
+                "payout": (payout * 100.0).round() / 100.0,
+            }));
+        }
+
+        // Resolution formatting
+        let resolve_str = if hours_remaining > 24.0 {
+            format!("{:.1}d", hours_remaining / 24.0)
+        } else {
+            format!("{:.0}h", hours_remaining)
+        };
+
+        let score_val = if hours_remaining > 0.01 {
+            exp_pct / 100.0 / hours_remaining
+        } else { 0.0 };
+
+        // Count how many strategies hold this position
+        let strat_count: usize = strategies.iter().filter(|st| {
+            st["positions"].as_array().map_or(false, |ps| {
+                ps.iter().any(|p| p["constraint_id"].as_str() == vp["constraint_id"].as_str())
+            })
+        }).count();
+        let strat_label = if strat_count > 1 {
+            format!("{} [{}×]", strategy_fmt, strat_count)
+        } else {
+            strategy_fmt.clone()
+        };
+
+        let guaranteed = compute_guaranteed_payout(&legs, is_sell, total_cap + exp_profit);
+
+        positions.push(json!({
+            "idx": idx + 1, "short_name": short_name, "full_names": market_names,
+            "strategy": strat_label, "score": (score_val * 1000.0 * 100.0).round() / 100.0,
+            "total_cap": (total_cap * 100.0).round() / 100.0,
+            "exp_profit": (exp_profit * 100.0).round() / 100.0,
+            "exp_pct": (exp_pct * 10.0).round() / 10.0,
+            "resolve": resolve_str, "_resolve_secs": hours_remaining * 3600.0,
+            "end_date": "", "status": "monitoring", "postpone": null,
+            "entry_ts": entry_ts_fmt, "legs": legs,
+            "guaranteed": (guaranteed * 100.0).round() / 100.0,
+            "unrealized_pnl": 0.0,
+            "uma_disputed": false, "uma_status": "",
+            "scenarios": [],
+        }));
+    }
+
+    // Sort by score descending, re-number
+    positions.sort_by(|a, b| {
+        b["score"].as_f64().unwrap_or(0.0).total_cmp(&a["score"].as_f64().unwrap_or(0.0))
+    });
+    for (i, pos) in positions.iter_mut().enumerate() {
+        pos["idx"] = serde_json::Value::from(i + 1);
+    }
+
+    // Build aggregates
+    let mut agg_map: std::collections::HashMap<String, (String, f64, f64, f64, usize)> = std::collections::HashMap::new();
+    for (pidx, pos) in positions.iter().enumerate() {
+        if let Some(legs) = pos["legs"].as_array() {
+            for leg in legs {
+                let name = leg["name"].as_str().unwrap_or("?").to_string();
+                let side = leg["side"].as_str().unwrap_or("?").to_string();
+                let bet = leg["bet"].as_f64().unwrap_or(0.0);
+                let price = leg["price"].as_f64().unwrap_or(0.0);
+                let payout = leg["payout"].as_f64().unwrap_or(0.0);
+                let entry = agg_map.entry(name.clone()).or_insert((side, 0.0, 0.0, 0.0, pidx + 1));
+                entry.1 += bet;
+                entry.2 = price;
+                entry.3 += payout;
+            }
+        }
+    }
+    let mut aggregates: Vec<Value> = agg_map.iter().map(|(name, (side, bet, price, payout, pidx))| {
+        json!({"name": name, "side": side, "total_bet": bet, "avg_price": price, "payout": payout, "pos_idx": pidx})
+    }).collect();
+    aggregates.sort_by(|a, b| a["pos_idx"].as_u64().unwrap_or(0).cmp(&b["pos_idx"].as_u64().unwrap_or(0)));
     let agg_total: f64 = aggregates.iter().map(|a| a["total_bet"].as_f64().unwrap_or(0.0)).sum();
 
     json!({ "positions": positions, "pos_count": positions.len(),
