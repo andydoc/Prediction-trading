@@ -1396,8 +1396,14 @@ fn build_monitor(s: &DashboardState, full: bool) -> Value {
     let mut result = mon.build_json(full, &mut log_ring);
     drop(log_ring);
 
-    // Add financial summary from closed positions
-    let financial = mon.compute_financial_summary(&closed_snapshot);
+    // Add financial summary from closed positions (always use main PM for trade-level analysis)
+    let pm_closed: Vec<crate::position::Position> = if closed_snapshot.is_empty() {
+        let pm = s.positions.lock();
+        pm.closed_positions().to_vec()
+    } else {
+        closed_snapshot
+    };
+    let financial = mon.compute_financial_summary(&pm_closed);
     if let Value::Object(ref mut map) = result {
         map.insert("financial".to_string(), financial);
     }
