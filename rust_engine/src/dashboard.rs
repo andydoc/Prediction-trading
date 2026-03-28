@@ -1410,13 +1410,14 @@ fn build_monitor(s: &DashboardState, full: bool) -> Value {
         .map(|a| !a.is_empty())
         .unwrap_or(false);
 
-    let (cap, deployed, total_value, realized, closed_snapshot) = if has_strategies {
+    let (cap, deployed, total_value, realized, closed_snapshot, init_cap) = if has_strategies {
         let strategies = strat_summary["strategies"].as_array().unwrap();
         let agg_cash: f64 = strategies.iter().map(|st| st["capital"].as_f64().unwrap_or(0.0)).sum();
         let agg_tv: f64 = strategies.iter().map(|st| st["total_value"].as_f64().unwrap_or(0.0)).sum();
         let agg_deployed = agg_tv - agg_cash;
         let agg_realized: f64 = strategies.iter().map(|st| st["total_realized"].as_f64().unwrap_or(0.0)).sum();
-        (agg_cash, agg_deployed, agg_tv, agg_realized, Vec::new())
+        let agg_init: f64 = strategies.iter().map(|st| st["initial_capital"].as_f64().unwrap_or(0.0)).sum();
+        (agg_cash, agg_deployed, agg_tv, agg_realized, Vec::new(), agg_init)
     } else {
         let pm = s.positions.lock();
         let c = pm.current_capital();
@@ -1427,7 +1428,8 @@ fn build_monitor(s: &DashboardState, full: bool) -> Value {
         let r = perf.get("total_actual_profit").copied().unwrap_or(0.0);
         let cs = pm.closed_positions().to_vec();
         drop(pm);
-        (c, d, tv, r, cs)
+        let ic = s.positions.lock().initial_capital();
+        (c, d, tv, r, cs, ic)
     };
 
     // Unrealized P&L: for strategies, use 0 (arb positions have guaranteed payouts,
@@ -1474,7 +1476,7 @@ fn build_monitor(s: &DashboardState, full: bool) -> Value {
     } else {
         closed_snapshot
     };
-    let financial = mon.compute_financial_summary(&summary_closed);
+    let financial = mon.compute_financial_summary(&summary_closed, init_cap);
     if let Value::Object(ref mut map) = result {
         map.insert("financial".to_string(), financial);
     }

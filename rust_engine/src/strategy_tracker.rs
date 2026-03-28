@@ -364,41 +364,51 @@ impl VirtualPortfolio {
         sum / self.closed_positions.len() as f64
     }
 
+    /// Sharpe ratio: daily PnL (% of initial capital), annualized, risk-free subtracted.
+    /// Groups closed trades by UTC day, computes daily return as sum(profit)/initial_capital.
     fn sharpe(&self, days: u32) -> f64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        let cutoff = now - (days as f64 * 86400.0);
-        let returns: Vec<f64> = self.closed_positions.iter()
-            .filter(|p| p.close_ts >= cutoff)
-            .map(|p| p.actual_profit_pct)
-            .collect();
-        if returns.len() < 2 { return 0.0; }
-        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (returns.len() - 1) as f64;
+        let daily = self.daily_pnl_pct(days);
+        if daily.len() < 2 { return 0.0; }
+        let rf_daily = 0.045 / 365.0;
+        let n = daily.len() as f64;
+        let mean = daily.iter().sum::<f64>() / n;
+        let variance = daily.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1.0);
         let std_dev = variance.sqrt();
-        if std_dev < 1e-10 { return 0.0; }
-        mean / std_dev
+        if std_dev < 1e-12 { return 0.0; }
+        (mean - rf_daily) / std_dev * 365.0_f64.sqrt()
     }
 
     /// Sortino ratio: like Sharpe but only penalises downside deviation.
     fn sortino(&self, days: u32) -> f64 {
+        let daily = self.daily_pnl_pct(days);
+        if daily.len() < 2 { return 0.0; }
+        let rf_daily = 0.045 / 365.0;
+        let n = daily.len() as f64;
+        let mean = daily.iter().sum::<f64>() / n;
+        let downside_sq: f64 = daily.iter()
+            .map(|r| r - rf_daily)
+            .filter(|&x| x < 0.0)
+            .map(|x| x.powi(2))
+            .sum();
+        let downside_dev = (downside_sq / n).sqrt();
+        if downside_dev < 1e-12 { return 0.0; }
+        (mean - rf_daily) / downside_dev * 365.0_f64.sqrt()
+    }
+
+    /// Daily PnL as percentage of initial capital, grouped by UTC day.
+    fn daily_pnl_pct(&self, days: u32) -> Vec<f64> {
+        if self.config.initial_capital <= 0.0 { return Vec::new(); }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
         let cutoff = now - (days as f64 * 86400.0);
-        let returns: Vec<f64> = self.closed_positions.iter()
-            .filter(|p| p.close_ts >= cutoff)
-            .map(|p| p.actual_profit_pct)
-            .collect();
-        if returns.len() < 2 { return 0.0; }
-        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-        let downside_var = returns.iter()
-            .map(|r| if *r < mean { (r - mean).powi(2) } else { 0.0 })
-            .sum::<f64>() / (returns.len() - 1) as f64;
-        let downside_dev = downside_var.sqrt();
-        if downside_dev < 1e-10 { return 0.0; }
-        mean / downside_dev
+        let mut by_day: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
+        for p in &self.closed_positions {
+            if p.close_ts < cutoff { continue; }
+            let day = (p.close_ts / 86400.0).floor() as i64;
+            *by_day.entry(day).or_insert(0.0) += p.actual_profit / self.config.initial_capital;
+        }
+        by_day.into_values().collect()
     }
 
     /// Recovery factor: cumulative return / max drawdown.

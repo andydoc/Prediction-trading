@@ -342,9 +342,12 @@ impl MonitorState {
     // -- Financial summary --------------------------------------------------
 
     /// Compute financial summary statistics from closed positions.
+    /// `initial_capital` is used to normalise daily PnL to percentage returns for Sharpe/Sortino.
+    /// Pass 0.0 to use absolute dollar PnL (legacy behaviour).
     pub fn compute_financial_summary(
         &self,
         closed_positions: &[crate::position::Position],
+        initial_capital: f64,
     ) -> Value {
         if closed_positions.is_empty() {
             return json!({
@@ -361,7 +364,13 @@ impl MonitorState {
         }
 
         // -- Daily PnL for Sharpe / Sortino --------------------------------
-        let daily_pnl = compute_daily_pnl(closed_positions);
+        let daily_pnl_abs = compute_daily_pnl(closed_positions);
+        // Normalise to percentage of initial capital for consistent Sharpe across scales
+        let daily_pnl: Vec<f64> = if initial_capital > 0.0 {
+            daily_pnl_abs.iter().map(|&d| d / initial_capital).collect()
+        } else {
+            daily_pnl_abs
+        };
         let sharpe = compute_sharpe(&daily_pnl);
         let sortino = compute_sortino(&daily_pnl);
 
