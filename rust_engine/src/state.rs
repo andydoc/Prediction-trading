@@ -456,25 +456,34 @@ impl StateDB {
         &self, strategy_name: &str, capital: f64, profit: f64, profit_pct: f64,
         entry_ts: f64, close_ts: f64, is_win: bool,
         short_name: &str, method: &str, is_sell: bool,
+        close_reason: &str,
     ) {
         let db = self.db.conn();
+        // ALTER TABLE migration: add close_reason column if missing
+        let _ = db.execute_batch(
+            "ALTER TABLE strategy_closed_positions ADD COLUMN close_reason TEXT NOT NULL DEFAULT 'resolved';"
+        );
         let _ = db.execute(
             "INSERT INTO strategy_closed_positions \
-             (strategy_name, capital_deployed, actual_profit, actual_profit_pct, entry_ts, close_ts, is_win, short_name, method, is_sell) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (strategy_name, capital_deployed, actual_profit, actual_profit_pct, entry_ts, close_ts, is_win, short_name, method, is_sell, close_reason) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![strategy_name, capital, profit, profit_pct, entry_ts, close_ts, is_win as i32,
-                    short_name, method, is_sell as i32],
+                    short_name, method, is_sell as i32, close_reason],
         );
     }
 
     /// Load closed virtual positions for a strategy within a time window.
     pub fn load_strategy_closed_positions(&self, strategy_name: &str, since_ts: f64)
-        -> Vec<(f64, f64, f64, f64, f64, bool, String, String, bool)>
+        -> Vec<(f64, f64, f64, f64, f64, bool, String, String, bool, String)>
     {
         let db = self.db.conn();
+        // Ensure close_reason column exists
+        let _ = db.execute_batch(
+            "ALTER TABLE strategy_closed_positions ADD COLUMN close_reason TEXT NOT NULL DEFAULT 'resolved';"
+        );
         let mut stmt = match db.prepare(
             "SELECT capital_deployed, actual_profit, actual_profit_pct, entry_ts, close_ts, is_win, \
-             COALESCE(short_name, ''), COALESCE(method, ''), COALESCE(is_sell, 0) \
+             COALESCE(short_name, ''), COALESCE(method, ''), COALESCE(is_sell, 0), COALESCE(close_reason, 'resolved') \
              FROM strategy_closed_positions WHERE strategy_name = ?1 AND close_ts >= ?2 ORDER BY close_ts"
         ) {
             Ok(s) => s,
@@ -483,7 +492,8 @@ impl StateDB {
         let rows = stmt.query_map(params![strategy_name, since_ts], |row| {
             Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?, row.get::<_, f64>(2)?,
                 row.get::<_, f64>(3)?, row.get::<_, f64>(4)?, row.get::<_, i32>(5)? != 0,
-                row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, i32>(8)? != 0))
+                row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, i32>(8)? != 0,
+                row.get::<_, String>(9)?))
         });
         match rows {
             Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),

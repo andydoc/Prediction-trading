@@ -121,6 +121,7 @@ pub struct ClosedVirtualPosition {
     pub short_name: String,
     pub method: String,
     pub is_sell: bool,
+    pub close_reason: String, // "resolved" or "proactive_exit"
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +326,7 @@ impl VirtualPortfolio {
             short_name: vp.short_name.clone(),
             method: vp.method.clone(),
             is_sell: vp.is_sell,
+            close_reason: "resolved".to_string(),
         };
         self.closed_positions.push(closed.clone());
         Some(closed)
@@ -657,6 +659,7 @@ impl StrategyTracker {
                         "close_ts": c.close_ts,
                         "hold_secs": hold_secs,
                         "is_win": c.is_win,
+                        "close_reason": c.close_reason,
                     })
                 }).collect::<Vec<_>>(),
             })
@@ -727,7 +730,7 @@ impl StrategyTracker {
 
             // Restore closed positions (last 30 days)
             let closed_rows = db.load_strategy_closed_positions(&p.config.name, since_ts);
-            for (capital, profit, profit_pct, entry_ts, close_ts, is_win, short_name, method, is_sell) in closed_rows {
+            for (capital, profit, profit_pct, entry_ts, close_ts, is_win, short_name, method, is_sell, close_reason) in closed_rows {
                 p.closed_positions.push(ClosedVirtualPosition {
                     capital_deployed: capital,
                     actual_profit: profit,
@@ -738,6 +741,7 @@ impl StrategyTracker {
                     short_name,
                     method,
                     is_sell,
+                    close_reason,
                 });
             }
 
@@ -763,6 +767,7 @@ impl StrategyTracker {
             closed.actual_profit, closed.actual_profit_pct,
             closed.entry_ts, closed.close_ts, closed.is_win,
             &closed.short_name, &closed.method, closed.is_sell,
+            &closed.close_reason,
         );
     }
 
@@ -782,6 +787,7 @@ impl StrategyTracker {
                         closed.actual_profit, closed.actual_profit_pct,
                         closed.entry_ts, closed.close_ts, closed.is_win,
                         &closed.short_name, &closed.method, closed.is_sell,
+                        &closed.close_reason,
                     );
                 }
             }
@@ -816,6 +822,7 @@ impl StrategyTracker {
                     is_win: profit > 0.0,
                     method: vp.method.clone(),
                     is_sell: vp.is_sell,
+                    close_reason: "proactive_exit".to_string(),
                 };
                 portfolio.closed_positions.push(closed.clone());
 
@@ -829,6 +836,7 @@ impl StrategyTracker {
                     profit, profit_pct,
                     vp.entry_ts, close_ts, profit > 0.0,
                     &vp.short_name, &vp.method, vp.is_sell,
+                    "proactive_exit",
                 );
             }
         }

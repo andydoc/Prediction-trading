@@ -1154,12 +1154,12 @@ fn build_positions_from_strategy_closed(strat_summary: &Value) -> Vec<crate::pos
 /// Build closed positions from strategy tracker data (deduplicated, correct per-strategy sizing).
 fn build_closed_from_strategies(strat_summary: &Value) -> Value {
     let strategies = strat_summary["strategies"].as_array().unwrap();
-    let resolved: Vec<Value> = Vec::new();
+    let mut resolved: Vec<Value> = Vec::new();
     let mut proactive_exit: Vec<Value> = Vec::new();
 
     // Deduplicate by (name, close_ts) — show each closed trade once with aggregate capital
     struct ClosedEntry { name: String, strategy: String, deployed: f64, profit: f64, profit_pct: f64,
-        hold_secs: f64, close_ts: f64, count: usize }
+        hold_secs: f64, close_ts: f64, count: usize, close_reason: Option<String> }
     let mut dedup: std::collections::HashMap<String, ClosedEntry> = std::collections::HashMap::new();
 
     for strat in strategies {
@@ -1177,6 +1177,7 @@ fn build_closed_from_strategies(strat_summary: &Value) -> Value {
                     hold_secs: c["hold_secs"].as_f64().unwrap_or(0.0),
                     close_ts,
                     count: 0,
+                    close_reason: c["close_reason"].as_str().map(|s| s.to_string()),
                 });
                 entry.deployed += c["deployed"].as_f64().unwrap_or(0.0);
                 entry.profit += c["profit"].as_f64().unwrap_or(0.0);
@@ -1206,8 +1207,12 @@ fn build_closed_from_strategies(strat_summary: &Value) -> Value {
             "legs": [], "full_names": [e.name],
             "_sort_ts": e.close_ts, "_hold_secs": e.hold_secs,
         });
-        // All strategy closes are resolutions (proactive exits only in main PM)
-        proactive_exit.push(row);
+        let reason = e.close_reason.as_deref().unwrap_or("proactive_exit");
+        if reason == "resolved" {
+            resolved.push(row);
+        } else {
+            proactive_exit.push(row);
+        }
     }
 
     // Sort by close time descending
