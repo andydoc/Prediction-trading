@@ -1087,6 +1087,70 @@ fn build_opportunities(s: &DashboardState) -> Value {
     json!({ "opportunities": result, "total_found": result.len() })
 }
 
+/// Build lightweight Position structs from strategy closed data for compute_financial_summary.
+/// Deduplicates across strategies by (name, close_ts).
+fn build_positions_from_strategy_closed(strat_summary: &Value) -> Vec<crate::position::Position> {
+    let strategies = match strat_summary["strategies"].as_array() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let mut seen: std::collections::HashMap<(String, i64), usize> = std::collections::HashMap::new();
+    let mut positions: Vec<crate::position::Position> = Vec::new();
+
+    for strategy in strategies {
+        let closed = match strategy["closed"].as_array() {
+            Some(c) => c,
+            None => continue,
+        };
+        for c in closed {
+            let name = c["name"].as_str().unwrap_or("").to_string();
+            let close_ts = c["close_ts"].as_f64().unwrap_or(0.0);
+            let entry_ts = c["entry_ts"].as_f64().unwrap_or(0.0);
+            let capital = c["deployed"].as_f64().unwrap_or(0.0);
+            let profit = c["profit"].as_f64().unwrap_or(0.0);
+
+            let key = (name.clone(), (close_ts * 10.0) as i64);
+            if let Some(&idx) = seen.get(&key) {
+                positions[idx].total_capital += capital;
+                positions[idx].actual_profit += profit;
+            } else {
+                let mut markets = std::collections::HashMap::new();
+                markets.insert("0".to_string(), crate::position::MarketLeg {
+                    name: name.clone(),
+                    entry_price: 0.0, bet_amount: capital, shares: 0.0,
+                    outcome: String::new(), token_id: String::new(),
+                });
+                let pos = crate::position::Position {
+                    position_id: format!("strat_closed_{}", positions.len()),
+                    opportunity_id: String::new(),
+                    markets,
+                    total_capital: capital,
+                    expected_profit: 0.0, expected_profit_pct: 0.0,
+                    fees_paid: 0.0,
+                    entry_timestamp: format!("{}", entry_ts),
+                    status: "closed".to_string(),
+                    last_check: String::new(),
+                    price_drift: std::collections::HashMap::new(),
+                    resolved_at: None,
+                    close_timestamp: Some(close_ts),
+                    winning_market: None,
+                    actual_payout: 0.0,
+                    actual_profit: profit,
+                    actual_profit_pct: if capital > 0.0 { profit / capital } else { 0.0 },
+                    profit_delta: 0.0, profit_accuracy: 0.0,
+                    metadata: std::collections::HashMap::new(),
+                    entry_prices: std::collections::HashMap::new(),
+                    chain_id: Some(String::new()), chain_generation: 0,
+                    parent_position_id: None,
+                };
+                seen.insert(key, positions.len());
+                positions.push(pos);
+            }
+        }
+    }
+    positions
+}
+
 /// Build closed positions from strategy tracker data (deduplicated, correct per-strategy sizing).
 fn build_closed_from_strategies(strat_summary: &Value) -> Value {
     let strategies = strat_summary["strategies"].as_array().unwrap();
@@ -1396,14 +1460,16 @@ fn build_monitor(s: &DashboardState, full: bool) -> Value {
     let mut result = mon.build_json(full, &mut log_ring);
     drop(log_ring);
 
-    // Add financial summary from closed positions (always use main PM for trade-level analysis)
-    let pm_closed: Vec<crate::position::Position> = if closed_snapshot.is_empty() {
+    // Financial summary: use strategy closed data when strategies active, else main PM
+    let summary_closed: Vec<crate::position::Position> = if has_strategies {
+        build_positions_from_strategy_closed(&strat_summary)
+    } else if closed_snapshot.is_empty() {
         let pm = s.positions.lock();
         pm.closed_positions().to_vec()
     } else {
         closed_snapshot
     };
-    let financial = mon.compute_financial_summary(&pm_closed);
+    let financial = mon.compute_financial_summary(&summary_closed);
     if let Value::Object(ref mut map) = result {
         map.insert("financial".to_string(), financial);
     }

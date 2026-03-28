@@ -788,6 +788,52 @@ impl StrategyTracker {
         }
     }
 
+    /// Forward a proactive exit to all virtual portfolios that hold this constraint.
+    /// Uses the actual profit_pct from the main PM's liquidation result.
+    pub fn proactive_exit_with_db(&mut self, constraint_id: &str, profit_pct: f64, close_ts: f64, db: &StateDB) {
+        for portfolio in &mut self.portfolios {
+            if let Some(vp) = portfolio.open_positions.remove(constraint_id) {
+                let profit = vp.capital_deployed * profit_pct;
+                portfolio.current_capital += vp.capital_deployed + profit;
+                if profit > 0.0 { portfolio.total_wins += 1; } else { portfolio.total_losses += 1; }
+
+                // Release market exposure
+                let n_markets = vp.market_ids.len().max(1) as f64;
+                let per_market = vp.capital_deployed / n_markets;
+                for mid in &vp.market_ids {
+                    if let Some(exp) = portfolio.market_exposure.get_mut(mid) {
+                        *exp = (*exp - per_market).max(0.0);
+                    }
+                }
+
+                let closed = ClosedVirtualPosition {
+                    short_name: vp.short_name.clone(),
+                    capital_deployed: vp.capital_deployed,
+                    actual_profit: profit,
+                    actual_profit_pct: profit_pct,
+                    entry_ts: vp.entry_ts,
+                    close_ts,
+                    is_win: profit > 0.0,
+                    method: vp.method.clone(),
+                    is_sell: vp.is_sell,
+                };
+                portfolio.closed_positions.push(closed.clone());
+
+                tracing::info!(
+                    "Strategy {} proactive exit {}: profit=${:.2} ({:.1}%)",
+                    portfolio.config.name, &constraint_id[..8.min(constraint_id.len())],
+                    profit, profit_pct * 100.0,
+                );
+                db.save_strategy_closed_position(
+                    &portfolio.config.name, vp.capital_deployed,
+                    profit, profit_pct,
+                    vp.entry_ts, close_ts, profit > 0.0,
+                    &vp.short_name, &vp.method, vp.is_sell,
+                );
+            }
+        }
+    }
+
     /// Prune old closed positions from SQLite too.
     pub fn prune_old_closed_with_db(&mut self, db: &StateDB) {
         self.prune_old_closed();

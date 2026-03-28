@@ -2489,28 +2489,40 @@ impl Orchestrator {
             tracing::info!("PROACTIVE EXIT: {}... ratio={:.3}",
                 truncate(&exit.position_id, 40), exit.ratio);
 
-            // Capture tiered WS exit info before liquidation
-            let exit_info = if self.cfg.use_tiered_ws {
+            // Capture constraint_id, assets, and deployed capital before liquidation
+            let (cid, assets, deployed) = {
                 let pm = self.engine.positions.lock();
-                pm.get_position(&exit.position_id).map(|p| {
-                    let cid = p.metadata.get("constraint_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    // P2: clone required — assets outlive the position lock
-                    let assets: Vec<String> = p.markets.keys().cloned().collect();
-                    (cid, assets)
-                })
-            } else {
-                None
+                match pm.get_position(&exit.position_id) {
+                    Some(p) => {
+                        let cid = p.metadata.get("constraint_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let assets: Vec<String> = p.markets.keys().cloned().collect();
+                        let deployed = p.total_capital;
+                        (cid, assets, deployed)
+                    }
+                    None => (String::new(), Vec::new(), 0.0),
+                }
             };
 
             let bids = self.get_position_bids_by_id(&exit.position_id);
             if let Some((net, profit)) = self.engine.liquidate_position(&exit.position_id, "proactive_exit", &bids) {
                 self.held_ids_cache = None;
                 // Tiered WS: move assets back to Tier B if still hot
-                if let Some((cid, assets)) = exit_info {
+                if self.cfg.use_tiered_ws && !cid.is_empty() {
                     let still_hot = self.last_constraint_to_assets.contains_key(&cid);
                     self.engine.tiered_on_position_exit(&cid, assets, still_hot);
                 }
                 tracing::info!("  Sold: freed ${:.2}, profit=${:+.2}", net, profit);
+
+                // Forward proactive exit to strategy tracker
+                if !cid.is_empty() {
+                    if let Some(ref mut tracker) = self.strategy_tracker {
+                        let profit_pct = if deployed > 0.0 { profit / deployed } else { 0.0 };
+                        let close_ts = now_secs();
+                        tracker.proactive_exit_with_db(&cid, profit_pct, close_ts, &self.state_db);
+                        *self.engine.strategy_summary.lock() = tracker.build_summary();
+                    }
+                }
+
                 let _ = self.notifier.send(&NotifyEvent::ProactiveExit {
                     position_id: exit.position_id.clone(),
                     profit,
