@@ -4,7 +4,7 @@ Operational incidents for the Prediction Market Arbitrage System. Most recent fi
 
 ---
 
-### INC-015: Cross-Filesystem Git Blindspot — 172 Lines Uncommitted (2026-03-24)
+### INC-016: Cross-Filesystem Git Blindspot — 172 Lines Uncommitted (2026-03-24)
 
 **Severity**: HIGH
 **Impact**: `rust_engine/src/lib.rs` had 172 lines of uncommitted changes (module declarations for `usdc_monitor`, `fill_confirmation`, `sports_ws`, plus reconciliation return type fixes) that were invisible to Windows git but visible to WSL git. The E3 commit deployed to VPS failed to build because the reconciliation functions returned tuples but lib.rs declared single-value returns. VPS was unable to build for ~30 minutes during the E4 launch window.
@@ -13,6 +13,25 @@ Operational incidents for the Prediction Market Arbitrage System. Most recent fi
 **Fix**: Committed the missing changes from WSL git and pushed. VPS pull + rebuild succeeded.
 **Prevention**: Always run `git status` and `git diff` from WSL (not Windows) when working on a WSL-hosted repo. Consider adding a pre-push hook that runs `git diff HEAD` from within WSL to catch cross-filesystem blindspots.
 **Lessons**: Never trust Windows git to see changes on a WSL ext4 mount. The `P:\` drive mount is for editor convenience only — all git operations should go through WSL.
+
+---
+
+### INC-015: Strategy-Only Positions Not Resolution-Checked (2026-03-29)
+
+**Severity**: MEDIUM
+**Status**: RESOLVED
+
+**Summary**: Positions held exclusively by the strategy tracker (not in the main portfolio manager) were never checked for resolution via Gamma API. `check_api_resolutions()` only polled for positions in the main PM, so strategy-only virtual positions could remain open indefinitely after their markets resolved.
+
+**Detection**: Wellington temperature and Montedio Yamagata positions stayed open 13+ hours after their events ended. Manual investigation revealed the resolution polling path never covered strategy-tracker-only positions.
+
+**Root Cause**: `check_api_resolutions()` iterated only over positions in the main portfolio manager. The strategy tracker maintained its own independent set of virtual positions, but no code path polled Gamma API for their resolution status.
+
+**Fix**: Extracted a shared Gamma resolution helper from the existing `check_api_resolutions()` logic. Added `check_strategy_resolutions()` that polls strategy-only constraint IDs on the same 5-minute interval.
+
+**Data Note**: Wellington temperature market was manually resolved with the wrong winner (21C instead of 22C) before the automated fix was deployed. Auto-resolution later confirmed the correct outcome (22C). Minor historical data inconsistency.
+
+**Lessons**: Any subsystem that independently tracks positions must have its own resolution polling path, or share the main one. Strategy tracker was added after the resolution system and was never wired into it.
 
 ---
 

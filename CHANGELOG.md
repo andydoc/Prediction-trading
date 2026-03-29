@@ -7,6 +7,14 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.20.1] — 2026-03-29 — Fix: Strategy-Independent Resolution Polling
+
+### Fixed
+- **Strategy-only positions never resolution-checked** (`resolution.rs`, `strategy_tracker.rs`): Positions held exclusively by the strategy tracker (not in the main portfolio manager) were never polled via Gamma API for resolution status. Discovered when Wellington temperature and Montedio Yamagata positions stayed open 13+ hours after events ended. Extracted shared Gamma resolution helper, added `check_strategy_resolutions()` on the same 5-min polling interval. INC-015.
+- **Wellington manual resolution data inconsistency**: Wellington temperature market was manually resolved with wrong winner (21°C instead of 22°C) before the auto-fix was deployed. Auto-resolution later confirmed the correct outcome (22°C). Minor data inconsistency in historical records.
+
+---
+
 ## [0.20.0] — 2026-03-25 — E4 Day 2: Opportunity Logging + Strategy Eval Counters
 
 ### Added
