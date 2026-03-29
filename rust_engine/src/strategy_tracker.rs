@@ -597,6 +597,18 @@ impl StrategyTracker {
         }
     }
 
+    /// Collect unique (constraint_id, Vec<market_id>) across all portfolios.
+    /// Used by orchestrator to check resolution for strategy-only positions.
+    pub fn open_constraint_market_ids(&self) -> Vec<(String, Vec<String>)> {
+        let mut seen: HashMap<String, Vec<String>> = HashMap::new();
+        for p in &self.portfolios {
+            for (cid, vp) in &p.open_positions {
+                seen.entry(cid.clone()).or_insert_with(|| vp.market_ids.clone());
+            }
+        }
+        seen.into_iter().collect()
+    }
+
     /// Build JSON summary for the dashboard SSE event.
     pub fn build_summary(&self) -> serde_json::Value {
         let strategies: Vec<serde_json::Value> = self.portfolios.iter().map(|p| {

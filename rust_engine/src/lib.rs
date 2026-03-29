@@ -749,6 +749,95 @@ impl TradingEngine {
     }
 
     /// Check Polymarket API for missed resolutions (catches WS gaps).
+    /// Query Gamma API for a single market's resolution status.
+    /// Returns Some(("yes"|"no", uma_status)) if definitively resolved, None otherwise.
+    fn check_market_resolution_gamma(&self, mid: &str) -> (Option<String>, String) {
+        let url = format!("https://gamma-api.polymarket.com/markets/{}", mid);
+        match self.http_client.get(&url).send() {
+            Ok(resp) => {
+                if let Ok(mdata) = resp.json::<serde_json::Value>() {
+                    let uma_status = mdata["umaResolutionStatus"].as_str().unwrap_or("").to_string();
+                    if uma_status != "resolved" {
+                        return (None, uma_status);
+                    }
+                    // Market is definitively resolved — read outcome from prices
+                    let prices_raw = &mdata["outcomePrices"];
+                    let prices: Vec<f64> = if let Some(s) = prices_raw.as_str() {
+                        match serde_json::from_str::<Vec<serde_json::Value>>(s) {
+                            Ok(vals) => vals.iter()
+                                .filter_map(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                                .collect(),
+                            Err(e) => {
+                                tracing::warn!("outcomePrices parse fail for market {}: {e}", mid);
+                                return (None, uma_status);
+                            }
+                        }
+                    } else if let Some(arr) = prices_raw.as_array() {
+                        arr.iter().filter_map(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    if prices.len() >= 2 {
+                        if prices[0] >= 0.99 && prices[1] <= 0.01 {
+                            return (Some("yes".into()), uma_status);
+                        } else if prices[1] >= 0.99 && prices[0] <= 0.01 {
+                            return (Some("no".into()), uma_status);
+                        } else {
+                            tracing::warn!("Market {} resolved but prices ambiguous: {:?}", mid, prices);
+                        }
+                    }
+                    (None, uma_status)
+                } else {
+                    (None, String::new())
+                }
+            }
+            Err(e) => {
+                tracing::debug!("API check failed for market {}: {}", mid, e);
+                (None, String::new())
+            }
+        }
+    }
+
+    /// Check all constraint groups for resolution via Gamma API.
+    /// Returns Vec<(id, winning_market_id)> and Vec<DisputeInfo>.
+    fn check_constraints_resolution(&self, items: &[(String, Vec<String>)], label: &str)
+        -> (Vec<(String, String)>, Vec<DisputeInfo>)
+    {
+        let mut resolved = Vec::new();
+        let mut disputes = Vec::new();
+
+        for (id, market_ids) in items {
+            let mut outcomes: HashMap<String, String> = HashMap::new();
+            let mut all_ok = true;
+
+            for mid in market_ids {
+                let (outcome, uma_status) = self.check_market_resolution_gamma(mid);
+                if let Some(o) = outcome {
+                    outcomes.insert(mid.clone(), o);
+                } else {
+                    if !uma_status.is_empty() && uma_status != "too_early" && uma_status != "resolved" {
+                        disputes.push(DisputeInfo {
+                            position_id: id.clone(),
+                            market_id: mid.clone(),
+                            uma_status,
+                        });
+                    }
+                    all_ok = false;
+                }
+            }
+
+            if !all_ok || outcomes.len() != market_ids.len() { continue; }
+
+            if let Some((winning_mid, _)) = outcomes.iter().find(|(_, v)| v.as_str() == "yes") {
+                resolved.push((id.clone(), winning_mid.clone()));
+            } else {
+                tracing::warn!("{} {}: all markets resolved but no YES winner", label, id);
+            }
+        }
+
+        (resolved, disputes)
+    }
+
     pub fn check_api_resolutions(&self) -> (Vec<ApiResolution>, Vec<DisputeInfo>) {
         // Collect position IDs and their market IDs under the lock, then release
         let position_data: Vec<(String, Vec<String>)> = {
@@ -763,101 +852,9 @@ impl TradingEngine {
 
         tracing::info!("Checking API resolution for {} open positions...", position_data.len());
 
-        let client = &self.http_client;
+        let (results, disputes) = self.check_constraints_resolution(&position_data, "Position");
 
-        let mut results = Vec::new();
-        let mut disputes = Vec::new();
-
-        for (pid, market_ids) in &position_data {
-            let mut resolved_outcomes: HashMap<String, String> = HashMap::new();
-            let mut all_resolved = true;
-
-            for mid in market_ids {
-                let url = format!("https://gamma-api.polymarket.com/markets/{}", mid);
-                match client.get(&url).send() {
-                    Ok(resp) => {
-                        if let Ok(mdata) = resp.json::<serde_json::Value>() {
-                            // Only trust umaResolutionStatus == "resolved" — not prices
-                            let uma_status = mdata["umaResolutionStatus"].as_str().unwrap_or("");
-                            if uma_status != "resolved" {
-                                // R14: Detect active disputes (proposed, disputed, etc.)
-                                if !uma_status.is_empty() && uma_status != "too_early" {
-                                    disputes.push(DisputeInfo {
-                                        position_id: pid.clone(),
-                                        market_id: mid.clone(),
-                                        uma_status: uma_status.to_string(),
-                                    });
-                                }
-                                all_resolved = false;
-                                continue;
-                            }
-
-                            // Market is definitively resolved — read outcome from prices
-                            let prices_raw = &mdata["outcomePrices"];
-                            let prices: Vec<f64> = if let Some(s) = prices_raw.as_str() {
-                                match serde_json::from_str::<Vec<serde_json::Value>>(s) {
-                                    Ok(vals) => vals.iter()
-                                        .filter_map(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-                                        .collect(),
-                                    Err(e) => {
-                                        tracing::warn!("outcomePrices parse fail for market {}: {e}", mid);
-                                        all_resolved = false;
-                                        continue;
-                                    }
-                                }
-                            } else if let Some(arr) = prices_raw.as_array() {
-                                arr.iter().filter_map(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).collect()
-                            } else {
-                                Vec::new()
-                            };
-
-                            if prices.is_empty() {
-                                tracing::warn!("Market {} has empty/unparseable outcomePrices — skipping", mid);
-                                all_resolved = false;
-                                continue;
-                            }
-
-                            if prices.len() >= 2 {
-                                if prices[0] >= 0.99 && prices[1] <= 0.01 {
-                                    resolved_outcomes.insert(mid.clone(), "yes".into());
-                                } else if prices[1] >= 0.99 && prices[0] <= 0.01 {
-                                    resolved_outcomes.insert(mid.clone(), "no".into());
-                                } else {
-                                    // Resolved but prices ambiguous — skip
-                                    tracing::warn!("Market {} resolved but prices ambiguous: {:?}", mid, prices);
-                                    all_resolved = false;
-                                }
-                            } else {
-                                all_resolved = false;
-                            }
-                        } else {
-                            all_resolved = false;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("API check failed for market {}: {}", mid, e);
-                        all_resolved = false;
-                    }
-                }
-            }
-
-            if !all_resolved || resolved_outcomes.len() != market_ids.len() {
-                continue;
-            }
-
-            let winning_mid = match resolved_outcomes.iter().find(|(_, v)| v.as_str() == "yes") {
-                Some((mid, _)) => mid.clone(),
-                None => {
-                    tracing::warn!("Position {}: all markets resolved but no YES winner", pid);
-                    continue;
-                }
-            };
-
-            results.push((pid.clone(), winning_mid));
-        }
-
-        // Apply all resolutions in a single lock acquisition (P12: batch to avoid
-        // re-acquiring the positions lock per resolved position)
+        // Apply all resolutions in a single lock acquisition
         let mut final_results = Vec::new();
         if !results.is_empty() {
             let mut pm = self.positions.lock();
@@ -877,8 +874,7 @@ impl TradingEngine {
             }
         }
 
-        let results = final_results;
-        let count = results.len();
+        let count = final_results.len();
         if count > 0 {
             tracing::info!("API resolution check: resolved {} positions", count);
         } else {
@@ -889,7 +885,24 @@ impl TradingEngine {
             tracing::warn!("UMA dispute detected: {} market(s) in dispute", disputes.len());
         }
 
-        (results, disputes)
+        (final_results, disputes)
+    }
+
+    /// Check resolution for strategy-only constraints (not in main PM).
+    /// Returns Vec<(constraint_id, winning_market_id)>.
+    pub fn check_strategy_resolutions(&self, constraints: Vec<(String, Vec<String>)>)
+        -> Vec<(String, String)>
+    {
+        if constraints.is_empty() { return Vec::new(); }
+        tracing::info!("Checking strategy resolution for {} constraints...", constraints.len());
+        let (resolved, disputes) = self.check_constraints_resolution(&constraints, "Strategy constraint");
+        if !resolved.is_empty() {
+            tracing::info!("Strategy resolution check: resolved {} constraints", resolved.len());
+        }
+        if !disputes.is_empty() {
+            tracing::warn!("Strategy UMA dispute: {} market(s) in dispute", disputes.len());
+        }
+        resolved
     }
 
     // === Reconciliation (B4.0/B4.1/B4.2) ===

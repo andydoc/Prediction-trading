@@ -1627,6 +1627,32 @@ impl Orchestrator {
                 // No positions to check, but mark API as reachable
                 self.circuit_breaker.record_api_success(now);
             }
+            // Check strategy-only positions (not in main PM)
+            if let Some(ref mut tracker) = self.strategy_tracker {
+                let all_strat = tracker.open_constraint_market_ids();
+                // Exclude constraints already in main PM
+                let main_cids: HashSet<String> = {
+                    let pm = self.engine.positions.lock();
+                    pm.open_positions().values()
+                        .filter_map(|p| p.metadata.get("constraint_id")
+                            .and_then(|v| v.as_str()).map(|s| s.to_string()))
+                        .collect()
+                };
+                let strat_only: Vec<(String, Vec<String>)> = all_strat.into_iter()
+                    .filter(|(cid, _)| !main_cids.contains(cid))
+                    .collect();
+                if !strat_only.is_empty() {
+                    let resolved = self.engine.check_strategy_resolutions(strat_only);
+                    for (cid, winner) in &resolved {
+                        tracing::info!("STRATEGY RESOLUTION: constraint={} → winner={}", cid, winner);
+                        tracker.resolve_with_db(cid, winner, &self.state_db);
+                    }
+                    if !resolved.is_empty() {
+                        *self.engine.strategy_summary.lock() = tracker.build_summary();
+                    }
+                }
+            }
+
             self.last_api_resolution_check = now;
         }
 
