@@ -1221,7 +1221,7 @@ impl Orchestrator {
         // portfolios see ALL opportunities (including markets the main trader holds).
         // The main trader's held filter is applied later in try_enter_or_replace.
         let t0 = Instant::now();
-        let result = if self.strategy_tracker.is_some() {
+        let mut result = if self.strategy_tracker.is_some() {
             let empty_cids = HashSet::new();
             let empty_mids = HashSet::new();
             self.engine.evaluate_batch(
@@ -1251,7 +1251,17 @@ impl Orchestrator {
             self.engine.latency.record_eval_batch(batch_us);
         }
 
-        // Feed ALL opportunities to strategy tracker (unfiltered by held)
+        // Filter non-exhaustive mutex arbs before strategy tracker and main PM both consume them.
+        // Done once here so we only make the Gamma API call once per opportunity per batch.
+        result.opportunities.retain(|opp| {
+            if opp.method == "mutex_buy_all" || opp.method == "mutex_sell_all" {
+                self.engine.check_mutex_exhaustiveness(&opp.constraint_id, &opp.market_ids)
+            } else {
+                true
+            }
+        });
+
+        // Feed ALL (exhaustive) opportunities to strategy tracker (unfiltered by held)
         if let Some(ref mut tracker) = self.strategy_tracker {
             if !result.opportunities.is_empty() {
                 let fee_rate = self.engine.eval_config.lock().fee_rate;
@@ -2170,6 +2180,13 @@ impl Orchestrator {
             let opp = &opportunities[idx];
 
             if !self.validate_opportunity(opp, held_cids, held_mids) { continue; }
+
+            // Exhaustiveness check for mutex arbs: verify no uncovered outcome in condition group
+            if opp.method == "mutex_buy_all" || opp.method == "mutex_sell_all" {
+                if !self.engine.check_mutex_exhaustiveness(&opp.constraint_id, &opp.market_ids) {
+                    continue;
+                }
+            }
 
             // R2 risk mitigation: flag suspiciously large arbs
             if opp.expected_profit_pct >= self.cfg.suspicious_profit_threshold {

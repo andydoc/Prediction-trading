@@ -831,7 +831,11 @@ impl TradingEngine {
             if let Some((winning_mid, _)) = outcomes.iter().find(|(_, v)| v.as_str() == "yes") {
                 resolved.push((id.clone(), winning_mid.clone()));
             } else {
-                tracing::warn!("{} {}: all markets resolved but no YES winner", label, id);
+                // All markets resolved NO — non-exhaustive arb or cancelled market.
+                // Push NONE so the position is closed (buy_all: full loss; sell_all: all NO
+                // tokens win = max payout). Without this, the position stays open forever.
+                tracing::warn!("{} {}: all markets resolved NO — closing with NONE winner", label, id);
+                resolved.push((id.clone(), "NONE".to_string()));
             }
         }
 
@@ -903,6 +907,63 @@ impl TradingEngine {
             tracing::warn!("Strategy UMA dispute: {} market(s) in dispute", disputes.len());
         }
         resolved
+    }
+
+    /// Check whether a mutex arb opportunity has exhaustive coverage of its condition group.
+    ///
+    /// Fetches all markets sharing the same condition_id from Gamma API and verifies
+    /// that no market outside our candidate set has a YES price > 0.005.
+    /// This prevents entering non-exhaustive arbs where an uncovered outcome can void
+    /// the trade (e.g., "exactly 20°C" + "≤19°C" missing all "≥21°C" outcomes).
+    ///
+    /// Returns true = exhaustive (safe to enter), false = non-exhaustive (reject).
+    /// On API error, returns true (fail-open, don't block trading on network issues).
+    pub fn check_mutex_exhaustiveness(&self, constraint_id: &str, candidate_market_ids: &[String]) -> bool {
+        // Extract hex condition_id from "mutex_0x<hex>" format
+        let hex = match constraint_id.strip_prefix("mutex_0x") {
+            Some(h) => h,
+            None => return true,  // non-mutex constraint, skip check
+        };
+        let url = format!("https://gamma-api.polymarket.com/markets?condition_id=0x{}&limit=100", hex);
+        let group_markets: Vec<serde_json::Value> = match self.http_client.get(&url).send() {
+            Ok(resp) => match resp.json::<serde_json::Value>() {
+                Ok(serde_json::Value::Array(arr)) => arr,
+                Ok(v) if v.is_object() => vec![v],
+                _ => return true,  // API parse error → fail-open
+            },
+            Err(e) => {
+                tracing::debug!("Exhaustiveness check API error for {}: {}", constraint_id, e);
+                return true;  // Network error → fail-open
+            }
+        };
+
+        let candidate_set: std::collections::HashSet<&str> =
+            candidate_market_ids.iter().map(|s| s.as_str()).collect();
+
+        for market in &group_markets {
+            let mid = market["id"].as_str()
+                .or_else(|| market["market_id"].as_str())
+                .unwrap_or("");
+            if candidate_set.contains(mid) { continue; }
+
+            // Non-candidate market: check its YES price
+            let yes_price: f64 = market["outcomePrices"].as_str()
+                .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
+                .or_else(|| market["outcomePrices"].as_array().cloned())
+                .and_then(|arr| arr.first().and_then(|v| {
+                    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                }))
+                .unwrap_or(0.0);
+
+            if yes_price > 0.005 {
+                tracing::warn!(
+                    "SKIP (non-exhaustive): {} has uncovered market {} with YES={:.3}",
+                    &constraint_id[..constraint_id.len().min(40)], mid, yes_price
+                );
+                return false;
+            }
+        }
+        true
     }
 
     // === Reconciliation (B4.0/B4.1/B4.2) ===
