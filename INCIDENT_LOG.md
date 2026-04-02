@@ -4,6 +4,31 @@ Operational incidents for the Prediction Market Arbitrage System. Most recent fi
 
 ---
 
+### INC-017: Non-Exhaustive Mutex Arb — Hong Kong Temperature (2026-04-01)
+
+**Severity**: MEDIUM
+**Status**: RESOLVED
+
+**Summary**: Shadow strategies A/B/C/D/F entered a `mutex_buy_all` arb on two Hong Kong temperature markets ("exactly 20°C on March 30" and "≤19°C on March 30"). The actual temperature was above 20°C — both YES tokens resolved to zero. Total shadow loss ≈ $808.52. Positions became zombies (never closed) due to a second bug: the resolution code had no handler for "all markets resolve NO."
+
+**Detection**: Repeated log warning `Strategy constraint mutex_0x876e920c...: all markets resolved NO — closing with NONE winner` (after fix). Pre-fix: warning fired but position stayed open.
+
+**Root Cause (Bug 1 — entry)**: `check_mutex_arb()` in `arb.rs` only checked that YES prices of *candidate markets* summed to < 1.0 — it did not verify the candidate set was exhaustive. The two HK markets are part of a larger condition group (~8 temperature bands). Markets for 21°C, 22°C, 23°C+ were not in the hot WebSocket set and were never fetched. The system assumed a 2-market group covered all outcomes.
+
+**Root Cause (Bug 2 — resolution)**: `check_constraints_resolution()` in `lib.rs` only pushed a resolved entry when a YES winner was found. When all markets resolved NO, it logged a warning but left the position open forever (zombie).
+
+**Fix**:
+- Bug 1: Added `check_mutex_exhaustiveness()` — fetches full condition group from Gamma API at entry time, rejects if any non-candidate market has YES price > 0.005. Applied once per eval batch before strategy tracker and main PM both consume opportunities.
+- Bug 2: `check_constraints_resolution()` now pushes sentinel `NONE` when all markets resolve NO. `buy_all` NONE → payout 0 (full loss); `sell_all` NONE → all NO tokens pay (max win). Both `position.rs` and `strategy_tracker.rs` handle NONE correctly by coincidence of their lookup logic.
+- DB: 5 zombie positions manually closed as full losses post-deploy.
+
+**Lessons**:
+- Price-sum < 1.0 is *necessary* but not *sufficient* for a risk-free mutex arb — exhaustive coverage of the condition group is also required.
+- Always handle the "all NO" resolution case explicitly; don't assume a YES winner must exist.
+- sell_all non-exhaustiveness is benign (uncovered YES winner = all our NO tokens pay); buy_all non-exhaustiveness is catastrophic (uncovered YES winner = full loss).
+
+---
+
 ### INC-016: Cross-Filesystem Git Blindspot — 172 Lines Uncommitted (2026-03-24)
 
 **Severity**: HIGH

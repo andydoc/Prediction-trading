@@ -7,6 +7,18 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.20.2] — 2026-04-01 — Fix: Non-Exhaustive Mutex Arb Guard + NONE Resolution
+
+### Fixed
+- **Non-exhaustive mutex arb entry** (`lib.rs`, `orchestrator.rs`): Added `check_mutex_exhaustiveness()` — fetches the full condition group from Gamma API at entry time and rejects any opportunity where a non-candidate market has YES price > 0.005. Prevents entering temperature-band or score-range arbs where the candidate set doesn't cover all outcomes. Filtered once per eval batch before strategy tracker and main PM consume opportunities. INC-017.
+- **Resolution zombie — "all NO" case** (`lib.rs`): `check_constraints_resolution()` previously warned and silently dropped constraints where all markets resolved NO, leaving positions open forever. Now pushes sentinel `NONE` so positions are always closed: `buy_all` NONE = payout 0 (full loss), `sell_all` NONE = all NO tokens pay (max win). INC-017.
+- **DB: 5 zombie HK temperature positions** closed manually as full losses (Shadow A/B/C/D/F, total ~$808.52) after service stop. Strategy capitals updated accordingly.
+
+### Decision
+E4 run continued (not restarted) despite INC-017 contamination. Rationale: the majority of positions (football matches, binary events) are clean exhaustive arbs. Wellington and Tokyo temperature wins are retained — if E4 is extended to a third cycle, accounting can be rebased from today's post-fix state. The HK temperature loss is a valid Sortino/profit-factor data point.
+
+---
+
 ## [0.20.1] — 2026-03-29 — Fix: Strategy-Independent Resolution Polling
 
 ### Fixed
