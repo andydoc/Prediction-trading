@@ -27,6 +27,11 @@ pub struct Constraint {
     pub implications: Vec<(usize, usize)>,
     /// Earliest resolution date as unix timestamp (from market end_date). 0 = unknown.
     pub end_date_ts: f64,
+    /// Total number of markets in the negRisk group at detection time (including those
+    /// without valid CLOB token IDs that were excluded from `markets`). 0 = unknown.
+    /// If markets.len() < full_group_size, some group members had no order book at
+    /// detection time and are excluded from candidates — the set may be non-exhaustive.
+    pub full_group_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +217,19 @@ pub fn evaluate_batch(
 
         // M1: Verify price arrays match market count (built in same loop, should always hold)
         debug_assert_eq!(yes_prices.len(), market_ids.len(), "price array length mismatch");
+
+        // Exhaustiveness guard: all markets in the negRisk group must be candidates.
+        // If full_group_size > candidates, some group members had no CLOB order book at
+        // detection time and were excluded. One of those excluded markets could resolve YES,
+        // making all our candidate YES tokens worthless. Skip the constraint in this case.
+        if constraint.full_group_size > 0 && n < constraint.full_group_size {
+            tracing::debug!(
+                "SKIP (non-exhaustive): {} has {}/{} group markets as candidates",
+                &constraint.constraint_id[..constraint.constraint_id.len().min(40)],
+                n, constraint.full_group_size
+            );
+            continue;
+        }
 
         // Try direct mutex arb first
         let mut result: Option<ArbResult> = arb::check_mutex_arb(

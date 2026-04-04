@@ -131,6 +131,7 @@ pub fn detect_constraints(
         constraints.push(Constraint {
             constraint_id,
             constraint_type: "mutex".to_string(),
+            full_group_size: indices.len(),  // total markets in group, including those without CLOB token IDs
             markets: market_refs,
             is_neg_risk: true,
             implications: Vec::new(),
