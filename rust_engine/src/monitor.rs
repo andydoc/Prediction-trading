@@ -36,6 +36,10 @@ impl TimeSeries {
         self.buf.back().map(|&(_, v)| v)
     }
 
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Return entries with ts >= `since_ts` as `[ts, value]` pairs.
     pub fn as_json_array(&self, since_ts: f64) -> Vec<[f64; 2]> {
         self.buf
@@ -282,7 +286,7 @@ impl MonitorState {
         let logs_json = if full { log_ring.to_json_full() } else { log_ring.to_json_delta() };
 
         if full {
-            let since = now_ts() - 86_400.0; // last 24 h
+            let since = now_ts() - 7.0 * 86_400.0; // last 7 days (covers all timespan buttons)
             let series = json!({
                 "cpu_pct": self.cpu_pct.as_json_array(since),
                 "mem_used_mb": self.mem_used_mb.as_json_array(since),

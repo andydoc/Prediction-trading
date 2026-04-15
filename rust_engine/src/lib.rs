@@ -551,6 +551,44 @@ impl TradingEngine {
     pub fn pm_open_count(&self) -> usize { self.positions.lock().open_count() }
     pub fn pm_closed_count(&self) -> usize { self.positions.lock().closed_count() }
 
+    /// Pre-seed the monitor ring buffer with the historical equity curve derived from
+    /// strategy tracker closed positions. Called once at startup after strategy state
+    /// is loaded so the portfolio graph shows history immediately (not just since last restart).
+    ///
+    /// Reconstructs a step-function equity curve: starting from the sum of all strategy
+    /// initial capitals, applies each closed trade's profit in chronological order.
+    pub fn seed_monitor_from_strategy_history(&self, tracker: &crate::strategy_tracker::StrategyTracker) {
+        // Collect all (close_ts, profit) events across all portfolios
+        let mut events: Vec<(f64, f64)> = tracker.portfolios.iter()
+            .flat_map(|p| p.closed_positions.iter().map(|c| (c.close_ts, c.actual_profit)))
+            .collect();
+
+        if events.is_empty() { return; }
+
+        // Sort chronologically
+        events.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        // Running equity starts from aggregate initial capital across all portfolios
+        let agg_initial: f64 = tracker.portfolios.iter()
+            .map(|p| p.config.initial_capital)
+            .sum();
+
+        let mut running_value = agg_initial;
+        let mut running_realized = 0.0f64;
+
+        let mut mon = self.monitor.lock();
+        for (ts, profit) in events {
+            running_value += profit;
+            running_realized += profit;
+            mon.total_value.push(ts, running_value);
+            mon.realized_pnl.push(ts, running_realized);
+        }
+        tracing::info!(
+            "Monitor seeded from strategy history: {} data points, equity ${:.2}→${:.2}",
+            mon.total_value.len(), agg_initial, running_value
+        );
+    }
+
     /// Snapshot of dashboard-relevant position stats under a single lock acquisition.
     pub fn dashboard_snapshot(&self) -> DashboardSnapshot {
         let pm = self.positions.lock();

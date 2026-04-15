@@ -1054,6 +1054,8 @@ impl Orchestrator {
             tracker.apply_widest_gates(&mut ec);
             *self.engine.eval_config.lock() = ec;
             tracing::info!("Strategy tracker: {} virtual portfolios loaded", tracker.len());
+            // Pre-seed monitor ring buffer so portfolio graph survives restarts
+            self.engine.seed_monitor_from_strategy_history(&tracker);
             // Initial summary for dashboard
             *self.engine.strategy_summary.lock() = tracker.build_summary();
             self.strategy_tracker = Some(tracker);
