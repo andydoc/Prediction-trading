@@ -534,7 +534,7 @@ fn build_stats(s: &DashboardState) -> Value {
         total_unrealized += sale_proceeds - p.total_capital;
     }
 
-    let total_value = if has_strategies {
+    let total_value = if aggregate_shadows {
         let strategies = strat_summary["strategies"].as_array().unwrap();
         strategies.iter()
             .map(|st| st["total_value"].as_f64().unwrap_or(0.0))
@@ -543,10 +543,10 @@ fn build_stats(s: &DashboardState) -> Value {
         cap + deployed
     };
     // Recalculate deployed from total_value - cash (more accurate for strategies)
-    if has_strategies { deployed = total_value - cap; }
+    if aggregate_shadows { deployed = total_value - cap; }
     // Return % based on realized P&L only (not mark-to-market on open positions)
     let ret_pct = if init_cap > 0.0 { total_realized / init_cap * 100.0 } else { 0.0 };
-    let trades = if has_strategies {
+    let trades = if aggregate_shadows {
         let strategies = strat_summary["strategies"].as_array().unwrap();
         strategies.iter()
             .map(|st| st["total_entered"].as_u64().unwrap_or(0))
@@ -659,14 +659,17 @@ fn resolve_with_delay(
 fn build_positions(s: &DashboardState) -> Value {
     let mut positions = Vec::new();
 
-    // When strategy tracker is active, build positions from all virtual portfolios
+    // In shadow mode, render positions from all virtual portfolios (research view).
+    // In live mode, show only the live PositionManager's positions in the main
+    // card — shadow portfolios are visible on their own page/section.
     let strat_summary = s.strategy_summary.lock().clone();
     let has_strategies = strat_summary.get("strategies")
         .and_then(|v| v.as_array())
         .map(|a| !a.is_empty())
         .unwrap_or(false);
+    let is_shadow = s.shadow_only.load(Ordering::SeqCst);
 
-    if has_strategies {
+    if is_shadow && has_strategies {
         return build_positions_from_strategies(s, &strat_summary);
     }
 
@@ -1253,14 +1256,16 @@ fn build_closed_from_strategies(strat_summary: &Value) -> Value {
 }
 
 fn build_closed(s: &DashboardState) -> Value {
-    // When strategies active, build closed from strategy tracker aggregate
+    // Shadow mode: aggregate closed positions across all 6 virtual portfolios.
+    // Live mode: show only the live PositionManager's closed positions.
     let strat_summary = s.strategy_summary.lock().clone();
     let has_strategies = strat_summary.get("strategies")
         .and_then(|v| v.as_array())
         .map(|a| !a.is_empty())
         .unwrap_or(false);
+    let is_shadow = s.shadow_only.load(Ordering::SeqCst);
 
-    if has_strategies {
+    if is_shadow && has_strategies {
         return build_closed_from_strategies(&strat_summary);
     }
 
@@ -1422,14 +1427,18 @@ fn build_monitor(s: &DashboardState, full: bool) -> Value {
     );
     drop(m);
 
-    // Financial metrics — aggregate from strategies when active
+    // Financial metrics — aggregate across shadow portfolios only in shadow mode.
+    // In live mode, the headline reflects the live PositionManager even when
+    // the tracker is running alongside.
     let strat_summary = s.strategy_summary.lock().clone();
     let has_strategies = strat_summary.get("strategies")
         .and_then(|v| v.as_array())
         .map(|a| !a.is_empty())
         .unwrap_or(false);
+    let is_shadow = s.shadow_only.load(Ordering::SeqCst);
+    let aggregate_shadows = is_shadow && has_strategies;
 
-    let (cap, deployed, total_value, realized, closed_snapshot, init_cap) = if has_strategies {
+    let (cap, deployed, total_value, realized, closed_snapshot, init_cap) = if aggregate_shadows {
         let strategies = strat_summary["strategies"].as_array().unwrap();
         let agg_cash: f64 = strategies.iter().map(|st| st["capital"].as_f64().unwrap_or(0.0)).sum();
         let agg_tv: f64 = strategies.iter().map(|st| st["total_value"].as_f64().unwrap_or(0.0)).sum();
@@ -1453,7 +1462,7 @@ fn build_monitor(s: &DashboardState, full: bool) -> Value {
 
     // Unrealized P&L: for strategies, use 0 (arb positions have guaranteed payouts,
     // mark-to-market is misleading). For main PM, use live bids.
-    let unrealized = if has_strategies {
+    let unrealized = if aggregate_shadows {
         0.0  // Strategy positions use cost basis; guaranteed profit shown separately
     } else {
         let pm = s.positions.lock();
@@ -1486,8 +1495,8 @@ fn build_monitor(s: &DashboardState, full: bool) -> Value {
     let mut result = mon.build_json(full, &mut log_ring);
     drop(log_ring);
 
-    // Financial summary: use strategy closed data when strategies active, else main PM
-    let summary_closed: Vec<crate::position::Position> = if has_strategies {
+    // Financial summary: shadow closed data in shadow mode, else main PM closed.
+    let summary_closed: Vec<crate::position::Position> = if aggregate_shadows {
         build_positions_from_strategy_closed(&strat_summary)
     } else if closed_snapshot.is_empty() {
         let pm = s.positions.lock();
