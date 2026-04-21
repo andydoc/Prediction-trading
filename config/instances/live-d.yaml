@@ -22,7 +22,12 @@ arbitrage:
 live_trading:
   enabled: true
   shadow_only: false            # REAL ORDERS — Q1=B armed-live per operator decision 2026-04-21
-  execute_orders: true          # G1 executor armed-live
+  # 2026-04-21 20:10 UTC: DISARMED pending wallet reconciliation.
+  # On-chain diagnostic revealed EOA holds $65.11 USDC.e (stakeable) + $100 native USDC
+  # (stranded — Polymarket can't accept native). Operator is swapping $34.89 native→USDC.e
+  # and returning $65.11 native to Binance. Re-arm by flipping to true after wallet shows
+  # ~$100 USDC.e and $0 native; see docs/INCIDENT_LOG.md entry (TODO on re-arm).
+  execute_orders: false         # G1 executor DISARMED — overnight hold
   initial_capital: 100          # $100 USDC.e starting bankroll
   max_capital: 200              # cap auto-sizing; prevents over-allocation on bumper days
   max_positions: 8              # aligned with Strategy D max_concurrent_positions
