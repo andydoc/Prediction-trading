@@ -47,6 +47,12 @@ safety:
     # Disabled in base config so it doesn't run during pure-shadow operation;
     # enabled here because we are live with real USDC.e on the wallet.
     enabled: true
+    # The UsdcMonitorYaml serde default is https://polygon-rpc.com, which is a
+    # shared public endpoint that has IP-banned this VPS ("API key disabled,
+    # tenant disabled, json-rpc code: -32051"). gas_monitor uses publicnode's
+    # polygon-bor-rpc endpoint which works; match it here so eth_call for the
+    # USDC.e balanceOf() succeeds.
+    rpc_url: https://polygon-bor-rpc.publicnode.com
     check_interval_seconds: 300      # 5 min — tight enough to catch drain events quickly
     drift_threshold: 1.0             # $1 drift from accounting triggers a warning
     warning_balance: 15.0            # warn under $15 available (headroom above $10 pause)
