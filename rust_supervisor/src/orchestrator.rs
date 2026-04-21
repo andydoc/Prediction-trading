@@ -188,6 +188,11 @@ struct LiveTradingYaml {
     depth_haircut: f64,
     #[serde(default = "default_070")]
     min_profit_ratio: f64,
+    // G7 / F-pre-7: pre-trade Gamma freshness check
+    #[serde(default)]
+    gamma_freshness_check: bool,
+    #[serde(default = "default_5000u64")]
+    gamma_freshness_timeout_ms: u64,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -366,6 +371,7 @@ fn default_300u64() -> u64 { 300 }
 fn default_450u64() -> u64 { 450 }
 fn default_500u64() -> u64 { 500 }
 fn default_5556u64() -> u64 { 5556 }
+fn default_5000u64() -> u64 { 5000 }
 fn default_localhost() -> String { "127.0.0.1".into() }
 fn default_ws_url() -> String { "wss://ws-subscriptions-clob.polymarket.com/ws/market".into() }
 fn default_rpc_url() -> String { "https://polygon-rpc.com".into() }
@@ -415,6 +421,10 @@ pub struct OrchestratorConfig {
     pub depth_haircut: f64,
     pub max_book_staleness_secs: f64,
     pub min_profit_ratio: f64,
+
+    // G7 / F-pre-7: Gamma freshness check
+    pub gamma_freshness_check: bool,
+    pub gamma_freshness_timeout_ms: u64,
 
     // Record retention (B1.2)
     pub closed_retention_days: u32,
@@ -589,7 +599,6 @@ impl OrchestratorConfig {
             shadow_only: cfg.live_trading.shadow_only,
             dashboard_port: cfg.dashboard.port as u16,
             dashboard_bind: cfg.dashboard.bind_addr,
-
             max_positions: cfg.arbitrage.max_concurrent_positions as usize,
             max_days_entry: cfg.arbitrage.max_days_to_resolution as u32,
             max_days_replace: cfg.arbitrage.max_days_to_replacement as u32,
@@ -613,6 +622,8 @@ impl OrchestratorConfig {
             depth_haircut: cfg.live_trading.depth_haircut,
             max_book_staleness_secs: cfg.engine.max_book_staleness_secs,
             min_profit_ratio: cfg.live_trading.min_profit_ratio,
+            gamma_freshness_check: cfg.live_trading.gamma_freshness_check,
+            gamma_freshness_timeout_ms: cfg.live_trading.gamma_freshness_timeout_ms,
             closed_retention_days: cfg.engine.closed_position_retention_days as u32,
 
             resolution_validation_enabled: cfg.arbitrage.resolution_validation.enabled,
@@ -747,6 +758,10 @@ pub struct Orchestrator {
 
     /// CLOB API key daily refresh — keys can expire or be revoked
     last_clob_auth_refresh: f64,
+
+    /// G7 / F-pre-7: cumulative count of opportunities skipped because the live
+    /// Gamma group state diverged from the detection-time snapshot.
+    gamma_freshness_rejects: u64,
 }
 
 impl Orchestrator {
@@ -955,6 +970,7 @@ impl Orchestrator {
             sports_ws: None,
             last_sports_prune: 0.0,
             last_clob_auth_refresh: now_secs(),
+            gamma_freshness_rejects: 0,
         })
     }
 
@@ -2213,6 +2229,29 @@ impl Orchestrator {
                 .collect();
             let scaled_profit = opp.expected_profit * scale;
 
+            // G7 / F-pre-7: pre-trade Gamma freshness check
+            // In live mode, do one fresh REST call to Gamma to verify the negRisk
+            // group hasn't grown since the scanner last refreshed. If a NEW outcome
+            // was added, our YES candidates may be worthless (INC-001 / INC-017 class).
+            // Fail-closed on network errors. Shadow mode skips (no real money at stake).
+            if self.cfg.gamma_freshness_check && !self.cfg.shadow_only {
+                if let Some(c) = self.engine.constraints.get(&opp.constraint_id) {
+                    let nrm_id = c.neg_risk_market_id.clone();
+                    let expected = c.full_group_size;
+                    drop(c);  // release DashMap ref guard before the blocking HTTP call
+                    let timeout = std::time::Duration::from_millis(self.cfg.gamma_freshness_timeout_ms);
+                    let verdict = rust_engine::gamma_freshness::check_group_freshness(&nrm_id, expected, timeout);
+                    if !verdict.is_ok() {
+                        tracing::warn!(
+                            "SKIP (gamma_freshness): {}... reason={}",
+                            truncate(&opp.constraint_id, 40), verdict.reason()
+                        );
+                        self.gamma_freshness_rejects = self.gamma_freshness_rejects.saturating_add(1);
+                        continue;
+                    }
+                }
+            }
+
             // Store negRisk info in metadata via chain_info=None for new entries
             match self.engine.enter_position(
                 &opp.constraint_id, &opp.constraint_id,
@@ -2389,21 +2428,46 @@ impl Orchestrator {
                             let chain_ref = chain_info_owned.as_ref()
                                 .map(|(cid, gen, ppid)| (cid.as_str(), *gen, ppid.as_str()));
 
-                            let _ = self.engine.enter_position(
-                                &best_opp.constraint_id, &best_opp.constraint_id,
-                                if is_sell { "arb_sell" } else { "arb_buy" }, &best_opp.method,
-                                &best_opp.market_ids, &best_opp.market_names,
-                                &best_opp.current_prices, &best_opp.current_no_prices,
-                                &scaled_bets, best_opp.expected_profit * scale,
-                                best_opp.expected_profit_pct, is_sell,
-                                chain_ref,
-                            );
+                            // G7 / F-pre-7: pre-trade Gamma freshness check (replacement path).
+                            // Same gating as entry path; if non-Ok, skip the replacement entry.
+                            // Note: the worst position has already been liquidated above; this just
+                            // means we don't re-enter on the freshness-suspect opportunity.
+                            let mut skip_replacement = false;
+                            if self.cfg.gamma_freshness_check && !self.cfg.shadow_only {
+                                if let Some(c) = self.engine.constraints.get(&best_opp.constraint_id) {
+                                    let nrm_id = c.neg_risk_market_id.clone();
+                                    let expected = c.full_group_size;
+                                    drop(c);
+                                    let timeout = std::time::Duration::from_millis(self.cfg.gamma_freshness_timeout_ms);
+                                    let verdict = rust_engine::gamma_freshness::check_group_freshness(&nrm_id, expected, timeout);
+                                    if !verdict.is_ok() {
+                                        tracing::warn!(
+                                            "SKIP REPLACEMENT (gamma_freshness): {}... reason={}",
+                                            truncate(&best_opp.constraint_id, 40), verdict.reason()
+                                        );
+                                        self.gamma_freshness_rejects = self.gamma_freshness_rejects.saturating_add(1);
+                                        skip_replacement = true;
+                                    }
+                                }
+                            }
 
-                            self.last_replacement = now;
-                            tracing::info!("  WITH: {}... | score={:.6} | {:.1}h | chain_gen={}",
-                                truncate(&best_opp.constraint_id, 30),
-                                best_score, best_hours,
-                                chain_info_owned.as_ref().map(|(_, g, _)| *g).unwrap_or(0));
+                            if !skip_replacement {
+                                let _ = self.engine.enter_position(
+                                    &best_opp.constraint_id, &best_opp.constraint_id,
+                                    if is_sell { "arb_sell" } else { "arb_buy" }, &best_opp.method,
+                                    &best_opp.market_ids, &best_opp.market_names,
+                                    &best_opp.current_prices, &best_opp.current_no_prices,
+                                    &scaled_bets, best_opp.expected_profit * scale,
+                                    best_opp.expected_profit_pct, is_sell,
+                                    chain_ref,
+                                );
+
+                                self.last_replacement = now;
+                                tracing::info!("  WITH: {}... | score={:.6} | {:.1}h | chain_gen={}",
+                                    truncate(&best_opp.constraint_id, 30),
+                                    best_score, best_hours,
+                                    chain_info_owned.as_ref().map(|(_, g, _)| *g).unwrap_or(0));
+                            }
                         }
                     }
                 }
@@ -2752,6 +2816,12 @@ impl Orchestrator {
             m.sports_ws_games = sports.game_count() as u64;
             m.sports_ws_msgs = sports.total_messages();
             m.sports_ws_postponed = sports.postponed_count() as u64;
+        }
+
+        // G7 / F-pre-7: surface gamma freshness reject counter on /metrics
+        {
+            let mut m = self.engine.engine_metrics.lock();
+            m.gamma_freshness_rejects = self.gamma_freshness_rejects;
         }
 
         // Log circuit breaker state if tripped

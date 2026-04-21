@@ -89,6 +89,9 @@ pub struct EngineMetrics {
     pub sports_ws_games: u64,
     pub sports_ws_msgs: u64,
     pub sports_ws_postponed: u64,
+    // G7 / F-pre-7: count of opportunities skipped because Gamma group state
+    // diverged from detection-time snapshot (live mode only).
+    pub gamma_freshness_rejects: u64,
 }
 
 /// Static HTML — loaded at compile time from the extracted template.
@@ -348,6 +351,7 @@ fn build_metrics(s: &DashboardState) -> Value {
         "sports_ws_games": m.sports_ws_games,
         "sports_ws_msgs": m.sports_ws_msgs,
         "sports_ws_postponed": m.sports_ws_postponed,
+        "gamma_freshness_rejects": m.gamma_freshness_rejects,
     })
 }
 

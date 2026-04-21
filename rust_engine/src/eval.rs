@@ -32,6 +32,10 @@ pub struct Constraint {
     /// If markets.len() < full_group_size, some group members had no order book at
     /// detection time and are excluded from candidates — the set may be non-exhaustive.
     pub full_group_size: usize,
+    /// negRisk group identifier from Polymarket Gamma API (`negRiskMarketID` field).
+    /// Empty for non-negRisk constraints. Used by the F-pre-7 / G7 pre-trade Gamma
+    /// freshness check to query the live group state at entry time.
+    pub neg_risk_market_id: String,
 }
 
 #[derive(Debug, Clone)]

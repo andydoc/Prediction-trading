@@ -132,6 +132,7 @@ pub fn detect_constraints(
             constraint_id,
             constraint_type: "mutex".to_string(),
             full_group_size: indices.len(),  // total markets in group, including those without CLOB token IDs
+            neg_risk_market_id: nrm_id.to_string(),  // G7 / F-pre-7: full negRiskMarketID for Gamma freshness lookup
             markets: market_refs,
             is_neg_risk: true,
             implications: Vec::new(),
