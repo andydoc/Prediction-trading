@@ -990,9 +990,9 @@ impl Executor {
         if status.is_success() {
             tracing::info!("[KILL] CLOB cancel-all succeeded");
             Ok(())
-        } else if status.as_u16() == 401 {
-            // Expected in shadow mode — no L2 credentials configured
-            tracing::info!("[KILL] CLOB cancel-all returned 401 (no L2 credentials — expected in shadow mode)");
+        } else if status.as_u16() == 401 && self.config.dry_run {
+            // 401 in dry-run / shadow mode is expected — no L2 credentials configured
+            tracing::info!("[KILL] CLOB cancel-all returned 401 (no L2 credentials — expected in dry-run/shadow mode)");
             Ok(())
         } else {
             let body = resp.text().unwrap_or_default();

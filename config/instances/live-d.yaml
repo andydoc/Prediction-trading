@@ -6,14 +6,18 @@ arbitrage:
   # Strategy D "High Concentration" parameters (mirrors shadow-d.yaml)
   capital_per_trade_pct: 0.30
   max_concurrent_positions: 8
-  max_position_size: 1500
+  # NOTE (audit R-6, 2026-04-21): max_position_size and max_exposure_per_market are
+  # enforced by strategy_tracker (shadow portfolios) but NOT by the live execution path.
+  # At $100 bankroll the current_capital check in position.rs is the de-facto hard cap.
+  # These values are scaled correctly for when the live path is wired up (pre-Milestone F).
+  max_position_size: 60          # ~60% of $100 bankroll; not enforced live, correct for shadow
   min_profit_threshold: 0.04
   max_profit_threshold: 0.20
   min_resolution_time_secs: 900
   max_days_to_resolution: 30
   replacement_cooldown_seconds: 120
   max_days_to_replacement: 21
-  max_exposure_per_market: 750
+  max_exposure_per_market: 50    # ~50% of $100; not enforced live, correct for shadow
 
 live_trading:
   enabled: true
@@ -25,6 +29,21 @@ live_trading:
   low_balance_pause_usd: 10     # pause new entries if available < $10
   gamma_freshness_check: true   # F-pre-7: fresh Gamma call at entry (G7)
   gamma_freshness_timeout_ms: 5000
+
+safety:
+  circuit_breaker:
+    # R-1 fix (audit 2026-04-21): raised from 0.10 to 0.35.
+    # Strategy D observed 34% max drawdown on $1,000 shadow capital.
+    # 10% CB would trip on normal Strategy D losing streak, requiring manual restart.
+    # 0.35 matches observed envelope; still halts genuine runaway events.
+    max_drawdown_pct: 0.35
+  gas_monitor:
+    # Y-6 fix (audit 2026-04-21): non-zero threshold so CB fires before gas is depleted.
+    # At 0.0 the gas trip only fires after cancel orders can no longer be submitted.
+    critical_pol_balance: 0.5
+
+notifications:
+  hostname: madrid
 
 dashboard:
   port: 5558                    # main live engine port (not 5563 which is shadow-d)
