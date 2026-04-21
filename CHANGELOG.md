@@ -38,7 +38,13 @@ E rejected as primary (sample size thin, Sortino undefined). F retained as futur
 ### Added
 
 - **`config/instances/live-d.yaml`** (G-E9): live overlay for Strategy D with `shadow_only: false`, `execute_orders: true`, `initial_capital: 100`, `max_capital: 200`, `gamma_freshness_check: true`. Dashboard port 5558 (main), distinct from shadow-d port 5563.
-- [TBD — G1, G2, G3, G4, G5, G7, G-KILL as they land]
+- **G2 — `rust_engine/src/http_client.rs`** (F-pre-2): centralised `secure_client()` / `secure_client_with_timeout()` / `secure_client_tagged()` with `min_tls_version(TLS_1_2)`, `https_only(true)`, `tls_built_in_root_certs(true)`. Refactored 8 reqwest sites in rust_engine to use the helper.
+- **G3 — zeroize** (F-pre-3): `ClobApiCreds` and `ClobAuth` now derive `Zeroize, ZeroizeOnDrop`. `OrderSigner::new` explicitly zeroizes the intermediate `key_bytes` buffer on both success and length-error paths.
+- **G7 — `rust_engine/src/gamma_freshness.rs`** (F-pre-7): pre-trade Gamma freshness check, wired into BOTH entry and replacement paths in orchestrator. On negRisk-group-size drift, skips entry, logs WARN, increments `gamma_freshness_rejects` counter (exposed via /metrics). Added `neg_risk_market_id` field to `Constraint` so the lookup uses the full nrm_id, not the truncated `constraint_id`.
+- **G5 — capital velocity metric** (F-pre-5): `VirtualPortfolio::capital_velocity(days)` computes dollar-days-deployed per initial capital dollar; surfaced as `capital_velocity_28d` in the strategies JSON.
+- **G4-infra — `rust_engine/src/fill_quality.rs`** (F-pre-4 INFRASTRUCTURE only): JSON-Lines log writer for intent/actual fill records; `scripts/validate_fill_quality.py` computes notional-weighted whole-trade ratios and alerts when <95% meet `min_profit_ratio`. The 95% validation itself is intentionally post-live per operator acceptance (real fills required).
+- **G-KILL — `rust_engine/src/telegram_kill.rs`** (Q2=B): async Telegram long-poll handler. `/kill` from the configured chat_id flips the same AtomicBool the dashboard `POST /api/kill-switch` does. Other chat_ids silently ignored. Three unit tests for bot-token URL parser.
+- **G1 — live executor wiring** (F-pre-1, CRITICAL): `Executor` instantiated in `Orchestrator::new` when `execute_orders && !shadow_only && private_key && clob_auth` all present. `execute_arb()` called after successful `enter_position()` on BOTH entry and replacement paths, building legs from `opp.market_ids` × `scaled_bets` + constraint lookup for yes/no token_id (branched on `is_sell`, always `Side::Buy`). `FillQualityLog::record_intent` fires at submit time. Kill switch wire now calls `executor.cancel_all_orders()` BEFORE flipping `shadow_only = true`. Log banner `[G1] LIVE EXECUTOR ARMED — Real CLOB orders WILL be placed` prints on successful wiring. Safe default: `execute_orders: false` in serde; live-d.yaml is explicit about setting it true.
 
 ### Fixed
 

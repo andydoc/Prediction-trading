@@ -193,6 +193,12 @@ struct LiveTradingYaml {
     gamma_freshness_check: bool,
     #[serde(default = "default_5000u64")]
     gamma_freshness_timeout_ms: u64,
+    // G1 / F-pre-1: executor wiring. When true + shadow_only=false, the engine
+    // places real CLOB orders via Executor after each enter_position() success.
+    // Default false so shadow mode is safe even if the overlay sets
+    // shadow_only=false by accident.
+    #[serde(default)]
+    execute_orders: bool,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -426,6 +432,11 @@ pub struct OrchestratorConfig {
     pub gamma_freshness_check: bool,
     pub gamma_freshness_timeout_ms: u64,
 
+    // G1 / F-pre-1: executor wiring
+    pub execute_orders: bool,
+    pub private_key: String,      // from secrets.yaml — empty when no key configured
+    pub clob_host: String,        // default https://clob.polymarket.com
+
     // Record retention (B1.2)
     pub closed_retention_days: u32,
 
@@ -624,6 +635,14 @@ impl OrchestratorConfig {
             min_profit_ratio: cfg.live_trading.min_profit_ratio,
             gamma_freshness_check: cfg.live_trading.gamma_freshness_check,
             gamma_freshness_timeout_ms: cfg.live_trading.gamma_freshness_timeout_ms,
+
+            // G1: executor wiring. private_key and clob_host are captured here
+            // so Orchestrator::new can construct a fresh OrderSigner without
+            // re-reading secrets.yaml.
+            execute_orders: cfg.live_trading.execute_orders,
+            private_key: secrets.pointer("/polymarket/private_key")
+                .and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            clob_host: "https://clob.polymarket.com".to_string(),
             closed_retention_days: cfg.engine.closed_position_retention_days as u32,
 
             resolution_validation_enabled: cfg.arbitrage.resolution_validation.enabled,
@@ -762,6 +781,16 @@ pub struct Orchestrator {
     /// G7 / F-pre-7: cumulative count of opportunities skipped because the live
     /// Gamma group state diverged from the detection-time snapshot.
     gamma_freshness_rejects: u64,
+
+    /// G1 / F-pre-1: live CLOB executor. Some only when execute_orders=true
+    /// AND !shadow_only AND CLOB auth + private key are available. None in
+    /// every shadow instance and on any config/credential gap.
+    executor: Option<Arc<rust_engine::executor::Executor>>,
+
+    /// G4 / F-pre-4: append-only JSON-lines writer for intent/actual fill
+    /// records. Some when execute_orders=true (real trades produce fills).
+    /// Cheap to clone; call-sites take a clone where needed.
+    fill_quality_log: Option<rust_engine::fill_quality::FillQualityLog>,
 }
 
 impl Orchestrator {
@@ -929,6 +958,69 @@ impl Orchestrator {
                 cfg.usdc_drift_threshold, cfg.usdc_warning_balance, cfg.usdc_critical_balance);
         }
 
+        // G1 / F-pre-1: build the live CLOB executor iff all preconditions met.
+        //   execute_orders flag set (yaml/overlay)
+        //   !shadow_only (safety net — live overlay must flip this)
+        //   private_key available (secrets.yaml)
+        //   clob_auth already built (see OrchestratorConfig::load)
+        // ANY miss → executor stays None and the engine runs exactly as before.
+        let executor: Option<Arc<rust_engine::executor::Executor>> = if cfg.execute_orders
+            && !cfg.shadow_only
+            && !cfg.private_key.is_empty()
+            && cfg.clob_auth.is_some()
+        {
+            match rust_engine::signing::OrderSigner::new(&cfg.private_key) {
+                Ok(signer) => {
+                    use rust_engine::executor::{Executor, ExecutorConfig, OrderType, OrderAggression};
+                    use rust_engine::rate_limiter::RateLimiter;
+                    let exec_cfg = ExecutorConfig {
+                        clob_host: cfg.clob_host.clone(),
+                        dry_run: false,  // execute_orders=true → real submit
+                        order_type: OrderType::Fak,
+                        aggression: OrderAggression::AtMarket,
+                        fee_rate_bps: 0,
+                        confirmation_timeout_secs: 120.0,
+                    };
+                    match Executor::new(
+                        exec_cfg,
+                        signer,
+                        Arc::clone(&engine.instruments),
+                        Arc::new(RateLimiter::new()),
+                    ) {
+                        Ok(mut exec) => {
+                            if let Some(auth) = cfg.clob_auth.as_ref() {
+                                exec.set_clob_auth(auth.clone());
+                            }
+                            tracing::warn!("[G1] LIVE EXECUTOR ARMED — execute_orders=true, shadow_only=false. Real CLOB orders WILL be placed.");
+                            Some(Arc::new(exec))
+                        }
+                        Err(e) => {
+                            tracing::error!("[G1] Executor build failed: {}. Engine will run without live execution.", e);
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("[G1] OrderSigner build failed: {}. Engine will run without live execution.", e);
+                    None
+                }
+            }
+        } else if cfg.execute_orders && cfg.shadow_only {
+            tracing::warn!("[G1] execute_orders=true but shadow_only=true — live executor NOT started (safety). Flip shadow_only=false in the overlay to enable.");
+            None
+        } else {
+            None
+        };
+
+        // G4 infra: open fill quality log only when we have a live executor
+        // (shadow mode produces no fills to analyse).
+        let fill_quality_log = if executor.is_some() {
+            let path = cfg.workspace.join("data").join("fill_quality.log");
+            Some(rust_engine::fill_quality::FillQualityLog::open(path))
+        } else {
+            None
+        };
+
         Ok(Self {
             cfg, engine,
             scanner: Arc::new(scanner),
@@ -971,6 +1063,8 @@ impl Orchestrator {
             last_sports_prune: 0.0,
             last_clob_auth_refresh: now_secs(),
             gamma_freshness_rejects: 0,
+            executor,
+            fill_quality_log,
         })
     }
 
@@ -1407,11 +1501,17 @@ impl Orchestrator {
         // (a) Cancel all open CLOB orders
         // The executor is owned by the orchestrator (or accessible via engine).
         // In shadow mode, this is a no-op since there are no real CLOB orders.
-        // When live trading is enabled (Milestone D), this will cancel via the CLOB API.
+        // When live trading is enabled (G1), this cancels via the CLOB API.
         let cancelled_msg = if !self.cfg.shadow_only {
-            // TODO(D): Access executor and call cancel_all_orders()
-            // For now, log that we would cancel.
-            "CLOB cancel attempted (live mode)".to_string()
+            if let Some(executor) = self.executor.clone() {
+                let (count, err) = executor.cancel_all_orders();
+                match err {
+                    Some(e) => format!("CLOB cancel-all: {} cancelled locally, API error: {}", count, e),
+                    None => format!("CLOB cancel-all: {} orders cancelled", count),
+                }
+            } else {
+                "Live mode but no executor wired (check execute_orders + CLOB auth)".to_string()
+            }
         } else {
             "No CLOB orders to cancel (shadow mode)".to_string()
         };
@@ -2339,6 +2439,81 @@ impl Orchestrator {
                         capital: cap,
                         profit_pct: opp.expected_profit_pct,
                     });
+
+                    // G1 / F-pre-1: place real CLOB orders via the live executor.
+                    // Only runs when executor is Some (execute_orders && !shadow_only && PK && auth).
+                    // Legs are built from the SAME prices / bets the PM just recorded so
+                    // intent and PM state agree. We ALWAYS use Side::Buy: for buy-arb we
+                    // buy YES tokens, for sell-arb we buy NO tokens (which is how
+                    // Polymarket expresses "short YES" in a mutex group).
+                    if let Some(executor) = self.executor.clone() {
+                        let mut legs: Vec<(String, String, rust_engine::signing::Side, f64, f64)> =
+                            Vec::with_capacity(opp.market_ids.len());
+                        if let Some(c) = self.engine.constraints.get(&opp.constraint_id) {
+                            for (mid, bet_usd) in scaled_bets.iter() {
+                                if *bet_usd <= 0.0 { continue; }
+                                let market_ref = c.markets.iter().find(|m| &m.market_id == mid);
+                                let (token_id, price) = match market_ref {
+                                    Some(m) if is_sell => (
+                                        m.no_asset_id.clone(),
+                                        opp.current_no_prices.get(mid).copied().unwrap_or(0.0),
+                                    ),
+                                    Some(m) => (
+                                        m.yes_asset_id.clone(),
+                                        opp.current_prices.get(mid).copied().unwrap_or(0.0),
+                                    ),
+                                    None => continue,
+                                };
+                                if token_id.is_empty() || price <= 0.0 { continue; }
+                                legs.push((mid.clone(), token_id, rust_engine::signing::Side::Buy, price, *bet_usd));
+                            }
+                        }
+                        // Log intent BEFORE submit so we keep a record even if the engine
+                        // crashes between submit and the actual fill.
+                        if let Some(log) = &self.fill_quality_log {
+                            let mut intended_bets = serde_json::Map::new();
+                            let mut intended_prices = serde_json::Map::new();
+                            let mut intended_no_prices = serde_json::Map::new();
+                            for (mid, usd) in scaled_bets.iter() {
+                                intended_bets.insert(mid.clone(), serde_json::json!(*usd));
+                                intended_prices.insert(mid.clone(),
+                                    serde_json::json!(opp.current_prices.get(mid).copied().unwrap_or(0.0)));
+                                intended_no_prices.insert(mid.clone(),
+                                    serde_json::json!(opp.current_no_prices.get(mid).copied().unwrap_or(0.0)));
+                            }
+                            log.record_intent(&rust_engine::fill_quality::IntentRecord {
+                                kind: "intent",
+                                ts: now_secs(),
+                                opp_id: pos.position_id.clone(),
+                                constraint_id: opp.constraint_id.clone(),
+                                strategy: if is_sell { "arb_sell".into() } else { "arb_buy".into() },
+                                method: opp.method.clone(),
+                                intended_bets_usd: serde_json::Value::Object(intended_bets),
+                                intended_prices: serde_json::Value::Object(intended_prices),
+                                intended_no_prices: serde_json::Value::Object(intended_no_prices),
+                                expected_profit_usd: scaled_profit,
+                                expected_profit_pct: opp.expected_profit_pct,
+                                is_sell,
+                            });
+                        }
+                        if legs.is_empty() {
+                            tracing::warn!("[G1] {} → no valid legs for execute_arb (token_ids missing or zero prices)", pos.position_id);
+                        } else {
+                            let result = executor.execute_arb(&pos.position_id, &legs);
+                            if !result.all_accepted {
+                                let rejected = result.legs.iter()
+                                    .filter(|r| matches!(r, rust_engine::executor::OrderResult::Rejected(_)))
+                                    .count();
+                                tracing::warn!(
+                                    "[G1] Partial submit on {}: {}/{} legs accepted. Fill tracker will decide unwind via evaluate_arb_fills.",
+                                    pos.position_id, legs.len() - rejected, legs.len()
+                                );
+                            } else {
+                                tracing::info!("[G1] Live orders submitted on {}: {} legs", pos.position_id, legs.len());
+                            }
+                        }
+                    }
+
                     entered += 1;
                 }
                 position::EntryResult::InsufficientCapital { available, required } => {
@@ -2479,7 +2654,7 @@ impl Orchestrator {
                             }
 
                             if !skip_replacement {
-                                let _ = self.engine.enter_position(
+                                let entry_res = self.engine.enter_position(
                                     &best_opp.constraint_id, &best_opp.constraint_id,
                                     if is_sell { "arb_sell" } else { "arb_buy" }, &best_opp.method,
                                     &best_opp.market_ids, &best_opp.market_names,
@@ -2488,6 +2663,67 @@ impl Orchestrator {
                                     best_opp.expected_profit_pct, is_sell,
                                     chain_ref,
                                 );
+
+                                // G1: live execute on replacement path if entry succeeded
+                                if let position::EntryResult::Entered(pos) = entry_res {
+                                    if let Some(executor) = self.executor.clone() {
+                                        let mut legs: Vec<(String, String, rust_engine::signing::Side, f64, f64)> =
+                                            Vec::with_capacity(best_opp.market_ids.len());
+                                        if let Some(c) = self.engine.constraints.get(&best_opp.constraint_id) {
+                                            for (mid, bet_usd) in scaled_bets.iter() {
+                                                if *bet_usd <= 0.0 { continue; }
+                                                let market_ref = c.markets.iter().find(|m| &m.market_id == mid);
+                                                let (token_id, price) = match market_ref {
+                                                    Some(m) if is_sell => (
+                                                        m.no_asset_id.clone(),
+                                                        best_opp.current_no_prices.get(mid).copied().unwrap_or(0.0),
+                                                    ),
+                                                    Some(m) => (
+                                                        m.yes_asset_id.clone(),
+                                                        best_opp.current_prices.get(mid).copied().unwrap_or(0.0),
+                                                    ),
+                                                    None => continue,
+                                                };
+                                                if token_id.is_empty() || price <= 0.0 { continue; }
+                                                legs.push((mid.clone(), token_id, rust_engine::signing::Side::Buy, price, *bet_usd));
+                                            }
+                                        }
+                                        if let Some(log) = &self.fill_quality_log {
+                                            let mut intended_bets = serde_json::Map::new();
+                                            let mut intended_prices = serde_json::Map::new();
+                                            let mut intended_no_prices = serde_json::Map::new();
+                                            for (mid, usd) in scaled_bets.iter() {
+                                                intended_bets.insert(mid.clone(), serde_json::json!(*usd));
+                                                intended_prices.insert(mid.clone(),
+                                                    serde_json::json!(best_opp.current_prices.get(mid).copied().unwrap_or(0.0)));
+                                                intended_no_prices.insert(mid.clone(),
+                                                    serde_json::json!(best_opp.current_no_prices.get(mid).copied().unwrap_or(0.0)));
+                                            }
+                                            log.record_intent(&rust_engine::fill_quality::IntentRecord {
+                                                kind: "intent",
+                                                ts: now_secs(),
+                                                opp_id: pos.position_id.clone(),
+                                                constraint_id: best_opp.constraint_id.clone(),
+                                                strategy: if is_sell { "arb_sell".into() } else { "arb_buy".into() },
+                                                method: best_opp.method.clone(),
+                                                intended_bets_usd: serde_json::Value::Object(intended_bets),
+                                                intended_prices: serde_json::Value::Object(intended_prices),
+                                                intended_no_prices: serde_json::Value::Object(intended_no_prices),
+                                                expected_profit_usd: best_opp.expected_profit * scale,
+                                                expected_profit_pct: best_opp.expected_profit_pct,
+                                                is_sell,
+                                            });
+                                        }
+                                        if !legs.is_empty() {
+                                            let result = executor.execute_arb(&pos.position_id, &legs);
+                                            if !result.all_accepted {
+                                                tracing::warn!("[G1-REPL] Partial submit on {}: fill tracker will handle unwind", pos.position_id);
+                                            } else {
+                                                tracing::info!("[G1-REPL] Live orders submitted on {}: {} legs", pos.position_id, legs.len());
+                                            }
+                                        }
+                                    }
+                                }
 
                                 self.last_replacement = now;
                                 tracing::info!("  WITH: {}... | score={:.6} | {:.1}h | chain_gen={}",
