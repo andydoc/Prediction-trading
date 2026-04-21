@@ -602,7 +602,10 @@ fn build_stats(s: &DashboardState) -> Value {
     } else { "N/A".into() };
     let now_str = chrono::Utc::now().format("%d/%m/%Y %H:%M:%S").to_string();
     let start_str = s.start_time.format("%d/%m/%Y %H:%M").to_string();
-    let usdc_balance = s.engine_metrics.lock().usdc_balance;
+    let (usdc_balance, pol_balance) = {
+        let m = s.engine_metrics.lock();
+        (m.usdc_balance, m.pol_balance)
+    };
 
     json!({
         "cash": cap, "deployed": deployed, "total_value": total_value,
@@ -615,6 +618,7 @@ fn build_stats(s: &DashboardState) -> Value {
         "mode_class": if is_shadow { "mode-shadow" } else { "mode-live" },
         "first_trade": first_trade_str, "start_time": start_str,
         "live_balance": usdc_balance,
+        "pol_balance": pol_balance,
         "neg_risk_deployed": neg_risk_deployed,
         "neg_risk_count": neg_risk_count,
         "neg_risk_pct": if total_value > 0.0 { (neg_risk_deployed / total_value * 100.0).round() } else { 0.0 },

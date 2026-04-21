@@ -419,6 +419,10 @@ function renderStats(d) {
   h += st('FEES PAID', 'stat-fees', '$'+d.fees.toFixed(2));
   if (d.live_balance !== null && d.live_balance !== undefined)
     h += st('USDC (LIVE)', 'stat-usdc', '$'+d.live_balance.toFixed(2), 'color-amber');
+  if (d.pol_balance !== null && d.pol_balance !== undefined) {
+    var polCls = d.pol_balance < 0.5 ? 'bad' : d.pol_balance < 1.0 ? 'color-amber' : 'good';
+    h += st('POL GAS', 'stat-pol', d.pol_balance.toFixed(3)+' POL', polCls);
+  }
   h += st('RETURN', 'stat-return', (d.ret_pct>=0?'+':'')+d.ret_pct.toFixed(1)+'%', d.ret_pct>=0?'good':'bad');
   h += st('TRADES', 'stat-trades', d.trades);
   h += st('OPEN', 'stat-open', d.open_count);
