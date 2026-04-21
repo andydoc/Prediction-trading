@@ -113,6 +113,11 @@ pub struct TradingEngine {
     pub instruments: Arc<InstrumentStore>,
     /// C2: Kill switch flag — shared with dashboard, read by orchestrator.
     pub kill_switch: Arc<AtomicBool>,
+    /// Shadow-vs-live runtime flag — shared with dashboard so the mode badge and
+    /// capital headline reflect the *current* mode, not the startup-time mode.
+    /// Orchestrator sets this at startup from cfg.shadow_only and flips it to
+    /// true when the kill switch activates. Default true (safe-by-default).
+    pub shadow_only: Arc<AtomicBool>,
     /// Strategy tracker summary JSON — updated by orchestrator, read by dashboard SSE.
     pub strategy_summary: Arc<parking_lot::Mutex<serde_json::Value>>,
     /// Double-entry accounting ledger — tracks all cash movements independently.
@@ -226,6 +231,7 @@ impl TradingEngine {
         let resolved_events = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let instruments = Arc::new(InstrumentStore::new());
         let kill_switch = Arc::new(AtomicBool::new(false));
+        let shadow_only = Arc::new(AtomicBool::new(true));
 
         Ok(Self {
             book, eval_queue, ws, constraints, instruments,
@@ -243,6 +249,7 @@ impl TradingEngine {
             log_ring,
             resolved_events,
             kill_switch,
+            shadow_only,
             strategy_summary: Arc::new(parking_lot::Mutex::new(serde_json::Value::Null)),
             accounting: Arc::new(parking_lot::Mutex::new(accounting::AccountingLedger::new(0.0, 0.0))),
         })
@@ -282,6 +289,7 @@ impl TradingEngine {
                 monitor: Arc::clone(&self.monitor),
                 log_ring: Arc::clone(&self.log_ring),
                 kill_switch: Arc::clone(&self.kill_switch),
+                shadow_only: Arc::clone(&self.shadow_only),
                 strategy_summary: Arc::clone(&self.strategy_summary),
             };
             let bind_addr = dashboard_bind.to_string();

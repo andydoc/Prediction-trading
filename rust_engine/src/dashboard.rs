@@ -50,6 +50,11 @@ pub struct DashboardState {
     pub log_ring: Arc<Mutex<crate::monitor::LogRing>>,
     /// C2: Kill switch flag — set by POST /api/kill-switch, read by orchestrator
     pub kill_switch: Arc<AtomicBool>,
+    /// Shadow-vs-live runtime flag. Updated by orchestrator (startup + kill switch).
+    /// Dashboard reads this to render the mode badge and decide whether headline
+    /// stats should come from the live PositionManager ($100) or aggregate shadow
+    /// portfolios.
+    pub shadow_only: Arc<AtomicBool>,
     /// Strategy tracker summary JSON — updated by orchestrator
     pub strategy_summary: Arc<Mutex<Value>>,
 }
@@ -127,9 +132,13 @@ pub async fn start(state: DashboardState, port: u16, bind_addr: &str) {
 // =====================================================================
 
 async fn handle_html(State(s): State<Arc<DashboardState>>) -> Html<String> {
+    // Read live shadow_only flag so a fresh page load shows the current mode
+    // (the SSE stream keeps the badge updated after that).
+    let is_shadow = s.shadow_only.load(Ordering::SeqCst);
+    let mode_str = if is_shadow { "shadow" } else { "live" };
     let html = DASHBOARD_HTML
-        .replace("{{MODE_LABEL}}", &s.mode.to_uppercase())
-        .replace("{{MODE_CLASS}}", &format!("mode-{}", s.mode))
+        .replace("{{MODE_LABEL}}", &mode_str.to_uppercase())
+        .replace("{{MODE_CLASS}}", &format!("mode-{}", mode_str))
         .replace("{{VERSION}}", &format!("v{}", env!("CARGO_PKG_VERSION")));
     Html(html)
 }
@@ -417,13 +426,17 @@ fn fmt_strategy(strategy: &str, method: &str) -> String {
 }
 
 fn build_stats(s: &DashboardState) -> Value {
-    // When strategy tracker is active, aggregate stats across all shadow strategies
-    // for the main dashboard header. This gives the correct aggregate risk view.
+    // In shadow-only mode we aggregate across the 6 virtual portfolios so the
+    // header reflects the overall research view. In LIVE mode we always show the
+    // live PositionManager's numbers ($100 bankroll, live open positions); the
+    // shadow cards are rendered separately elsewhere on the page.
+    let is_shadow = s.shadow_only.load(Ordering::SeqCst);
     let strat_summary = s.strategy_summary.lock().clone();
     let has_strategies = strat_summary.get("strategies")
         .and_then(|v| v.as_array())
         .map(|a| !a.is_empty())
         .unwrap_or(false);
+    let aggregate_shadows = is_shadow && has_strategies;
 
     // Lock scope: extract all needed data from PositionManager in one locked section,
     // then drop the lock before doing any further computation or accessing other locks.
@@ -435,8 +448,9 @@ fn build_stats(s: &DashboardState) -> Value {
         let total_fees = pm.total_fees();
         let open_snapshot: Vec<crate::position::Position> = pm.open_positions().values().cloned().collect();
 
-        // When strategies active: aggregate from strategy summary
-        let (cap, init_cap, open_count, closed_count) = if has_strategies {
+        // Shadow mode with strategies: aggregate shadow portfolios.
+        // Live mode (or no strategies): use the live engine's PositionManager.
+        let (cap, init_cap, open_count, closed_count) = if aggregate_shadows {
             let strategies = strat_summary["strategies"].as_array().unwrap();
             let agg_cash: f64 = strategies.iter()
                 .map(|st| st["capital"].as_f64().unwrap_or(0.0))
@@ -464,7 +478,7 @@ fn build_stats(s: &DashboardState) -> Value {
             let ts = parse_entry_ts_str(&p.entry_timestamp);
             if ts > 0.0 && ts < first_entry_ts { first_entry_ts = ts; }
         }
-        let total_realized = if has_strategies {
+        let total_realized = if aggregate_shadows {
             let strategies = strat_summary["strategies"].as_array().unwrap();
             strategies.iter()
                 .map(|st| st["total_realized"].as_f64().unwrap_or(0.0))
@@ -478,7 +492,7 @@ fn build_stats(s: &DashboardState) -> Value {
     }; // pm lock dropped here
 
     // Calculate deployed capital: aggregate from strategies or from main PM snapshot
-    let mut deployed = if has_strategies {
+    let mut deployed = if aggregate_shadows {
         let strategies = strat_summary["strategies"].as_array().unwrap();
         let agg_init: f64 = strategies.iter()
             .map(|st| st["initial_capital"].as_f64().unwrap_or(0.0))
@@ -597,7 +611,8 @@ fn build_stats(s: &DashboardState) -> Value {
         "realized": total_realized,
         "unrealized": (total_unrealized * 100.0).round() / 100.0,
         "annualized": annualized_str, "annualized_ret": annualized_ret,
-        "mode_label": s.mode.to_uppercase(), "mode_class": format!("mode-{}", s.mode),
+        "mode_label": if is_shadow { "SHADOW" } else { "LIVE" },
+        "mode_class": if is_shadow { "mode-shadow" } else { "mode-live" },
         "first_trade": first_trade_str, "start_time": start_str,
         "live_balance": usdc_balance,
         "neg_risk_deployed": neg_risk_deployed,

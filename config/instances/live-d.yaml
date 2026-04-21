@@ -41,6 +41,16 @@ safety:
     # Y-6 fix (audit 2026-04-21): non-zero threshold so CB fires before gas is depleted.
     # At 0.0 the gas trip only fires after cancel orders can no longer be submitted.
     critical_pol_balance: 0.5
+  usdc_monitor:
+    # B4.6: on-chain USDC.e balance tracker. Required for dashboard "live_balance"
+    # and for CB when balance drifts from accounting or drops below critical.
+    # Disabled in base config so it doesn't run during pure-shadow operation;
+    # enabled here because we are live with real USDC.e on the wallet.
+    enabled: true
+    check_interval_seconds: 300      # 5 min — tight enough to catch drain events quickly
+    drift_threshold: 1.0             # $1 drift from accounting triggers a warning
+    warning_balance: 15.0            # warn under $15 available (headroom above $10 pause)
+    critical_balance: 5.0            # CB trip under $5 (below low_balance_pause_usd)
 
 notifications:
   hostname: madrid

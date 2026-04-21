@@ -1156,7 +1156,16 @@ impl Orchestrator {
         }
 
         // 6b. Load strategy tracker for virtual portfolios (Shadow A-F)
-        let strategy_configs = strategy_tracker::load_strategy_configs(&self.cfg.workspace);
+        // Seed shadow portfolios with the same bankroll as live so comparisons are
+        // like-for-like (fixed 2026-04-21 go-live: previously hardcoded $1000).
+        let live_initial_capital = self.cached_yaml
+            .pointer("/live_trading/initial_capital")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(100.0);
+        let strategy_configs = strategy_tracker::load_strategy_configs(
+            &self.cfg.workspace,
+            live_initial_capital,
+        );
         if !strategy_configs.is_empty() {
             let tracker = StrategyTracker::load_or_new(&self.state_db, strategy_configs);
             // Widen eval gates so all strategy opportunities are visible
@@ -1216,6 +1225,9 @@ impl Orchestrator {
         }
 
         let mode_str = if self.cfg.shadow_only { "SHADOW" } else { "LIVE" };
+        // Publish current mode to dashboard (was defaulting to SHADOW because
+        // the engine was constructed before shadow_only was known).
+        self.engine.shadow_only.store(self.cfg.shadow_only, Ordering::SeqCst);
         tracing::info!("Orchestrator ready [{}] — entering event loop", mode_str);
 
         // Send startup notification
@@ -1520,6 +1532,9 @@ impl Orchestrator {
         // (b) Set mode to shadow
         if !self.cfg.shadow_only {
             self.cfg.shadow_only = true;
+            // Flip the dashboard atomic too so the mode badge / headline stats
+            // switch to SHADOW without requiring a restart.
+            self.engine.shadow_only.store(true, Ordering::SeqCst);
             tracing::warn!("[KILL] Mode set to SHADOW — no live trades will be placed");
         }
 

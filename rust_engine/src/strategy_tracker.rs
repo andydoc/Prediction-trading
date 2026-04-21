@@ -35,7 +35,10 @@ pub struct StrategyConfig {
 }
 
 /// Load strategy configs from config/instances/shadow-{a..f}.yaml.
-pub fn load_strategy_configs(workspace: &Path) -> Vec<StrategyConfig> {
+///
+/// `live_initial_capital` seeds each shadow portfolio so its P&L comparison
+/// is like-for-like with the live engine (go-live 2026-04-21: $100).
+pub fn load_strategy_configs(workspace: &Path, live_initial_capital: f64) -> Vec<StrategyConfig> {
     let instances_dir = workspace.join("config").join("instances");
     let names = [
         ("shadow-a", "Max Diversification"),
@@ -77,7 +80,9 @@ pub fn load_strategy_configs(workspace: &Path) -> Vec<StrategyConfig> {
             max_days_to_resolution: arb["max_days_to_resolution"].as_f64().unwrap_or(60.0),
             replacement_cooldown_seconds: arb["replacement_cooldown_seconds"].as_f64().unwrap_or(60.0),
             max_exposure_per_market: arb["max_exposure_per_market"].as_f64().unwrap_or(500.0),
-            initial_capital: 1000.0,
+            // Shadow seed mirrors the live bankroll so P&L comparisons are like-for-like.
+            // Previously hardcoded to $1000; go-live 2026-04-21 seeds live at $100.
+            initial_capital: live_initial_capital,
         });
     }
     configs
