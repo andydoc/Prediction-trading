@@ -145,6 +145,20 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 const BACKOFF_SECONDS: f64 = 300.0; // 5 minutes
 
 impl Notifier {
+    /// Read-only access to the webhook URL (used by G-KILL telegram_kill::spawn
+    /// to extract the bot token without re-loading config). May be empty.
+    pub fn webhook_url(&self) -> &str { &self.config.webhook_url }
+
+    /// Read-only access to the configured phone_number / chat_id. Used by
+    /// G-KILL to scope the /kill handler to a single allowed chat.
+    pub fn phone_number(&self) -> &str { &self.config.phone_number }
+
+    /// Whether notifications are enabled at all (master switch). Used by
+    /// G-KILL to decide whether to start the polling task at all.
+    pub fn enabled(&self) -> bool { self.config.enabled }
+}
+
+impl Notifier {
     /// Create a new notifier with the given config.
     /// If config.enabled is false or webhook_url is empty, the notifier
     /// will be in noop mode (all sends are silently skipped).

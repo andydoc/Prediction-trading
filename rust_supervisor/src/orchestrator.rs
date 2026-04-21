@@ -1094,6 +1094,33 @@ impl Orchestrator {
             tracing::info!("Sports WS: started for postponement pre-screening");
         }
 
+        // G-KILL / Q2=B: Telegram /kill command handler. Spawned only when:
+        //   - notifications are enabled,
+        //   - webhook_url points at api.telegram.org,
+        //   - phone_number (chat_id) is set.
+        // The handler shares the engine's existing kill_switch AtomicBool —
+        // typing /kill from the configured chat has the same effect as
+        // POST /api/kill-switch on the dashboard.
+        if self.notifier.enabled()
+            && self.notifier.webhook_url().contains("api.telegram.org")
+            && !self.notifier.phone_number().is_empty()
+        {
+            if let Some(token) = rust_engine::telegram_kill::token_from_webhook(self.notifier.webhook_url()) {
+                let chat_id = self.notifier.phone_number().to_string();
+                let kill_switch = self.engine.kill_switch.clone();
+                let running_clone = running.clone();
+                rust_engine::telegram_kill::spawn(
+                    self.engine.runtime.handle(),
+                    token,
+                    chat_id,
+                    kill_switch,
+                    running_clone,
+                );
+            } else {
+                tracing::warn!("[telegram_kill] webhook_url contains api.telegram.org but bot token could not be extracted");
+            }
+        }
+
         let mode_str = if self.cfg.shadow_only { "SHADOW" } else { "LIVE" };
         tracing::info!("Orchestrator ready [{}] — entering event loop", mode_str);
 
