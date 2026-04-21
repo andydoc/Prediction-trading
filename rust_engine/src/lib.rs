@@ -47,6 +47,7 @@ pub mod gas_monitor;
 pub mod usdc_monitor;
 pub mod http_client;
 pub mod gamma_freshness;
+pub mod fill_quality;
 pub mod fill_confirmation;
 pub mod strategy_tracker;
 pub mod accounting;
