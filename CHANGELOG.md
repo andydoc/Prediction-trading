@@ -7,6 +7,59 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [0.20.3] — 2026-04-21 — Pre-Live Gates + Strategy D Go-Live
+
+### Shadow Validation Summary (E4 — 28 days, 2026-03-24 → 2026-04-21)
+
+All 6 virtual shadow portfolios observed the same 917 evaluated opportunities over 28 days. 100% win rate on resolved positions across every instance (INC-017 HK temperature losses absorbed as manual DB-patch closures, $808.52 spread across A/B/C/D/F, contributes to `max_drawdown_28d` but not `win_rate`).
+
+| Strategy | total_value | pnl_28d | return | trades | max_dd | Sharpe | Sortino | PF | accept% |
+|----------|------------:|--------:|-------:|-------:|-------:|-------:|--------:|---:|--------:|
+| A Max-Div    | $1,774 |   $77 |  +7.7% | 57 | $54   | 13.81 | 124.67 | 15.35 | 6.2% |
+| B Baseline   | $2,064 |  $106 | +10.6% | 33 | $113  | 13.75 |  88.78 | 10.44 | 3.6% |
+| C Mod-Conc   | $3,947 |  $295 | +29.5% | 31 | $249  | 13.04 | 105.05 | 12.84 | 3.4% |
+| **D High-Conc** | **$5,072** | **$407** | **+40.7%** | **24** | **$340** | **13.30** | **115.55** | **12.98** | **2.6%** |
+| E Max-Conc   | $8,803 |  $780 | +78.0% | 19 | $0*   | 15.22 | 0*     | 99*   | 2.1% |
+| F Fast-Mkts  | $1,933 |   $93 |  +9.3% | 71 | $53   | 17.23 | 176.27 | 18.58 | 7.6% |
+
+\* E stats saturated (n=19 thin sample); not "zero risk".
+
+### Parameter Selection (E9)
+
+**Strategy D (High Concentration) selected** for $100 live deployment. Rationale:
+- Best risk-adjusted return with meaningful sample size (24 trades vs E's 19)
+- 40.7% return scales to +$40.70 over 28 days on $100 real bankroll
+- Observed 34% max drawdown scales to $34 peak paper loss on $100 — within operator tolerance
+- Capital utilisation 277% → ~2.8× turnover; sufficient velocity without over-trading
+- Fewer, higher-quality trades match operator attention budget for first 48h supervised window
+
+E rejected as primary (sample size thin, Sortino undefined). F retained as future candidate for crypto-price markets.
+
+### Added
+
+- **`config/instances/live-d.yaml`** (G-E9): live overlay for Strategy D with `shadow_only: false`, `execute_orders: true`, `initial_capital: 100`, `max_capital: 200`, `gamma_freshness_check: true`. Dashboard port 5558 (main), distinct from shadow-d port 5563.
+- [TBD — G1, G2, G3, G4, G5, G7, G-KILL as they land]
+
+### Fixed
+
+- **ROADMAP.md D9 status** corrected ⬚ → ✅. Commit `fae8786` closed D9 via `clob_test/src/tests/d9_partial_fill.rs` on 2026-03-20 (per commit `e23df85` refinement). Unwind *execution* (not *decision*) remains F-pre-1 scope per G1.
+
+### Decisions (operator, 2026-04-21)
+
+- **Q1 = B**: Armed-LIVE immediately. No 24-48h dry-run soak. Real orders from first entry.
+- **Q2 = B**: Telegram `/kill` command handler added as G-KILL gate.
+- **Q3 = A**: systemd `Restart=on-failure` on crash.
+
+### Risks explicitly accepted
+
+- **INC-017 HK loss** ($808.52 across A/B/C/D/F) stays in burn-in record; E4 run not restarted
+- **F-pre-4 fill-quality 95% validation** moved post-live (requires real fills)
+- **F-pre-6 geoblock runbook** deferred to Dublin migration
+- **F-pre-8 deferred audit items** (ACC-2, NT-2, NT-4, ACC-6, ACC-7, API-9) stay deferred per audit v5 low-impact rating
+- **Q1=B armed-live**: first executor bug ships with real money
+
+---
+
 ## [0.20.2] — 2026-04-01 — Fix: Non-Exhaustive Mutex Arb Guard + NONE Resolution
 
 ### Fixed

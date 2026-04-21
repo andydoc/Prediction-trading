@@ -55,14 +55,13 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 
 ---
 
-## Milestone D: CLOB Integration Test — 🔧 8/9 PASS, D9 remaining
+## Milestone D: CLOB Integration Test — ✅ 9/9 PASS
 
 **Goal**: Prove full execution path works against real Polymarket CLOB. Place, fill, cancel, and reconcile real micro-orders. Target: 1 week.
 
 | Status | Count |
 |--------|-------|
-| ✅ Complete | 8/9 |
-| ⬚ Remaining | 1/9 |
+| ✅ Complete | 9/9 |
 
 **VPS**: is*hosting Madrid (176.97.72.199). Interim location — Dublin (Interxion DC, 0.83ms latency) planned when capacity available.
 **Funds**: ~$50 USDC.e deposited, wallet 0x21f1...fb1.
@@ -79,7 +78,7 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 | D7a: Circuit breaker | ✅ | Engine state validation |
 | D7b: Kill switch | ✅ | Executor cancel-all |
 | D8: Closeout positions | ✅ | Real SELL orders + accounting verification |
-| D9: Partial fill test | ⬚ | Deliberately trigger partial fill on multi-leg arb. Validates B3.6 against real CLOB. Must pass before F-pre-9. |
+| D9: Partial fill test | ✅ | Validated decision logic against real CLOB via `clob_test/src/tests/d9_partial_fill.rs` (commit fae8786). SELL at 0.99 triggers reliable one-sided fill; `evaluate_partial_fills()` correctly returns Unwind for unprofitable partials. Unwind **execution** is F-pre-1 (G1). |
 
 ### Known Issues / Next Steps (from D)
 
@@ -162,7 +161,7 @@ Shadow-F targets short-lived crypto price markets (5-15 min resolution) with fas
 | A: Rust Port | 13/13 | ✅ Complete |
 | B: Execution Infrastructure | 29/29 | ✅ Complete |
 | C: Safety | 10/10 | ✅ Complete |
-| D: CLOB Integration Test | 8/9 | 🔧 D9 remaining |
+| D: CLOB Integration Test | 9/9 | ✅ Complete |
 | E: Shadow Validation | 6/12 | 🔧 In Progress |
 | F: Go Live | 0/15 | ⬚ Planned (9 pre-live gates + 6 tasks) |
 | G: Scale | 0/4 | ⬚ Future |

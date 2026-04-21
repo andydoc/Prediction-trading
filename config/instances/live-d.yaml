@@ -1,0 +1,30 @@
+# Live-D: Strategy D in LIVE mode ($100 real capital)
+# Derived from shadow-d.yaml + live_trading overrides
+# Created 2026-04-21 for v0.20.3 go-live per GO_LIVE_PLAN_V1_STRATEGY_D_100USD.md
+
+arbitrage:
+  # Strategy D "High Concentration" parameters (mirrors shadow-d.yaml)
+  capital_per_trade_pct: 0.30
+  max_concurrent_positions: 8
+  max_position_size: 1500
+  min_profit_threshold: 0.04
+  max_profit_threshold: 0.20
+  min_resolution_time_secs: 900
+  max_days_to_resolution: 30
+  replacement_cooldown_seconds: 120
+  max_days_to_replacement: 21
+  max_exposure_per_market: 750
+
+live_trading:
+  enabled: true
+  shadow_only: false            # REAL ORDERS — Q1=B armed-live per operator decision 2026-04-21
+  execute_orders: true          # G1 executor armed-live
+  initial_capital: 100          # $100 USDC.e starting bankroll
+  max_capital: 200              # cap auto-sizing; prevents over-allocation on bumper days
+  max_positions: 8              # aligned with Strategy D max_concurrent_positions
+  low_balance_pause_usd: 10     # pause new entries if available < $10
+  gamma_freshness_check: true   # F-pre-7: fresh Gamma call at entry (G7)
+  gamma_freshness_timeout_ms: 5000
+
+dashboard:
+  port: 5558                    # main live engine port (not 5563 which is shadow-d)
