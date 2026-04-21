@@ -181,14 +181,27 @@ impl UsdcMonitor {
             .send()
             .map_err(|e| format!("RPC request failed: {}", e))?;
 
-        let body: serde_json::Value = resp.json()
-            .map_err(|e| format!("RPC response parse failed: {}", e))?;
+        let status = resp.status();
+        let raw_text = resp.text()
+            .map_err(|e| format!("RPC response read failed: {}", e))?;
+
+        // Char-boundary-safe preview (RPC bodies are ASCII JSON in practice but be defensive).
+        let preview: String = raw_text.chars().take(300).collect();
+
+        let body: serde_json::Value = serde_json::from_str(&raw_text)
+            .map_err(|e| format!(
+                "RPC response parse failed: {} | status={} body_len={} preview={:?}",
+                e, status, raw_text.len(), preview
+            ))?;
 
         let hex_str = body["result"].as_str()
             .ok_or_else(|| {
                 let err = body["error"].as_object()
                     .map(|e| format!("{}", serde_json::Value::Object(e.clone())))
-                    .unwrap_or_else(|| "no result field".to_string());
+                    .unwrap_or_else(|| format!(
+                        "no result field (status={}, body_len={}, preview={:?})",
+                        status, raw_text.len(), preview
+                    ));
                 format!("RPC error: {}", err)
             })?;
 
