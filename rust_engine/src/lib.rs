@@ -45,6 +45,7 @@ pub mod reconciliation;
 pub mod circuit_breaker;
 pub mod gas_monitor;
 pub mod usdc_monitor;
+pub mod http_client;
 pub mod fill_confirmation;
 pub mod strategy_tracker;
 pub mod accounting;
@@ -217,11 +218,7 @@ impl TradingEngine {
             .build()
             .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
 
-        let http_client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        let http_client = crate::http_client::secure_client_with_timeout(10)?;
 
         let resolved_events = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let instruments = Arc::new(InstrumentStore::new());

@@ -480,10 +480,7 @@ impl PostponementDetector {
 
         let cache = PostponementCache::new(&cache_path_str, config.cache_ttl_secs)?;
 
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(90))
-            .build()
-            .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+        let client = crate::http_client::secure_client_tagged(90, "postponement")?;
 
         tracing::info!(
             "PostponementDetector initialized: model={}, cache={}",

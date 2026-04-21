@@ -326,7 +326,7 @@ impl OrderSigner {
     /// Calls GET /auth/derive-api-key with L1 auth headers.
     pub fn derive_api_key(&self, clob_host: &str) -> Result<ClobApiCreds, String> {
         let headers = self.build_l1_headers(0)?;
-        let client = reqwest::blocking::Client::new();
+        let client = crate::http_client::secure_client_tagged(30, "signing.derive")?;
         let url = format!("{}/auth/derive-api-key", clob_host.trim_end_matches('/'));
 
         let mut req = client.get(&url);
@@ -351,7 +351,7 @@ impl OrderSigner {
     /// Calls POST /auth/api-key with L1 auth headers.
     pub fn create_api_key(&self, clob_host: &str) -> Result<ClobApiCreds, String> {
         let headers = self.build_l1_headers(0)?;
-        let client = reqwest::blocking::Client::new();
+        let client = crate::http_client::secure_client_tagged(30, "signing.create")?;
         let url = format!("{}/auth/api-key", clob_host.trim_end_matches('/'));
 
         let mut req = client.post(&url);

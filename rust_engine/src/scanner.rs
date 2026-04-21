@@ -307,10 +307,7 @@ pub struct MarketScanner {
 
 impl MarketScanner {
     pub fn new(db_path: &str) -> Result<Self, String> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        let client = crate::http_client::secure_client_tagged(30, "scanner")?;
 
         let db = ScannerDB::new(db_path)?;
 

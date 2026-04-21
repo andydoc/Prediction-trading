@@ -474,10 +474,7 @@ impl Executor {
         instruments: Arc<InstrumentStore>,
         rate_limiter: Arc<RateLimiter>,
     ) -> Result<Self, String> {
-        let http_client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
-            .build()
-            .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+        let http_client = crate::http_client::secure_client_tagged(HTTP_TIMEOUT_SECS, "executor")?;
         Ok(Self {
             config,
             signer,

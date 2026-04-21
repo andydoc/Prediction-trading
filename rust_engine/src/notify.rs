@@ -150,10 +150,7 @@ impl Notifier {
     /// will be in noop mode (all sends are silently skipped).
     pub fn new(config: NotifyConfig) -> Self {
         let client = if config.enabled && !config.webhook_url.is_empty() {
-            match reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-            {
+            match crate::http_client::secure_client_tagged(10, "notify") {
                 Ok(c) => {
                     let backend = if config.webhook_url.contains("api.telegram.org") {
                         "Telegram"
