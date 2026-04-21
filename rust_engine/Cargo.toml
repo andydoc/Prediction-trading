@@ -28,6 +28,7 @@ tokio-stream = "0.1"
 chrono = "0.4"
 async-stream = "0.3"
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
+zeroize = { version = "1.7", features = ["zeroize_derive"] }
 serde_yaml_ng = "0.9"
 secrecy = "0.10"
 sysinfo = "0.33"

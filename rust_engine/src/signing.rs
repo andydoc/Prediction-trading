@@ -183,17 +183,29 @@ pub struct OrderSigner {
 
 impl OrderSigner {
     /// Create a new signer from a hex-encoded private key (with or without 0x prefix).
+    ///
+    /// G3 (F-pre-3): the intermediate `key_bytes` Vec is explicitly zeroized
+    /// after `PrivateKeySigner::from_bytes` consumes it. The PrivateKeySigner
+    /// itself holds the key internally and is not zeroized on drop — this is
+    /// a known gap pending upstream alloy support (alloy-signer-local does
+    /// not currently implement Zeroize on its key material). Wrapping it
+    /// would require an unsafe transmute which is worse than the gap.
     pub fn new(private_key_hex: &str) -> Result<Self, String> {
+        use zeroize::Zeroize;
         let key_hex = private_key_hex.strip_prefix("0x").unwrap_or(private_key_hex);
-        let key_bytes = hex::decode(key_hex)
+        let mut key_bytes = hex::decode(key_hex)
             .map_err(|e| format!("Invalid private key hex: {}", e))?;
         if key_bytes.len() != 32 {
+            key_bytes.zeroize();
             return Err(format!("Private key must be 32 bytes, got {}", key_bytes.len()));
         }
 
-        let signer = PrivateKeySigner::from_bytes(
+        let signer_result = PrivateKeySigner::from_bytes(
             &FixedBytes::from_slice(&key_bytes),
-        ).map_err(|e| format!("Invalid private key: {}", e))?;
+        );
+        // Zeroize the intermediate buffer regardless of from_bytes outcome.
+        key_bytes.zeroize();
+        let signer = signer_result.map_err(|e| format!("Invalid private key: {}", e))?;
 
         let ctf_addr: Address = CTF_EXCHANGE.parse()
             .map_err(|e| format!("Invalid CTF Exchange address: {}", e))?;
@@ -245,7 +257,11 @@ impl OrderSigner {
 // ---------------------------------------------------------------------------
 
 /// CLOB API credentials returned by /auth/derive-api-key or /auth/api-key.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// G3 (F-pre-3): `Zeroize, ZeroizeOnDrop` — `secret` and `passphrase` are
+/// wiped from memory on drop. `Clone` is preserved; each clone is
+/// independently zeroized when its own scope ends.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct ClobApiCreds {
     #[serde(rename = "apiKey")]
     pub api_key: String,
@@ -395,7 +411,13 @@ impl OrderSigner {
 // ---------------------------------------------------------------------------
 
 /// L2 HMAC-SHA256 auth for CLOB API trading endpoints.
-#[derive(Clone)]
+///
+/// G3 (F-pre-3): `Zeroize, ZeroizeOnDrop` — `secret` and `passphrase` are
+/// wiped from memory on drop. The `address` is also zeroized for hygiene
+/// (the wallet address is public on-chain but treating it as sensitive
+/// is harmless and keeps the derive uniform). `Clone` is preserved; each
+/// clone is independently zeroized when its own scope ends.
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct ClobAuth {
     api_key: String,
     secret: Vec<u8>,  // base64url-decoded secret
