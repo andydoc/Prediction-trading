@@ -469,6 +469,44 @@ impl VirtualPortfolio {
         deployed / self.config.initial_capital * 100.0
     }
 
+    /// Capital velocity (G5 / F-pre-5): average days each dollar was deployed
+    /// over the lookback period, expressed as a number of days.
+    ///
+    /// Computed as: (sum over positions of deployed * hold_days) / initial_capital.
+    /// Includes closed positions whose close_ts falls in the window plus all
+    /// currently open positions (using now - entry_ts for their hold time).
+    ///
+    /// Interpretation:
+    ///  - 0.5 → on average, each dollar of initial capital was deployed for ~12h total
+    ///  - 5.0 → ~5 days of deployment per dollar (moderate)
+    ///  - 28.0 (over a 28-day window) → 100% deployed every moment
+    ///  - >28.0 → over-deployed via leverage / capital recycling beyond initial
+    ///
+    /// Higher = more capital put to work; meaningful only paired with PnL.
+    fn capital_velocity(&self, days: u32) -> f64 {
+        if self.config.initial_capital <= 0.0 { return 0.0; }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let cutoff = now - (days as f64 * 86400.0);
+
+        let closed_dd: f64 = self.closed_positions.iter()
+            .filter(|p| p.close_ts >= cutoff)
+            .map(|p| {
+                let hold_days = (p.close_ts - p.entry_ts).max(0.0) / 86400.0;
+                p.capital_deployed * hold_days
+            })
+            .sum();
+        let open_dd: f64 = self.open_positions.values()
+            .map(|p| {
+                let hold_days = (now - p.entry_ts).max(0.0) / 86400.0;
+                p.capital_deployed * hold_days
+            })
+            .sum();
+
+        (closed_dd + open_dd) / self.config.initial_capital
+    }
+
     /// Turnover rate: resolved trades per day.
     fn turnover_rate(&self, days: u32) -> f64 {
         let now = std::time::SystemTime::now()
@@ -660,6 +698,7 @@ impl StrategyTracker {
                 "win_rate": (p.win_rate() * 10.0).round() / 10.0,
                 "avg_hold_hours": (p.avg_hold_hours() * 10.0).round() / 10.0,
                 "capital_util_pct": (p.capital_utilisation_pct() * 10.0).round() / 10.0,
+                "capital_velocity_28d": (p.capital_velocity(28) * 100.0).round() / 100.0,
                 "turnover_rate_14d": (p.turnover_rate(14) * 100.0).round() / 100.0,
                 "total_entered": p.total_entered,
                 "total_resolved": p.total_wins + p.total_losses,
