@@ -1402,16 +1402,33 @@ impl Orchestrator {
             self.engine.latency.record_eval_batch(batch_us);
         }
 
-        // Feed ALL opportunities to strategy tracker (unfiltered by held)
+        // Compute the quality reject reason for every opportunity once per tick.
+        // Used to gate BOTH the shadow tracker feed and the live execution path
+        // — INC-018 fix: shadow and live must apply the same quality gates
+        // (depth/book/AI) so shadow P&L reflects what live could physically take.
+        let reject_reasons: Vec<Option<&'static str>> = result.opportunities.iter()
+            .map(|opp| self.quality_reject_reason(opp))
+            .collect();
+
+        // Feed quality-passing opportunities to strategy tracker (unfiltered by held).
         if let Some(ref mut tracker) = self.strategy_tracker {
             if !result.opportunities.is_empty() {
                 let fee_rate = self.engine.eval_config.lock().fee_rate;
-                tracker.process_opportunities(&result.opportunities, fee_rate);
-                *self.engine.strategy_summary.lock() = tracker.build_summary();
+                let passing: Vec<Opportunity> = result.opportunities.iter()
+                    .zip(reject_reasons.iter())
+                    .filter(|(_, r)| r.is_none())
+                    .map(|(o, _)| o.clone())
+                    .collect();
+                if !passing.is_empty() {
+                    tracker.process_opportunities(&passing, fee_rate);
+                    *self.engine.strategy_summary.lock() = tracker.build_summary();
+                }
             }
         }
 
-        // Log all evaluated opportunities to SQLite for post-run analysis
+        // Log all evaluated opportunities to SQLite for post-run analysis.
+        // `rejected_reason` is populated from `quality_reject_reason` so shadow/live
+        // divergences leave a DB breadcrumb (INC-018 telemetry fix).
         if !result.opportunities.is_empty() {
             let now_ts = now_secs();
             // Collect which strategies accepted each opp
@@ -1432,7 +1449,7 @@ impl Orchestrator {
                     now_ts, &opp.constraint_id, &opp.method, opp.market_ids.len(),
                     opp.expected_profit, opp.expected_profit_pct, opp.total_capital_required,
                     opp.hours_to_resolve, opp.expected_profit_pct / opp.hours_to_resolve.max(0.01),
-                    false, None, accepted,
+                    false, reject_reasons[i], accepted,
                 );
             }
         }
@@ -2753,18 +2770,24 @@ impl Orchestrator {
         }
     }
 
-    fn validate_opportunity(&self, opp: &Opportunity, held_cids: &HashSet<String>, held_mids: &HashSet<String>) -> bool {
-        if held_cids.contains(&opp.constraint_id) { return false; }
-        for mid in &opp.market_ids {
-            if held_mids.contains(mid) { return false; }
-        }
-
+    /// Quality filters that should apply uniformly to live AND shadow execution.
+    /// Returns `Some(reason_tag)` if the opportunity should be rejected, `None` if it passes.
+    ///
+    /// These are checks about whether the opportunity is *actionable*:
+    /// book depth, book freshness, semantic exhaustiveness (AI), resolution
+    /// horizon. They do NOT include inventory/held checks — those are
+    /// path-specific (live PM vs shadow portfolios). See INC-018.
+    ///
+    /// Reason tags (stable, used in `evaluated_opportunities.rejected_reason`
+    /// and in `SKIP (...)` log lines): `"depth"`, `"no_book"`, `"stale_book"`,
+    /// `"unrepresented_outcome"`, `"ai_date"`.
+    fn quality_reject_reason(&self, opp: &Opportunity) -> Option<&'static str> {
         // B1.0: Depth gating — skip if any leg has insufficient depth
         if self.cfg.min_depth_per_leg > 0.0 && opp.min_leg_depth_usd < self.cfg.min_depth_per_leg {
             tracing::debug!("SKIP (depth): {}... min_depth=${:.2} < ${:.2}",
                 truncate(&opp.constraint_id, 30),
                 opp.min_leg_depth_usd, self.cfg.min_depth_per_leg);
-            return false;
+            return Some("depth");
         }
 
         // B1.3: Book staleness — check that all legs have fresh book data
@@ -2778,12 +2801,13 @@ impl Orchestrator {
                             tracing::debug!("SKIP (no book): {}... asset {} has no book data",
                                 truncate(&opp.constraint_id, 30),
                                 truncate(asset_id, 16));
+                            return Some("no_book");
                         } else {
                             tracing::debug!("SKIP (stale book): {}... asset {} is {:.1}s old",
                                 truncate(&opp.constraint_id, 30),
                                 truncate(asset_id, 16), age);
+                            return Some("stale_book");
                         }
-                        return false;
                     }
                 }
             }
@@ -2796,9 +2820,14 @@ impl Orchestrator {
                 .unwrap_or(0);
 
             if let Some(validation) = rv.validate(&opp.constraint_id, mid) {
-                if validation.has_unrepresented_outcome {
+                // INC-018 follow-up: unrepresented outcomes are CATASTROPHIC for
+                // buy_all (all candidate YES = $0 if uncovered winner wins) but
+                // BENIGN for sell_all (all candidate NOs pay $1 if uncovered winner
+                // wins — maximum profit case). See INC-017 "Lessons". Only gate
+                // buy_all here; sell_all with unrepresented outcomes is a valid arb.
+                if validation.has_unrepresented_outcome && !opp.is_sell {
                     tracing::info!("SKIP (unrepresented outcome): {}...", truncate(&opp.constraint_id, 30));
-                    return false;
+                    return Some("unrepresented_outcome");
                 }
                 if let Ok(vd) = chrono::NaiveDate::parse_from_str(&validation.latest_resolution_date, "%Y-%m-%d") {
                     let today = chrono::Utc::now().date_naive();
@@ -2807,13 +2836,21 @@ impl Orchestrator {
                         tracing::debug!("SKIP (AI date): {} resolves in {}d > {}d",
                             truncate(&opp.constraint_id, 30),
                             days, self.cfg.max_days_entry);
-                        return false;
+                        return Some("ai_date");
                     }
                 }
             }
         }
 
-        true
+        None
+    }
+
+    fn validate_opportunity(&self, opp: &Opportunity, held_cids: &HashSet<String>, held_mids: &HashSet<String>) -> bool {
+        if held_cids.contains(&opp.constraint_id) { return false; }
+        for mid in &opp.market_ids {
+            if held_mids.contains(mid) { return false; }
+        }
+        self.quality_reject_reason(opp).is_none()
     }
 
     /// Extract LIVE bid prices for a position's markets from the order book.

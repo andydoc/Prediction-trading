@@ -4,6 +4,121 @@ Operational incidents for the Prediction Market Arbitrage System. Most recent fi
 
 ---
 
+### INC-018: Shadow/Live Divergence — Hull City Startup-Race Miss (2026-04-23)
+
+**Severity**: LOW (first observation; no capital impact — live correctly abstained)
+**Status**: OPEN — reactive-fix policy adopted
+
+**Summary**: 75 seconds after rearming on the newly-rebuilt Dublin VPS, a mutex-arb
+opportunity on a Hull City 3-way fired. The live executor correctly SKIPPED
+(`SKIP (no book): mutex_0xda4e7ddcec2ea870744128... asset 2053143248550204 has no
+book data`) because one of the three WS order books had not yet populated after
+restart. However, the strategy tracker (Shadow-D et al.) entered the position
+anyway, using something other than the live WS book (likely the Gamma REST
+snapshot or a stale fetch). Shadow portfolio booked an entry that live physically
+could not.
+
+**Detection**: Operator noticed shadow portfolios showed open positions after
+arming; forensics on `journalctl` found the single `SKIP (no book)` line at
+10:46:15.628 UTC, 75s after the 10:45:00 UTC armed restart.
+
+**Root Cause**: `strategy_tracker` evaluation path does not enforce the same
+book-freshness gate that `eval.rs` applies on the live path. When any of the
+3 legs has no WS book data, live refuses but shadow proceeds on best-available
+pricing.
+
+**Impact**: Shadow P&L systematically overstates what live could execute during
+any window where WS book coverage is incomplete (restarts, new hot-constraint
+promotions, shard disconnects). Worst during the first ~1–2 minutes after a
+service restart. No direct capital impact; the safety behaviour of the live
+path is correct.
+
+**Mitigation (initial wipe)**: Wiped `strategy_open_positions` /
+`strategy_closed_positions`, reset all 6 strategy portfolios to $100, restarted
+armed at 10:49:33 UTC. WS shards had fully converged by that point
+(7938/7938 assets, all ~584 hot constraints with book data), so the
+book-staleness race could not recur until the next restart.
+
+**Update 2026-04-23 ~15:45 UTC — second-occurrence investigation**:
+After the 10:49 wipe, four new shadow entries appeared within the next ~5 hours,
+none of which entered live:
+
+| t (UTC)  | constraint                          | method          | profit% | accepted_by       |
+|----------|-------------------------------------|-----------------|---------|-------------------|
+| 12:54:33 | `mutex_0x751f4f67…` Horníček/Atubolu "most clean sheets" | `mutex_sell_all` | 5.25%   | Shadow-B, C, **D** |
+| 15:08:07 | `mutex_0xf6139c35…` Argentina vs Algeria 3-way            | `mutex_buy_all`  | 4.16%   | Shadow-B          |
+
+Forensics:
+- The Horníček/Atubolu one hit `SKIP (unrepresented outcome)` in live at
+  12:54:33.268. The AI resolution validator correctly flagged that "most
+  clean sheets in Europa League" has ~20+ candidate goalkeepers, not 2 —
+  the AI answer was semantically correct. **However, the orchestrator's use
+  of that flag was wrong**: it rejected for both buy_all and sell_all, but
+  per INC-017 lessons unrepresented outcomes are *catastrophic* only for
+  buy_all. For sell_all (which this was), an uncovered winner pays all our
+  NO tokens at $1 — the maximum-profit case. **Live's rejection was
+  over-conservative — shadow-B/C/D taking this opp was the correct call.**
+  We have been leaving valid sell_all arbs on the table since INC-017
+  shipped.
+- The Argentina/Algeria one has no `SKIP` line in the journal but did not
+  enter live (`evaluated_opportunities.entered=0`, `rejected_reason=NULL`).
+  Most likely rejected on depth or staleness at the execution tick; the
+  reject-reason telemetry gap prevents a definitive call post-hoc.
+
+This reveals TWO distinct issues:
+1. **Shadow/live asymmetry** (the original INC-018 framing): shadow uses raw
+   `eval.rs` output; live additionally applies `validate_opportunity` in
+   `orchestrator.rs` which gates on depth (B1.0), book staleness (B1.3),
+   unrepresented outcomes, and AI date bounds. Shadow bypasses all four.
+2. **Wrong direction on `unrepresented_outcome` for sell_all**: the
+   orchestrator gate was over-conservative — should only reject when
+   `!opp.is_sell`.
+
+**Fix (2026-04-23) — deployed in commit _TBD_**:
+1. Extracted `quality_reject_reason(&self, opp) -> Option<&'static str>` from
+   `validate_opportunity` — canonical reject tag for depth / no_book /
+   stale_book / unrepresented_outcome / ai_date.
+2. Strategy tracker feed now filters opportunities through
+   `quality_reject_reason` before `process_opportunities`. Shadow and live
+   are gated identically on quality; only holdings/inventory differ.
+3. `evaluated_opportunities.rejected_reason` now populated from
+   `quality_reject_reason` output instead of hardcoded `None`. Future
+   shadow/live divergences leave a DB breadcrumb.
+4. **INC-017 follow-on correction**: `has_unrepresented_outcome` now only
+   rejects when `!opp.is_sell`. Sell_all with unrepresented outcomes is
+   explicitly allowed — uncovered winner pays all NO tokens (max profit).
+   The Horníček/Atubolu opp would have entered live under this fix.
+5. Shadow state wiped and service restarted armed post-deploy.
+
+**Lessons**:
+- Shadow-path divergence is a two-way signal: it can reveal missing gates
+  in shadow OR over-conservative gates in live. Always investigate which
+  direction is wrong before "fixing" in one direction.
+- AI flags should be interpreted in the context of the trade structure
+  (buy_all vs sell_all). The flag `has_unrepresented_outcome` is a
+  semantic property of the market; its trading implication depends on
+  which side we're taking.
+- Reject-reason telemetry matters. NULL `rejected_reason` rows in
+  `evaluated_opportunities` are a forensic black hole.
+
+**Fix Policy (adopted 2026-04-23)**: Divergences of this class are handled
+**reactively**: as each occurs, (1) log it as a new INC entry, (2) fix toward
+parity with live (Option B — shadow gates on same book-freshness/fresh-data
+requirement as live), (3) wipe shadow state tables, (4) restart service armed.
+Not chasing proactive coverage; waiting for real divergences to reveal which
+gates matter.
+
+**Lessons**:
+- Shadow P&L is a strategy-comparison signal, not a forecast of live P&L,
+  unless shadow and live share identical entry gates.
+- Warm-up window (WS book convergence) is ~60–120s post-restart at current
+  shard count; avoid drawing conclusions from shadow entries inside that window.
+- The live path's strict "no book → no trade" gate is working correctly and
+  should be the reference behaviour; any subsystem that tracks positions
+  should match it.
+
+---
+
 ### INC-017: Non-Exhaustive Mutex Arb — Hong Kong Temperature (2026-04-01)
 
 **Severity**: MEDIUM
