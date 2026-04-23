@@ -72,7 +72,7 @@ safety:
     critical_balance: 5.0            # CB trip under $5 (below low_balance_pause_usd)
 
 notifications:
-  hostname: madrid
+  hostname: dublin
 
 dashboard:
   port: 5558                    # main live engine port (not 5563 which is shadow-d)
