@@ -30,12 +30,17 @@ live_trading:
   # Rebuild underway on Dublin VPS (38.180.151.102). Wallet blockchain state
   # (balance + approvals) persists; CLOB L2 creds will auto-derive on first boot
   # via create_or_derive_api_key against the fresh EOA signature.
-  # 2026-04-23: DISARMED for Dublin first-boot validation. Re-arm after:
-  #   - service starts cleanly, CLOB L2 creds derived, /balance-allowance 200 OK
-  #   - shadow evals run for at least one market cycle
-  #   - dashboard tunnel confirmed reachable
+  # 2026-04-23 06:38 UTC: First boot on Dublin — DISARMED for validation.
+  # Verified: clean start, CLOB L2 creds derived (key=c5a8fcd5...), wallet
+  # 0x37B2…A105 has $100.02 USDC.e + 14.47 POL + MAX approvals on all 3
+  # exchange contracts, eval loop p50=31μs / p95=727μs, 17 WS shards / 7938
+  # assets / 584 hot constraints, 1.7M msgs ingested, 0 errors, dashboard
+  # tunnel reachable via Windows ssh after icacls ACL fix.
+  # /balance-allowance 401 persists (same pre-existing issue as Madrid;
+  # on-chain fallback works).
+  # 2026-04-23 ~07:15 UTC: RE-ARMED on operator signal.
   # See docs/INCIDENT_LOG.md.
-  execute_orders: false         # G1 executor DISARMED — Dublin first-boot validation
+  execute_orders: true          # G1 executor ARMED — live trading on Dublin
   initial_capital: 100          # $100 USDC.e starting bankroll
   max_capital: 200              # cap auto-sizing; prevents over-allocation on bumper days
   max_positions: 8              # aligned with Strategy D max_concurrent_positions
