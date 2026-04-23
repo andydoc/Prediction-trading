@@ -74,7 +74,7 @@ This reveals TWO distinct issues:
    orchestrator gate was over-conservative — should only reject when
    `!opp.is_sell`.
 
-**Fix (2026-04-23) — deployed in commit _TBD_**:
+**Fix (2026-04-23) — deployed in commit 35899c7, restarted 15:58:58 UTC**:
 1. Extracted `quality_reject_reason(&self, opp) -> Option<&'static str>` from
    `validate_opportunity` — canonical reject tag for depth / no_book /
    stale_book / unrepresented_outcome / ai_date.
