@@ -22,12 +22,20 @@ arbitrage:
 live_trading:
   enabled: true
   shadow_only: false            # REAL ORDERS — Q1=B armed-live per operator decision 2026-04-21
-  # 2026-04-21 20:10 UTC: DISARMED pending wallet reconciliation.
-  # On-chain diagnostic revealed EOA holds $65.11 USDC.e (stakeable) + $100 native USDC
-  # (stranded — Polymarket can't accept native). Operator is swapping $34.89 native→USDC.e
-  # and returning $65.11 native to Binance. Re-arm by flipping to true after wallet shows
-  # ~$100 USDC.e and $0 native; see docs/INCIDENT_LOG.md entry (TODO on re-arm).
-  execute_orders: false         # G1 executor DISARMED — overnight hold
+  # 2026-04-22 16:xx UTC: Wallet rotated to 0x37B2…A105 after old key (0x21f1…bfb1)
+  # transited the Windows clipboard during a MetaMask re-import step. Unlimited USDC.e
+  # approvals set on CTF Exchange, NegRisk Exchange, NegRisk Adapter. Bankroll
+  # (~$100 USDC.e) transferred to rotated wallet.
+  # 2026-04-22 ~22:00 UTC: Madrid VPS terminated by provider (missed payment).
+  # Rebuild underway on Dublin VPS (38.180.151.102). Wallet blockchain state
+  # (balance + approvals) persists; CLOB L2 creds will auto-derive on first boot
+  # via create_or_derive_api_key against the fresh EOA signature.
+  # 2026-04-23: DISARMED for Dublin first-boot validation. Re-arm after:
+  #   - service starts cleanly, CLOB L2 creds derived, /balance-allowance 200 OK
+  #   - shadow evals run for at least one market cycle
+  #   - dashboard tunnel confirmed reachable
+  # See docs/INCIDENT_LOG.md.
+  execute_orders: false         # G1 executor DISARMED — Dublin first-boot validation
   initial_capital: 100          # $100 USDC.e starting bankroll
   max_capital: 200              # cap auto-sizing; prevents over-allocation on bumper days
   max_positions: 8              # aligned with Strategy D max_concurrent_positions
