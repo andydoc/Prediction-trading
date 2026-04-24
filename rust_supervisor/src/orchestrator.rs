@@ -1140,6 +1140,36 @@ impl Orchestrator {
             }
         }
 
+        // 5c. NT-3: Orphan-order sweep (live mode only).
+        //
+        // Queries the CLOB for all LIVE orders and cancels any that the
+        // executor isn't tracking. Closes a gap where an order submitted
+        // right before a crash/reboot would otherwise remain live on the
+        // venue indefinitely — the engine comes up with no memory of it,
+        // and if it later fills the DB has no record.
+        //
+        // Matters particularly now that pt-safe-reboot auto-reboots on
+        // kernel/libc updates: the more frequent the reboots, the larger
+        // the orphan-order risk without this sweep.
+        //
+        // Skipped in shadow mode (no venue orders exist) and when the
+        // executor isn't available (e.g. config with live_trading disabled).
+        if !self.cfg.shadow_only {
+            if let Some(executor) = self.executor.as_ref() {
+                let (found, cancelled) = executor.sweep_orphan_orders(&self.cfg.clob_host);
+                if found > 0 {
+                    tracing::info!(
+                        "NT-3 startup orphan sweep: {} live orders on CLOB, {} cancelled as orphan",
+                        found, cancelled
+                    );
+                } else {
+                    tracing::debug!("NT-3 startup orphan sweep: no live orders on CLOB");
+                }
+            } else {
+                tracing::debug!("NT-3 startup orphan sweep: no executor (live_trading disabled)");
+            }
+        }
+
         // 6. Check API for missed resolutions
         if self.cfg.shadow_only {
             let (results, disputes) = self.engine.check_api_resolutions();

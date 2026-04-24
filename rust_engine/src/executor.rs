@@ -876,6 +876,38 @@ impl Executor {
             .collect()
     }
 
+    /// Return the set of all order IDs the executor is currently tracking.
+    ///
+    /// Used by the startup orphan-order sweep (`reconciliation::sweep_orphan_orders`)
+    /// to distinguish "our" live orders from strays left behind by a prior
+    /// process crash or a failed trade. Includes terminal orders too — not
+    /// harmful to "protect" a filled/cancelled order ID from the sweep since
+    /// the CLOB will never return it as LIVE. Empty IDs (pre-submission) are
+    /// filtered out so they don't match unrelated orders.
+    pub fn all_tracked_order_ids(&self) -> std::collections::HashSet<String> {
+        self.tracked.lock().values()
+            .map(|o| o.order_id.clone())
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+
+    /// Query the CLOB for live orders and cancel any the executor isn't tracking.
+    /// Wrapper over `reconciliation::sweep_orphan_orders` that plugs in this
+    /// executor's http client, auth, and tracked set. Returns (found, cancelled).
+    ///
+    /// Safe no-op in shadow mode: `clob_auth` is `None`, so the sweep runs
+    /// unauthenticated and returns (0,0) — Polymarket's `/orders` endpoint
+    /// requires L2 auth to return anything useful.
+    pub fn sweep_orphan_orders(&self, clob_host: &str) -> (usize, usize) {
+        let tracked = self.all_tracked_order_ids();
+        crate::reconciliation::sweep_orphan_orders(
+            &self.http_client,
+            clob_host,
+            self.clob_auth.as_ref(),
+            &tracked,
+        )
+    }
+
     /// Get timed-out orders (submitted but no update within confirmation_timeout).
     pub fn timed_out_orders(&self) -> Vec<TrackedOrder> {
         let now = chrono::Utc::now().timestamp() as f64;
