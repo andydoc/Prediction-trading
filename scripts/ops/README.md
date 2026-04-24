@@ -54,13 +54,37 @@ sudo systemctl enable --now pt-safe-reboot.timer
 
 `pt-safe-reboot.sh` blocks reboot until all of:
 
-- `open_positions` (live PM) = 0 — never reboot mid-trade
-- `queue_urgent` = 0 — no pending time-sensitive evaluations
+- `queue_urgent` = 0 — no pending time-sensitive evaluations (don't reboot
+  mid-evaluation; a trade decision in flight could be lost)
 - `ws_live` ≥ 1 — not rebooting into a reconnection storm
 
+**Open positions are NOT a drain blocker.** Startup reconciliation handles
+offline state changes for both live and shadow paths:
+
+- Resolved markets: `check_api_resolutions` (rust_engine/src/lib.rs) polls
+  Data API for each open position on startup and auto-closes any that
+  settled while offline, crediting P&L correctly.
+- Partial fills landed offline: quantity-mismatch detection in
+  `apply_reconciliation` (same file) syncs DB `leg.shares` to venue.
+- Shadow positions: same resolution check runs when `shadow_only=true`
+  (orchestrator.rs), and SQLite-persisted state survives reboots.
+
+Gating on open positions would mean the box could go weeks without
+rebooting, accumulating unpatched kernel/libc CVEs for no real safety
+gain — the only thing we'd actually be protecting is in-flight order
+submission, which is covered by the `queue_urgent` gate.
+
 Background queue depth is ignored (long-running constraint refresh is not
-trade-critical). Shadow positions are persistent and intentionally not
-checked — they survive reboots via SQLite.
+trade-critical).
 
 If drain doesn't happen within `MAX_WAIT_SECS` (default 1800 = 30 min),
 the script exits 1 and the timer retries 15 min later.
+
+## Known gap
+
+`sweep_orphan_orders` (rust_engine/src/reconciliation.rs:~576) exists but
+is not called on startup. An open limit order that the engine wasn't
+tracking (e.g., submitted right before restart, fill not yet confirmed)
+will remain live on CLOB across a reboot. This is orthogonal to reboot
+frequency — it already affects every manual restart — and should be
+fixed by wiring the sweep into the startup sequence.

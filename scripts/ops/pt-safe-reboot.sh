@@ -81,20 +81,25 @@ PY
     [ -z "$parsed" ] && return 1
     read -r OPEN Q_URG Q_BG WS_LIVE WS_SUB <<< "$parsed"
 
-    # Drain criteria:
-    #  - no open live positions (resolving / in-flight trades would be lost)
-    #  - urgent eval queue empty (background queue is allowed to be non-zero
-    #    because it's long-running constraint refresh, not trading work)
+    # Drain criteria (open positions are OK — see note below):
+    #  - urgent eval queue empty (don't reboot mid-evaluation; background
+    #    queue is allowed non-zero because it's long-running constraint
+    #    refresh, not trading work)
     #  - at least one healthy WS connection (avoids rebooting during a
     #    reconnection storm when we'd restart in the same unhealthy state)
+    #
+    # Why open positions are NOT a blocker:
+    #  - Resolved markets are detected on startup by check_api_resolutions
+    #    (rust_engine/src/lib.rs) for both live (Data API) and shadow paths,
+    #    and auto-close with correct P&L.
+    #  - Partial fills that landed offline are reconciled via quantity
+    #    mismatch detection in apply_reconciliation (same file).
+    #  - If we gated on open positions the box could go weeks without
+    #    rebooting, accumulating unpatched kernel/libc vulnerabilities.
     log "drain check: open=$OPEN q_urg=$Q_URG q_bg=$Q_BG ws_live=$WS_LIVE ws_sub=$WS_SUB"
 
-    if [ "$OPEN" -gt 0 ]; then
-        log "not drained: $OPEN live positions still open"
-        return 1
-    fi
     if [ "$Q_URG" -gt 0 ]; then
-        log "not drained: $Q_URG urgent queue items"
+        log "not drained: $Q_URG urgent queue items (mid-evaluation)"
         return 1
     fi
     if [ "$WS_LIVE" -lt 1 ]; then
