@@ -573,80 +573,120 @@ mod tests {
 
 /// Query the CLOB for all live orders and cancel any not in our tracked set.
 /// Call at startup after state load to clean up orders from a previous crash.
+///
+/// Endpoints (per Polymarket CLOB docs):
+///   GET  /data/orders       → {"data":[OpenOrder,...]} — list live orders
+///   DELETE /orders          → batch cancel, body {"ids":[...]} (max 3000)
+/// Both require L2 HMAC auth; returns (0,0) unauthenticated.
 pub fn sweep_orphan_orders(
     http_client: &reqwest::blocking::Client,
     clob_host: &str,
     auth: Option<&crate::signing::ClobAuth>,
     tracked_order_ids: &std::collections::HashSet<String>,
 ) -> (usize, usize) {
-    // Query live orders
-    let url = format!("{}/orders?status=LIVE", clob_host);
-    let mut req = http_client.get(&url);
-    if let Some(auth) = auth {
-        let headers = auth.build_headers("GET", "/orders?status=LIVE", None);
-        for (k, v) in headers {
-            req = req.header(&k, &v);
+    // Without L2 auth, /data/orders returns 401 — bail out as a no-op to avoid
+    // log spam and a useless round-trip.
+    let auth = match auth {
+        Some(a) => a,
+        None => {
+            tracing::debug!("NT-3: skipped (no L2 auth — shadow mode)");
+            return (0, 0);
         }
+    };
+
+    // 1. List live orders: GET /data/orders
+    let list_path = "/data/orders";
+    let url = format!("{}{}", clob_host, list_path);
+    let mut req = http_client.get(&url);
+    for (k, v) in auth.build_headers("GET", list_path, None) {
+        req = req.header(&k, &v);
     }
     let resp = match req.send() {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("NT-3: Failed to query live orders: {}", e);
+            tracing::warn!("NT-3: GET {} failed: {}", list_path, e);
             return (0, 0);
         }
     };
-
     if !resp.status().is_success() {
-        tracing::warn!("NT-3: GET /orders returned {}", resp.status());
+        tracing::warn!("NT-3: GET {} returned {}", list_path, resp.status());
         return (0, 0);
     }
-
     let body: serde_json::Value = match resp.json() {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!("NT-3: Failed to parse live orders response: {}", e);
-            return (0, 0);
-        }
-    };
-    let orders = match body.as_array() {
-        Some(arr) => arr,
-        None => {
-            tracing::debug!("NT-3: No live orders found");
+            tracing::warn!("NT-3: Failed to parse /data/orders response: {}", e);
             return (0, 0);
         }
     };
 
-    let mut found = 0usize;
-    let mut cancelled = 0usize;
+    // Response shape: {"data": [OpenOrder, ...], "next_cursor": "..."}
+    // Older / unwrapped responses returned a bare array — accept both to be
+    // resilient to API shape changes.
+    let orders: &Vec<serde_json::Value> = if let Some(arr) = body.get("data").and_then(|v| v.as_array()) {
+        arr
+    } else if let Some(arr) = body.as_array() {
+        arr
+    } else {
+        tracing::debug!("NT-3: no live orders on CLOB");
+        return (0, 0);
+    };
+
+    let found = orders.len();
+    if found == 0 {
+        tracing::debug!("NT-3: no live orders on CLOB");
+        return (0, 0);
+    }
+
+    // 2. Identify orphans
+    let mut orphan_ids: Vec<String> = Vec::new();
     for order in orders {
-        found += 1;
-        let order_id = order["id"].as_str().unwrap_or("");
-        if order_id.is_empty() { continue; }
-
-        if !tracked_order_ids.contains(order_id) {
-            tracing::warn!("NT-3: Orphan order detected: {} — cancelling", order_id);
-            // Cancel single order
-            let cancel_url = format!("{}/order/{}", clob_host, order_id);
-            let mut cancel_req = http_client.delete(&cancel_url);
-            if let Some(auth) = auth {
-                let headers = auth.build_headers("DELETE", &format!("/order/{}", order_id), None);
-                for (k, v) in headers {
-                    cancel_req = cancel_req.header(&k, &v);
-                }
-            }
-            match cancel_req.send() {
-                Ok(r) if r.status().is_success() => {
-                    cancelled += 1;
-                    tracing::info!("NT-3: Cancelled orphan order {}", order_id);
-                }
-                Ok(r) => tracing::warn!("NT-3: Cancel {} returned {}", order_id, r.status()),
-                Err(e) => tracing::warn!("NT-3: Cancel {} failed: {}", order_id, e),
-            }
+        let id = order["id"].as_str().unwrap_or("");
+        if id.is_empty() { continue; }
+        if !tracked_order_ids.contains(id) {
+            orphan_ids.push(id.to_string());
         }
     }
 
-    if found > 0 {
-        tracing::info!("NT-3: Orphan order sweep: {} live orders, {} orphans cancelled", found, cancelled);
+    if orphan_ids.is_empty() {
+        tracing::info!("NT-3: {} live orders on CLOB, all tracked (no orphans)", found);
+        return (found, 0);
     }
-    (found, cancelled)
+
+    tracing::warn!(
+        "NT-3: {} live orders on CLOB, {} orphans: {:?} — batch-cancelling",
+        found, orphan_ids.len(), orphan_ids,
+    );
+
+    // 3. Batch cancel: DELETE /orders with body {"ids": [...]}. We send the
+    // body as exact JSON via serde_json to guarantee the signing hash matches
+    // the bytes on the wire.
+    let cancel_path = "/orders";
+    let cancel_url = format!("{}{}", clob_host, cancel_path);
+    let body_json = serde_json::json!({"ids": orphan_ids});
+    let body_str = body_json.to_string();
+    let mut cancel_req = http_client
+        .delete(&cancel_url)
+        .header("Content-Type", "application/json")
+        .body(body_str.clone());
+    for (k, v) in auth.build_headers("DELETE", cancel_path, Some(&body_str)) {
+        cancel_req = cancel_req.header(&k, &v);
+    }
+    match cancel_req.send() {
+        Ok(r) if r.status().is_success() => {
+            let cancelled = orphan_ids.len();
+            tracing::info!("NT-3: batch-cancelled {} orphan orders", cancelled);
+            (found, cancelled)
+        }
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().unwrap_or_default();
+            tracing::warn!("NT-3: DELETE /orders returned {} body={}", status, text);
+            (found, 0)
+        }
+        Err(e) => {
+            tracing::warn!("NT-3: DELETE /orders failed: {}", e);
+            (found, 0)
+        }
+    }
 }

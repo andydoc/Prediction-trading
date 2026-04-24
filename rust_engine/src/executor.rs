@@ -895,9 +895,9 @@ impl Executor {
     /// Wrapper over `reconciliation::sweep_orphan_orders` that plugs in this
     /// executor's http client, auth, and tracked set. Returns (found, cancelled).
     ///
-    /// Safe no-op in shadow mode: `clob_auth` is `None`, so the sweep runs
-    /// unauthenticated and returns (0,0) — Polymarket's `/orders` endpoint
-    /// requires L2 auth to return anything useful.
+    /// Safe no-op in shadow mode: `clob_auth` is `None`, so the sweep skips
+    /// the query entirely — Polymarket's `/data/orders` endpoint requires L2
+    /// auth and would 401.
     pub fn sweep_orphan_orders(&self, clob_host: &str) -> (usize, usize) {
         let tracked = self.all_tracked_order_ids();
         crate::reconciliation::sweep_orphan_orders(
