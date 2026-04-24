@@ -80,6 +80,24 @@ trade-critical).
 If drain doesn't happen within `MAX_WAIT_SECS` (default 1800 = 30 min),
 the script exits 1 and the timer retries 15 min later.
 
+## 24h stuck-update alert
+
+If `reboot-required` persists for ≥ `ALERT_AFTER_SECS` (default 86400 = 24h)
+without drain ever succeeding, `pt-safe-reboot.sh` sends a one-shot Telegram
+alert so the operator knows the update is blocked. It reads the bot token
+from `config/secrets.yaml` (`telegram_bot_token`) and the chat id from
+`config/config.yaml` (`phone_number` under the notifier block).
+
+State files used for this:
+
+| File | Meaning |
+|------|---------|
+| `/var/lib/prediction-trader/safe-reboot-pending-since` | Epoch timestamp of the first tick that saw `reboot-required`. Used to compute the 24h window. Cleared when reboot-required goes away. |
+| `/var/lib/prediction-trader/safe-reboot-alert-sent` | Sentinel — one alert per reboot cycle. Cleared when reboot-required goes away. |
+
+The alert text includes the host, the pkg list, and a suggested `sudo reboot`
+escape hatch for operators who accept the mid-trade risk.
+
 ## Known gap
 
 `sweep_orphan_orders` (rust_engine/src/reconciliation.rs:~576) exists but
