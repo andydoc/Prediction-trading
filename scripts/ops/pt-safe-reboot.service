@@ -1,0 +1,10 @@
+[Unit]
+Description=Drain-safe reboot for prediction-trader after unattended-upgrade
+# Don't run if the system is already shutting down / rebooting.
+ConditionPathExists=/var/run/reboot-required
+After=prediction-trader.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pt-safe-reboot.sh
+# Script is idempotent and safe to re-run; the timer handles scheduling.

@@ -1,0 +1,15 @@
+[Unit]
+Description=Periodically check for pending kernel/libc reboot and drain-safely reboot
+# Only run when reboot-required is set — the service has ConditionPathExists
+# as a backstop but the timer condition avoids waking up for nothing.
+
+[Timer]
+# Start checking 5 min after boot so the engine has time to warm up its WS
+# shards before the drain check runs. Then check every 15 min.
+OnBootSec=5min
+OnUnitActiveSec=15min
+Unit=pt-safe-reboot.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1230,11 +1230,18 @@ impl Orchestrator {
         self.engine.shadow_only.store(self.cfg.shadow_only, Ordering::SeqCst);
         tracing::info!("Orchestrator ready [{}] — entering event loop", mode_str);
 
-        // Send startup notification
+        // Send startup notification.
+        // `reason` is sourced from TRADER_START_REASON env var so systemd / the
+        // safe-restart hook can tag why this start happened ("manual",
+        // "post_unattended_upgrade", "crash_recovery", "kernel_update", etc.)
+        // without needing a new CLI flag. Defaults to "manual" when unset.
+        let start_reason = std::env::var("TRADER_START_REASON")
+            .unwrap_or_else(|_| "manual".to_string());
         let _ = self.notifier.send(&NotifyEvent::Startup {
             mode: mode_str.to_string(),
             positions: self.engine.pm_open_count(),
             capital: self.engine.current_capital(),
+            reason: start_reason,
         });
 
         // E3: Record test period end time for dashboard countdown

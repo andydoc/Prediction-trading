@@ -52,6 +52,12 @@ pub enum NotifyEvent {
         mode: String,
         positions: usize,
         capital: f64,
+        /// Human-readable startup reason. Sourced from `TRADER_START_REASON`
+        /// env var (set by systemd drop-in / safe-restart hook) or defaults
+        /// to "manual" if unset. Makes restart events self-documenting on
+        /// Telegram so unattended-upgrade restarts are not confused with
+        /// operator-initiated restarts.
+        reason: String,
     },
     /// B3.2: Trade failed on-chain — suspense reversed, opposing legs may need selling.
     TradeFailed {
@@ -405,10 +411,10 @@ impl Notifier {
                     pfx, entries, exits, fees, net_pnl, capital_util_pct * 100.0, drawdown_pct * 100.0
                 )
             }
-            NotifyEvent::Startup { mode, positions, capital } => {
+            NotifyEvent::Startup { mode, positions, capital, reason } => {
                 format!(
-                    "{}[STARTUP] Engine started\nMode: {}\nOpen positions: {}\nCapital: ${:.2}",
-                    pfx, mode, positions, capital
+                    "{}[STARTUP] Engine started\nReason: {}\nMode: {}\nOpen positions: {}\nCapital: ${:.2}",
+                    pfx, reason, mode, positions, capital
                 )
             }
             NotifyEvent::TradeFailed {
