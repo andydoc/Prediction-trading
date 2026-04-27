@@ -876,6 +876,23 @@ impl Executor {
             .collect()
     }
 
+    /// INC-020: Snapshot all tracked SELL orders for a given position_id.
+    /// Used by the live proactive-exit reconciliation path to find the actual
+    /// filled quantity and price per leg after submission.
+    ///
+    /// Returns a Vec of (market_id, filled_quantity, avg_fill_price, terminal).
+    /// `terminal` indicates the order has reached a final state (Confirmed,
+    /// Failed, or Cancelled) — the caller should only reconcile when all legs
+    /// are terminal, or after the FAK fill window has elapsed.
+    pub fn sell_orders_for_position(
+        &self, position_id: &str,
+    ) -> Vec<(String, f64, f64, bool)> {
+        self.tracked.lock().values()
+            .filter(|o| o.position_id == position_id && o.side == Side::Sell)
+            .map(|o| (o.market_id.clone(), o.filled_quantity, o.avg_fill_price, o.status.is_terminal()))
+            .collect()
+    }
+
     /// Return the set of all order IDs the executor is currently tracking.
     ///
     /// Used by the startup orphan-order sweep (`reconciliation::sweep_orphan_orders`)

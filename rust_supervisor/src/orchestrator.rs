@@ -2945,46 +2945,158 @@ impl Orchestrator {
             tracing::info!("PROACTIVE EXIT: {}... ratio={:.3}",
                 truncate(&exit.position_id, 40), exit.ratio);
 
-            // Capture constraint_id, assets, and deployed capital before liquidation
-            let (cid, assets, deployed) = {
+            // Capture constraint_id, assets, deployed capital, and per-leg
+            // (token_id, current_shares) BEFORE any mutation.
+            let (cid, assets, deployed, legs_pre): (String, Vec<String>, f64, Vec<(String, String, f64)>) = {
                 let pm = self.engine.positions.lock();
                 match pm.get_position(&exit.position_id) {
                     Some(p) => {
                         let cid = p.metadata.get("constraint_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let assets: Vec<String> = p.markets.keys().cloned().collect();
                         let deployed = p.total_capital;
-                        (cid, assets, deployed)
+                        let legs: Vec<(String, String, f64)> = p.markets.iter()
+                            .map(|(mid, leg)| {
+                                let tok = if !leg.token_id.is_empty() { leg.token_id.clone() } else { mid.clone() };
+                                (mid.clone(), tok, leg.shares)
+                            }).collect();
+                        (cid, assets, deployed, legs)
                     }
-                    None => (String::new(), Vec::new(), 0.0),
+                    None => (String::new(), Vec::new(), 0.0, Vec::new()),
                 }
             };
 
             let bids = self.get_position_bids_by_id(&exit.position_id);
-            if let Some((net, profit)) = self.engine.liquidate_position(&exit.position_id, "proactive_exit", &bids) {
-                self.held_ids_cache = None;
-                // Tiered WS: move assets back to Tier B if still hot
-                if self.cfg.use_tiered_ws && !cid.is_empty() {
-                    let still_hot = self.last_constraint_to_assets.contains_key(&cid);
-                    self.engine.tiered_on_position_exit(&cid, assets, still_hot);
-                }
-                tracing::info!("  Sold: freed ${:.2}, profit=${:+.2}", net, profit);
 
-                // Forward proactive exit to strategy tracker
-                if !cid.is_empty() {
-                    if let Some(ref mut tracker) = self.strategy_tracker {
-                        let profit_pct = if deployed > 0.0 { profit / deployed } else { 0.0 };
-                        let close_ts = now_secs();
-                        tracker.proactive_exit_with_db(&cid, profit_pct, close_ts, &self.state_db);
-                        *self.engine.strategy_summary.lock() = tracker.build_summary();
+            // ----------------------------------------------------------------
+            // INC-020: Live execution path (real CLOB sells via executor) vs.
+            // shadow paper bookkeeping.
+            //
+            // PRE-INC-020 BUG: this branch unconditionally called the paper
+            // `liquidate_position` even in live mode — crediting `current_capital`
+            // as if shares had been sold while the wallet still held them. With
+            // proactive exits firing on ~78% of trades historically, the live
+            // accounting would have rapidly diverged from the wallet on the
+            // first live arb taken. Fixed by routing live exits through the
+            // executor and only booking proceeds from actual fills.
+            // ----------------------------------------------------------------
+            let live_mode = !self.cfg.shadow_only && self.executor.is_some();
+
+            let (net, profit, fully_closed) = if live_mode {
+                let executor = self.executor.as_ref().expect("live_mode implies executor present");
+                // Build leg list: (market_id, token_id, bid_price, shares_to_sell).
+                // Skip legs whose share count is below the executor's hard floor
+                // (compute_order_quantity rejects <0.01 shares). Below-min residuals
+                // hold to resolution — they'd error at submit time anyway.
+                let mut exec_legs: Vec<(String, String, f64, f64)> = Vec::new();
+                let mut skipped_below_min: Vec<String> = Vec::new();
+                for (mid, tok, shares) in &legs_pre {
+                    if *shares < 0.01 {
+                        skipped_below_min.push(mid.clone());
+                        continue;
+                    }
+                    let bid = bids.get(mid).copied().unwrap_or(0.0);
+                    if bid <= 0.0 {
+                        tracing::warn!("INC-020 exit: leg {} has no bid — skipping", truncate(mid, 30));
+                        continue;
+                    }
+                    exec_legs.push((mid.clone(), tok.clone(), bid, *shares));
+                }
+                if !skipped_below_min.is_empty() {
+                    tracing::info!("INC-020 exit: skipping {} below-min legs (will hold to resolution): {:?}",
+                        skipped_below_min.len(), skipped_below_min);
+                }
+                if exec_legs.is_empty() {
+                    tracing::warn!("INC-020 exit: no submittable legs for {} — position holds",
+                        truncate(&exit.position_id, 40));
+                    continue;
+                }
+
+                tracing::info!("INC-020 submitting {} FAK SELLs for position {}",
+                    exec_legs.len(), truncate(&exit.position_id, 40));
+                let submit_result = self.engine.execute_position_exit(executor, &exit.position_id, &exec_legs);
+                if !submit_result.all_accepted {
+                    tracing::warn!("INC-020 exit: partial submission ({} legs accepted of {})",
+                        submit_result.legs.iter().filter(|r| matches!(r, rust_engine::executor::OrderResult::Accepted(_))).count(),
+                        submit_result.legs.len());
+                }
+
+                // Wait briefly for FAK fills to settle. FAK orders either fill
+                // (fully or partially) within milliseconds and the rest is
+                // auto-cancelled by the CLOB. WS fill events update tracked
+                // order state; we poll a few times to give them a chance.
+                let mut tracked_fills: Vec<(String, f64, f64, bool)> = Vec::new();
+                for _ in 0..6 {  // ~3 seconds total
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    tracked_fills = executor.sell_orders_for_position(&exit.position_id);
+                    if !tracked_fills.is_empty() && tracked_fills.iter().all(|(_, _, _, terminal)| *terminal) {
+                        break;
                     }
                 }
 
-                let _ = self.notifier.send(&NotifyEvent::ProactiveExit {
-                    position_id: exit.position_id.clone(),
-                    profit,
-                    ratio: exit.ratio,
-                });
+                if tracked_fills.is_empty() {
+                    tracing::warn!("INC-020 exit: no tracked SELL orders found for {} — position holds, no bookkeeping update",
+                        truncate(&exit.position_id, 40));
+                    continue;
+                }
+
+                // Translate tracked fills into ExitLegFill records and apply.
+                let exit_fills: Vec<rust_engine::position::ExitLegFill> = tracked_fills.iter()
+                    .filter(|(_, qty, _, _)| *qty > 0.0)
+                    .map(|(mid, qty, price, _)| rust_engine::position::ExitLegFill {
+                        market_id: mid.clone(),
+                        filled_shares: *qty,
+                        avg_fill_price: *price,
+                    })
+                    .collect();
+
+                if exit_fills.is_empty() {
+                    tracing::warn!("INC-020 exit: zero fills on all submitted legs for {} — position holds",
+                        truncate(&exit.position_id, 40));
+                    continue;
+                }
+
+                match self.engine.apply_exit_fills(&exit.position_id, &exit_fills, "proactive_exit") {
+                    Some(outcome) => (outcome.net_proceeds, outcome.realised_profit, outcome.closed),
+                    None => {
+                        tracing::error!("INC-020 exit: apply_exit_fills returned None for {} — bookkeeping out of sync",
+                            truncate(&exit.position_id, 40));
+                        continue;
+                    }
+                }
+            } else {
+                // Shadow / paper-only mode: legacy path is correct here.
+                // No real shares exist; "sold at bid" is the model.
+                match self.engine.liquidate_position(&exit.position_id, "proactive_exit", &bids) {
+                    Some((n, p)) => (n, p, true),
+                    None => continue,
+                }
+            };
+
+            self.held_ids_cache = None;
+            // Tiered WS: move assets back to Tier B only when fully closed.
+            if fully_closed && self.cfg.use_tiered_ws && !cid.is_empty() {
+                let still_hot = self.last_constraint_to_assets.contains_key(&cid);
+                self.engine.tiered_on_position_exit(&cid, assets, still_hot);
             }
+            tracing::info!("  Exit: net=${:.2}, profit=${:+.2}, fully_closed={}", net, profit, fully_closed);
+
+            // Forward proactive exit to strategy tracker only when the position
+            // is fully closed — partial exits leave the position open and
+            // shadow tracking continues until the next event.
+            if fully_closed && !cid.is_empty() {
+                if let Some(ref mut tracker) = self.strategy_tracker {
+                    let profit_pct = if deployed > 0.0 { profit / deployed } else { 0.0 };
+                    let close_ts = now_secs();
+                    tracker.proactive_exit_with_db(&cid, profit_pct, close_ts, &self.state_db);
+                    *self.engine.strategy_summary.lock() = tracker.build_summary();
+                }
+            }
+
+            let _ = self.notifier.send(&NotifyEvent::ProactiveExit {
+                position_id: exit.position_id.clone(),
+                profit,
+                ratio: exit.ratio,
+            });
         }
     }
 

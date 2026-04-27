@@ -4,6 +4,120 @@ Operational incidents for the Prediction Market Arbitrage System. Most recent fi
 
 ---
 
+### INC-020: Proactive Exits Did Not Submit Real CLOB Sells — Phantom-Proceeds Latent Bug (2026-04-27)
+
+**Severity**: CRITICAL (would have caused immediate accounting/wallet divergence on first live arb post-INC-019 fix)
+**Status**: FIXED — discovered + fixed in the same session, never bit live because pre-INC-019 the gamma_freshness false-positive prevented all live entries
+
+**Summary**: When the live engine detected a proactive-exit opportunity (liquidation
+value ≥ 1.2× resolution payout), it called `engine.liquidate_position()` —
+which only does paper bookkeeping. **No CLOB sell order was ever submitted.**
+The accounting credited `current_capital += net_proceeds` and moved the
+position to `closed_positions`, but the actual ERC-1155 share tokens stayed
+in the wallet. At resolution they would have paid out (or not) on top of the
+already-credited "exit proceeds", double-counting on wins and producing
+phantom losses on losers.
+
+**Detection**: User asked whether early exits were calibrated. Investigation
+of `orchestrator.rs::check_proactive_exits` (line 2941) revealed the call
+chain: `→ engine.liquidate_position` → `lib.rs:712` → only paper bookkeeping
++ accounting-ledger record from `current_bids` (top-of-book), no executor
+call. Confirmed by reading the entire path from `check_proactive_exits`
+through to the CLOB submit primitives — the executor's `execute_arb` is
+fully sell-capable and present, just not wired here.
+
+**Why it never bit production**: Live capital sat at $100 with zero open
+positions throughout 2026-04-23 → 2026-04-27 because INC-019's
+gamma_freshness false-positive blocked every entry. So the proactive-exit
+code never had a real position to mishandle. The bug would have manifested
+on the first arb entry following the INC-019 fix shipped earlier the same
+day (commit `de3cf09`).
+
+**Historical context — the 78% / 74% data**: SQLite snapshot
+`state_rust.db.bak` (Mar 22) shows 32 closed positions from earlier
+paper-trading runs: **25 (78%)** closed via `proactive_exit` at avg **74.33%
+profit**, **7 (22%)** via `resolved` at avg 7.97%. That data is from shadow
+/ paper mode where the "sold at top bid" model is the *intended* abstraction
+— not from a real wallet. So the 350% portfolio growth recorded in earlier
+backups was a *valid simulation* result, not real money.
+
+**Fix (commit pending — this session)**:
+
+1. **`rust_engine/src/position.rs`** — added `ExitLegFill` and `ExitOutcome`
+   types plus `PositionManager::apply_exit_fills(position_id, &[ExitLegFill],
+   reason)`. Reduces per-leg shares by ACTUAL filled amounts, credits ACTUAL
+   proceeds (filled_shares × fill_price − fees, not bid×shares), and only
+   moves the position to `closed_positions` when every leg has reached zero
+   shares. Partials reduce the position in place; below-min residuals hold
+   to resolution.
+
+2. **`rust_engine/src/lib.rs`** — added `Engine::apply_exit_fills` (wraps
+   the PM method + records ACTUAL fills on the accounting ledger via
+   `record_sell_dedup`) and `Engine::execute_position_exit(executor, …)`
+   (translates `(market_id, token_id, bid, shares)` legs into FAK SELL
+   orders via the existing `Executor::execute_arb`). Added a doc comment to
+   the legacy `liquidate_position` warning callers it's paper-only and
+   must not be used in live trading contexts (except `reason="resolution"`
+   where the platform itself settles the tokens).
+
+3. **`rust_engine/src/executor.rs`** — added
+   `Executor::sell_orders_for_position(pid)` returning per-leg
+   `(market_id, filled_qty, avg_fill_price, terminal)` so the orchestrator
+   can reconcile from real fills after the FAK window closes.
+
+4. **`rust_supervisor/src/orchestrator.rs::check_proactive_exits`** — split
+   live vs. shadow paths:
+   - **Live** (`!shadow_only && executor.is_some()`): collect per-leg
+     `(mid, token, bid, shares)`; skip below-min legs (logged); submit
+     FAK SELLs via `engine.execute_position_exit`; poll
+     `executor.sell_orders_for_position` up to ~3s (six 500ms ticks); apply
+     actual fills via `engine.apply_exit_fills`. If any phase produces
+     zero submittable legs or zero fills, the position is **left open** —
+     no phantom proceeds credited.
+   - **Shadow / paper-only**: legacy `engine.liquidate_position` retained;
+     same behaviour as before because there are no real shares to sell.
+
+**Pre-live testing limits acknowledged**: this is a money-handling
+correctness fix that can't be fully validated without a real arb entering
+live AND the bid then crossing the 1.2× exit gate. Tests cover the unit
+behaviour of `apply_exit_fills` (full close, partial close, zero fills)
+but the end-to-end CLOB submission path requires real-money observation.
+Mitigations: (a) safety guard in `liquidate_position` doc comment, (b)
+explicit "no fills → position holds" branches in the orchestrator, (c)
+Telegram alert on every exit submission so the operator can spot-check
+against the wallet.
+
+**Lessons**:
+
+- "It was tested in shadow" is not the same as "it was tested live." Shadow
+  / paper modes use idealised execution models that are fine *as models*
+  but mask real-execution gaps. Any code path that touches real money needs
+  a separate review checking the executor is actually invoked, not just
+  the bookkeeping.
+- Function names like `liquidate_position` create strong implications
+  ("liquidate = sell"). The legacy method only ever did bookkeeping and
+  ledger-recording — should probably be renamed `book_paper_liquidation`
+  or similar. Filed as a follow-up rename.
+- Symmetric instrumentation (entry vs. exit) is missing. Entries go through
+  `executor.execute_arb` which is well-tested. Exits had no equivalent
+  test coverage of the actual submission path. The new tests cover the PM
+  bookkeeping; exec-path tests should follow once the live deploy has
+  shaken out edge cases.
+
+**Open follow-ups**:
+- **PROACTIVE_EXIT_MULTIPLIER calibration** (raised by user): the 1.2 value
+  is arbitrary. The historical 25 proactive exits captured an avg 74%
+  profit at the 1.2 gate, which strongly suggests we're exiting too early
+  on average. Calibration needs (a) value-curve recording (`ratio` over
+  time per position) and (b) book-depth recording (both bid and ask, 5
+  levels each) to model the liquidity-adjusted exit ratio achievable at
+  full position size. Filed as a separate work item.
+- **Rename** `PositionManager::liquidate_position` → `book_paper_liquidation`
+  and `Engine::liquidate_position` similarly, to make the safety contract
+  obvious from the name. Keep `apply_exit_fills` as the live-path API.
+
+---
+
 ### INC-019: gamma_freshness 100% False-Reject — 11 Live Trades Missed (2026-04-27)
 
 **Severity**: HIGH (revenue impact — 5 winning shadow-D trades worth +10.16% missed live across 4 days)

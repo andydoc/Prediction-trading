@@ -709,6 +709,96 @@ impl TradingEngine {
         self.positions.lock().check_proactive_exits(current_bids, exit_multiplier)
     }
 
+    /// INC-020: Apply real CLOB exit fills to a position. Wraps
+    /// `PositionManager::apply_exit_fills` and also records the sells on the
+    /// accounting ledger using the **actual** filled prices/sizes — not
+    /// bid×shares (which is what the legacy `liquidate_position` does).
+    ///
+    /// Returns `Some(ExitOutcome)` if the position existed; `None` otherwise.
+    pub fn apply_exit_fills(
+        &self,
+        position_id: &str,
+        fills: &[position::ExitLegFill],
+        reason: &str,
+    ) -> Option<position::ExitOutcome> {
+        // Snapshot per-leg cost basis before mutating PM (used for accounting)
+        let asset_index: HashMap<String, (String, f64)> = {
+            let pm = self.positions.lock();
+            pm.open_positions().get(position_id).map(|p| {
+                p.markets.iter().map(|(mid, leg)| {
+                    let asset_id = if !leg.token_id.is_empty() {
+                        leg.token_id.clone()
+                    } else {
+                        mid.clone()
+                    };
+                    let per_share_cost = if leg.shares > 0.0 {
+                        leg.bet_amount / leg.shares
+                    } else { 0.0 };
+                    (mid.clone(), (asset_id, per_share_cost))
+                }).collect()
+            }).unwrap_or_default()
+        };
+
+        let outcome = self.positions.lock().apply_exit_fills(position_id, fills, reason)?;
+
+        // Record actual sells on accounting ledger (with dedup per leg).
+        let taker_fee = self.positions.lock().taker_fee();
+        let mut acct = self.accounting.lock();
+        let desc = format!("SELL {} ({})", position_id, reason);
+        for fill in fills {
+            if fill.filled_shares <= 0.0 { continue; }
+            if let Some((asset_id, per_share_cost)) = asset_index.get(&fill.market_id) {
+                let leg_proceeds = fill.filled_shares * fill.avg_fill_price;
+                let leg_fees = leg_proceeds * taker_fee;
+                let cost_basis = per_share_cost * fill.filled_shares;
+                let trade_key = format!("exit_{}_{}", position_id, fill.market_id);
+                acct.record_sell_dedup(
+                    &trade_key, position_id, leg_proceeds, cost_basis, leg_fees,
+                    asset_id, fill.filled_shares, fill.avg_fill_price, &desc,
+                );
+            }
+        }
+
+        Some(outcome)
+    }
+
+    /// INC-020: Submit FAK SELL orders to liquidate position legs at the given
+    /// bid prices. Returns the executor's per-leg result (accepted/rejected).
+    /// Caller must subsequently poll `executor.tracked` for fill amounts and
+    /// then call `apply_exit_fills` with the actual outcomes.
+    ///
+    /// `legs`: (market_id, token_id, bid_price, shares_to_sell). Legs whose
+    /// shares fall below the executor's min order size will be rejected by
+    /// `compute_order_quantity` — caller should pre-filter those if it wants
+    /// silent skipping rather than an error log.
+    pub fn execute_position_exit(
+        &self,
+        executor: &executor::Executor,
+        position_id: &str,
+        legs: &[(String, String, f64, f64)],
+    ) -> executor::ArbExecutionResult {
+        // Translate to the executor's leg shape: (mid, token_id, Side::Sell, price, size_usd)
+        // For FAK SELL, compute_order_quantity uses size_usd / price → shares,
+        // so we pass size_usd = shares * price to recover the intended share count.
+        let exec_legs: Vec<(String, String, signing::Side, f64, f64)> = legs.iter()
+            .map(|(mid, tok, price, shares)| {
+                let size_usd = shares * price;
+                (mid.clone(), tok.clone(), signing::Side::Sell, *price, size_usd)
+            })
+            .collect();
+        executor.execute_arb(position_id, &exec_legs)
+    }
+
+    /// Paper liquidation: assumes all shares sell at top-of-book bid.
+    ///
+    /// **INC-020 SAFETY**: callers MUST ensure this is only invoked in shadow /
+    /// paper-trading contexts, OR for non-trading exit reasons such as
+    /// `"resolution"` (where no CLOB sell is needed because the platform
+    /// settles the tokens itself). Calling this with `reason == "proactive_exit"`
+    /// or `"replaced"` while real shares are held in a wallet would credit
+    /// phantom proceeds and corrupt accounting. The orchestrator's live-mode
+    /// proactive-exit path now uses `apply_exit_fills` (real CLOB submission +
+    /// reconciliation from actual fills) instead.
     pub fn liquidate_position(
         &self, position_id: &str, reason: &str, current_bids: &HashMap<String, f64>,
     ) -> Option<(f64, f64)> {

@@ -63,7 +63,7 @@ Each iteration:
 2. For each constraint: read prices from BookMirror → arb math → opportunities
 3. Filter by profit/resolution thresholds, score by `profit_pct / (hours + p95_delay)`
 4. Enter top-N positions (capital check, leg calculation)
-5. Check proactive exits (positions worth > 1.2× resolution payout)
+5. Check proactive exits (positions worth > 1.2× resolution payout). Live mode submits real FAK SELL orders via `Engine::execute_position_exit` and reconciles bookkeeping from actual fills via `Engine::apply_exit_fills` (INC-020). Shadow mode uses paper bookkeeping (`Engine::liquidate_position`).
 6. Periodic tasks: state save, API resolution check, monitor refresh, constraint rebuild
 
 ---

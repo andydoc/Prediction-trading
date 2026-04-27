@@ -121,6 +121,28 @@ pub struct ProactiveExit {
     pub ratio: f64,  // net_proceeds / resolution_payout (>1.2 = exit)
 }
 
+/// Per-leg fill outcome from a real CLOB exit execution.
+/// Used by `apply_exit_fills` to update position state from actual fills
+/// instead of paper-assumed top-of-book sweeps.
+#[derive(Debug, Clone)]
+pub struct ExitLegFill {
+    pub market_id: String,
+    pub filled_shares: f64,   // shares actually sold (can be < intended_shares for partials)
+    pub avg_fill_price: f64,  // weighted-average fill price
+}
+
+/// Outcome of applying real exit fills to a position.
+#[derive(Debug)]
+pub struct ExitOutcome {
+    pub position_id: String,
+    /// True if the position is now fully closed (all legs reached zero shares).
+    pub closed: bool,
+    /// Sum of (filled_shares * avg_fill_price) across legs, minus taker fees.
+    pub net_proceeds: f64,
+    /// net_proceeds minus the cost basis of the cleared shares.
+    pub realised_profit: f64,
+}
+
 /// Core position manager — owns all capital accounting.
 ///
 /// Thread safety is provided by the outer `Arc<parking_lot::Mutex<PositionManager>>`
@@ -548,6 +570,110 @@ impl PositionManager {
         self.closed_positions.push(position);
 
         Some((liq.net_proceeds, liq.profit))
+    }
+
+    /// INC-020: Apply real CLOB exit fills to a position. Reduces per-leg shares
+    /// by the actual filled amounts, credits actual proceeds (not bid×shares),
+    /// and closes the position only if every leg has reached zero shares.
+    ///
+    /// Caller (orchestrator) is responsible for having already submitted the
+    /// FAK sells via `Executor::execute_position_exit` and waited for the
+    /// CLOB to settle them. This method only books the bookkeeping side.
+    ///
+    /// Returns `None` if the position doesn't exist, otherwise an `ExitOutcome`
+    /// describing what was cleared and whether the position is now closed.
+    pub fn apply_exit_fills(
+        &mut self,
+        position_id: &str,
+        fills: &[ExitLegFill],
+        reason: &str,
+    ) -> Option<ExitOutcome> {
+        let taker_fee = self.taker_fee;
+        let position = self.open_positions.get_mut(position_id)?;
+
+        let mut total_proceeds = 0.0;
+        let mut total_fees = 0.0;
+        let mut total_cost_cleared = 0.0;
+
+        // Apply each fill, reducing shares and tracking proceeds + cost basis
+        // proportional to shares cleared.
+        for fill in fills {
+            if fill.filled_shares <= 0.0 { continue; }
+            let leg = match position.markets.get_mut(&fill.market_id) {
+                Some(l) => l,
+                None => {
+                    tracing::warn!(
+                        "INC-020 apply_exit_fills: leg {} not found on position {} — fill ignored",
+                        fill.market_id, position_id
+                    );
+                    continue;
+                }
+            };
+
+            // Compute the cost-basis fraction being cleared. We estimate per-share
+            // cost as bet_amount / current_share_count BEFORE the fill, so that
+            // the remaining (open) cost basis stays consistent across partials.
+            let pre_shares = leg.shares;
+            let cleared = fill.filled_shares.min(pre_shares.max(0.0));
+            let per_share_cost = if pre_shares > 0.0 {
+                leg.bet_amount / pre_shares
+            } else { 0.0 };
+            let cost_cleared = per_share_cost * cleared;
+
+            let leg_gross = cleared * fill.avg_fill_price;
+            let leg_fee = leg_gross * taker_fee;
+            total_proceeds += leg_gross - leg_fee;
+            total_fees += leg_fee;
+            total_cost_cleared += cost_cleared;
+
+            // Reduce leg by cleared amount
+            leg.shares = (pre_shares - cleared).max(0.0);
+            leg.bet_amount = (leg.bet_amount - cost_cleared).max(0.0);
+        }
+
+        let realised_profit = total_proceeds - total_cost_cleared;
+        position.actual_payout += total_proceeds;
+        position.actual_profit += realised_profit;
+        position.fees_paid += total_fees;
+        position.total_capital = (position.total_capital - total_cost_cleared).max(0.0);
+
+        // Check whether all legs are now exhausted (all reached zero shares).
+        let all_closed = position.markets.values().all(|l| l.shares <= 1e-9);
+
+        let outcome = ExitOutcome {
+            position_id: position_id.to_string(),
+            closed: all_closed,
+            net_proceeds: total_proceeds,
+            realised_profit,
+        };
+
+        // Move to closed_positions only if everything cleared.
+        if all_closed {
+            // Re-borrow without the &mut
+            let mut pos = self.open_positions.remove(position_id)
+                .expect("just had &mut to it");
+            pos.status = "closed".to_string();
+            pos.close_timestamp = Some(now_ts());
+            pos.actual_profit_pct = if pos.total_capital > 0.0 {
+                pos.actual_profit / pos.total_capital
+            } else if total_cost_cleared > 0.0 {
+                pos.actual_profit / total_cost_cleared
+            } else { 0.0 };
+            pos.metadata.insert("close_reason".into(),
+                serde_json::Value::String(reason.to_string()));
+
+            self.current_capital += pos.actual_payout;
+            self.total_actual_profit += pos.actual_profit;
+            if pos.actual_profit > WIN_LOSS_THRESHOLD { self.winning_trades += 1; }
+            else if pos.actual_profit < -WIN_LOSS_THRESHOLD { self.losing_trades += 1; }
+            self.closed_positions.push(pos);
+        } else {
+            // Partial: credit realised proceeds to capital but leave position open.
+            self.current_capital += total_proceeds;
+            self.total_actual_profit += realised_profit;
+        }
+
+        Some(outcome)
     }
 
     // --- Asset index (for WS resolution mapping) ---

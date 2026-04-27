@@ -7,6 +7,59 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [Unreleased] — 2026-04-27
+
+### Fixed (CRITICAL)
+- **INC-020: Proactive exits now submit real CLOB sells in live mode.**
+  Previously, `orchestrator::check_proactive_exits` called the paper-only
+  `engine.liquidate_position()` even with a real wallet, which would have
+  credited phantom proceeds and corrupted accounting on the first live arb
+  to cross the 1.2× exit gate. The bug never bit production because INC-019
+  (gamma_freshness false-positive) had blocked all live entries until the
+  fix landed earlier the same day. Live path now: `Engine::execute_position_exit`
+  → `Executor::execute_arb` (FAK SELL per leg) → poll
+  `Executor::sell_orders_for_position` → `Engine::apply_exit_fills`. Partial
+  fills reduce shares in place; below-min residuals hold to resolution; zero
+  fills leave the position open with no bookkeeping update. Shadow mode
+  retains the legacy paper path.
+- **INC-019: gamma_freshness false-positive fix.** Detect `current >= page_limit`
+  as Gamma's broken-filter symptom and return `Verdict::Ok` with a warn log,
+  instead of `GroupGrew{100,N}` which had been rejecting 100% of negRisk
+  entries since v0.20.3. The `eval.rs` `full_group_size` check at detection
+  time remains the authoritative exhaustiveness gate.
+- **INC-019: live silent-skip telemetry.** `gamma_freshness`, `negRisk_cap_full`,
+  and `insufficient_capital` skip paths in `try_enter_or_replace` now write
+  `rejected_reason` to `evaluated_opportunities` via
+  `state_db.update_opportunity_reject_reason()`. No more invisible rejections.
+
+### Added
+- `position::ExitLegFill`, `ExitOutcome`, and `PositionManager::apply_exit_fills`
+  to apply real CLOB exit fills with partial-fill support.
+- `Engine::execute_position_exit` and `Engine::apply_exit_fills` wrappers that
+  also record actual fills on the accounting ledger.
+- `Executor::sell_orders_for_position(pid)` to query per-leg
+  `(market_id, filled_qty, avg_fill_price, terminal)` after exit submission.
+- `state_db::update_opportunity_reject_reason(constraint_id, reason, max_age_secs)`
+  for retroactively tagging silent skips.
+- Drain-aware reboot automation (`scripts/ops/pt-safe-reboot.{sh,service,timer}`,
+  `pt-service-wrapper.sh`) with 24h failed-update Telegram alert and
+  `TRADER_START_REASON` flowing into Telegram startup messages.
+- `NT-3` startup orphan-order sweep wired into the live boot sequence
+  (`Engine::execute_arb` for entries, `sweep_orphan_orders` against
+  `/data/orders` and `/orders` batch DELETE).
+
+### Known follow-ups
+- `PROACTIVE_EXIT_MULTIPLIER = 1.2` is a hardcoded constant pulled out of thin
+  air. Historical paper data shows 78% of trades exited proactively at avg 74%
+  profit, suggesting the gate fires too early. Empirical calibration needs (a)
+  per-position value-curve recording (ratio over time) and (b) book-depth
+  recording (bid + ask, 5 levels each) to model liquidity-adjusted exit ratio
+  at full position size.
+- Rename `PositionManager::liquidate_position` → `book_paper_liquidation` so
+  the paper-only safety contract is obvious from the name.
+
+---
+
 ## [0.20.3] — 2026-04-21 — Pre-Live Gates + Strategy D Go-Live
 
 ### Shadow Validation Summary (E4 — 28 days, 2026-03-24 → 2026-04-21)
