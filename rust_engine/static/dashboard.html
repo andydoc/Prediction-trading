@@ -1350,11 +1350,30 @@ function splashStatus(msg) {
 }
 function markDataReceived(key) {
   _dataReceived[key] = true;
-  // Dismiss only when we have stats + positions + system + monitor (all visible sections)
-  if (_dataReceived.stats && _dataReceived.positions && _dataReceived.system && _dataReceived.monitor) {
+  // Dismiss only when every tab's primary data has rendered. Adding `strategies`
+  // here ensures the Strategies tab is populated before the splash fades —
+  // previously it could fade with stats+positions+system+monitor in hand and
+  // leave the Strategies tab blank for the first SSE tick.
+  if (_dataReceived.stats && _dataReceived.positions && _dataReceived.system
+      && _dataReceived.monitor && _dataReceived.strategies) {
     dismissSplash();
   }
 }
+// Fallback: if strategies never arrives (e.g. strategy_tracker disabled),
+// don't hang the splash forever. After 10s of having stats+positions+system+monitor,
+// dismiss anyway.
+setInterval(function() {
+  if (_splashDismissed) return;
+  if (_dataReceived.stats && _dataReceived.positions && _dataReceived.system && _dataReceived.monitor) {
+    if (!_dataReceived.strategies && !_strategiesFallbackArmed) {
+      _strategiesFallbackArmed = Date.now();
+    } else if (_strategiesFallbackArmed && (Date.now() - _strategiesFallbackArmed) > 10000) {
+      console.warn('Splash: strategies event never arrived after 10s — dismissing anyway');
+      dismissSplash();
+    }
+  }
+}, 1000);
+var _strategiesFallbackArmed = 0;
 function dismissSplash() {
   if (_splashDismissed) return;
   _splashDismissed = true;
@@ -1416,7 +1435,7 @@ document.addEventListener('DOMContentLoaded', function() { splashStatus('connect
       } catch(ex) { console.warn('closed parse error', ex); }
     });
     es.addEventListener('strategies', function(e) {
-      try { renderStrategies(JSON.parse(e.data)); } catch(ex) { console.warn('strategies parse error', ex); }
+      try { renderStrategies(JSON.parse(e.data)); markDataReceived('strategies'); } catch(ex) { console.warn('strategies parse error', ex); }
     });
     es.addEventListener('live', function(e) {
       try { renderLive(JSON.parse(e.data)); } catch(ex) { console.warn('live parse error', ex); }
