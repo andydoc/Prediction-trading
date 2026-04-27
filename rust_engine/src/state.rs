@@ -699,6 +699,33 @@ impl StateDB {
         );
     }
 
+    /// INC-019: Update the most-recently-logged row for `constraint_id` whose
+    /// `rejected_reason` is still NULL, scoped to the current eval cycle
+    /// (rows with `ts > now - max_age_secs`). Used by live-only silent-skip
+    /// paths in the orchestrator (gamma_freshness, negRisk_cap_full,
+    /// InsufficientCapital) to attach a reject reason after the initial INSERT.
+    /// No-op if no matching row exists. Safe under concurrent INSERTs because
+    /// constraint_id appears at most once per eval batch from the ranker.
+    pub fn update_opportunity_reject_reason(
+        &self, constraint_id: &str, reason: &str, max_age_secs: f64,
+    ) {
+        let db = self.db.conn();
+        let cutoff_ts = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)) - max_age_secs;
+        let _ = db.execute(
+            "UPDATE evaluated_opportunities \
+             SET rejected_reason = ?1 \
+             WHERE id = ( \
+               SELECT id FROM evaluated_opportunities \
+               WHERE constraint_id = ?2 AND rejected_reason IS NULL AND ts > ?3 \
+               ORDER BY id DESC LIMIT 1 \
+             )",
+            params![reason, constraint_id, cutoff_ts],
+        );
+    }
+
     // --- Journal persistence ---
 
     /// Bulk insert journal entries into SQLite.

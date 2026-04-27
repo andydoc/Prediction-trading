@@ -2402,6 +2402,9 @@ impl Orchestrator {
                     if available_nr < self.cfg.min_trade_size {
                         tracing::debug!("SKIP (negRisk cap full): {}... ${:.2} available < ${:.2} min",
                             truncate(&opp.constraint_id, 30), available_nr, self.cfg.min_trade_size);
+                        // INC-019: write reject reason so this isn't a silent skip.
+                        self.state_db.update_opportunity_reject_reason(
+                            &opp.constraint_id, "negRisk_cap_full", 5.0);
                         continue;
                     }
                     let capped = cap.min(available_nr);
@@ -2443,6 +2446,11 @@ impl Orchestrator {
                             truncate(&opp.constraint_id, 40), verdict.reason()
                         );
                         self.gamma_freshness_rejects = self.gamma_freshness_rejects.saturating_add(1);
+                        // INC-019: write reject reason so this isn't a silent skip.
+                        // Reason includes the verdict subtype for forensic granularity.
+                        let tag = format!("gamma_freshness:{}", verdict.reason());
+                        self.state_db.update_opportunity_reject_reason(
+                            &opp.constraint_id, &tag, 5.0);
                         continue;
                     }
                 }
@@ -2587,6 +2595,10 @@ impl Orchestrator {
                 }
                 position::EntryResult::InsufficientCapital { available, required } => {
                     tracing::debug!("Insufficient capital: ${:.2} < ${:.2}", available, required);
+                    // INC-019: write reject reason so this isn't a silent skip.
+                    let tag = format!("insufficient_capital:${:.2}<${:.2}", available, required);
+                    self.state_db.update_opportunity_reject_reason(
+                        &opp.constraint_id, &tag, 5.0);
                 }
             }
         }

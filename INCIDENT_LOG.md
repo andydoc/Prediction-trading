@@ -4,6 +4,104 @@ Operational incidents for the Prediction Market Arbitrage System. Most recent fi
 
 ---
 
+### INC-019: gamma_freshness 100% False-Reject — 11 Live Trades Missed (2026-04-27)
+
+**Severity**: HIGH (revenue impact — 5 winning shadow-D trades worth +10.16% missed live across 4 days)
+**Status**: ROOT-CAUSED — fix in flight
+
+**Summary**: For ~4 days starting 2026-04-24, every negRisk-group mutex arbitrage that
+the scanner correctly identified as a structurally-exhaustive 3-leg group was
+**rejected at the live entry gate** by the runtime `gamma_freshness::check_group_freshness`
+check. Shadow strategies (which skip this check via `!self.cfg.shadow_only`) entered
+and won. Live capital stayed at $100. Shadow-D (strategy that mirrors live's gates)
+grew to $110.16 — the exact 10.16% the user noticed at 11:33 UTC 2026-04-27.
+
+**Detection**: Operator asked "why did we miss 5 trades and 10% growth (live vs strat d
+shadow)?". SQL on `evaluated_opportunities` showed 11 rows with
+`entered=0`, `rejected_reason=NULL`, `strategy_accepted='Shadow-B,Shadow-C,Shadow-D,Shadow-E'`
+— shadows took them, live didn't, and no reason was logged. `journalctl` grep for
+`SKIP \(gamma_freshness` matched all 11 timestamps with the same string:
+**`reason=group_grew:3->100`** for every single one.
+
+**Root Cause**: `rust_engine/src/gamma_freshness.rs:91-94` queries
+```
+GET https://gamma-api.polymarket.com/markets?negRiskMarketID={id}&limit=100
+```
+and counts the returned array length. Polymarket's Gamma API does **not actually
+filter** by `negRiskMarketID` — the same broken behaviour we documented in INC-017's
+investigation. The endpoint just returns the first 100 markets in its catalog. So
+`current` is always exactly 100 (the page-size cap), `expected` is the recorded
+`full_group_size` (typically 3-12), and the verdict is always `GroupGrew { 100, expected }`.
+
+This was a single-line conceptual error: the function assumed Gamma's
+`?negRiskMarketID=` filter worked. INC-017's investigation explicitly noted it
+doesn't, and the structural fix (using `constraint.full_group_size` recorded at
+detection time, in `eval.rs`) was deployed correctly. The runtime gamma_freshness
+check was added at the same time (v0.20.3, 2026-04-21) but never validated against
+the same broken endpoint, and quietly burned every live opportunity since.
+
+**Why shadow worked**: `orchestrator.rs:2433` skips the freshness call entirely when
+`self.cfg.shadow_only`. But the `strategy_tracker` shadow path is a *different*
+mechanism — it operates on the same `Opportunity` stream that the live executor sees,
+*before* the orchestrator's per-opp gates run. So the shadow strategies bypass the
+gamma_freshness gate by virtue of being upstream of it, not by `shadow_only`. Net
+effect: same — shadows ran the trades, live didn't.
+
+**Why we trust shadow over the freshness check**: Shadow-D entered all 5 of these
+"group_grew" opportunities and won 5/5. If the group had genuinely expanded to 100
+outcomes between detection and entry, those YES/NO tokens would have been worthless
+or near-worthless. The 5/5 win record is direct evidence that `full_group_size=3`
+captured at detection time was correct, and that `gamma_freshness` returned a
+spurious "100" every time.
+
+**Impact**: 11 evaluated opportunities silently skipped. 5 of them were trades
+shadow-D won — gross expected profit ~$5–10 each at $30 capital_per_trade (4-9% on
+$30 ≈ $1.20–$2.70/trade). Total missed live profit: roughly **$10 over 4 days**, or
+the entire 10.16% gap visible on Shadow-D vs live.
+
+**Forensic data** (preserved at `docs/forensics/inc019_pre_wipe_20260427_103322Z.txt`
+and `data/forensics/inc019_pre_wipe_20260427_103322Z.txt` on Dublin):
+
+```
+Pre-wipe strategy_portfolios @ 2026-04-27 10:33:22 UTC:
+  Shadow-A    100.00   entered=0  W/L=0/0   evals_seen=10  rejected=10
+  Shadow-B    103.31   entered=5  W/L=5/0   evals_seen=10  rejected=5
+  Shadow-C    106.69   entered=5  W/L=5/0   evals_seen=10  rejected=5
+  Shadow-D    110.16   entered=5  W/L=5/0   evals_seen=10  rejected=5
+  Shadow-E    116.28   entered=4  W/L=4/0   evals_seen=10  rejected=6
+  Shadow-F    100.00   entered=0  W/L=0/0   evals_seen=10  rejected=10
+
+Live PM:        100.00 (initial)  open=0  closed=0  trades=0
+```
+
+**Fixes**:
+
+1. **gamma_freshness.rs**: detect `current == limit` as a broken-filter symptom
+   and return `Verdict::Ok` with a warn-level log, instead of `GroupGrew`. The
+   `eval.rs` `full_group_size` check at evaluation time remains the authoritative
+   exhaustiveness gate (deterministic, uses scanner-time data).
+2. **orchestrator.rs**: every live-only silent-skip path (`gamma_freshness`,
+   `negRisk_cap_full`, `InsufficientCapital`) now writes `rejected_reason` into
+   `evaluated_opportunities`. No more invisible rejections.
+3. **Shadow portfolios reset to $100 / no history** so post-fix comparisons are
+   apples-to-apples. Pre-wipe state preserved in forensics file above.
+
+**Lessons**:
+
+- Any opportunity-level decision that doesn't write to `evaluated_opportunities`
+  is a forensic black hole. The "rejected_reason hardcoded None" gap from INC-018
+  was supposedly fixed yesterday, but only at *one* log site — three other live
+  silent-skip paths still bypassed the table.
+- "Same broken thing in two places" — INC-017's broken `?negRiskMarketID=` was
+  fixed in `eval.rs` but missed in `gamma_freshness.rs`. When fixing a vendor-API
+  defect, grep for *every* call site of the bad endpoint, not just the first one
+  encountered.
+- Live-vs-shadow capital divergence is the canonical regression signal. Daily
+  delta-check should be a dashboard widget — would have caught this within hours
+  instead of days.
+
+---
+
 ### INC-018: Shadow/Live Divergence — Hull City Startup-Race Miss (2026-04-23)
 
 **Severity**: LOW (first observation; no capital impact — live correctly abstained)

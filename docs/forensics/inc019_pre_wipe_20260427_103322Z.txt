@@ -1,0 +1,39 @@
+=== strategy_portfolios @ 20260427_103322Z ===
+name      current_capital   total_entered  total_wins  total_losses  evals_seen  evals_rejected
+--------  ----------------  -------------  ----------  ------------  ----------  --------------
+Shadow-A  100.0             0              0           0             10          10
+Shadow-B  103.308932461666  5              5           0             10          5
+Shadow-C  106.694679129416  5              5           0             10          5
+Shadow-D  110.158357095608  5              5           0             10          5
+Shadow-E  116.282469203746  4              4           0             10          6
+Shadow-F  100.0             0              0           0             10          10
+
+=== evaluated_opportunities (full) ===
+id  time                 cid                                     method          num_legs  profit  hrs     entered  rejected_reason  strategy_accepted
+--  -------------------  --------------------------------------  --------------  --------  ------  ------  -------  ---------------  -----------------------------------
+5   2026-04-24 09:26:29  mutex_0x2d141fb39c92b86389fa461c588c94  mutex_sell_all  3         8.10%   199.3   0        no_book
+6   2026-04-24 22:34:44  mutex_0xe20e8b0c3082522ba241dbdc8ff425  mutex_buy_all   3         4.16%   0.8     0                         Shadow-B,Shadow-C,Shadow-D
+7   2026-04-24 22:34:49  mutex_0xe20e8b0c3082522ba241dbdc8ff425  mutex_buy_all   3         4.16%   0.8     0                         Shadow-B,Shadow-C,Shadow-D
+8   2026-04-24 22:35:20  mutex_0xe20e8b0c3082522ba241dbdc8ff425  mutex_buy_all   3         4.16%   0.7     0                         Shadow-B,Shadow-C,Shadow-D
+9   2026-04-24 22:35:25  mutex_0xe20e8b0c3082522ba241dbdc8ff425  mutex_buy_all   3         6.37%   0.7     0                         Shadow-B,Shadow-C,Shadow-D,Shadow-E
+10  2026-04-25 11:51:09  mutex_0x6f1311295d44d62ac89742b1fc1a45  mutex_sell_all  3         9.28%   2.1     0                         Shadow-B,Shadow-C,Shadow-D,Shadow-E
+11  2026-04-25 12:03:06  mutex_0x4c6141c82839e7a2fd4c03fe39048e  mutex_sell_all  3         7.52%   1188.9  0        no_book
+12  2026-04-25 12:55:44  mutex_0x175a1e473c0f89cc89ec51393f1425  mutex_buy_all   3         4.16%   1.1     0                         Shadow-B,Shadow-C,Shadow-D
+13  2026-04-25 12:55:44  mutex_0x175a1e473c0f89cc89ec51393f1425  mutex_buy_all   3         4.16%   1.1     0                         Shadow-B,Shadow-C,Shadow-D
+14  2026-04-25 22:55:39  mutex_0xfc466c5b741bafbc21cb79551db7d8  mutex_sell_all  3         8.16%   2.6     0                         Shadow-B,Shadow-C,Shadow-D,Shadow-E
+15  2026-04-26 09:08:34  mutex_0x41e77d7cf25534061bf4959e909bc5  mutex_sell_all  3         6.94%   2.4     0                         Shadow-B,Shadow-C,Shadow-D,Shadow-E
+16  2026-04-26 09:35:31  mutex_0x41e77d7cf25534061bf4959e909bc5  mutex_buy_all   3         6.37%   2.0     0                         Shadow-B,Shadow-C,Shadow-D,Shadow-E
+17  2026-04-26 21:11:32  mutex_0x751f4f67c8b0c3bc0d26887fb4dda5  mutex_sell_all  2         7.52%   578.8   0        ai_date
+18  2026-04-26 21:44:34  mutex_0x751f4f67c8b0c3bc0d26887fb4dda5  mutex_sell_all  2         4.16%   578.3   0        ai_date
+19  2026-04-27 05:18:17  mutex_0x48e2d9a1282d3d21044dc55ee676c3  mutex_sell_all  3         14.93%  277.2   0        no_book
+
+=== Notes ===
+- Live PM at $100.00 (initial), open=0 closed=0 trades=0 (entire period 2026-04-24 to 2026-04-27).
+- Shadow-D took 5 wins for +10.16% growth; live took 0.
+- All "missed" rows (id 6,7,8,9,10,12,13,14,15,16) had rejected_reason=NULL but strategy_accepted populated.
+- journalctl grep showed every one was actually rejected by gamma_freshness with `reason=group_grew:3->100`.
+  The "100" is the Gamma /markets?limit=100 page cap, not a real group measurement —
+  Polymarket's negRiskMarketID query parameter does not actually filter (same defect as INC-017).
+- Rows 5,11,17,18,19 were correctly rejected for legitimate reasons (no_book, ai_date).
+
+See INC-019 in INCIDENT_LOG.md for the full write-up.

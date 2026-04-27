@@ -85,12 +85,20 @@ pub fn check_group_freshness(
         Err(e) => return Verdict::NetworkError(format!("client build failed: {}", e)),
     };
 
-    // Polymarket Gamma API supports filtering by negRiskMarketID; the group's
-    // current size is the length of the returned array. limit=100 is far above
-    // any negRisk group size we've observed (typical 4-12).
+    // Polymarket Gamma API: we send `?negRiskMarketID=<id>&limit=N` and count
+    // the returned array length as the current group size.
+    //
+    // INC-019 caveat: the Gamma `negRiskMarketID` filter is **unreliable** —
+    // for many neg_risk_market_ids it ignores the filter entirely and returns
+    // the first N markets in the catalog. When that happens, `current` saturates
+    // at `limit` and every check looks like a `GroupGrew` event. We detect that
+    // failure mode by checking `current == limit` and treating it as a broken-API
+    // signal, falling back to the authoritative `full_group_size` already
+    // verified by `eval.rs::evaluate_batch` at evaluation time.
+    const PAGE_LIMIT: usize = 100;
     let url = format!(
-        "https://gamma-api.polymarket.com/markets?negRiskMarketID={}&limit=100",
-        neg_risk_market_id
+        "https://gamma-api.polymarket.com/markets?negRiskMarketID={}&limit={}",
+        neg_risk_market_id, PAGE_LIMIT
     );
 
     let resp = match client.get(&url).send() {
@@ -113,6 +121,22 @@ pub fn check_group_freshness(
         Some(arr) => arr.len(),
         None => return Verdict::NetworkError("response was not a JSON array".into()),
     };
+
+    // INC-019: broken-filter detection. If the response saturates at the page
+    // limit, Gamma is almost certainly NOT filtering by negRiskMarketID — we
+    // cannot trust `current` as a real measurement of the group, so don't use
+    // it to reject. The eval.rs `full_group_size` check at detection time is
+    // the authoritative gate; this runtime check exists only to catch the
+    // narrow window between scanner refresh and entry, and degrading to Ok on
+    // a broken response is strictly safer than a 100% false-reject rate.
+    if current >= PAGE_LIMIT {
+        tracing::warn!(
+            "gamma_freshness: Gamma returned {} markets (>= page limit {}) for negRiskMarketID={} — \
+             filter likely ignored, falling back to detection-time full_group_size={}",
+            current, PAGE_LIMIT, neg_risk_market_id, expected_size
+        );
+        return Verdict::Ok;
+    }
 
     if current == expected_size {
         Verdict::Ok
