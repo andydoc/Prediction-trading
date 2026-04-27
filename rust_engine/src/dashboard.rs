@@ -217,10 +217,19 @@ async fn handle_sse(
                     serde_json::to_string(&build_monitor(&s, false)).unwrap_or_default()));
             }
 
-            // Opportunities + strategies: every 15s (every 3rd tick)
+            // Opportunities: every 15s (every 3rd tick)
             if tick % 3 == 0 {
                 yield Ok(sse::Event::default().event("opportunities").data(
                     serde_json::to_string(&build_opportunities(&s)).unwrap_or_default()));
+            }
+
+            // Strategies: every tick (5s). Was every 3rd tick, but the dashboard
+            // server starts before the strategy_tracker loads in the orchestrator
+            // startup sequence — so the initial-snapshot guard would skip emission
+            // and the user could see a blank Strategies tab for 15s while waiting
+            // for the next tick % 3 == 0. Payload is small; emitting every tick
+            // is cheaper than the UX bug.
+            {
                 let mut strat = s.strategy_summary.lock().clone();
                 if !strat.is_null() {
                     // E3: Inject test period end timestamp for dashboard countdown

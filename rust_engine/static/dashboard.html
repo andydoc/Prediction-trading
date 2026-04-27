@@ -417,11 +417,16 @@ function renderStats(d) {
   h += st('CASH', 'stat-cash', '$'+d.cash.toFixed(2));
   h += st('DEPLOYED', 'stat-deployed', '$'+d.deployed.toFixed(2));
   h += st('FEES PAID', 'stat-fees', '$'+d.fees.toFixed(2));
+  // USDC + POL come from periodic on-chain polls; show "loading…" until first read
   if (d.live_balance !== null && d.live_balance !== undefined)
     h += st('USDC (LIVE)', 'stat-usdc', '$'+d.live_balance.toFixed(2), 'color-amber');
+  else
+    h += st('USDC (LIVE)', 'stat-usdc', 'loading…', 'color-amber');
   if (d.pol_balance !== null && d.pol_balance !== undefined) {
     var polCls = d.pol_balance < 0.5 ? 'bad' : d.pol_balance < 1.0 ? 'color-amber' : 'good';
     h += st('POL GAS', 'stat-pol', d.pol_balance.toFixed(3)+' POL', polCls);
+  } else {
+    h += st('POL GAS', 'stat-pol', 'loading…', 'color-amber');
   }
   h += st('RETURN', 'stat-return', (d.ret_pct>=0?'+':'')+d.ret_pct.toFixed(1)+'%', d.ret_pct>=0?'good':'bad');
   h += st('TRADES', 'stat-trades', d.trades);
@@ -1359,16 +1364,17 @@ function markDataReceived(key) {
     dismissSplash();
   }
 }
-// Fallback: if strategies never arrives (e.g. strategy_tracker disabled),
-// don't hang the splash forever. After 10s of having stats+positions+system+monitor,
-// dismiss anyway.
+// Fallback: if strategies never arrives (e.g. strategy_tracker disabled or
+// engine stuck), don't hang the splash forever. After 30s of having
+// stats+positions+system+monitor, dismiss anyway. 30s is generous because
+// strategy_tracker loads after WS shard convergence (~15-25s on restart).
 setInterval(function() {
   if (_splashDismissed) return;
   if (_dataReceived.stats && _dataReceived.positions && _dataReceived.system && _dataReceived.monitor) {
     if (!_dataReceived.strategies && !_strategiesFallbackArmed) {
       _strategiesFallbackArmed = Date.now();
-    } else if (_strategiesFallbackArmed && (Date.now() - _strategiesFallbackArmed) > 10000) {
-      console.warn('Splash: strategies event never arrived after 10s — dismissing anyway');
+    } else if (_strategiesFallbackArmed && (Date.now() - _strategiesFallbackArmed) > 30000) {
+      console.warn('Splash: strategies event never arrived after 30s — dismissing anyway');
       dismissSplash();
     }
   }
