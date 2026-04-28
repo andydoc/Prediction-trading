@@ -147,6 +147,81 @@ pub fn check_group_freshness(
     }
 }
 
+/// F-pre-7 boot probe: classify the live state of the Gamma negRiskMarketID
+/// filter so the operator knows whether the runtime check is meaningful or
+/// running in degraded fallback mode.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BootProbeResult {
+    /// Gamma filtered correctly: returned a small array (<page_limit) of markets,
+    /// likely the actual group. The runtime gamma_freshness check is meaningful.
+    FilterWorking { sample_size: usize },
+    /// Gamma returned exactly page_limit markets (saturation): filter is broken
+    /// per INC-019. Runtime check will degrade to Ok/no-op; eval.rs::full_group_size
+    /// remains the authoritative exhaustiveness gate.
+    FilterBroken { sample_size: usize },
+    /// Gamma was unreachable, returned non-2xx, or response was unparseable.
+    /// Runtime check will fail-open (Verdict::NetworkError → caller skips entry).
+    Unreachable { reason: String },
+}
+
+impl BootProbeResult {
+    pub fn summary(&self) -> String {
+        match self {
+            BootProbeResult::FilterWorking { sample_size } =>
+                format!("OK: Gamma filter returned {} markets (working)", sample_size),
+            BootProbeResult::FilterBroken { sample_size } =>
+                format!("DEGRADED: Gamma filter saturated at {} (broken — runtime check is no-op, eval.rs::full_group_size is authoritative)", sample_size),
+            BootProbeResult::Unreachable { reason } =>
+                format!("UNREACHABLE: {}", reason),
+        }
+    }
+}
+
+/// Run the F-pre-7 boot probe. Hits Gamma with an arbitrary negRiskMarketID
+/// and classifies the response. Used at engine startup so the operator can
+/// see in the journal + Telegram which mode the runtime gamma_freshness check
+/// is operating in.
+///
+/// `probe_id` should be a reasonably-stable real negRiskMarketID. We don't
+/// require a specific known-size match — the sample-vs-page-limit comparison
+/// alone tells us whether the filter is working without coupling the test
+/// to a specific market that may resolve.
+pub fn boot_probe(probe_id: &str, timeout: Duration) -> BootProbeResult {
+    const PAGE_LIMIT: usize = 100;
+
+    let timeout_secs = timeout.as_secs().max(1);
+    let client = match crate::http_client::secure_client_tagged(timeout_secs, "gamma_freshness_probe") {
+        Ok(c) => c,
+        Err(e) => return BootProbeResult::Unreachable { reason: format!("client build failed: {}", e) },
+    };
+
+    let url = format!(
+        "https://gamma-api.polymarket.com/markets?negRiskMarketID={}&limit={}",
+        probe_id, PAGE_LIMIT
+    );
+
+    let resp = match client.get(&url).send() {
+        Ok(r) => r,
+        Err(e) => return BootProbeResult::Unreachable { reason: format!("request failed: {}", e) },
+    };
+
+    if !resp.status().is_success() {
+        return BootProbeResult::Unreachable { reason: format!("status {}", resp.status()) };
+    }
+
+    let body: Value = match resp.json() {
+        Ok(v) => v,
+        Err(e) => return BootProbeResult::Unreachable { reason: format!("parse failed: {}", e) },
+    };
+
+    let n = body.as_array().map(|a| a.len()).unwrap_or(0);
+    if n >= PAGE_LIMIT {
+        BootProbeResult::FilterBroken { sample_size: n }
+    } else {
+        BootProbeResult::FilterWorking { sample_size: n }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

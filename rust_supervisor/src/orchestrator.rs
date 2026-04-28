@@ -193,6 +193,9 @@ struct LiveTradingYaml {
     gamma_freshness_check: bool,
     #[serde(default = "default_5000u64")]
     gamma_freshness_timeout_ms: u64,
+    // F-pre-7 strict mode (boot probe abort). Default false.
+    #[serde(default)]
+    gamma_freshness_abort_on_broken_filter: bool,
     // G1 / F-pre-1: executor wiring. When true + shadow_only=false, the engine
     // places real CLOB orders via Executor after each enter_position() success.
     // Default false so shadow mode is safe even if the overlay sets
@@ -431,6 +434,13 @@ pub struct OrchestratorConfig {
     // G7 / F-pre-7: Gamma freshness check
     pub gamma_freshness_check: bool,
     pub gamma_freshness_timeout_ms: u64,
+    /// F-pre-7 strict mode: panic on boot if the Gamma negRiskMarketID
+    /// filter is detected as broken (saturating at page_limit). Default
+    /// false because INC-019 confirmed the filter has been broken for some
+    /// time and `eval.rs::full_group_size` is the authoritative exhaustiveness
+    /// gate. Operator can flip this true when running calibration / strict
+    /// validation work that depends on the live check returning real data.
+    pub gamma_freshness_abort_on_broken_filter: bool,
 
     // G1 / F-pre-1: executor wiring
     pub execute_orders: bool,
@@ -635,6 +645,7 @@ impl OrchestratorConfig {
             min_profit_ratio: cfg.live_trading.min_profit_ratio,
             gamma_freshness_check: cfg.live_trading.gamma_freshness_check,
             gamma_freshness_timeout_ms: cfg.live_trading.gamma_freshness_timeout_ms,
+            gamma_freshness_abort_on_broken_filter: cfg.live_trading.gamma_freshness_abort_on_broken_filter,
 
             // G1: executor wiring. private_key and clob_host are captured here
             // so Orchestrator::new can construct a fresh OrderSigner without
@@ -1167,6 +1178,72 @@ impl Orchestrator {
                 }
             } else {
                 tracing::debug!("NT-3 startup orphan sweep: no executor (live_trading disabled)");
+            }
+        }
+
+        // 5d. F-pre-7 boot probe: classify the live state of Gamma's
+        // negRiskMarketID filter so the operator (and Telegram) sees which
+        // mode the runtime gamma_freshness gate is in. Per INC-019, the
+        // filter has been broken since at least 2026-04-21 — saturating at
+        // page_limit. The probe is informational; it does NOT abort boot
+        // because:
+        //   - eval.rs::full_group_size at detection time is the authoritative
+        //     exhaustiveness gate and remains effective regardless;
+        //   - aborting boot on a Polymarket API defect would lock us out
+        //     until they fix it.
+        // If `gamma_freshness_abort_on_broken_filter` is set true in config,
+        // the probe DOES abort on FilterBroken — operator opt-in for strict
+        // mode (e.g. when running calibration runs that depend on the live
+        // check).
+        if self.cfg.gamma_freshness_check {
+            // Use a stable real negRiskMarketID for the probe. Picked from
+            // the INC-019 forensics — these IDs have been seen historically
+            // and are stable enough to probe with. Falls back to the next
+            // ID if one becomes unreachable.
+            const PROBE_IDS: &[&str] = &[
+                "0x41e77d7cf25534061bf4959e909bc5",   // football constraint, INC-019 forensics row 16
+                "0xfc466c5b741bafbc21cb79551db7d8",   // football, INC-019 row 14
+                "0x6f1311295d44d62ac89742b1fc1a45",   // football, INC-019 row 10
+            ];
+            let timeout = std::time::Duration::from_millis(
+                self.cfg.gamma_freshness_timeout_ms.max(2000)
+            );
+            let mut probe_result = None;
+            for pid in PROBE_IDS {
+                let r = rust_engine::gamma_freshness::boot_probe(pid, timeout);
+                match &r {
+                    rust_engine::gamma_freshness::BootProbeResult::Unreachable { .. } => {
+                        // Try next ID
+                        probe_result = Some(r);
+                        continue;
+                    }
+                    _ => {
+                        probe_result = Some(r);
+                        break;
+                    }
+                }
+            }
+            if let Some(probe) = probe_result {
+                let summary = probe.summary();
+                match &probe {
+                    rust_engine::gamma_freshness::BootProbeResult::FilterWorking { .. } => {
+                        tracing::info!("F-pre-7 boot probe: {}", summary);
+                    }
+                    rust_engine::gamma_freshness::BootProbeResult::FilterBroken { .. } => {
+                        tracing::warn!("F-pre-7 boot probe: {}", summary);
+                        // One-shot Telegram alert so the operator sees this state
+                        let _ = self.notifier.send(&NotifyEvent::Error {
+                            message: format!("F-pre-7: {}", summary),
+                        });
+                        if self.cfg.gamma_freshness_abort_on_broken_filter {
+                            panic!("F-pre-7 boot probe: filter broken AND \
+                                gamma_freshness_abort_on_broken_filter=true — refusing to start");
+                        }
+                    }
+                    rust_engine::gamma_freshness::BootProbeResult::Unreachable { .. } => {
+                        tracing::warn!("F-pre-7 boot probe: {} (all probe IDs failed)", summary);
+                    }
+                }
             }
         }
 
