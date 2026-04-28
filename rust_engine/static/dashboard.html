@@ -1039,8 +1039,59 @@ function getSpanMs(span) {
   }
 }
 
+// Pin the x-axis lower bound to the selected timespan, and pick a tick
+// granularity + display format that's appropriate for the span. Without the
+// span-driven format, Chart.js stays on hour-unit even for a 7-day view,
+// rendering identical "HH:mm" labels for each day with no date distinction.
+//
+// We DON'T set x.max — leaving it as auto means the chart's right edge
+// sits at the latest data point, with no trailing empty space on the right.
+function setChartTimeWindow(chart, cutoffMs, _nowMs, span) {
+  if (!chart || !chart.options || !chart.options.scales || !chart.options.scales.x) return;
+  chart.options.scales.x.min = cutoffMs;
+  // Drop any previously-set max so the right edge tracks the data
+  delete chart.options.scales.x.max;
+
+  // Span-aware time unit + format. Chart.js will auto-pick ticks within the
+  // chosen unit; setting `unit` explicitly prevents it from collapsing to
+  // hour-unit for multi-day views.
+  var t = chart.options.scales.x.time;
+  if (!t) return;
+  if (span === '7d') {
+    t.unit = 'day';
+    t.displayFormats = {
+      hour: 'MMM d HH:mm',
+      day: 'MMM d',
+      week: 'MMM d',
+      month: 'MMM yyyy'
+    };
+  } else if (span === '24h') {
+    t.unit = 'hour';
+    t.displayFormats = {
+      minute: 'HH:mm',
+      hour: 'MMM d HH:mm',
+      day: 'MMM d'
+    };
+  } else if (span === '6h') {
+    t.unit = 'hour';
+    t.displayFormats = {
+      minute: 'HH:mm',
+      hour: 'HH:mm'
+    };
+  } else { // 1h
+    t.unit = 'minute';
+    t.displayFormats = {
+      second: 'HH:mm:ss',
+      minute: 'HH:mm',
+      hour: 'HH:mm'
+    };
+  }
+}
+
 function applyMonitorSpan() {
-  var cutoff = Date.now() - getSpanMs(_monitorSpan);
+  var span = getSpanMs(_monitorSpan);
+  var now = Date.now();
+  var cutoff = now - span;
   Object.keys(monitorCharts).forEach(function(chartId) {
     var chart = monitorCharts[chartId];
     if (!chart) return;
@@ -1052,13 +1103,28 @@ function applyMonitorSpan() {
         ds.data = full.filter(function(pt) { return pt.x >= cutoff; });
       }
     });
+    setChartTimeWindow(chart, cutoff, now, _monitorSpan);
     chart.update('none');
   });
 }
 
 function updateChartSeries(chartId, datasetIdx, seriesKey, points) {
   if (!_monitorSeries[seriesKey]) _monitorSeries[seriesKey] = [];
-  _monitorSeries[seriesKey] = _monitorSeries[seriesKey].concat(points);
+  // Append, then sort + dedupe by x (timestamp). Without this, a snapshot
+  // arriving after deltas (or vice versa, e.g. on SSE reconnect) leaves the
+  // array with timestamps out of chronological order. Chart.js draws lines
+  // in array order, which produced the visible "loop back to beginning"
+  // artifact across all monitor charts.
+  var combined = _monitorSeries[seriesKey].concat(points);
+  combined.sort(function(a, b) { return a.x - b.x; });
+  // Dedupe: when consecutive entries share the same x, keep the most-recent
+  // (last) one — the newer arrival overrides the older.
+  var deduped = [];
+  for (var i = 0; i < combined.length; i++) {
+    if (i + 1 < combined.length && combined[i + 1].x === combined[i].x) continue;
+    deduped.push(combined[i]);
+  }
+  _monitorSeries[seriesKey] = deduped;
   // Cap at 10000 points
   if (_monitorSeries[seriesKey].length > 10000) {
     _monitorSeries[seriesKey] = _monitorSeries[seriesKey].slice(-10000);
@@ -1068,8 +1134,13 @@ function updateChartSeries(chartId, datasetIdx, seriesKey, points) {
   var ds = chart.data.datasets[datasetIdx || 0];
   if (!ds) return;
   ds._seriesKey = seriesKey;
-  var cutoff = Date.now() - getSpanMs(_monitorSpan);
+  var now = Date.now();
+  var cutoff = now - getSpanMs(_monitorSpan);
   ds.data = _monitorSeries[seriesKey].filter(function(pt) { return pt.x >= cutoff; });
+  // Keep the x-axis pinned to the selected timespan window so the right edge
+  // tracks "now" and tick intervals match the selection (5/15/30 min for 1h,
+  // hourly for 6h, 2-hourly for 24h, etc.) regardless of how much data exists.
+  setChartTimeWindow(chart, cutoff, now);
   chart.update('none');
 }
 
