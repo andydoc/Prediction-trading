@@ -4,6 +4,129 @@ Operational incidents for the Prediction Market Arbitrage System. Most recent fi
 
 ---
 
+### INC-021: Polymarket CLOB Schema Mismatch — Live Halted, Six Bugs Surfaced (2026-04-29)
+
+**Severity**: HIGH (live execution non-functional, phantom accounting accumulating)
+**Status**: HALTED — `shadow_only: true` set on Dublin 2026-04-29 05:25 UTC; remediation pending
+
+**Trigger**: Operator noticed the Strategies page and Positions page disagreed
+about the state of a Guangzhou-temperature `mutex_sell_all` constraint —
+Positions reported a "preemptive exit" had occurred, Telegram + Strategies
+said the trade was still live, and there had been "no live trade" in the
+wallet sense. Investigation surfaced six interlocking issues, summarised
+below.
+
+**Forensic snapshots** (preserved on Dublin):
+- `data/state_rust.db.inc021_pre_halt_20260429_052507Z` — full DB at halt
+- `config/config.yaml.inc021_pre_halt_20260429_052507Z` — pre-flip config
+- `data/forensics/inc021_pre_halt_20260429_052507Z.txt` — text-mode dump of
+  scalars / positions / strategy_portfolios / strategy_open_positions /
+  evaluated_opportunities (last 5)
+
+**Timeline (UTC 2026-04-29)**:
+
+| Time | Event |
+|---|---|
+| 00:07:08 | Mutex_sell_all opportunity fires on Guangzhou temperature 25°C / ≥26°C, 13.6% expected. Live PM creates paper position `paper_1777421228...`. `executor.execute_arb` called. |
+| 00:07:08 | **CLOB rejects both legs**: `HTTP 400 {"error":"order_version_mismatch"}`. No real shares acquired. |
+| 00:07:23 → 03:38 | `check_proactive_exits` fires every ~30s for ~3.5h, ratio 1.34→2.46. INC-020 path correctly refuses to credit phantom proceeds (zero fills). Position holds. |
+| 03:28 / 03:33 | UMA dispute detected on both legs (`uma_status=proposed`). Bot logs warning, does not act. |
+| 03:38:56 | `check_api_resolutions` finds the market resolved (winner=2092010). `close_on_resolution` runs, credits **+$29.92 fictional profit** to live PM (`current_capital` 100.02 → 129.94). |
+| 05:25 UTC | Operator triggers halt; service stopped, shadow_only=true set, restarted. |
+
+**Live state at halt**:
+- Wallet USDC.e: **$100.02** (untouched since deploy — zero real trades)
+- Live PM `current_capital` (in-memory, dashboard): **$129.94** (fictional)
+- `scalars.current_capital` (persisted): **$70.01** (post-deploy deduction, not updated by close_on_resolution — separate scalars-drift issue)
+- Shadow portfolios: B/C/D/E at **$90/$80/$70/$50** with phantom open positions on the same constraint
+- Telegram log: 1 ProactiveExit alert was sent (the FIRST one before INC-020 logic refused) per legacy code path; subsequent ~420 attempts were silent. Resolution event: no Telegram (live PM resolution doesn't currently fire a notification — separate gap).
+
+**Six interlocking bugs**:
+
+1. **CLOB schema mismatch** (root). `executor::submit_to_clob` posts an order
+   payload that Polymarket now responds to with `order_version_mismatch`.
+   Polymarket changed the schema (likely a new version field or a change to
+   the EIP-712 typed data). We do not currently know what the new shape is —
+   needs investigation against py-clob-client. Until fixed, every live order
+   submission fails. Live execution is non-functional.
+
+2. **No entry rollback on executor failure**. `enter_position` runs *before*
+   `execute_arb`. When all legs reject, the paper position remains. PM
+   bookkeeping diverges from wallet on the very next state-changing event
+   (resolution, close_on_resolution, etc.). The phantom $29.92 was a direct
+   consequence: position created on paper, market resolved, paper accounting
+   booked the win, wallet untouched.
+
+3. **Resolution closed paper-only position without verifying real shares**.
+   `close_on_resolution` doesn't ask the executor "do we actually have
+   terminal-Confirmed fills for these legs?" — it trusts PM state. Should
+   refuse to settle if no real shares ever filled.
+
+4. **Strategy tracker not notified on live API resolution**. When live PM
+   resolves via `check_api_resolutions`, shadow strategies with the same
+   constraint open keep their open-position rows. That's why the Strategies
+   tab kept showing the trade as live even though Positions had closed it.
+
+5. **INC-020 exit path uses empty `leg.token_id`**. By design, `MarketLeg.token_id`
+   is `""` until populated by fill_tracker after real fills come back. Entry
+   path correctly looks up `m.no_asset_id` from `engine.constraints` registry;
+   my INC-020 path (added 2026-04-27) used `leg.token_id` directly. Even if
+   bug 1 were fixed and entry succeeded, exit would still fail the executor's
+   instrument lookup with "Unknown token_id".
+
+6. **UMA dispute window ignored on close**. Resolution closed at 03:38 with
+   `uma_status:proposed`. UMA proposals can flip during the dispute window;
+   booking profit before finalisation can leave the books inconsistent if
+   the resolution is overturned.
+
+**Halt action (commit pending — this session)**:
+
+1. `data/state_rust.db` and `config/config.yaml` snapshotted to forensics paths.
+2. `live_trading.shadow_only` flipped `false → true` in config.yaml.
+3. Service restarted with reason tag `inc021_halt_clob_schema_mismatch`.
+   Boot log confirms: `[G1] execute_orders=true but shadow_only=true — live executor NOT started (safety)`.
+4. Phantom $29.92 not yet reset; left in place until remediation cycle so the
+   forensic chain is intact.
+
+**Remediation plan (to land before re-enabling live)**:
+
+| # | Fix | Priority |
+|---|-----|----------|
+| 1 | Investigate Polymarket order schema change. Hit /order with curl + reproduce. Diff against py-clob-client current. Update `executor::submit_to_clob` payload. | **P0 blocker** |
+| 2 | Add entry rollback: when `execute_arb.all_accepted` is false, undo `enter_position` (or never enter unless the executor accepts). | P1 |
+| 3 | `close_on_resolution`: refuse to settle if no terminal-Confirmed CLOB fills exist for this position (or no real shares are tracked in the wallet). | P1 |
+| 4 | Wire `check_api_resolutions` resolutions to also notify `strategy_tracker` so shadow positions close in sync. | P2 |
+| 5 | INC-020 exit path: pull `no_asset_id` / `yes_asset_id` from `engine.constraints` registry like the entry path does, instead of trusting empty `leg.token_id`. | P1 (bundle with #1) |
+| 6 | Hold off on `close_on_resolution` while `uma_status == proposed`; require `resolved`/`settled` finality. Add timeout for stuck UMA proposals. | P2 |
+
+**Already-shipped helpful infrastructure (this session, commit pending)**:
+
+- **API-change tracker** (`executor::classify_clob_rejection` +
+  `Orchestrator::alert_on_api_contract_rejection`): scans every CLOB rejection
+  for schema/version/field/format/auth-drift keywords and fires a one-shot
+  Telegram alert per (category, code, msg-snippet) per boot. Categories:
+  `schema_version_mismatch`, `field_drift`, `format_drift`, `deprecation`,
+  `auth_drift`. Means the next API change won't go undetected for hours.
+  Wired at all three execute_arb call sites (entry, replacement, INC-020 exit).
+
+**Lessons**:
+
+- "Live executor armed" log line was true but *useless* — the executor was
+  running but every single submission was failing with the same schema error
+  for hours. Need a "live trades successfully landing" health metric, not
+  just "executor not None". Could be: `time-since-last-Confirmed-fill > 24h`
+  while opportunities are firing → alert.
+- Paper bookkeeping and live execution diverge silently when entry isn't
+  atomic. Next architectural pass should make the "create position" and
+  "fill submitted to venue" boundary explicit — perhaps with a `Pending` state
+  that only promotes to `Open` when at least one leg reaches `Submitted`.
+- Phantom money is worse than no money: it makes the dashboard lie about
+  ROI, contaminates strategy-tracker comparisons, and erodes the operator's
+  trust in displayed numbers. The fictional $29.92 has to be reset before
+  any further trading or the win-rate stats are corrupt.
+
+---
+
 ### INC-020: Proactive Exits Did Not Submit Real CLOB Sells — Phantom-Proceeds Latent Bug (2026-04-27)
 
 **Severity**: CRITICAL (would have caused immediate accounting/wallet divergence on first live arb post-INC-019 fix)

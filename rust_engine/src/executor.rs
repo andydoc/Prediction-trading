@@ -80,6 +80,54 @@ pub enum QuantityType {
     Base,
 }
 
+/// INC-021: Classify a CLOB rejection by whether it looks like an API
+/// contract / schema mismatch (a Polymarket-side change we need to react to)
+/// vs. a routine business rejection (price out of range, insufficient depth,
+/// not accepting orders, etc.).
+///
+/// Returns `Some(category_tag)` for contract-style errors and `None` for
+/// routine ones. The orchestrator uses this to send a one-shot Telegram
+/// alert on first sighting of each contract category per boot — so we know
+/// to look at the API as soon as it changes, not days later.
+///
+/// Heuristic: match against known phrases in the message / code. We include
+/// generic field/format/version/unsupported keywords because those almost
+/// always indicate a payload-shape change rather than a per-order issue.
+pub fn classify_clob_rejection(code: &str, message: &str) -> Option<&'static str> {
+    let blob = format!("{} {}", code.to_lowercase(), message.to_lowercase());
+
+    // Schema / order-version drift (the order_version_mismatch we just hit)
+    if blob.contains("version_mismatch") || blob.contains("orderversion")
+        || blob.contains("order_version") || blob.contains("schema_version")
+        || blob.contains("api_version") || blob.contains("apiversion") {
+        return Some("schema_version_mismatch");
+    }
+    // Unknown / unexpected / missing fields — sharp signal of payload drift
+    if blob.contains("unknown_field") || blob.contains("unexpected_field")
+        || blob.contains("missing_field") || blob.contains("required_field")
+        || blob.contains("field_required") || blob.contains("invalid_field") {
+        return Some("field_drift");
+    }
+    // Format / serialization complaints
+    if blob.contains("invalid_format") || blob.contains("malformed")
+        || blob.contains("invalid_json") || blob.contains("parse_error")
+        || blob.contains("decode_error") {
+        return Some("format_drift");
+    }
+    // Deprecation / unsupported markers
+    if blob.contains("deprecated") || blob.contains("unsupported")
+        || blob.contains("not_supported") || blob.contains("removed") {
+        return Some("deprecation");
+    }
+    // Auth contract drift (signature scheme, header contract)
+    if blob.contains("invalid_signature") || blob.contains("signature_invalid")
+        || blob.contains("bad_hmac") || blob.contains("hmac_invalid")
+        || blob.contains("signature_type") {
+        return Some("auth_drift");
+    }
+    None
+}
+
 /// Validate and compute the correct quantity for an order.
 ///
 /// Returns (quantity, quantity_type) or an error if the combination is invalid.

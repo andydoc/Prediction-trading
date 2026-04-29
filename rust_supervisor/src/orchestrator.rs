@@ -793,6 +793,13 @@ pub struct Orchestrator {
     /// Gamma group state diverged from the detection-time snapshot.
     gamma_freshness_rejects: u64,
 
+    /// INC-021: track which CLOB API-contract error categories we've already
+    /// alerted on this boot. Prevents Telegram spam when an entire batch of
+    /// orders rejects with the same `order_version_mismatch` (or similar)
+    /// — first occurrence sends a single alert, subsequent ones are silent
+    /// until next service restart. HashSet of `"<category>:<code>:<msg_snippet>"`.
+    api_contract_alerts_seen: std::collections::HashSet<String>,
+
     /// G1 / F-pre-1: live CLOB executor. Some only when execute_orders=true
     /// AND !shadow_only AND CLOB auth + private key are available. None in
     /// every shadow instance and on any config/credential gap.
@@ -1074,6 +1081,7 @@ impl Orchestrator {
             last_sports_prune: 0.0,
             last_clob_auth_refresh: now_secs(),
             gamma_freshness_rejects: 0,
+            api_contract_alerts_seen: std::collections::HashSet::new(),
             executor,
             fill_quality_log,
         })
@@ -2665,6 +2673,8 @@ impl Orchestrator {
                             } else {
                                 tracing::info!("[G1] Live orders submitted on {}: {} legs", pos.position_id, legs.len());
                             }
+                            // INC-021: scan rejections for API-contract drift
+                            self.alert_on_api_contract_rejection(&result);
                         }
                     }
 
@@ -2879,6 +2889,8 @@ impl Orchestrator {
                                             } else {
                                                 tracing::info!("[G1-REPL] Live orders submitted on {}: {} legs", pos.position_id, legs.len());
                                             }
+                                            // INC-021: scan rejections for API-contract drift
+                                            self.alert_on_api_contract_rejection(&result);
                                         }
                                     }
                                 }
@@ -3015,6 +3027,41 @@ impl Orchestrator {
 
     // --- Proactive exits ---
 
+    /// INC-021: scan executor result.legs for CLOB rejections that look like
+    /// API contract drift (schema/version/field/format/auth) and send a
+    /// one-shot Telegram alert per (category, code, msg-snippet) per boot.
+    ///
+    /// Called after every `executor.execute_arb` invocation. Routine
+    /// rejections (price out of range, depth, etc.) classify to None and
+    /// are silent. Schema-class rejections classify to a tag like
+    /// `schema_version_mismatch`, which is the signal that Polymarket has
+    /// changed something we need to react to (the trigger for INC-021 itself).
+    fn alert_on_api_contract_rejection(&mut self, result: &rust_engine::executor::ArbExecutionResult) {
+        for leg in &result.legs {
+            if let rust_engine::executor::OrderResult::Rejected(err) = leg {
+                if let rust_engine::executor::ExecutionError::ClobRejection { code, message } = err {
+                    if let Some(category) = rust_engine::executor::classify_clob_rejection(code, message) {
+                        // Dedup key: category + code + first 80 chars of message.
+                        // Keeps alert noise low while distinguishing distinct API drifts.
+                        let snippet = message.chars().take(80).collect::<String>();
+                        let key = format!("{}:{}:{}", category, code, snippet);
+                        if self.api_contract_alerts_seen.insert(key) {
+                            let body = format!(
+                                "[API-CHANGE {}] CLOB rejected an order with what looks like a schema/contract change. \
+                                code={} message={}. \
+                                Check Polymarket py-clob-client repo / changelog for breaking changes \
+                                and update the order payload before re-enabling live execution.",
+                                category, code, snippet
+                            );
+                            tracing::error!("{}", body);
+                            let _ = self.notifier.send(&NotifyEvent::Error { message: body });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn check_proactive_exits(&mut self) {
         let all_bids = self.collect_all_position_bids();
         let exits = self.engine.check_proactive_exits(&all_bids, PROACTIVE_EXIT_MULTIPLIER);
@@ -3059,7 +3106,10 @@ impl Orchestrator {
             let live_mode = !self.cfg.shadow_only && self.executor.is_some();
 
             let (net, profit, fully_closed) = if live_mode {
-                let executor = self.executor.as_ref().expect("live_mode implies executor present");
+                // Clone the Arc so we don't hold an immutable borrow of self
+                // for the whole arm — needed because we call &mut self
+                // methods (alert_on_api_contract_rejection) later in the block.
+                let executor = self.executor.clone().expect("live_mode implies executor present");
                 // Build leg list: (market_id, token_id, bid_price, shares_to_sell).
                 // Skip legs whose share count is below the executor's hard floor
                 // (compute_order_quantity rejects <0.01 shares). Below-min residuals
@@ -3090,12 +3140,14 @@ impl Orchestrator {
 
                 tracing::info!("INC-020 submitting {} FAK SELLs for position {}",
                     exec_legs.len(), truncate(&exit.position_id, 40));
-                let submit_result = self.engine.execute_position_exit(executor, &exit.position_id, &exec_legs);
+                let submit_result = self.engine.execute_position_exit(&executor, &exit.position_id, &exec_legs);
                 if !submit_result.all_accepted {
                     tracing::warn!("INC-020 exit: partial submission ({} legs accepted of {})",
                         submit_result.legs.iter().filter(|r| matches!(r, rust_engine::executor::OrderResult::Accepted(_))).count(),
                         submit_result.legs.len());
                 }
+                // INC-021: scan rejections for API-contract drift
+                self.alert_on_api_contract_rejection(&submit_result);
 
                 // Wait briefly for FAK fills to settle. FAK orders either fill
                 // (fully or partially) within milliseconds and the rest is
