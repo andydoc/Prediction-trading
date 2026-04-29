@@ -76,9 +76,13 @@ const PROACTIVE_EXIT_MULTIPLIER: f64 = 1.2;
 /// so persistent issues remind the operator daily without spamming.
 const API_DRIFT_DEDUP_SECS: f64 = 86400.0;
 
-/// Dynamic capital: % of total portfolio value, floor $10, cap $1000.
-fn dynamic_capital(total_value: f64, pct: f64) -> f64 {
-    total_value.mul_add(pct, 0.0).max(10.0).min(1000.0)
+/// Dynamic capital: pct% of total portfolio value, floored at `min_trade`,
+/// capped at $1000 absolute.
+///
+/// `min_trade` was hardcoded $10; now it threads `cfg.min_trade_size` through
+/// so a probe-trade run can configure $5 (or less) without code changes.
+fn dynamic_capital(total_value: f64, pct: f64, min_trade: f64) -> f64 {
+    total_value.mul_add(pct, 0.0).max(min_trade).min(1000.0)
 }
 
 /// Score an opportunity: profit_pct / effective_hours.
@@ -2300,7 +2304,7 @@ impl Orchestrator {
         let result = self.engine.detect_and_load_constraints(&markets_for_detect, &detect_config);
 
         // Update eval config with current capital
-        let cap = dynamic_capital(self.engine.total_value(), self.cfg.capital_pct);
+        let cap = dynamic_capital(self.engine.total_value(), self.cfg.capital_pct, self.cfg.min_trade_size);
         let arb = yaml.get("arbitrage").cloned().unwrap_or_default();
         let fees = arb.get("fees").cloned().unwrap_or_default();
         self.engine.set_eval_config(
@@ -2563,7 +2567,7 @@ impl Orchestrator {
         if ranked.is_empty() { return; }
 
         let mut slots = self.cfg.max_positions.saturating_sub(self.engine.pm_open_count());
-        let cap = dynamic_capital(self.engine.total_value(), self.cfg.capital_pct);
+        let cap = dynamic_capital(self.engine.total_value(), self.cfg.capital_pct, self.cfg.min_trade_size);
         if cap < self.cfg.min_trade_size {
             slots = 0;
         }
@@ -2909,7 +2913,7 @@ impl Orchestrator {
                                 truncate(&worst_pid, 30), net, profit);
 
                             // Enter replacement with chain tracking
-                            let cap = dynamic_capital(self.engine.total_value(), self.cfg.capital_pct);
+                            let cap = dynamic_capital(self.engine.total_value(), self.cfg.capital_pct, self.cfg.min_trade_size);
                             let old_cap = best_opp.optimal_bets.values().sum::<f64>();
                             let scale = if old_cap > 0.0 { cap / old_cap } else { 1.0 };
                             let scaled_bets: HashMap<String, f64> = best_opp.optimal_bets.iter()
