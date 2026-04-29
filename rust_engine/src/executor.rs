@@ -758,24 +758,36 @@ impl Executor {
     ) -> Result<String, ExecutionError> {
         let url = format!("{}/order", self.config.clob_host);
 
+        // INC-021 V2 envelope. Per py-clob-client-v2 v1.0.0
+        // `order_data_v2.order_to_json_v2`:
+        // - `salt` JSON number; all other uint256 fields are strings.
+        // - `side` is "BUY"/"SELL" on the wire even though signed as uint8.
+        // - `expiration` is in the body (for GTD) but NOT in the signed struct.
+        //   We use "0" (no expiry) for FAK/GTC.
+        // - `metadata` and `builder` are bytes32 hex (`0x` + 64 zero hex chars
+        //   when unset). Same hex string used in the signed struct.
+        // - Top-level adds `postOnly` and `deferExec` (both false for taker FAK).
+        // - Removed: taker, nonce, feeRateBps.
         let order_payload = serde_json::json!({
             "order": {
                 "salt": signed.order.salt.to::<u64>(),
                 "maker": format!("{}", signed.order.maker),
                 "signer": format!("{}", signed.order.signer),
-                "taker": "0x0000000000000000000000000000000000000000",
                 "tokenId": signed.order.token_id.to_string(),
                 "makerAmount": signed.order.maker_amount.to_string(),
                 "takerAmount": signed.order.taker_amount.to_string(),
-                "expiration": signed.order.expiration.to_string(),
-                "nonce": signed.order.nonce.to_string(),
-                "feeRateBps": signed.order.fee_rate_bps.to_string(),
                 "side": if side == Side::Buy { "BUY" } else { "SELL" },
+                "expiration": "0",
                 "signatureType": signed.order.signature_type,
+                "timestamp": signed.order.timestamp.to_string(),
+                "metadata": format!("0x{}", hex::encode(signed.order.metadata.as_slice())),
+                "builder":  format!("0x{}", hex::encode(signed.order.builder.as_slice())),
                 "signature": &signed.signature,
             },
             "owner": self.clob_auth.as_ref().map(|a| a.api_key()).unwrap_or_default(),
             "orderType": self.config.order_type.as_str(),
+            "deferExec": false,
+            "postOnly": false,
         });
 
         // Serialize once — same string for HMAC signing and HTTP body
@@ -1286,26 +1298,29 @@ impl Executor {
         }
 
         let mut order_payloads = Vec::with_capacity(prepared.len());
-        for (tracked, signed, instrument) in &prepared {
+        for (tracked, signed, _instrument) in &prepared {
             let side_str = if tracked.side == Side::Buy { "BUY" } else { "SELL" };
+            // INC-021 V2 envelope (see submit_to_clob for details)
             order_payloads.push(serde_json::json!({
                 "order": {
                     "salt": signed.order.salt.to::<u64>(),
                     "maker": format!("{}", signed.order.maker),
                     "signer": format!("{}", signed.order.signer),
-                    "taker": "0x0000000000000000000000000000000000000000",
                     "tokenId": signed.order.token_id.to_string(),
                     "makerAmount": signed.order.maker_amount.to_string(),
                     "takerAmount": signed.order.taker_amount.to_string(),
-                    "expiration": signed.order.expiration.to_string(),
-                    "nonce": signed.order.nonce.to_string(),
-                    "feeRateBps": signed.order.fee_rate_bps.to_string(),
                     "side": side_str,
+                    "expiration": "0",
                     "signatureType": signed.order.signature_type,
+                    "timestamp": signed.order.timestamp.to_string(),
+                    "metadata": format!("0x{}", hex::encode(signed.order.metadata.as_slice())),
+                    "builder":  format!("0x{}", hex::encode(signed.order.builder.as_slice())),
                     "signature": &signed.signature,
                 },
                 "owner": self.clob_auth.as_ref().map(|a| a.api_key()).unwrap_or_default(),
                 "orderType": self.config.order_type.as_str(),
+                "deferExec": false,
+                "postOnly": false,
             }));
         }
 

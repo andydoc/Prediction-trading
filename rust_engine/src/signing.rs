@@ -1,28 +1,39 @@
-/// EIP-712 order signing for Polymarket CLOB Exchange (B2.0).
+/// EIP-712 order signing for Polymarket CLOB Exchange.
 ///
-/// Implements pure Rust EIP-712 typed data signing matching the Polymarket
-/// py-clob-client `order_builder/` implementation. Signature type 0 (EOA).
+/// **INC-021 V2 port (2026-04-29):** Polymarket migrated CLOB to V2 on
+/// 2026-04-28 (per docs.polymarket.com/v2-migration). Old V1 orders return
+/// `HTTP 400 order_version_mismatch`. V2 changes:
 ///
-/// References:
-///   - EIP-712: https://eips.ethereum.org/EIPS/eip-712
-///   - Polymarket CLOB Exchange contract on Polygon (chain ID 137)
-///   - py-clob-client order_builder/helpers.py
+/// - Domain `version`: `"1"` → `"2"`
+/// - Exchange contracts moved to new V2 addresses (different per market type)
+/// - Signed order struct: dropped `taker`, `expiration`, `nonce`, `feeRateBps`;
+///   added `timestamp` (ms), `metadata` (bytes32), `builder` (bytes32)
+/// - SignatureType: EOA = `1` on V2 (was `0` on V1)
+///
+/// Reference (V2 SDK): https://github.com/Polymarket/py-clob-client-v2 @ v1.0.0
+/// `py_clob_client_v2/order_utils/model/ctf_exchange_v2_typed_data.py`.
+///
+/// **Caveat**: py-clob-client-v2 issue #32 (open at port time) reports the
+/// V2 SDK itself can return `order_version_mismatch` on prod. If our
+/// implementation matches the spec but rejections persist, that's a
+/// Polymarket-side issue, not our code. Halt + escalate.
 
 use alloy_primitives::{Address, B256, U256, FixedBytes, keccak256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 
 // ---------------------------------------------------------------------------
-// Polymarket contract addresses (Polygon mainnet)
+// Polymarket V2 contract addresses (Polygon mainnet, chain 137)
 // ---------------------------------------------------------------------------
 
-/// CTF Exchange — used for regular (non-negRisk) markets.
-pub const CTF_EXCHANGE: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
+/// V2 CTF Exchange — regular (non-negRisk) markets. (Was V1 0x4bFb41…982E.)
+pub const CTF_EXCHANGE: &str = "0xE111180000d2663C0091e4f400237545B87B996B";
 
-/// Neg Risk CTF Exchange — used for negRisk markets.
-pub const NEG_RISK_CTF_EXCHANGE: &str = "0xC5d563A36AE78145C45a50134d48A1215220f80a";
+/// V2 Neg Risk CTF Exchange. (Was V1 0xC5d563…f80a.)
+pub const NEG_RISK_CTF_EXCHANGE: &str = "0xe2222d279d744050d28e00520010520000310F59";
 
-/// Neg Risk Adapter — taker address for negRisk orders.
+/// Neg Risk Adapter — used as taker on V1; not on V2 signed body
+/// (taker removed from V2 struct). Preserved for reference / tooling.
 pub const NEG_RISK_ADAPTER: &str = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296";
 
 /// Polygon chain ID.
@@ -37,9 +48,11 @@ fn domain_type_hash() -> B256 {
     keccak256(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
 }
 
-/// keccak256("Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)")
+/// V2 Order type hash. New struct: 11 fields (was 12 in V1).
+/// Removed: `taker, expiration, nonce, feeRateBps`.
+/// Added: `timestamp (uint256), metadata (bytes32), builder (bytes32)`.
 fn order_type_hash() -> B256 {
-    keccak256(b"Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)")
+    keccak256(b"Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)")
 }
 
 // ---------------------------------------------------------------------------
@@ -63,37 +76,40 @@ impl Side {
 // Order data
 // ---------------------------------------------------------------------------
 
-/// All fields needed to construct and sign a Polymarket CLOB order.
+/// V2 fields needed to construct and sign a Polymarket CLOB order.
 ///
 /// Amounts are in raw token units (no decimals).
 /// For USDC (6 decimals): $10.00 = 10_000_000.
 /// For CTF tokens (6 decimals): 100 shares = 100_000_000.
+///
+/// **V1 → V2 schema diff** (INC-021):
+/// - Removed: `taker`, `expiration`, `nonce`, `fee_rate_bps`
+/// - Added: `timestamp` (ms since epoch), `metadata` (bytes32), `builder` (bytes32)
+/// - `expiration` is still in the wire body (for GTD orders) but NOT signed.
 #[derive(Debug, Clone)]
 pub struct OrderData {
     /// Random salt for uniqueness.
     pub salt: U256,
     /// Maker address (the trading wallet).
     pub maker: Address,
-    /// Signer address (same as maker for EOA, type 0).
+    /// Signer address (same as maker for EOA).
     pub signer: Address,
-    /// Taker address (0x0 for open orders, or Neg Risk Adapter for negRisk).
-    pub taker: Address,
     /// ERC1155 token ID of the conditional token.
     pub token_id: U256,
     /// Maker amount in raw units.
     pub maker_amount: U256,
     /// Taker amount in raw units.
     pub taker_amount: U256,
-    /// Order expiration (unix timestamp, 0 = no expiry).
-    pub expiration: U256,
-    /// Nonce (0 for most orders).
-    pub nonce: U256,
-    /// Fee rate in basis points (e.g., 100 = 1%).
-    pub fee_rate_bps: U256,
     /// Buy or Sell.
     pub side: Side,
-    /// Signature type: 0 = EOA.
+    /// Signature type: V2 EOA = 1.
     pub signature_type: u8,
+    /// V2: order timestamp in milliseconds since epoch.
+    pub timestamp: U256,
+    /// V2: app-defined metadata (bytes32). Use zero for none.
+    pub metadata: B256,
+    /// V2: builder attribution (bytes32). Use zero for none.
+    pub builder: B256,
 }
 
 /// Signed order ready for CLOB submission.
@@ -110,12 +126,13 @@ pub struct SignedOrder {
 // Domain separator
 // ---------------------------------------------------------------------------
 
-/// Compute the EIP-712 domain separator for a Polymarket exchange contract.
+/// Compute the EIP-712 domain separator for a Polymarket V2 exchange.
+/// Domain: `name="Polymarket CTF Exchange", version="2", chainId=137, verifyingContract=<exchange>`.
 fn domain_separator(exchange_address: Address) -> B256 {
     let mut buf = Vec::with_capacity(5 * 32);
     buf.extend_from_slice(domain_type_hash().as_slice());
     buf.extend_from_slice(keccak256(b"Polymarket CTF Exchange").as_slice());
-    buf.extend_from_slice(keccak256(b"1").as_slice());
+    buf.extend_from_slice(keccak256(b"2").as_slice());  // V2 domain version
     buf.extend_from_slice(&U256::from(CHAIN_ID).to_be_bytes::<32>());
     // Address is 20 bytes, left-padded to 32
     let mut addr_padded = [0u8; 32];
@@ -128,9 +145,12 @@ fn domain_separator(exchange_address: Address) -> B256 {
 // Struct hash
 // ---------------------------------------------------------------------------
 
-/// Compute the EIP-712 struct hash for an order.
+/// Compute the EIP-712 V2 struct hash for an order.
+/// 11 fields, in declaration order matching the V2 typed-data type list:
+/// `salt, maker, signer, tokenId, makerAmount, takerAmount, side,
+///  signatureType, timestamp, metadata, builder`.
 fn hash_order(order: &OrderData) -> B256 {
-    let mut buf = Vec::with_capacity(13 * 32);
+    let mut buf = Vec::with_capacity(12 * 32);
     buf.extend_from_slice(order_type_hash().as_slice());
     buf.extend_from_slice(&order.salt.to_be_bytes::<32>());
     // Addresses: left-padded to 32 bytes
@@ -140,17 +160,15 @@ fn hash_order(order: &OrderData) -> B256 {
     addr_buf = [0u8; 32];
     addr_buf[12..].copy_from_slice(order.signer.as_slice());
     buf.extend_from_slice(&addr_buf);
-    addr_buf = [0u8; 32];
-    addr_buf[12..].copy_from_slice(order.taker.as_slice());
-    buf.extend_from_slice(&addr_buf);
     buf.extend_from_slice(&order.token_id.to_be_bytes::<32>());
     buf.extend_from_slice(&order.maker_amount.to_be_bytes::<32>());
     buf.extend_from_slice(&order.taker_amount.to_be_bytes::<32>());
-    buf.extend_from_slice(&order.expiration.to_be_bytes::<32>());
-    buf.extend_from_slice(&order.nonce.to_be_bytes::<32>());
-    buf.extend_from_slice(&order.fee_rate_bps.to_be_bytes::<32>());
     buf.extend_from_slice(&U256::from(order.side.as_u8()).to_be_bytes::<32>());
     buf.extend_from_slice(&U256::from(order.signature_type).to_be_bytes::<32>());
+    buf.extend_from_slice(&order.timestamp.to_be_bytes::<32>());
+    // bytes32 fields: append the 32-byte payload directly
+    buf.extend_from_slice(order.metadata.as_slice());
+    buf.extend_from_slice(order.builder.as_slice());
     keccak256(&buf)
 }
 
@@ -599,40 +617,46 @@ pub fn build_order_with_precision(
 }
 
 /// Build order with explicit amount precision and market order flag.
+///
+/// V2: `taker`, `expiration`, `nonce`, `fee_rate_bps` no longer in the signed
+/// struct (server derives fees). `_neg_risk` is retained on the signature for
+/// the caller to thread to `sign_order` (selects domain separator).
 pub fn build_order_with_precision_and_type(
     maker: Address,
     token_id: &str,
     price: f64,
     size_usd: f64,
     side: Side,
-    neg_risk: bool,
-    fee_rate_bps: u64,
+    _neg_risk: bool,
+    _fee_rate_bps: u64,
     amount_decimals: u32,
     is_market_order: bool,
 ) -> Result<OrderData, String> {
     let token_id_u256 = U256::from_str_radix(token_id, 10)
         .map_err(|e| format!("Invalid token_id '{}': {}", token_id, e))?;
 
-    // Taker is always 0x0 — neg risk routing is handled server-side by the CLOB.
-    let taker = Address::ZERO;
-
     let (maker_amount, taker_amount) = compute_amounts_for_order_type(
         price, size_usd, side, amount_decimals, is_market_order,
     );
+
+    // V2 timestamp: milliseconds since epoch.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0) as u64;
 
     Ok(OrderData {
         salt: random_salt(),
         maker,
         signer: maker,
-        taker,
         token_id: token_id_u256,
         maker_amount,
         taker_amount,
-        expiration: U256::ZERO,
-        nonce: U256::ZERO,
-        fee_rate_bps: U256::from(fee_rate_bps),
         side,
-        signature_type: 0, // EOA
+        signature_type: 1, // V2 EOA = 1 (was 0 on V1)
+        timestamp: U256::from(now_ms),
+        metadata: B256::ZERO,
+        builder: B256::ZERO,
     })
 }
 
@@ -652,22 +676,21 @@ mod tests {
         assert_ne!(sep, B256::ZERO);
     }
 
-    /// Verify order hashing is deterministic.
+    /// Verify order hashing is deterministic (V2 struct).
     #[test]
     fn test_order_hash_deterministic() {
         let order = OrderData {
             salt: U256::from(12345u64),
             maker: Address::ZERO,
             signer: Address::ZERO,
-            taker: Address::ZERO,
             token_id: U256::from(1u64),
             maker_amount: U256::from(10_000_000u64),  // $10
-            taker_amount: U256::from(20_000_000u64),   // 20 shares
-            expiration: U256::ZERO,
-            nonce: U256::ZERO,
-            fee_rate_bps: U256::from(100u64),
+            taker_amount: U256::from(20_000_000u64),  // 20 shares
             side: Side::Buy,
-            signature_type: 0,
+            signature_type: 1,  // V2 EOA
+            timestamp: U256::from(1_745_000_000_000u64),
+            metadata: B256::ZERO,
+            builder: B256::ZERO,
         };
         let h1 = hash_order(&order);
         let h2 = hash_order(&order);
@@ -714,8 +737,9 @@ mod tests {
             100,
         ).unwrap();
 
-        // API-7: Taker is always Address::ZERO — negRisk routing is server-side
-        assert_eq!(order.taker, Address::ZERO);
+        // V2: `taker` is no longer in OrderData (server derives from market type).
+        // INC-021 V2 uses signature_type=1 (EOA).
+        assert_eq!(order.signature_type, 1);
 
         // Sign with neg_risk domain
         let signed = signer.sign_order(&order, true).unwrap();
