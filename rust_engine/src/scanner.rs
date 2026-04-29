@@ -223,14 +223,28 @@ fn extract_f64(obj: &serde_json::Value, key: &str) -> Option<f64> {
 // HTTP: paginated Gamma API fetch
 // ---------------------------------------------------------------------------
 
-/// INC-021: kept on legacy `/markets` (sunsets 2026-05-01) — migration to
-/// `/markets/keyset` blocked because that endpoint does NOT honour the
-/// `active=true&closed=false` query filter. First migration attempt walked
-/// 100,000 markets and hit our iter cap with no filter applied (vs. 48,984
-/// active+open via /markets). Keyset migration revisited once the right
-/// filter param name (or alternative) is found — header monitor and
-/// reactive tracker will both fire if /markets actually breaks at sunset
-/// before that's resolved, giving us the signal to scramble.
+/// INC-021: kept on legacy `/markets` (sunsets 2026-05-01).
+///
+/// Migration to `/markets/keyset` is blocked by a Polymarket-side filter
+/// difference: a 100-page deep walk of `/markets/keyset?active=true&closed=false`
+/// found that ALL 50,000 returned markets have `ready=false`, while
+/// `/markets` returns 48,984 markets that all have `ready=true`. The
+/// `/markets` endpoint applies an implicit server-side `ready=true` filter
+/// that has no equivalent query parameter:
+///   - `/markets?ready=true` → HTTP 500 internal error (rejected)
+///   - `/markets/keyset?ready=true` → timeout (rejected)
+///
+/// Pagination ordering on keyset puts `ready=false` markets first, so
+/// without a query filter we'd have to walk 100k+ markets per scan to
+/// reach the active-trading ones. Not viable on the current refresh
+/// interval.
+///
+/// Plan: keep `/markets` running until either (a) the api_drift_monitor
+/// header probe shows the endpoint actually returning HTTP 410/404, or
+/// (b) we identify the right filter / different endpoint. The reactive
+/// CLOB-rejection tracker (commit 4240898) and proactive header monitor
+/// (commit 6297507) both fire on any drift, so silent breakage is bounded
+/// to 1h of detection latency.
 fn fetch_all_markets(
     client: &reqwest::blocking::Client,
 ) -> (Vec<(String, serde_json::Value)>, usize) {

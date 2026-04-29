@@ -71,6 +71,11 @@ const MAX_LATENCY_SAMPLES: usize = 200;
 /// Proactive exit multiplier — sell if net_proceeds >= this × resolution_payout.
 const PROACTIVE_EXIT_MULTIPLIER: f64 = 1.2;
 
+/// INC-021: how long an API-contract / API-drift alert stays deduped.
+/// 24h × 3600s. After this window the same signature fires another Telegram
+/// so persistent issues remind the operator daily without spamming.
+const API_DRIFT_DEDUP_SECS: f64 = 86400.0;
+
 /// Dynamic capital: % of total portfolio value, floor $10, cap $1000.
 fn dynamic_capital(total_value: f64, pct: f64) -> f64 {
     total_value.mul_add(pct, 0.0).max(10.0).min(1000.0)
@@ -793,12 +798,12 @@ pub struct Orchestrator {
     /// Gamma group state diverged from the detection-time snapshot.
     gamma_freshness_rejects: u64,
 
-    /// INC-021: track which CLOB API-contract error categories we've already
-    /// alerted on this boot. Prevents Telegram spam when an entire batch of
-    /// orders rejects with the same `order_version_mismatch` (or similar)
-    /// — first occurrence sends a single alert, subsequent ones are silent
-    /// until next service restart. HashSet of `"<category>:<code>:<msg_snippet>"`.
-    api_contract_alerts_seen: std::collections::HashSet<String>,
+    /// INC-021: track when we last alerted on each unique CLOB API-contract
+    /// error category. Map of `"<category>:<code>:<msg_snippet>"` → last
+    /// alert timestamp. Re-alerts after `API_DRIFT_DEDUP_SECS` so a
+    /// persistent issue (e.g. an unfixed V2 schema mismatch) reminds the
+    /// operator daily instead of going silent after the first alert.
+    api_contract_alerts_seen: std::collections::HashMap<String, f64>,
 
     /// INC-021: last time the proactive API drift monitor ran (Unix secs).
     /// Drift monitor probes Polymarket for `Deprecation`/`Sunset`/`Warning`
@@ -806,9 +811,10 @@ pub struct Orchestrator {
     /// BEFORE breaking changes hit live orders.
     last_api_drift_check: f64,
 
-    /// INC-021: HeaderProbeFinding signatures already alerted on this boot.
-    /// Prevents the same `Sunset: <date>` header from firing every cycle.
-    api_drift_header_signatures_seen: std::collections::HashSet<String>,
+    /// INC-021: HeaderProbeFinding signatures with last-alert timestamps.
+    /// Re-alerts after `API_DRIFT_DEDUP_SECS` so a `Sunset: <date>` header
+    /// that's still live a week later reminds the operator daily.
+    api_drift_header_signatures_seen: std::collections::HashMap<String, f64>,
 
     /// G1 / F-pre-1: live CLOB executor. Some only when execute_orders=true
     /// AND !shadow_only AND CLOB auth + private key are available. None in
@@ -1091,9 +1097,9 @@ impl Orchestrator {
             last_sports_prune: 0.0,
             last_clob_auth_refresh: now_secs(),
             gamma_freshness_rejects: 0,
-            api_contract_alerts_seen: std::collections::HashSet::new(),
+            api_contract_alerts_seen: std::collections::HashMap::new(),
             last_api_drift_check: 0.0,  // Run on first periodic tick
-            api_drift_header_signatures_seen: std::collections::HashSet::new(),
+            api_drift_header_signatures_seen: std::collections::HashMap::new(),
             executor,
             fill_quality_log,
         })
@@ -2035,10 +2041,15 @@ impl Orchestrator {
         if (now - self.last_api_drift_check) >= 3600.0 {
             let timeout = std::time::Duration::from_secs(10);
 
-            // Probe 1: deprecation headers
+            // Probe 1: deprecation headers (per-day dedup)
             let header_findings = rust_engine::api_drift_monitor::probe_deprecation_headers(timeout);
             for f in &header_findings {
-                if self.api_drift_header_signatures_seen.insert(f.signature.clone()) {
+                let should_alert = match self.api_drift_header_signatures_seen.get(&f.signature) {
+                    Some(&last_at) => (now - last_at) >= API_DRIFT_DEDUP_SECS,
+                    None => true,
+                };
+                if should_alert {
+                    self.api_drift_header_signatures_seen.insert(f.signature.clone(), now);
                     let body = format!(
                         "[API-DRIFT header] {}\nSignature: {}\nMigrate / update before the sunset date if applicable.",
                         f.summary, f.signature
@@ -3160,15 +3171,21 @@ impl Orchestrator {
     /// `schema_version_mismatch`, which is the signal that Polymarket has
     /// changed something we need to react to (the trigger for INC-021 itself).
     fn alert_on_api_contract_rejection(&mut self, result: &rust_engine::executor::ArbExecutionResult) {
+        let now = now_secs();
         for leg in &result.legs {
             if let rust_engine::executor::OrderResult::Rejected(err) = leg {
                 if let rust_engine::executor::ExecutionError::ClobRejection { code, message } = err {
                     if let Some(category) = rust_engine::executor::classify_clob_rejection(code, message) {
                         // Dedup key: category + code + first 80 chars of message.
-                        // Keeps alert noise low while distinguishing distinct API drifts.
                         let snippet = message.chars().take(80).collect::<String>();
                         let key = format!("{}:{}:{}", category, code, snippet);
-                        if self.api_contract_alerts_seen.insert(key) {
+                        // Per-day dedup: re-alert if we haven't seen this in API_DRIFT_DEDUP_SECS.
+                        let should_alert = match self.api_contract_alerts_seen.get(&key) {
+                            Some(&last_at) => (now - last_at) >= API_DRIFT_DEDUP_SECS,
+                            None => true,
+                        };
+                        if should_alert {
+                            self.api_contract_alerts_seen.insert(key, now);
                             let body = format!(
                                 "[API-CHANGE {}] CLOB rejected an order with what looks like a schema/contract change. \
                                 code={} message={}. \
