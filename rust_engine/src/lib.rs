@@ -710,6 +710,37 @@ impl TradingEngine {
         self.positions.lock().check_proactive_exits(current_bids, exit_multiplier)
     }
 
+    /// INC-021 bug 3: reverse a phantom resolution credit. Used when
+    /// `close_on_resolution` settled a position whose wallet had no real
+    /// shares (executor rejected entry but `enter_position` paper-credited
+    /// the position anyway). Subtracts `payout` from `current_capital` and
+    /// `profit` from `total_actual_profit` to restore correct accounting.
+    pub fn reverse_phantom_payout(&self, payout: f64, profit: f64) {
+        let mut pm = self.positions.lock();
+        pm.adjust_capital(-payout);
+        pm.adjust_total_profit(-profit);
+    }
+
+    /// INC-021 bug 2: undo a `enter_position` that the executor failed to
+    /// fill. Removes the position from `open_positions` and restores its
+    /// `total_capital` to `current_capital`. Use ONLY when the executor
+    /// returned 0 accepted legs — i.e. the position is paper-only with no
+    /// real shares in the wallet. Returns true if a rollback happened.
+    pub fn rollback_paper_entry(&self, position_id: &str) -> bool {
+        let mut pm = self.positions.lock();
+        let removed = pm.open_positions_mut().remove(position_id);
+        if let Some(pos) = removed {
+            pm.refund_capital(pos.total_capital);
+            tracing::warn!(
+                "INC-021 rollback: removed paper position {} ({} legs, ${:.2} restored)",
+                position_id, pos.markets.len(), pos.total_capital
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     /// INC-020: Apply real CLOB exit fills to a position. Wraps
     /// `PositionManager::apply_exit_fills` and also records the sells on the
     /// accounting ledger using the **actual** filled prices/sizes — not

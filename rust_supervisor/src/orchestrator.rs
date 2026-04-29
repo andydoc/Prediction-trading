@@ -1903,6 +1903,36 @@ impl Orchestrator {
                         tracing::info!("API RESOLUTION: {} → winner={}, profit=${:.4}",
                             r.position_id, r.winning_market_id, r.profit);
 
+                        // INC-021 bug 3: phantom-payout sanity check.
+                        // In live mode, a position that never had real CLOB
+                        // fills must NOT receive resolution payout — the
+                        // wallet has no shares to settle. close_on_resolution
+                        // already booked the credit, so we reverse it here.
+                        // Shadow-only mode skips this (paper accounting is
+                        // the model in shadow).
+                        if !self.cfg.shadow_only {
+                            let has_real = self.executor.as_ref()
+                                .map(|e| e.position_has_confirmed_fills(&r.position_id))
+                                .unwrap_or(false);
+                            if !has_real {
+                                tracing::error!(
+                                    "INC-021 phantom payout reversed: {} resolved with profit ${:.2} but \
+                                    executor has zero Confirmed fills for it. Position was paper-only \
+                                    (executor rejected entry). Reversing the ${:.2} payout from current_capital.",
+                                    r.position_id, r.profit, r.payout
+                                );
+                                self.engine.reverse_phantom_payout(r.payout, r.profit);
+                                let _ = self.notifier.send(&NotifyEvent::Error {
+                                    message: format!(
+                                        "[INC-021 phantom payout] Position {} 'resolved' with profit ${:.2} \
+                                        but had zero real CLOB fills. Reversed; investigate why entry rollback \
+                                        didn't catch this.",
+                                        r.position_id, r.profit
+                                    ),
+                                });
+                            }
+                        }
+
                         // Forward to strategy tracker
                         if let Some(cid) = pid_to_cid.get(&r.position_id) {
                             if !cid.is_empty() {
@@ -2725,15 +2755,31 @@ impl Orchestrator {
                         }
                         if legs.is_empty() {
                             tracing::warn!("[G1] {} → no valid legs for execute_arb (token_ids missing or zero prices)", pos.position_id);
+                            // INC-021 bug 2: paper-only entry with no executable legs.
+                            // Roll back the position before it accrues phantom state.
+                            self.engine.rollback_paper_entry(&pos.position_id);
+                            continue;
                         } else {
                             let result = executor.execute_arb(&pos.position_id, &legs);
-                            if !result.all_accepted {
-                                let rejected = result.legs.iter()
-                                    .filter(|r| matches!(r, rust_engine::executor::OrderResult::Rejected(_)))
-                                    .count();
+                            let accepted_count = result.legs.iter()
+                                .filter(|r| matches!(r, rust_engine::executor::OrderResult::Accepted(_)))
+                                .count();
+                            if accepted_count == 0 {
+                                // INC-021 bug 2: ALL legs rejected. The position is paper-only,
+                                // wallet has no real shares. Roll back so PM accounting matches
+                                // wallet reality and resolution can't credit phantom proceeds.
+                                tracing::warn!(
+                                    "[G1] Entry FAILED on {}: 0/{} legs accepted — rolling back paper position",
+                                    pos.position_id, legs.len()
+                                );
+                                // INC-021: scan rejections for API-contract drift first (still useful)
+                                self.alert_on_api_contract_rejection(&result);
+                                self.engine.rollback_paper_entry(&pos.position_id);
+                                continue;
+                            } else if !result.all_accepted {
                                 tracing::warn!(
                                     "[G1] Partial submit on {}: {}/{} legs accepted. Fill tracker will decide unwind via evaluate_arb_fills.",
-                                    pos.position_id, legs.len() - rejected, legs.len()
+                                    pos.position_id, accepted_count, legs.len()
                                 );
                             } else {
                                 tracing::info!("[G1] Live orders submitted on {}: {} legs", pos.position_id, legs.len());
@@ -2949,13 +2995,25 @@ impl Orchestrator {
                                         }
                                         if !legs.is_empty() {
                                             let result = executor.execute_arb(&pos.position_id, &legs);
-                                            if !result.all_accepted {
-                                                tracing::warn!("[G1-REPL] Partial submit on {}: fill tracker will handle unwind", pos.position_id);
+                                            let accepted_count = result.legs.iter()
+                                                .filter(|r| matches!(r, rust_engine::executor::OrderResult::Accepted(_)))
+                                                .count();
+                                            if accepted_count == 0 {
+                                                // INC-021 bug 2: rollback paper-only replacement entry
+                                                tracing::warn!(
+                                                    "[G1-REPL] Replacement FAILED on {}: 0/{} legs accepted — rolling back",
+                                                    pos.position_id, legs.len()
+                                                );
+                                                self.alert_on_api_contract_rejection(&result);
+                                                self.engine.rollback_paper_entry(&pos.position_id);
+                                            } else if !result.all_accepted {
+                                                tracing::warn!("[G1-REPL] Partial submit on {}: {}/{} accepted, fill tracker will handle unwind",
+                                                    pos.position_id, accepted_count, legs.len());
+                                                self.alert_on_api_contract_rejection(&result);
                                             } else {
                                                 tracing::info!("[G1-REPL] Live orders submitted on {}: {} legs", pos.position_id, legs.len());
+                                                self.alert_on_api_contract_rejection(&result);
                                             }
-                                            // INC-021: scan rejections for API-contract drift
-                                            self.alert_on_api_contract_rejection(&result);
                                         }
                                     }
                                 }
@@ -3135,7 +3193,21 @@ impl Orchestrator {
                 truncate(&exit.position_id, 40), exit.ratio);
 
             // Capture constraint_id, assets, deployed capital, and per-leg
-            // (token_id, current_shares) BEFORE any mutation.
+            // (token_id, is_sell, current_shares) BEFORE any mutation.
+            //
+            // INC-021 bug 5: previously fell back to `mid.clone()` when
+            // `leg.token_id` was empty (which is by design — token_id is only
+            // populated by fill_tracker after real fills). That caused the
+            // executor's instrument lookup to fail. Now we look up the
+            // asset_id from `engine.constraints` like the entry path does:
+            // for sell-arbs the leg holds NO shares → use no_asset_id;
+            // for buy-arbs it holds YES shares → use yes_asset_id.
+            let is_sell_pos = {
+                let pm = self.engine.positions.lock();
+                pm.get_position(&exit.position_id)
+                    .and_then(|p| p.metadata.get("is_sell").and_then(|v| v.as_bool()))
+                    .unwrap_or(false)
+            };
             let (cid, assets, deployed, legs_pre): (String, Vec<String>, f64, Vec<(String, String, f64)>) = {
                 let pm = self.engine.positions.lock();
                 match pm.get_position(&exit.position_id) {
@@ -3143,9 +3215,24 @@ impl Orchestrator {
                         let cid = p.metadata.get("constraint_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let assets: Vec<String> = p.markets.keys().cloned().collect();
                         let deployed = p.total_capital;
+                        // Build (mid, token_id, shares). Token_id resolution order:
+                        //  1. leg.token_id (populated by fill_tracker)
+                        //  2. engine.constraints registry (no_asset_id for sells, yes for buys)
+                        //  3. empty (caller will skip the leg if empty)
+                        let constraint_ref = if !cid.is_empty() {
+                            self.engine.constraints.get(&cid)
+                        } else { None };
                         let legs: Vec<(String, String, f64)> = p.markets.iter()
                             .map(|(mid, leg)| {
-                                let tok = if !leg.token_id.is_empty() { leg.token_id.clone() } else { mid.clone() };
+                                let tok = if !leg.token_id.is_empty() {
+                                    leg.token_id.clone()
+                                } else if let Some(ref c) = constraint_ref {
+                                    c.markets.iter().find(|m| &m.market_id == mid)
+                                        .map(|m| if is_sell_pos { m.no_asset_id.clone() } else { m.yes_asset_id.clone() })
+                                        .unwrap_or_default()
+                                } else {
+                                    String::new()
+                                };
                                 (mid.clone(), tok, leg.shares)
                             }).collect();
                         (cid, assets, deployed, legs)

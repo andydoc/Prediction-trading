@@ -924,6 +924,24 @@ impl Executor {
             .collect()
     }
 
+    /// INC-021 bug 3: did this position get any real CLOB fills?
+    ///
+    /// Returns true iff at least one tracked order with this `position_id`
+    /// reached terminal `Confirmed` status (matched + transaction confirmed
+    /// on-chain) with a non-zero filled quantity. Used by the orchestrator
+    /// at API resolution time to refuse paper-only payouts.
+    ///
+    /// Note: this is the strict criterion. A position with `Submitted` or
+    /// even `Matched` status but no Confirmed tx hasn't yet had real shares
+    /// settle to the wallet (within the platform's settlement window).
+    pub fn position_has_confirmed_fills(&self, position_id: &str) -> bool {
+        self.tracked.lock().values().any(|o| {
+            o.position_id == position_id
+                && o.status == TradeStatus::Confirmed
+                && o.filled_quantity > 0.0
+        })
+    }
+
     /// INC-020: Snapshot all tracked SELL orders for a given position_id.
     /// Used by the live proactive-exit reconciliation path to find the actual
     /// filled quantity and price per leg after submission.

@@ -762,6 +762,31 @@ impl PositionManager {
     }
 
     /// Mutable access to open positions (for metadata updates).
+    /// INC-021: restore capital after a paper-only entry rollback. Used by
+    /// `Engine::rollback_paper_entry` when the executor failed to place real
+    /// orders for a freshly-entered position. The position has already been
+    /// removed from `open_positions` by the caller.
+    pub fn refund_capital(&mut self, amount: f64) {
+        if amount > 0.0 {
+            self.current_capital += amount;
+        }
+    }
+
+    /// INC-021 bug 3: adjust current_capital by a (possibly negative) delta.
+    /// Used to reverse phantom resolution payouts where `close_on_resolution`
+    /// credited capital that doesn't reflect a real wallet position. Floor
+    /// at 0 to prevent negative capital from accounting bugs propagating
+    /// further.
+    pub fn adjust_capital(&mut self, delta: f64) {
+        self.current_capital = (self.current_capital + delta).max(0.0);
+    }
+
+    /// INC-021 bug 3: adjust total_actual_profit by a (possibly negative)
+    /// delta. Mirror of `adjust_capital` for the cumulative profit counter.
+    pub fn adjust_total_profit(&mut self, delta: f64) {
+        self.total_actual_profit += delta;
+    }
+
     pub fn open_positions_mut(&mut self) -> &mut HashMap<String, Position> {
         &mut self.open_positions
     }
