@@ -15,6 +15,15 @@ const STATE_SCHEMA: &str = "
         key TEXT PRIMARY KEY,
         value REAL NOT NULL
     );
+    -- INC-021: small string KV store for things like the last-seen
+    -- py-clob-client release tag. Existing `scalars` is REAL-only; rather
+    -- than overloading it, this table is the canonical place for short
+    -- string state that needs to survive restart (e.g. version tags, last
+    -- alert signatures, feature flags later on).
+    CREATE TABLE IF NOT EXISTS meta_kv (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS positions (
         position_id TEXT PRIMARY KEY,
         status TEXT NOT NULL DEFAULT 'open',
@@ -164,6 +173,26 @@ impl StateDB {
             "SELECT value FROM scalars WHERE key = ?1",
             params![key],
             |row| row.get(0),
+        ).ok()
+    }
+
+    /// INC-021: small string KV — used for last-seen GitHub release tag etc.
+    /// See `meta_kv` table; kept distinct from the REAL-only `scalars` table
+    /// so each table type stays simple.
+    pub fn set_scalar_str(&self, key: &str, value: &str) {
+        let db = self.db.conn();
+        let _ = db.execute(
+            "INSERT OR REPLACE INTO meta_kv (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        );
+    }
+
+    pub fn get_scalar_str(&self, key: &str) -> Option<String> {
+        let db = self.db.conn();
+        db.query_row(
+            "SELECT value FROM meta_kv WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, String>(0),
         ).ok()
     }
 

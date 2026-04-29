@@ -223,45 +223,78 @@ fn extract_f64(obj: &serde_json::Value, key: &str) -> Option<f64> {
 // HTTP: paginated Gamma API fetch
 // ---------------------------------------------------------------------------
 
+/// INC-021: migrated from `/markets` (offset-paginated, sunsets 2026-05-01)
+/// to `/markets/keyset` (cursor-paginated). Response shape changed from a
+/// bare `[market, ...]` array to `{markets: [...], next_cursor: "..."}`.
+/// Pagination loop now follows next_cursor until it's empty.
 fn fetch_all_markets(
     client: &reqwest::blocking::Client,
 ) -> (Vec<(String, serde_json::Value)>, usize) {
-    let api_url = "https://gamma-api.polymarket.com/markets";
+    let api_url = "https://gamma-api.polymarket.com/markets/keyset";
     let limit = 500usize;
-    let mut offset = 0usize;
+    let mut next_cursor = String::new();
     let mut all_markets = Vec::new();
     let mut skipped = 0usize;
+    // Cap iterations as a defensive backstop in case the cursor never empties.
+    let mut iter_count = 0usize;
+    const MAX_ITERS: usize = 200;
 
     loop {
+        iter_count += 1;
+        if iter_count > MAX_ITERS {
+            tracing::warn!("[scanner] keyset pagination hit MAX_ITERS={}; stopping", MAX_ITERS);
+            break;
+        }
+
+        // First page: empty next_cursor sends nothing (or empty); subsequent pages echo back.
+        let mut query: Vec<(String, String)> = vec![
+            ("limit".into(), limit.to_string()),
+            ("active".into(), "true".into()),
+            ("closed".into(), "false".into()),
+        ];
+        if !next_cursor.is_empty() {
+            query.push(("next_cursor".into(), next_cursor.clone()));
+        }
+
         let resp = match client
             .get(api_url)
-            .query(&[
-                ("limit", limit.to_string()),
-                ("offset", offset.to_string()),
-                ("active", "true".to_string()),
-                ("closed", "false".to_string()),
-            ])
+            .query(&query)
             .timeout(Duration::from_secs(30))
             .send()
         {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("[scanner] Gamma API request failed at offset {}: {}", offset, e);
+                tracing::error!("[scanner] Gamma API request failed at iter {}: {}", iter_count, e);
                 break;
             }
         };
 
         if !resp.status().is_success() {
-            tracing::error!("[scanner] Gamma API returned {} at offset {}", resp.status(), offset);
+            tracing::error!("[scanner] Gamma API returned {} at iter {}", resp.status(), iter_count);
             break;
         }
 
-        let batch: Vec<serde_json::Value> = match resp.json() {
+        let body: serde_json::Value = match resp.json() {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!("[scanner] Failed to parse Gamma API response at offset {}: {}", offset, e);
+                tracing::error!("[scanner] Failed to parse Gamma /markets/keyset response at iter {}: {}", iter_count, e);
                 break;
             }
+        };
+
+        // Accept both new shape `{markets: [...], next_cursor: ...}` and bare-array
+        // legacy shape — defensive in case Polymarket flips back during the
+        // transition window.
+        let (batch, new_cursor): (&Vec<serde_json::Value>, String) = if let (Some(arr), Some(cur)) = (
+            body.get("markets").and_then(|v| v.as_array()),
+            body.get("next_cursor").and_then(|v| v.as_str()),
+        ) {
+            (arr, cur.to_string())
+        } else if let Some(arr) = body.as_array() {
+            (arr, String::new())
+        } else {
+            tracing::error!("[scanner] Gamma /markets/keyset response unrecognized shape at iter {}", iter_count);
+            break;
         };
 
         if batch.is_empty() {
@@ -269,17 +302,18 @@ fn fetch_all_markets(
         }
 
         let batch_len = batch.len();
-        for raw in &batch {
+        for raw in batch {
             match convert_market(raw) {
                 Some(pair) => all_markets.push(pair),
                 None => skipped += 1,
             }
         }
 
-        if batch_len < limit {
-            break; // Last page
+        // Termination: empty cursor OR a short page.
+        if new_cursor.is_empty() || batch_len < limit {
+            break;
         }
-        offset += limit;
+        next_cursor = new_cursor;
     }
 
     (all_markets, skipped)

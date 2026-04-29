@@ -47,6 +47,7 @@ pub mod gas_monitor;
 pub mod usdc_monitor;
 pub mod http_client;
 pub mod gamma_freshness;
+pub mod api_drift_monitor;
 pub mod fill_quality;
 pub mod telegram_kill;
 pub mod fill_confirmation;

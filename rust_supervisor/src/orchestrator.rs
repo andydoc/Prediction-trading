@@ -800,6 +800,16 @@ pub struct Orchestrator {
     /// until next service restart. HashSet of `"<category>:<code>:<msg_snippet>"`.
     api_contract_alerts_seen: std::collections::HashSet<String>,
 
+    /// INC-021: last time the proactive API drift monitor ran (Unix secs).
+    /// Drift monitor probes Polymarket for `Deprecation`/`Sunset`/`Warning`
+    /// headers and polls py-clob-client GitHub releases — alerts the operator
+    /// BEFORE breaking changes hit live orders.
+    last_api_drift_check: f64,
+
+    /// INC-021: HeaderProbeFinding signatures already alerted on this boot.
+    /// Prevents the same `Sunset: <date>` header from firing every cycle.
+    api_drift_header_signatures_seen: std::collections::HashSet<String>,
+
     /// G1 / F-pre-1: live CLOB executor. Some only when execute_orders=true
     /// AND !shadow_only AND CLOB auth + private key are available. None in
     /// every shadow instance and on any config/credential gap.
@@ -1082,6 +1092,8 @@ impl Orchestrator {
             last_clob_auth_refresh: now_secs(),
             gamma_freshness_rejects: 0,
             api_contract_alerts_seen: std::collections::HashSet::new(),
+            last_api_drift_check: 0.0,  // Run on first periodic tick
+            api_drift_header_signatures_seen: std::collections::HashSet::new(),
             executor,
             fill_quality_log,
         })
@@ -1975,6 +1987,59 @@ impl Orchestrator {
                 tracing::info!("Pruned {} closed positions (> {}d old)", pruned, self.cfg.closed_retention_days);
             }
             self.last_retention_prune = now;
+        }
+
+        // --- INC-021: proactive API drift monitor (hourly) ---
+        //
+        // Two probes:
+        //   1. Polymarket endpoint deprecation headers (Deprecation / Sunset /
+        //      Warning / X-API-Version). New finding → one-shot Telegram per
+        //      unique signature per boot. Catches things like the Apr 29
+        //      `Sunset: Fri, 01 May 2026` on the legacy /markets endpoint.
+        //   2. py-clob-client GitHub latest-release tag. New tag vs. last-seen
+        //      → one-shot Telegram. Last-seen persisted in `scalars` so
+        //      restart doesn't re-alert on the same release.
+        //
+        // 1h cadence is generous; both checks are tiny network calls and
+        // alerting is dedup'd.
+        if (now - self.last_api_drift_check) >= 3600.0 {
+            let timeout = std::time::Duration::from_secs(10);
+
+            // Probe 1: deprecation headers
+            let header_findings = rust_engine::api_drift_monitor::probe_deprecation_headers(timeout);
+            for f in &header_findings {
+                if self.api_drift_header_signatures_seen.insert(f.signature.clone()) {
+                    let body = format!(
+                        "[API-DRIFT header] {}\nSignature: {}\nMigrate / update before the sunset date if applicable.",
+                        f.summary, f.signature
+                    );
+                    tracing::warn!("{}", body);
+                    let _ = self.notifier.send(&NotifyEvent::Error { message: body });
+                }
+            }
+
+            // Probe 2: py-clob-client GitHub latest release
+            if let Some(rel) = rust_engine::api_drift_monitor::probe_clob_client_release(timeout) {
+                let last_seen_key = "api_drift_last_clob_client_tag";
+                let prev = self.state_db.get_scalar_str(last_seen_key);
+                let prev_tag = prev.as_deref().unwrap_or("");
+                if prev_tag != rel.tag {
+                    // Persist immediately so we don't double-alert across restarts
+                    self.state_db.set_scalar_str(last_seen_key, &rel.tag);
+                    if !prev_tag.is_empty() {
+                        let body = format!(
+                            "[API-DRIFT release] py-clob-client released {} (was {}). Published {}. {}\nReview the release notes for order-payload / auth changes.",
+                            rel.tag, prev_tag, rel.published_at, rel.html_url
+                        );
+                        tracing::warn!("{}", body);
+                        let _ = self.notifier.send(&NotifyEvent::Error { message: body });
+                    } else {
+                        tracing::info!("api_drift: first sighting of py-clob-client tag {} (no alert; persisted as baseline)", rel.tag);
+                    }
+                }
+            }
+
+            self.last_api_drift_check = now;
         }
 
         // --- C4: Daily P&L report (at midnight UTC) ---

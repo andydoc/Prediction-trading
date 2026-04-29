@@ -85,19 +85,21 @@ pub fn check_group_freshness(
         Err(e) => return Verdict::NetworkError(format!("client build failed: {}", e)),
     };
 
-    // Polymarket Gamma API: we send `?negRiskMarketID=<id>&limit=N` and count
-    // the returned array length as the current group size.
+    // INC-021: migrated from `/markets` (sunsets 2026-05-01) to
+    // `/markets/keyset`. Response shape changed: was bare-array, now
+    // `{markets: [...], next_cursor: ...}`. Both shapes parsed defensively.
     //
-    // INC-019 caveat: the Gamma `negRiskMarketID` filter is **unreliable** —
-    // for many neg_risk_market_ids it ignores the filter entirely and returns
-    // the first N markets in the catalog. When that happens, `current` saturates
-    // at `limit` and every check looks like a `GroupGrew` event. We detect that
-    // failure mode by checking `current == limit` and treating it as a broken-API
-    // signal, falling back to the authoritative `full_group_size` already
-    // verified by `eval.rs::evaluate_batch` at evaluation time.
+    // INC-019 caveat (still applies on keyset): the Gamma `negRiskMarketID`
+    // filter is unreliable — for many neg_risk_market_ids it ignores the
+    // filter entirely and returns the first N markets in the catalog. When
+    // that happens, `current` saturates at `limit` and every check looks
+    // like a `GroupGrew` event. We detect that failure mode by checking
+    // `current == limit` and treating it as a broken-API signal, falling
+    // back to the authoritative `full_group_size` already verified by
+    // `eval.rs::evaluate_batch` at evaluation time.
     const PAGE_LIMIT: usize = 100;
     let url = format!(
-        "https://gamma-api.polymarket.com/markets?negRiskMarketID={}&limit={}",
+        "https://gamma-api.polymarket.com/markets/keyset?negRiskMarketID={}&limit={}",
         neg_risk_market_id, PAGE_LIMIT
     );
 
@@ -115,11 +117,13 @@ pub fn check_group_freshness(
         Err(e) => return Verdict::NetworkError(format!("parse failed: {}", e)),
     };
 
-    // Gamma returns a JSON array of market objects. The array length is the
-    // current group size for this negRiskMarketID.
-    let current = match body.as_array() {
-        Some(arr) => arr.len(),
-        None => return Verdict::NetworkError("response was not a JSON array".into()),
+    // Accept both new keyset shape and legacy bare-array shape (defensive).
+    let current = if let Some(arr) = body.get("markets").and_then(|v| v.as_array()) {
+        arr.len()
+    } else if let Some(arr) = body.as_array() {
+        arr.len()
+    } else {
+        return Verdict::NetworkError("response shape unrecognised (expected {markets:[...]} or [...])".into());
     };
 
     // INC-019: broken-filter detection. If the response saturates at the page
@@ -195,8 +199,9 @@ pub fn boot_probe(probe_id: &str, timeout: Duration) -> BootProbeResult {
         Err(e) => return BootProbeResult::Unreachable { reason: format!("client build failed: {}", e) },
     };
 
+    // INC-021: migrated to /markets/keyset (legacy /markets sunsets 2026-05-01)
     let url = format!(
-        "https://gamma-api.polymarket.com/markets?negRiskMarketID={}&limit={}",
+        "https://gamma-api.polymarket.com/markets/keyset?negRiskMarketID={}&limit={}",
         probe_id, PAGE_LIMIT
     );
 
@@ -214,7 +219,12 @@ pub fn boot_probe(probe_id: &str, timeout: Duration) -> BootProbeResult {
         Err(e) => return BootProbeResult::Unreachable { reason: format!("parse failed: {}", e) },
     };
 
-    let n = body.as_array().map(|a| a.len()).unwrap_or(0);
+    // Accept both new keyset shape and legacy bare-array shape
+    let n = if let Some(arr) = body.get("markets").and_then(|v| v.as_array()) {
+        arr.len()
+    } else if let Some(arr) = body.as_array() {
+        arr.len()
+    } else { 0 };
     if n >= PAGE_LIMIT {
         BootProbeResult::FilterBroken { sample_size: n }
     } else {
