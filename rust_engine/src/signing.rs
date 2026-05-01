@@ -127,11 +127,21 @@ pub struct SignedOrder {
 // ---------------------------------------------------------------------------
 
 /// Compute the EIP-712 domain separator for a Polymarket V2 exchange.
-/// Domain: `name="Polymarket CTF Exchange", version="2", chainId=137, verifyingContract=<exchange>`.
-fn domain_separator(exchange_address: Address) -> B256 {
+///
+/// **INC-021 update (2026-05-02)**: domain *name* differs by exchange too.
+/// Standard: `"Polymarket CTF Exchange"`. NegRisk: `"Polymarket Neg Risk CTF Exchange"`.
+/// The V1 code only switched the verifyingContract; that produced a valid-looking
+/// signature against the WRONG domain, which Polymarket V2 returns as
+/// `400 invalid signature`. Domain version is `"2"` for both.
+fn domain_separator(exchange_address: Address, neg_risk: bool) -> B256 {
+    let name_bytes: &[u8] = if neg_risk {
+        b"Polymarket Neg Risk CTF Exchange"
+    } else {
+        b"Polymarket CTF Exchange"
+    };
     let mut buf = Vec::with_capacity(5 * 32);
     buf.extend_from_slice(domain_type_hash().as_slice());
-    buf.extend_from_slice(keccak256(b"Polymarket CTF Exchange").as_slice());
+    buf.extend_from_slice(keccak256(name_bytes).as_slice());
     buf.extend_from_slice(keccak256(b"2").as_slice());  // V2 domain version
     buf.extend_from_slice(&U256::from(CHAIN_ID).to_be_bytes::<32>());
     // Address is 20 bytes, left-padded to 32
@@ -232,8 +242,8 @@ impl OrderSigner {
 
         Ok(Self {
             signer,
-            domain_ctf: domain_separator(ctf_addr),
-            domain_neg_risk: domain_separator(neg_risk_addr),
+            domain_ctf: domain_separator(ctf_addr, false),
+            domain_neg_risk: domain_separator(neg_risk_addr, true),
         })
     }
 
@@ -668,9 +678,9 @@ mod tests {
     #[test]
     fn test_domain_separator() {
         let ctf_addr: Address = CTF_EXCHANGE.parse().unwrap();
-        let sep = domain_separator(ctf_addr);
+        let sep = domain_separator(ctf_addr, false);
         // Just verify it's deterministic (same inputs → same output)
-        let sep2 = domain_separator(ctf_addr);
+        let sep2 = domain_separator(ctf_addr, false);
         assert_eq!(sep, sep2);
         // Non-zero
         assert_ne!(sep, B256::ZERO);
