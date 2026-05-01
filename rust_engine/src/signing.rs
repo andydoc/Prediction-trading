@@ -128,20 +128,14 @@ pub struct SignedOrder {
 
 /// Compute the EIP-712 domain separator for a Polymarket V2 exchange.
 ///
-/// **INC-021 update (2026-05-02)**: domain *name* differs by exchange too.
-/// Standard: `"Polymarket CTF Exchange"`. NegRisk: `"Polymarket Neg Risk CTF Exchange"`.
-/// The V1 code only switched the verifyingContract; that produced a valid-looking
-/// signature against the WRONG domain, which Polymarket V2 returns as
-/// `400 invalid signature`. Domain version is `"2"` for both.
-fn domain_separator(exchange_address: Address, neg_risk: bool) -> B256 {
-    let name_bytes: &[u8] = if neg_risk {
-        b"Polymarket Neg Risk CTF Exchange"
-    } else {
-        b"Polymarket CTF Exchange"
-    };
+/// Per py-clob-client-v2 1.0.1rc1 `ctf_exchange_v2_typed_data.py`:
+/// `CTF_EXCHANGE_V2_DOMAIN_NAME = "Polymarket CTF Exchange"` (same for
+/// both standard and negRisk — only the verifyingContract differs).
+/// `CTF_EXCHANGE_V2_DOMAIN_VERSION = "2"`.
+fn domain_separator(exchange_address: Address) -> B256 {
     let mut buf = Vec::with_capacity(5 * 32);
     buf.extend_from_slice(domain_type_hash().as_slice());
-    buf.extend_from_slice(keccak256(name_bytes).as_slice());
+    buf.extend_from_slice(keccak256(b"Polymarket CTF Exchange").as_slice());
     buf.extend_from_slice(keccak256(b"2").as_slice());  // V2 domain version
     buf.extend_from_slice(&U256::from(CHAIN_ID).to_be_bytes::<32>());
     // Address is 20 bytes, left-padded to 32
@@ -242,8 +236,8 @@ impl OrderSigner {
 
         Ok(Self {
             signer,
-            domain_ctf: domain_separator(ctf_addr, false),
-            domain_neg_risk: domain_separator(neg_risk_addr, true),
+            domain_ctf: domain_separator(ctf_addr),
+            domain_neg_risk: domain_separator(neg_risk_addr),
         })
     }
 
@@ -663,7 +657,11 @@ pub fn build_order_with_precision_and_type(
         maker_amount,
         taker_amount,
         side,
-        signature_type: 1, // V2 EOA = 1 (was 0 on V1)
+        signature_type: 0, // V2 EOA = 0 (per py-clob-client-v2 1.0.1rc1
+                           // signature_type_v2.py: SignatureTypeV2.EOA = 0,
+                           // POLY_PROXY = 1). Our earlier port set this to 1
+                           // based on a speculative agent report — corrected
+                           // after fetching the actual SDK source.
         timestamp: U256::from(now_ms),
         metadata: B256::ZERO,
         builder: B256::ZERO,
@@ -678,9 +676,9 @@ mod tests {
     #[test]
     fn test_domain_separator() {
         let ctf_addr: Address = CTF_EXCHANGE.parse().unwrap();
-        let sep = domain_separator(ctf_addr, false);
+        let sep = domain_separator(ctf_addr);
         // Just verify it's deterministic (same inputs → same output)
-        let sep2 = domain_separator(ctf_addr, false);
+        let sep2 = domain_separator(ctf_addr);
         assert_eq!(sep, sep2);
         // Non-zero
         assert_ne!(sep, B256::ZERO);
@@ -697,7 +695,7 @@ mod tests {
             maker_amount: U256::from(10_000_000u64),  // $10
             taker_amount: U256::from(20_000_000u64),  // 20 shares
             side: Side::Buy,
-            signature_type: 1,  // V2 EOA
+            signature_type: 0,  // V2 EOA per SDK
             timestamp: U256::from(1_745_000_000_000u64),
             metadata: B256::ZERO,
             builder: B256::ZERO,
@@ -748,8 +746,8 @@ mod tests {
         ).unwrap();
 
         // V2: `taker` is no longer in OrderData (server derives from market type).
-        // INC-021 V2 uses signature_type=1 (EOA).
-        assert_eq!(order.signature_type, 1);
+        // V2 EOA signature_type = 0 (per SDK; POLY_PROXY = 1).
+        assert_eq!(order.signature_type, 0);
 
         // Sign with neg_risk domain
         let signed = signer.sign_order(&order, true).unwrap();
