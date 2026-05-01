@@ -194,6 +194,81 @@ cause. The next probe trade will tell us:
 
 ---
 
+### INC-021 final findings (2026-05-02): V2 uses a wrapped collateral token (pUSD)
+
+After fixing the negRisk domain name (commit `a4efdcd`, then reverted —
+the actual SDK uses one name) and the signatureType (`1` → `0`, commit
+`438e93f`), D2 reached the contract layer. New rejection:
+
+```
+HTTP 400 {"error":"not enough balance / allowance: the balance is not enough -> balance: 0, order amount: 2574250"}
+```
+
+**Discovery**: V2 trades against a NEW wrapped collateral token, not USDC.e.
+
+| Token | Address | Source |
+|------|---------|--------|
+| **pUSD ("Polymarket USD")** | `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB` | py-clob-client-v2 1.0.1rc1 `config.py` `collateral` field |
+| USDC.e (our monitor checks this) | `0x2791bca1f2de4661ed88a30c99a7a9449aa84174` | Polygon canonical USDC.e |
+
+The wallet `0x37B2c35944aF8bE382F5Efc18a4555E1eE25A105` has $100.02 USDC.e
+but **0.00 pUSD**. Every V2 BUY checks pUSD balance/allowance, sees 0,
+and rejects. This explains 100% of the V2 failures since the schema port
+landed.
+
+**py-clob-client-v2 1.0.1rc1 release notes** (published TODAY, 2026-05-01):
+`feat: add deposit wallet order support by @suhailkakar` (PR #39).
+This is exactly the V2 inline-wrapping feature: you submit an order with
+a `deposit_wallet`-flavored OrderType and the contract auto-wraps the
+USDC.e on the fly. Examples added:
+
+- `examples/account/approve_allowances.py`
+- `examples/account/approve_neg_risk_allowances.py`
+- `examples/account/get_balance_allowance.py`
+- `examples/account/update_balance_allowance.py`
+- `examples/orders/gtc_limit_buy_deposit_wallet.py`
+
+**Three options to unblock**:
+
+1. **Manual wrap via Polymarket UI** — operator logs into the web UI
+   with the wallet, deposits some USDC.e (auto-wraps to pUSD),
+   re-probes our $5 D2. Fastest path to validate everything else.
+2. **Implement deposit_wallet OrderType** — port the V2 SDK pattern
+   into our executor. Adds a new OrderType variant; build_order +
+   submit_to_clob check the right pUSD-vs-USDC.e source.
+3. **Implement wrap step in code** — add an on-chain
+   `pUSD.deposit(usdc_amount)` raw transaction signer. Bigger lift
+   (raw EIP-1559 signing, not EIP-712). One-time per top-up.
+
+**State after this discovery**:
+- `shadow_only: true` (halted)
+- `TRADER_FORCE_NEW_CLOB_KEY` systemd override removed (daily refresh
+  resumes normal flow on next start)
+- All Phase A bug fixes (entry rollback, journal reversal, phantom
+  payout reversal, token_id from constraints) confirmed working in
+  the May 1 17:18 + 23:11 + 23:18 + 23:24 probe cycles
+- V2 schema, signature, L2 auth all confirmed working
+
+**Net status**: not a code bug — a missing on-chain prerequisite
+(USDC.e → pUSD wrap). All deeper plumbing is correct.
+
+**Lessons**:
+- The agent's earlier V2 spec (`signatureType: 1`, `Polymarket Neg Risk
+  CTF Exchange` domain name) was speculative and wrong on both counts.
+  Always fetch the actual SDK source code at the named tag — the
+  authoritative file is `ctf_exchange_v2_typed_data.py` + `signature_type_v2.py`,
+  not a third-party cheatsheet or LLM summary.
+- Migration cliff bigger than the wire-format change. Polymarket V2 isn't
+  just a schema rev — it's a new collateral token. We caught it by
+  probing live (HTTP 400 with the explicit error message). A purely
+  static schema diff would have missed this.
+- Probe-trade pattern (D2: GTC at off-market + cancel) is invaluable for
+  surfacing layered failures fast. Got us from "401 unauthorized" to
+  "invalid signature" to "balance: 0" in under an hour, vs. waiting
+  hours for organic opportunities to fire.
+
+---
+
 ### INC-020: Proactive Exits Did Not Submit Real CLOB Sells — Phantom-Proceeds Latent Bug (2026-04-27)
 
 **Severity**: CRITICAL (would have caused immediate accounting/wallet divergence on first live arb post-INC-019 fix)
