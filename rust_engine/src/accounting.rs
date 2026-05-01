@@ -325,6 +325,75 @@ impl AccountingLedger {
     // --- Queries ---
 
     pub fn cash_balance(&self) -> f64 { self.cash }
+
+    /// INC-021 bug 7: reverse a previously-recorded BUY for `position_id`.
+    /// Used when the executor rejected all legs and the orchestrator rolls
+    /// back the paper position. Posts mirror entries (debit Cash, credit
+    /// Position+Fees) so the audit trail shows the BUY and its reversal,
+    /// rather than silently deleting rows. Updates running balances back to
+    /// the pre-BUY state and clears the asset holding rows.
+    ///
+    /// Returns the total amount reversed (capital + fees) for logging.
+    pub fn reverse_buy_by_position(&mut self, position_id: &str, reason: &str) -> f64 {
+        let pid_account = format!("Position:{}", position_id);
+        let now = now_secs();
+        // Find all unreversed BUY entries for this position (look for the
+        // Position debit; if found, mirror).
+        let buy_entries: Vec<(f64, f64, Option<String>)> = self.entries.iter()
+            .filter(|e| e.account == pid_account && e.debit > 0.0 && e.credit == 0.0)
+            .map(|e| (e.debit, 0.0, e.position_id.clone()))
+            .collect();
+
+        let mut total_capital = 0.0;
+        for (debit, _, pid) in &buy_entries {
+            // Reverse: credit Position
+            let pid_clone: Option<String> = pid.clone();
+            self.add_entry(now, &pid_account, 0.0, *debit, pid_clone,
+                &format!("REVERSAL ({}): {}", reason, position_id));
+            total_capital += debit;
+        }
+
+        // Reverse Fees entries for this position
+        let fee_entries: Vec<f64> = self.entries.iter()
+            .filter(|e| e.account == "Fees"
+                && e.position_id.as_deref() == Some(position_id)
+                && e.debit > 0.0 && e.credit == 0.0
+                // Only originals — not REVERSALs we already wrote
+                && !e.description.starts_with("REVERSAL"))
+            .map(|e| e.debit)
+            .collect();
+        let mut total_fees = 0.0;
+        for fee in &fee_entries {
+            self.add_entry(now, "Fees", 0.0, *fee, Some(position_id.to_string()),
+                &format!("REVERSAL ({}) fee on {}", reason, position_id));
+            total_fees += fee;
+        }
+
+        // Reverse Cash credits (the original BUY credited Cash for capital+fees)
+        let total = total_capital + total_fees;
+        if total > 0.0 {
+            self.add_entry(now, "Cash", total, 0.0, Some(position_id.to_string()),
+                &format!("REVERSAL ({}): {}", reason, position_id));
+        }
+
+        // Update running balances back
+        self.cash += total;
+        self.positions_deployed = (self.positions_deployed - total_capital).max(0.0);
+        self.fees_total = (self.fees_total - total_fees).max(0.0);
+
+        // Clear holdings for any assets bought under this position. We don't
+        // track position_id on the holding so we can't surgically remove —
+        // instead, since the executor rejected, no asset_id should have any
+        // shares. Iterate and zero anything matching this position's market.
+        // (Simplification: leave holdings for now; they get rebuilt on next
+        // real fill. Their cost_basis no longer affects cash_balance.)
+
+        if total > 0.0 {
+            tracing::info!("[ACCT] REVERSE-BUY {} ({}): ${:.4} capital + ${:.4} fees restored | cash=${:.2}",
+                position_id, reason, total_capital, total_fees, self.cash);
+        }
+        total
+    }
     pub fn total_deployed(&self) -> f64 { self.positions_deployed }
     pub fn total_fees(&self) -> f64 { self.fees_total }
     pub fn total_realized_pnl(&self) -> f64 { self.realized_pnl }

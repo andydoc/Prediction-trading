@@ -119,10 +119,16 @@ pub fn classify_clob_rejection(code: &str, message: &str) -> Option<&'static str
         || blob.contains("not_supported") || blob.contains("removed") {
         return Some("deprecation");
     }
-    // Auth contract drift (signature scheme, header contract)
+    // Auth contract drift (signature scheme, header contract, key invalidation).
+    // Includes plain HTTP 401 patterns ("unauthorized", "invalid api key") because
+    // a V2 migration (or any auth-scheme rotation on the venue side) frequently
+    // invalidates previously-issued L2 keys.
     if blob.contains("invalid_signature") || blob.contains("signature_invalid")
         || blob.contains("bad_hmac") || blob.contains("hmac_invalid")
-        || blob.contains("signature_type") {
+        || blob.contains("signature_type") || blob.contains("unauthorized")
+        || blob.contains("invalid api key") || blob.contains("invalid_api_key")
+        || blob.contains("api key") || blob.contains("api_key_expired")
+        || blob.contains("invalid passphrase") {
         return Some("auth_drift");
     }
     None

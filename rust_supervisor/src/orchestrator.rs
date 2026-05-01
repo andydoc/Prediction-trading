@@ -578,17 +578,35 @@ impl OrchestratorConfig {
                 .and_then(|v| v.as_str()).unwrap_or("");
             let clob_host = "https://clob.polymarket.com";
 
+            // INC-021: env var TRADER_FORCE_NEW_CLOB_KEY=1 forces a fresh
+            // create_api_key call (POST /auth/api-key) instead of the usual
+            // derive-first-create-on-fail flow. Used after a venue-side key
+            // rotation (e.g. the Polymarket V2 migration) where derive
+            // returns a stale/revoked key and /order then 401s.
+            let force_new = std::env::var("TRADER_FORCE_NEW_CLOB_KEY")
+                .ok().filter(|v| v == "1" || v.eq_ignore_ascii_case("true")).is_some();
             // Try derive fresh creds from wallet private key
             let fresh_creds = if !pk.is_empty() {
                 match rust_engine::signing::OrderSigner::new(pk) {
-                    Ok(signer) => match signer.create_or_derive_api_key(clob_host) {
-                        Ok(creds) => {
-                            tracing::info!("CLOB API key derived fresh (key={}...)", &creds.api_key[..8.min(creds.api_key.len())]);
-                            Some(creds)
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to derive fresh CLOB API key: {}", e);
-                            None
+                    Ok(signer) => {
+                        let result = if force_new {
+                            tracing::warn!("TRADER_FORCE_NEW_CLOB_KEY=1 — calling create_api_key (POST /auth/api-key) to force a fresh server-side key");
+                            signer.create_api_key(clob_host)
+                        } else {
+                            signer.create_or_derive_api_key(clob_host)
+                        };
+                        match result {
+                            Ok(creds) => {
+                                tracing::info!("CLOB API key {} (key={}...)",
+                                    if force_new { "CREATED FRESH" } else { "derived" },
+                                    &creds.api_key[..8.min(creds.api_key.len())]);
+                                Some(creds)
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to {} CLOB API key: {}",
+                                    if force_new { "create new" } else { "derive fresh" }, e);
+                                None
+                            }
                         }
                     }
                     Err(e) => {

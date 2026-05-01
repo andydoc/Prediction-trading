@@ -722,8 +722,9 @@ impl TradingEngine {
     }
 
     /// INC-021 bug 2: undo a `enter_position` that the executor failed to
-    /// fill. Removes the position from `open_positions` and restores its
-    /// `total_capital` to `current_capital`. Use ONLY when the executor
+    /// fill. Removes the position from `open_positions`, restores its
+    /// `total_capital` to PM `current_capital`, AND reverses the accounting
+    /// journal BUY entries (INC-021 bug 7). Use ONLY when the executor
     /// returned 0 accepted legs — i.e. the position is paper-only with no
     /// real shares in the wallet. Returns true if a rollback happened.
     pub fn rollback_paper_entry(&self, position_id: &str) -> bool {
@@ -731,9 +732,15 @@ impl TradingEngine {
         let removed = pm.open_positions_mut().remove(position_id);
         if let Some(pos) = removed {
             pm.refund_capital(pos.total_capital);
+            // INC-021 bug 7: also reverse the accounting ledger so the
+            // USDC drift check stays clean. Without this, the journal
+            // retains the BUY debit (Position) + credit (Cash) and the
+            // accounting cash balance drifts $X below the wallet.
+            let mut acct = self.accounting.lock();
+            let reversed = acct.reverse_buy_by_position(position_id, "executor rejected entry");
             tracing::warn!(
-                "INC-021 rollback: removed paper position {} ({} legs, ${:.2} restored)",
-                position_id, pos.markets.len(), pos.total_capital
+                "INC-021 rollback: removed paper position {} ({} legs, ${:.2} PM restored, ${:.2} ledger reversed)",
+                position_id, pos.markets.len(), pos.total_capital, reversed
             );
             true
         } else {
