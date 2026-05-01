@@ -127,6 +127,73 @@ below.
 
 ---
 
+### INC-021 update (2026-05-01 / 02): V2 port worked, auth + bug 7 surfaced
+
+After the V2 port shipped (commit `8c31a29`) and the $5 probe configuration
+(commit `ccfc26d`), the first live opportunity fired at **2026-05-01 17:18 UTC**:
+3-leg `mutex_sell_all` on `mutex_0x50aba305…`, expected 6.94%. Shadow-B/C/D/E
+all entered and won. Live attempted entry; outcome:
+
+- ✅ **V2 schema is correct.** Polymarket no longer returns
+  `order_version_mismatch`. The wire payload includes `signatureType: 1`,
+  `timestamp`, `metadata` / `builder` (zero bytes32), `postOnly: false`,
+  `deferExec: false`, no taker/nonce/feeRateBps. The full V2 envelope is
+  on the wire and accepted at the schema layer.
+- ❌ **All 3 legs rejected with `HTTP 401 {"error":"Unauthorized/Invalid api key"}`.**
+- ✅ **Phase A bug 2 entry rollback fired correctly:**
+  `INC-021 rollback: removed paper position … (3 legs, $5.00 restored)`.
+  Position cleanly removed from open_positions, PM scalar capital restored.
+- ❌ **Bug 7 (NEW): rollback didn't reverse the accounting journal.**
+  `enter_position` writes BUY entries to the journal (debit Position+Fees,
+  credit Cash) BEFORE the executor runs. The rollback restored the PM
+  scalar but left the journal entries. The next USDC monitor tick fired
+  `[ERROR] USDC drift: on-chain=$100.02 vs accounting=$95.02 ($5.00 drift)`.
+- ❌ **Reactive `classify_clob_rejection` didn't match** "Unauthorized" /
+  "Invalid api key" — heuristics only covered `signature_invalid` /
+  `hmac_invalid`. The 401 storm was silent on Telegram.
+
+**Fixes (commit `8c84eb9`)**:
+
+1. **Bug 7 — `AccountingLedger::reverse_buy_by_position`**: posts mirror
+   entries (credit Position, debit Cash, credit Fees) for the rejected
+   BUY. `Engine::rollback_paper_entry` now calls it. Audit trail preserved
+   (REVERSAL rows visible in journal).
+2. **`classify_clob_rejection` extended** with `unauthorized`,
+   `invalid api key`, `api_key_expired`, `invalid passphrase` patterns
+   under category `auth_drift`. Future 401 storms fire one-shot Telegram.
+3. **`TRADER_FORCE_NEW_CLOB_KEY=1` env var** override: forces
+   `create_api_key` (POST /auth/api-key) at startup instead of derive-first.
+   Used after a venue-side key rotation where derive returns a stale row
+   that subsequently 401s on /order. Set once via systemd drop-in:
+   `/etc/systemd/system/prediction-trader.service.d/force-new-key.conf`.
+
+**Re-armed 2026-05-01 23:05 UTC** with full state reset + force-new-key.
+The fresh `create_api_key` returned the same `c5a8fcd5…` prefix as the
+rejected key, which means either (a) Polymarket's create endpoint is
+idempotent on `wallet → key`, or (b) L2 auth isn't actually the root
+cause. The next probe trade will tell us:
+- 401 again → auth scheme changed in V2; need fresh investigation
+  (possibly POLY_ADDRESS / POLY_API_KEY header format changed)
+- different error → investigate that
+- success → the issue was a transient venue cache, now warm
+
+**Lessons**:
+- Rollback isn't atomic across subsystems by default. Any "undo entry"
+  primitive needs to undo PM scalar AND ledger AND any other
+  side-effect writers (suspense, fill_quality, etc.). Worth a full audit
+  pass before next live re-arm.
+- Telegram alert categories should err on the side of catching MORE error
+  patterns. A silent 401 storm cost us 2+ hours of observation. The
+  classifier should categorize anything matching common HTTP-failure
+  patterns into one of {schema/field/format/deprecation/auth/rate-limit}
+  rather than fall through to "uncategorized" silently.
+- "Idempotent" auth endpoints can mask a key-rotation bug: derive-first
+  returns the existing row; create-on-fail never fires; if the key is
+  bad, we never recover. Forcing create unconditionally on a rotation-class
+  401 should probably be the default.
+
+---
+
 ### INC-020: Proactive Exits Did Not Submit Real CLOB Sells — Phantom-Proceeds Latent Bug (2026-04-27)
 
 **Severity**: CRITICAL (would have caused immediate accounting/wallet divergence on first live arb post-INC-019 fix)
