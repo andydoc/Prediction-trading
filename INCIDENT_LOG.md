@@ -269,6 +269,123 @@ USDC.e on the fly. Examples added:
 
 ---
 
+### INC-021 SOLVED (2026-05-02): V2 onboarding complete — first live order accepted
+
+After fixing signatureType (`1` → `0`), reverting the spurious negRisk domain
+name, wrapping USDC.e → pUSD via KyberSwap, and setting all 6 V2 allowances,
+both BUY and SELL paths are validated end-to-end on Polymarket V2.
+
+**First successful V2 order**: `0x99270c39556857e8f3c6d73bb28bf878ee7379faf5cbb2ee400c10528ad6f21a`
+(GTC BUY 1.62 SPURS YES @ $0.01, placed 2026-05-01 23:40:38 UTC, cancelled
+~5s later). **First successful V2 SELL**:
+`0x4d99ecf57d51b8532a3df03ce54524710335eb1754963303821eaec3066c033b` (12.31
+shares of SPURS YES → $1.94 pUSD, 23:52:36 UTC).
+
+#### Why every prior attempt failed (V1 → V2 migration cliff)
+
+The D1-D9 milestone tests passed in March 2026 against V1 contracts, V1
+schema, and USDC.e direct collateral. Polymarket cut over to V2 on
+**2026-04-28**, and every single piece changed:
+
+| Layer | V1 (D-test era) | V2 (now) | Failure we hit | Fix commit |
+|------|-----------------|----------|---------------|----------|
+| EIP-712 schema | 12-field struct (taker/nonce/expiration/feeRateBps) | 11-field (timestamp/metadata/builder added; old 4 removed) | `order_version_mismatch` | `8c31a29` |
+| Domain version | "1" | "2" | (caught at port time) | `8c31a29` |
+| Contract addresses | `0x4bFb41…/0xC5d5…` | `0xE1111800…/0xe2222d…` | (caught at port time) | `8c31a29` |
+| signatureType for EOA | 0 | 0 (UNCHANGED — earlier agent report wrong) | `400 invalid signature` | `438e93f` |
+| Domain name | `"Polymarket CTF Exchange"` (single) | same single (UNCHANGED — earlier agent suggestion wrong) | `400 invalid signature` | `438e93f` (revert) |
+| Collateral token | USDC.e (`0x2791bc…`) directly | wrapped **pUSD** (`0xC011a7…`) — proxy, totalSupply 315M | `balance: 0` | wrap script `wrap_usdce_to_pusd.py` |
+| BUY spender (negRisk) | V1 Exchange | NegRiskAdapter (`0xd91E80…`) | `allowance: 0 spender: 0xd91E80…` | wrap script step 5b |
+| SELL spender (negRisk) | V1 Exchange (CTF approval) | NegRiskAdapter for CTF setApproval | `allowance: 0 spender: 0xd91E80…` (on SELL cleanup) | one-off `setApprovalForAll(CTF, Adapter, true)` |
+| API key store | unchanged (L1 derive) | **keys re-issued at cutover** | `401 Unauthorized/Invalid api key` | `TRADER_FORCE_NEW_CLOB_KEY=1` env override (`8c84eb9`) |
+
+#### V2 wallet onboarding (one-time per wallet)
+
+Required transactions (encoded in `scripts/ops/wrap_usdce_to_pusd.py`):
+
+1. `USDC.e.approve(KyberSwapRouter, $5)` — DEX router spend allowance
+2. KyberSwap aggregator swap: `$5 USDC.e → ~$4.97 pUSD` (~0.5% slippage; routed via Uniswap V4)
+3. `pUSD.approve(V2 CTF Exchange, MAX)` — for buys on standard markets
+4. `pUSD.approve(V2 NegRisk Exchange, MAX)` — for buys on negRisk markets
+5. `pUSD.approve(NegRiskAdapter, MAX)` — actual ERC-20 spender on negRisk
+6. `CTF.setApprovalForAll(V2 CTF Exchange, true)` — sells on standard
+7. `CTF.setApprovalForAll(V2 NegRisk Exchange, true)` — sells on negRisk
+8. `CTF.setApprovalForAll(NegRiskAdapter, true)` — sells on negRisk **(missed in initial run; surfaced when cleanup SELL hit `allowance: 0` on adapter)**
+
+Total gas: ~0.02 POL (~$0.005). Total swap slippage: ~$0.025 on $5.
+
+#### Telegram-side observations
+
+The reactive `classify_clob_rejection` heuristic was extended in commit
+`8c84eb9` to also match `unauthorized`, `invalid api key`,
+`api_key_expired`, `invalid passphrase` — auth_drift category. Without that
+extension, the May 1 17:18 401 storm went silent. With the extension, any
+future 401 fires a one-shot Telegram alert per (category, code, msg-snippet)
+per boot.
+
+#### Final V2-ready state (Dublin, 2026-05-02)
+
+Wallet `0x37B2c35944aF8bE382F5Efc18a4555E1eE25A105`:
+
+- **USDC.e**: $95.02 (operator reserve)
+- **pUSD**: $2.24 (depleted from probe testing — top up via wrap script if needed)
+- **All 6 V2 allowances**: MAX / True
+
+Engine config:
+- `shadow_only: false` (LIVE EXECUTOR ARMED)
+- `min_trade_size: 3.0`, `capital_per_trade_pct: 0.03`, `max_positions: 1`
+- Trade base size: $3 (fits inside pUSD with fee headroom)
+
+Code state (commit `438e93f` plus uncommitted `scripts/ops/wrap_usdce_to_pusd.py`):
+- V2 EIP-712 + envelope correct
+- All Phase A bug fixes (entry rollback, journal reversal, phantom payout
+  reversal, INC-020 token_id from constraints) confirmed working in 4+
+  probes
+- Reactive API-change tracker + proactive header monitor + GitHub release
+  poll all running
+
+**Status**: cleared for live. The next mutex arb opportunity that fires
+will exercise the full V2 BUY → fill → resolution → SELL chain. Phantom
+states + drift are protected by the bug-7 journal-reversal fix and the
+phantom-payout reversal sanity check.
+
+**Outstanding (non-blocking)**:
+- Non-negRisk path validation pending — Gamma's `?negRisk=false` query
+  filter is unreliable (consistent with INC-019 finding) so D2's
+  `find_liquid_market()` keeps selecting a misclassified negRisk market.
+  Patched client-side filter on Dublin (`clob_test/src/clob_client.rs`
+  added `&& m.neg_risk == want_neg_risk` clause) but Gamma's per-market
+  `neg_risk` field in the list response is itself flipped, so the filter
+  still doesn't catch. Path forward: hand-pick a known non-negRisk market
+  and probe it directly. The V2 Exchange + pUSD allowance + CTF
+  setApproval are all in place for that path so no additional onboarding
+  is needed.
+- Wrap script second-run regression: when run a second time on the same
+  KyberSwap quote, gas estimation reverts with `insufficient funds for
+  transfer`. Likely route caching at KyberSwap. Workaround: regenerate
+  the quote fresh each run (the script does this — but the gas estimate
+  on the swap tx still failed once). Not blocking; can be addressed if
+  another wrap is needed.
+
+**Lessons**:
+- LLM-summarised SDK specs are wrong often enough that you have to fetch
+  the actual source. Both the `signatureType: 1` and the
+  `"Polymarket Neg Risk CTF Exchange"` domain name guesses were wrong; the
+  authoritative source is `ctf_exchange_v2_typed_data.py` +
+  `signature_type_v2.py` in the V2 SDK at the released tag.
+- Probe-trade pattern (D2: GTC at off-market + cancel) surfaces layered
+  failures fast — got us through 6 distinct error codes in ~30 minutes
+  vs. waiting hours for organic opportunities.
+- Migration cliffs are bigger than the wire-format change. Polymarket's V2
+  isn't just a schema rev — it's a new collateral token, a new spender
+  contract for negRisk routing, a new key issuance, and a new EIP-712
+  domain. Every layer needs verification independently.
+- For geoblocked operators, on-chain DEX routing (via KyberSwap or
+  similar aggregator) is a reliable substitute for the venue's web UI.
+  ~30 minutes total for the first-time setup.
+
+---
+
 ### INC-020: Proactive Exits Did Not Submit Real CLOB Sells — Phantom-Proceeds Latent Bug (2026-04-27)
 
 **Severity**: CRITICAL (would have caused immediate accounting/wallet divergence on first live arb post-INC-019 fix)

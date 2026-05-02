@@ -419,9 +419,9 @@ function renderStats(d) {
   h += st('FEES PAID', 'stat-fees', '$'+d.fees.toFixed(2));
   // USDC + POL come from periodic on-chain polls; show "loading…" until first read
   if (d.live_balance !== null && d.live_balance !== undefined)
-    h += st('USDC (LIVE)', 'stat-usdc', '$'+d.live_balance.toFixed(2), 'color-amber');
+    h += st('pUSD (LIVE)', 'stat-usdc', '$'+d.live_balance.toFixed(2), 'color-amber');
   else
-    h += st('USDC (LIVE)', 'stat-usdc', 'loading…', 'color-amber');
+    h += st('pUSD (LIVE)', 'stat-usdc', 'loading…', 'color-amber');
   if (d.pol_balance !== null && d.pol_balance !== undefined) {
     var polCls = d.pol_balance < 0.5 ? 'bad' : d.pol_balance < 1.0 ? 'color-amber' : 'good';
     h += st('POL GAS', 'stat-pol', d.pol_balance.toFixed(3)+' POL', polCls);
@@ -870,7 +870,7 @@ function renderLive(d) {
   if (!el) return;
   var h = '<div class="stats">';
   if (d.balance !== null && d.balance !== undefined) {
-    h += '<div class="stat"><div class="label">USDC BALANCE</div><div class="value color-amber">$'+d.balance.toFixed(2)+'</div></div>';
+    h += '<div class="stat"><div class="label">pUSD BALANCE</div><div class="value color-amber">$'+d.balance.toFixed(2)+'</div></div>';
     var st = d.mode==='LIVE' ? 'ACTIVE' : '{{MODE_LABEL}} ONLY';
     var cls = d.mode==='LIVE' ? 'color-green' : 'color-amber';
     h += '<div class="stat"><div class="label">STATUS</div><div class="value '+cls+'">'+st+'</div></div>';

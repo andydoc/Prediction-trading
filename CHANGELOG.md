@@ -7,6 +7,100 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [Unreleased] — 2026-04-29 → 2026-05-02 — INC-021 Polymarket V2 cutover
+
+### Fixed (CRITICAL)
+
+- **INC-021: Polymarket CLOB V2 schema port (`8c31a29`)**.
+  Polymarket migrated CLOB to V2 on 2026-04-28; V1 orders return
+  `HTTP 400 order_version_mismatch`. Ported `signing.rs` to V2: domain
+  version `"1"` → `"2"`; new exchange addresses (standard
+  `0xE111180000d2663C0091e4f400237545B87B996B`, negRisk
+  `0xe2222d279d744050d28e00520010520000310F59`); 11-field signed struct
+  (added `timestamp` uint256ms, `metadata` bytes32, `builder` bytes32;
+  removed `taker`, `expiration`, `nonce`, `feeRateBps`). `executor.rs`
+  wire body updated to match V2 envelope (added `postOnly`, `deferExec`).
+- **INC-021: V2 EOA `signatureType` is `0` not `1` (`438e93f`)**. Earlier
+  port (commit `8c31a29`) followed an LLM-summarised spec that said V2
+  EOA = 1; the actual V2 SDK source confirms EOA = 0 (POLY_PROXY = 1).
+  Caused `HTTP 400 invalid signature` on every V2 attempt. Fixed by
+  fetching the canonical SDK source at tag `1.0.1rc1` and reading
+  `ctf_exchange_v2_typed_data.py` + `signature_type_v2.py` directly.
+- **INC-021 bug 7: rollback now reverses accounting journal (`8c84eb9`)**.
+  Phase A's `rollback_paper_entry` restored the PM scalar `current_capital`
+  but not the journal entries that `enter_position` writes upfront.
+  Caused `USDC drift: ...$X drift` on every failed live entry. Added
+  `AccountingLedger::reverse_buy_by_position` (mirror entries credit
+  Position+Fees, debit Cash) and wired into `Engine::rollback_paper_entry`.
+- **INC-021 bugs 2/3/5 (`66a022c`)**.
+  - Bug 2 (entry rollback): when `executor.execute_arb` returns 0 of N
+    legs accepted, the paper position is removed and capital restored.
+    Wired at both entry sites.
+  - Bug 3 (phantom-payout reversal): `check_api_resolutions` consults
+    `Executor::position_has_confirmed_fills`; if zero terminal-Confirmed
+    fills, reverses the payout via `Engine::reverse_phantom_payout`.
+    Telegram alerts the operator.
+  - Bug 5 (INC-020 token_id from constraints): the exit path's
+    `legs_pre` now pulls `no_asset_id`/`yes_asset_id` from
+    `engine.constraints` registry instead of trusting empty `leg.token_id`.
+
+### Added
+
+- **`scripts/ops/wrap_usdce_to_pusd.py`** — Polymarket V2 wallet onboarding
+  script for geoblocked operators. Wraps USDC.e → pUSD via KyberSwap
+  aggregator (Uniswap V4 routes), then issues all 5 V2 allowances:
+  pUSD → V2 CTF Exchange, V2 NegRisk Exchange, NegRiskAdapter, plus
+  CTF setApprovalForAll for both V2 exchanges. (Operator must also
+  setApprovalForAll(CTF, NegRiskAdapter, true) — surfaced when SELL
+  cleanup hit `allowance: 0` on adapter; documented in INC-021. Pending
+  inclusion in the script.)
+- **API-change reactive tracker (`4240898` extended `8c84eb9`)**:
+  `Executor::classify_clob_rejection` categorises CLOB rejections into
+  `schema_version_mismatch`, `field_drift`, `format_drift`,
+  `deprecation`, `auth_drift`. `Orchestrator::alert_on_api_contract_rejection`
+  fires a one-shot Telegram alert per (category, code, msg-snippet) per
+  boot. `auth_drift` extended in `8c84eb9` to also catch `unauthorized`,
+  `invalid api key`, `api_key_expired`, `invalid passphrase` — without
+  this extension the May 1 17:18 401 storm was silent.
+- **`TRADER_FORCE_NEW_CLOB_KEY=1` env override (`8c84eb9`)**: forces
+  `create_api_key` (POST /auth/api-key) at startup instead of
+  derive-first. Used after a venue-side key rotation where derive
+  returns a stale row that subsequently 401s. Set once via systemd
+  drop-in `/etc/systemd/system/prediction-trader.service.d/force-new-key.conf`.
+- **`scalars` `meta_kv` table (`6297507`)**: small string KV store for
+  things that need to survive restart but aren't REAL-typed (last-seen
+  py-clob-client release tag, future feature flags).
+- **api_drift_monitor module (`6297507`)**: in-binary periodic probe
+  (hourly) for `Deprecation`/`Sunset`/`Warning`/`X-API-Version` headers
+  on Polymarket endpoints, plus py-clob-client GitHub release polling.
+  Persists last-seen tag. One-shot Telegram per unique signature per
+  boot. Caught the `/markets` deprecation header pre-sunset.
+- **`dynamic_capital` floor configurable (`ccfc26d`)**: was hardcoded
+  $10; now uses `cfg.min_trade_size`. Enables sub-$10 probe trades.
+
+### Operational notes
+
+- Wallet onboarded for V2 via `wrap_usdce_to_pusd.py` + one-off
+  `setApprovalForAll(CTF, NegRiskAdapter, true)` tx
+  (`0xef63925b811bab373cf0487ac5ef9de5d1346918444f260deba7fe332dd3dc8d`).
+  First successful V2 BUY: `0x99270c39…6f21a` (D2 probe at 23:40 UTC,
+  GTC SPURS YES @ $0.01, cancelled cleanly). First successful V2 SELL:
+  `0x4d99ecf5…66c033b` (12.31 SPURS YES → $1.94 pUSD, 23:52 UTC).
+
+### Known follow-ups
+
+- Add `setApprovalForAll(CTF, NegRiskAdapter, true)` to
+  `wrap_usdce_to_pusd.py` (currently issued as a one-off; operator
+  re-running the script wouldn't reproduce a complete onboarding).
+- Non-negRisk D2 validation pending — Gamma's `?negRisk=false` filter
+  is unreliable (consistent with INC-019); D2's `find_liquid_market`
+  patches don't catch it. Direct probe with a hand-picked non-negRisk
+  market is the path forward.
+- Wrap script second-run `insufficient funds for transfer` regression
+  on KyberSwap quote re-use. Workaround: regenerate quote each run.
+
+---
+
 ## [Unreleased] — 2026-04-27
 
 ### Fixed (CRITICAL)

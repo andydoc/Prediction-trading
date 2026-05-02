@@ -12,10 +12,17 @@
 use reqwest::blocking::Client;
 use crate::signing::ClobAuth;
 
-/// USDC.e token contract address on Polygon.
-const USDC_E_CONTRACT: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+/// pUSD ("Polymarket USD") — V2 wrapped collateral that the CLOB actually
+/// settles trades against. Was USDC.e (`0x2791Bca…`) under V1; V2 introduced
+/// the pUSD wrapper and the CLOB no longer touches USDC.e directly. We monitor
+/// pUSD here because it's the working trade balance — the dashboard's
+/// "USDC (LIVE)" stat needs to reflect pUSD if drift checks are to be useful.
+///
+/// USDC.e is still in the wallet as the topup reserve; it's wrapped to pUSD
+/// via `scripts/ops/wrap_usdce_to_pusd.py` when needed.
+const USDC_E_CONTRACT: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
 
-/// USDC.e has 6 decimals.
+/// pUSD has 6 decimals (same as USDC.e).
 const USDC_DECIMALS: f64 = 1e6;
 
 /// ERC-20 `balanceOf(address)` function selector (first 4 bytes of keccak256).
