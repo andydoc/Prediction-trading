@@ -75,10 +75,16 @@ pub enum UsdcCheckResult {
     Error(String),
 }
 
+/// Minimum seconds between two consecutive CLOB balance reads (#12 / py-clob-client #300).
+/// Server-side cache race can double-count on fast follow-ups.
+const CLOB_BALANCE_DEBOUNCE_SECS: f64 = 30.0;
+
 /// USDC.e balance monitor. Owned by the orchestrator.
 pub struct UsdcMonitor {
     config: UsdcMonitorConfig,
     last_on_chain: Option<f64>,
+    /// Timestamp of the most recent CLOB balance query (for debounce, #12).
+    last_clob_read_ts: f64,
 }
 
 impl UsdcMonitor {
@@ -86,6 +92,7 @@ impl UsdcMonitor {
         Self {
             config,
             last_on_chain: None,
+            last_clob_read_ts: 0.0,
         }
     }
 
@@ -118,8 +125,50 @@ impl UsdcMonitor {
 
         // Primary: CLOB exchange balance (requires L2 auth)
         if let Some(auth) = clob_auth {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            // Debounce: skip if a CLOB read happened recently (#12 / py-clob-client #300).
+            // Server-side cache race can double-count on fast follow-up reads.
+            if now - self.last_clob_read_ts < CLOB_BALANCE_DEBOUNCE_SECS {
+                tracing::debug!("CLOB balance debounced (last read {:.0}s ago)", now - self.last_clob_read_ts);
+                if let Some(cached) = self.last_on_chain {
+                    return self.evaluate_balance(cached, accounting_cash);
+                }
+            }
             match self.query_clob_balance(client, auth) {
-                Ok(exchange_bal) => {
+                Ok(first_read) => {
+                    self.last_clob_read_ts = now;
+                    // 2× jump re-read: if balance doubled since last known, re-query once
+                    // to confirm it's real and not a server-side double-count (#12).
+                    let exchange_bal = if let Some(prev) = self.last_on_chain {
+                        if prev > 0.0 && first_read > prev * 2.0 {
+                            tracing::warn!(
+                                "CLOB balance suspicious 2× jump: ${:.2} → ${:.2}, re-reading",
+                                prev, first_read
+                            );
+                            match self.query_clob_balance(client, auth) {
+                                Ok(second) => {
+                                    if (second - first_read).abs() / first_read > 0.05 {
+                                        tracing::warn!(
+                                            "CLOB balance re-read differs ({:.2} vs {:.2}), using lower",
+                                            first_read, second
+                                        );
+                                    }
+                                    first_read.min(second)
+                                }
+                                Err(e) => {
+                                    tracing::warn!("CLOB balance re-read failed: {}, using first read", e);
+                                    first_read
+                                }
+                            }
+                        } else {
+                            first_read
+                        }
+                    } else {
+                        first_read
+                    };
                     self.last_on_chain = Some(exchange_bal);
                     return self.evaluate_balance(exchange_bal, accounting_cash);
                 }

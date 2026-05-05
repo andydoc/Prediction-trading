@@ -159,7 +159,17 @@ pub fn compute_order_quantity(
         // For FAK BUY (our standard), quantity is in base (token count).
 
         // (c) FAK/GTC/FOK BUY → base (token count)
-        (OrderType::Fak | OrderType::Gtc | OrderType::Fok, Side::Buy) => {
+        // FAK BUY floors (never rounds up) to avoid overspending the USDC notional
+        // when the taker fills at a worse price than expected (#13 / py-clob-client #323).
+        (OrderType::Fak, Side::Buy) => {
+            let rounded = instrument.rounding.round_size_floor(shares);
+            if rounded < 0.01 {
+                return Err(format!("Order size too small: {} shares (${:.2} at {:.4})",
+                    rounded, size_usd, price));
+            }
+            Ok((rounded, QuantityType::Base))
+        }
+        (OrderType::Gtc | OrderType::Fok, Side::Buy) => {
             let rounded = instrument.rounding.round_size(shares);
             if rounded < 0.01 {
                 return Err(format!("Order size too small: {} shares (${:.2} at {:.4})",
@@ -301,6 +311,15 @@ pub enum ExecutionError {
     QuantityGuardRejection { message: String },
     /// Signing failed.
     SigningError { message: String },
+    /// CLOB returned 401 — L2 credentials may have expired (~30 min TTL, issue #6).
+    /// Caller should re-derive credentials and retry.
+    Unauthorized,
+    /// Cloudflare challenge page returned instead of JSON (issue #5).
+    /// Treat as transient; retry with backoff.
+    CloudflareChallenge,
+    /// V2 `sum_of_matched_orders` counter pinned; free placeable balance is zero (issue #1).
+    /// Circuit-break until the counter resets server-side.
+    BalancePinned { sum_of_matched: u64 },
 }
 
 impl std::fmt::Display for ExecutionError {
@@ -316,6 +335,10 @@ impl std::fmt::Display for ExecutionError {
             Self::InstrumentError { message } => write!(f, "Instrument error: {}", message),
             Self::QuantityGuardRejection { message } => write!(f, "Quantity guard: {}", message),
             Self::SigningError { message } => write!(f, "Signing error: {}", message),
+            Self::Unauthorized => write!(f, "CLOB 401 Unauthorized — credentials expired"),
+            Self::CloudflareChallenge => write!(f, "Cloudflare challenge (transient)"),
+            Self::BalancePinned { sum_of_matched } =>
+                write!(f, "Balance pinned by sum_of_matched_orders={} — free balance is zero", sum_of_matched),
         }
     }
 }
@@ -817,7 +840,10 @@ impl Executor {
                         elapsed_secs: HTTP_TIMEOUT_SECS as f64,
                     }
                 } else {
-                    ExecutionError::NetworkFailure { message: e.to_string() }
+                    // Strip URL from error string to avoid leaking auth query params
+                    // in logs (#15 / clob-client TS #327). Request headers are never
+                    // included in reqwest error strings regardless.
+                    ExecutionError::NetworkFailure { message: format!("POST /order: {}", e.without_url()) }
                 }
             })?;
 
@@ -833,20 +859,45 @@ impl Executor {
         }
 
         if !status.is_success() {
+            // Cloudflare challenge (#5): HTML body from WAF means transient geoblock.
+            // Pull the body once and reuse for all checks below.
             let text = response.text().unwrap_or_default();
+
+            if crate::signing::is_cloudflare_html(&text) {
+                tracing::warn!("[CLOB] Cloudflare challenge on POST /order (HTTP {})", status.as_u16());
+                return Err(ExecutionError::CloudflareChallenge);
+            }
+
+            // 401 Unauthorized → credentials likely expired (~30 min L2 TTL, issue #6)
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                tracing::warn!("[CLOB] 401 Unauthorized — L2 creds may have expired");
+                return Err(ExecutionError::Unauthorized);
+            }
+
             tracing::warn!("[CLOB REJECT] HTTP {}: {}", status.as_u16(), &text[..text.len().min(500)]);
-            let (code, message) = if let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) {
+
+            if let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) {
+                // sum_of_matched_orders pinning (#1): counter ratchets up and never decrements;
+                // available_balance stays near zero → all new orders rejected.
+                if let Some(som) = body.get("sum_of_matched_orders").and_then(|v| v.as_u64()) {
+                    let avail = body.get("available_balance").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if som > 0 && avail == 0 {
+                        tracing::warn!("[CLOB] sum_of_matched_orders={} pinned (available_balance=0)", som);
+                        return Err(ExecutionError::BalancePinned { sum_of_matched: som });
+                    }
+                }
                 let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("UNKNOWN").to_string();
-                let msg = body.get("message")
+                let message = body.get("message")
                     .or_else(|| body.get("error"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown error")
                     .to_string();
-                (code, msg)
-            } else {
-                ("UNKNOWN".to_string(), format!("HTTP {}: {}", status.as_u16(), text))
-            };
-            return Err(ExecutionError::ClobRejection { code, message });
+                return Err(ExecutionError::ClobRejection { code, message });
+            }
+            return Err(ExecutionError::ClobRejection {
+                code: "UNKNOWN".to_string(),
+                message: format!("HTTP {}: {}", status.as_u16(), &text[..text.len().min(200)]),
+            });
         }
 
         let body: serde_json::Value = response.json()

@@ -117,6 +117,10 @@ pub struct ClobClientRelease {
     pub tag: String,
     pub published_at: String,
     pub html_url: String,
+    /// First 800 chars of the GitHub release body (Markdown).
+    /// Included in the Telegram delta alert so the operator can triage
+    /// wire-format changes without leaving Telegram (#re-audit process).
+    pub release_notes: String,
 }
 
 /// Hit GitHub's "latest release" API for `Polymarket/py-clob-client`.
@@ -163,10 +167,16 @@ pub fn probe_clob_client_release(timeout: Duration) -> Option<ClobClientRelease>
     let published = body.get("published_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let url = body.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
+    // Capture release notes (GitHub `body` field, Markdown). Truncate to 800 chars
+    // so the Telegram delta message stays readable. Missing/null → empty string.
+    let raw_notes = body.get("body").and_then(|v| v.as_str()).unwrap_or("");
+    let release_notes: String = raw_notes.chars().take(800).collect();
+
     Some(ClobClientRelease {
         tag,
         published_at: published,
         html_url: url,
+        release_notes,
     })
 }
 

@@ -60,6 +60,9 @@ pub struct TieredWsConfig {
 pub struct TieredWsManager {
     tier_b: TierB,
     tier_c: TierC,
+    /// Silent-freeze watchdog: last time total_msgs increased (#7 / py-clob-client #292).
+    last_msg_count: u64,
+    last_msg_advance_ts: f64,
 }
 
 impl TieredWsManager {
@@ -106,7 +109,7 @@ impl TieredWsManager {
             instruments,
         );
 
-        Self { tier_b, tier_c }
+        Self { tier_b, tier_c, last_msg_count: 0, last_msg_advance_ts: 0.0 }
     }
 
     /// Start both tiers. Tier C starts first (command connection), then Tier B with stagger.
@@ -184,10 +187,45 @@ impl TieredWsManager {
         self.tier_c.flush_if_ready()
     }
 
-    /// Periodic maintenance: consolidation check, etc.
+    /// Periodic maintenance: consolidation check + silent-freeze watchdog.
     /// Call this from the orchestrator tick loop.
-    pub fn periodic_maintenance(&self) {
+    /// Returns `true` if a freeze was detected (caller should log/alert).
+    pub fn periodic_maintenance(&mut self, now: f64) -> bool {
         self.tier_b.maybe_consolidate();
+        self.check_freeze(now)
+    }
+
+    /// Silent-freeze watchdog (#7 / py-clob-client #292).
+    ///
+    /// WS connection can be OPEN with ping/pong fine yet deliver zero `book`
+    /// events for hours while the order book is moving.  We detect this by
+    /// comparing the rolling total message count against a 5-minute window:
+    /// if count hasn't advanced and we have active subscriptions, flag it.
+    /// The orchestrator should then call `stop()` + `start()` to reconnect.
+    fn check_freeze(&mut self, now: f64) -> bool {
+        const FREEZE_WINDOW_SECS: f64 = 300.0;
+        let stats = self.stats();
+        let current = stats.total_msgs;
+        let has_subs = stats.total_assets > 0;
+
+        if current != self.last_msg_count {
+            self.last_msg_count = current;
+            self.last_msg_advance_ts = now;
+            return false;
+        }
+        if self.last_msg_advance_ts == 0.0 {
+            self.last_msg_advance_ts = now;
+            return false;
+        }
+        let stale_secs = now - self.last_msg_advance_ts;
+        if has_subs && stale_secs >= FREEZE_WINDOW_SECS {
+            tracing::warn!(
+                "TieredWS silent-freeze detected: no messages in {:.0}s ({} assets subscribed)",
+                stale_secs, stats.total_assets,
+            );
+            return true;
+        }
+        false
     }
 
     /// Get combined stats across both tiers.
@@ -220,5 +258,12 @@ impl TieredWsManager {
             heartbeat_failures: b.heartbeat_send_failures.load(Ordering::Relaxed)
                 + c.heartbeat_send_failures.load(Ordering::Relaxed),
         }
+    }
+}
+
+// Ensure background threads are stopped when the manager is dropped (#8 / rs-clob-client #325).
+impl Drop for TieredWsManager {
+    fn drop(&mut self) {
+        self.stop();
     }
 }

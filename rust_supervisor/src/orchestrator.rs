@@ -847,6 +847,18 @@ pub struct Orchestrator {
     /// records. Some when execute_orders=true (real trades produce fills).
     /// Cheap to clone; call-sites take a clone where needed.
     fill_quality_log: Option<rust_engine::fill_quality::FillQualityLog>,
+
+    /// Rolling on-chain revert-rate tracker (issue #4 / py-clob-client #338).
+    /// Records Confirmed/Reverted outcomes for each settled fill and trips
+    /// the circuit breaker when the 30-trade window exceeds 35%.
+    revert_tracker: rust_engine::circuit_breaker::RevertRateTracker,
+
+    /// Timestamp of last WS silent-freeze Telegram alert (#7).
+    /// Rate-limits alerts to once per 10 minutes to avoid spam.
+    last_ws_freeze_alert: f64,
+
+    /// Timestamp of last BalancePinned alert (#1). Rate-limited to once/hour.
+    last_balance_pinned_alert: f64,
 }
 
 impl Orchestrator {
@@ -1124,6 +1136,10 @@ impl Orchestrator {
             api_drift_header_signatures_seen: std::collections::HashMap::new(),
             executor,
             fill_quality_log,
+            // 30-trade window, min 10 fills before tripping, 35% threshold
+            revert_tracker: rust_engine::circuit_breaker::RevertRateTracker::new(30, 10, 0.35),
+            last_ws_freeze_alert: 0.0,
+            last_balance_pinned_alert: 0.0,
         })
     }
 
@@ -1905,7 +1921,17 @@ impl Orchestrator {
                     self.engine.tiered_add_new_market_constraint(synthetic_cid, all_burst_assets);
                 }
             }
-            self.engine.tiered_periodic_maintenance();
+            let freeze = self.engine.tiered_periodic_maintenance(now);
+            if freeze && (now - self.last_ws_freeze_alert) >= 600.0 {
+                self.last_ws_freeze_alert = now;
+                // Alert operator; automatic reconnect would require rebuilding
+                // the full hot-constraint asset set, so we surface this for
+                // manual restart. The watchdog fires at most once per 10 min.
+                let body = "[WS] Silent-freeze: no book events for 5 min with active subscriptions. \
+                    Book data is stale — consider restarting the process. (py-clob-client #292)".to_string();
+                tracing::warn!("{}", body);
+                let _ = self.notifier.send(&NotifyEvent::Error { message: body });
+            }
         }
 
         // --- API resolution poll (safety net for missed WS events) ---
@@ -2090,9 +2116,19 @@ impl Orchestrator {
                     // Persist immediately so we don't double-alert across restarts
                     self.state_db.set_scalar_str(last_seen_key, &rel.tag);
                     if !prev_tag.is_empty() {
+                        // Include truncated release notes so the operator can triage
+                        // wire-format changes directly from Telegram (re-audit process).
+                        let notes_section = if rel.release_notes.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n\nRelease notes:\n{}", rel.release_notes)
+                        };
                         let body = format!(
-                            "[API-DRIFT release] py-clob-client released {} (was {}). Published {}. {}\nReview the release notes for order-payload / auth changes.",
-                            rel.tag, prev_tag, rel.published_at, rel.html_url
+                            "[API-DRIFT release] py-clob-client {} (was {}). Published {}.\n{}\
+                            {}\n\n⚠️ Re-audit docs/POLYMARKET_ISSUE_WATCHLIST.md against this release. \
+                            Check for order-payload / auth / field changes. Update watchlist snapshot.",
+                            rel.tag, prev_tag, rel.published_at, rel.html_url,
+                            notes_section,
                         );
                         tracing::warn!("{}", body);
                         let _ = self.notifier.send(&NotifyEvent::Error { message: body });
@@ -3215,32 +3251,91 @@ impl Orchestrator {
     /// `schema_version_mismatch`, which is the signal that Polymarket has
     /// changed something we need to react to (the trigger for INC-021 itself).
     fn alert_on_api_contract_rejection(&mut self, result: &rust_engine::executor::ArbExecutionResult) {
+        use rust_engine::executor::{OrderResult, ExecutionError};
+        use rust_engine::circuit_breaker::FillOutcome;
         let now = now_secs();
         for leg in &result.legs {
-            if let rust_engine::executor::OrderResult::Rejected(err) = leg {
-                if let rust_engine::executor::ExecutionError::ClobRejection { code, message } = err {
-                    if let Some(category) = rust_engine::executor::classify_clob_rejection(code, message) {
-                        // Dedup key: category + code + first 80 chars of message.
-                        let snippet = message.chars().take(80).collect::<String>();
-                        let key = format!("{}:{}:{}", category, code, snippet);
-                        // Per-day dedup: re-alert if we haven't seen this in API_DRIFT_DEDUP_SECS.
+            if let OrderResult::Rejected(err) = leg {
+                match err {
+                    ExecutionError::ClobRejection { code, message } => {
+                        if let Some(category) = rust_engine::executor::classify_clob_rejection(code, message) {
+                            let snippet = message.chars().take(80).collect::<String>();
+                            let key = format!("{}:{}:{}", category, code, snippet);
+                            let should_alert = match self.api_contract_alerts_seen.get(&key) {
+                                Some(&last_at) => (now - last_at) >= API_DRIFT_DEDUP_SECS,
+                                None => true,
+                            };
+                            if should_alert {
+                                self.api_contract_alerts_seen.insert(key, now);
+                                let body = format!(
+                                    "[API-CHANGE {}] CLOB rejected an order with what looks like a schema/contract change. \
+                                    code={} message={}. \
+                                    Check Polymarket py-clob-client repo / changelog for breaking changes \
+                                    and update the order payload before re-enabling live execution.",
+                                    category, code, snippet
+                                );
+                                tracing::error!("{}", body);
+                                let _ = self.notifier.send(&NotifyEvent::Error { message: body });
+                            }
+                        }
+                    }
+
+                    // L2 credentials expired (~30 min TTL, issue #6).
+                    // Force an immediate re-derive on the next periodic tick
+                    // rather than waiting for the 24h refresh window.
+                    ExecutionError::Unauthorized => {
+                        tracing::warn!("[CLOB] 401 Unauthorized on execute_arb — forcing immediate auth refresh");
+                        self.last_clob_auth_refresh = 0.0;
+                    }
+
+                    // Cloudflare WAF challenge (issue #5). Transient; alert once/hour.
+                    ExecutionError::CloudflareChallenge => {
+                        let key = "cf_challenge".to_string();
                         let should_alert = match self.api_contract_alerts_seen.get(&key) {
-                            Some(&last_at) => (now - last_at) >= API_DRIFT_DEDUP_SECS,
+                            Some(&last_at) => (now - last_at) >= 3600.0,
                             None => true,
                         };
                         if should_alert {
                             self.api_contract_alerts_seen.insert(key, now);
+                            let body = "[CLOB] Cloudflare challenge on order submission (transient geoblock). \
+                                Will retry automatically. If recurring, check VPS egress route.".to_string();
+                            tracing::warn!("{}", body);
+                            let _ = self.notifier.send(&NotifyEvent::Error { message: body });
+                        }
+                    }
+
+                    // sum_of_matched_orders counter pinned (#1): free balance is zero.
+                    // Circuit-break until the server resets the counter.
+                    ExecutionError::BalancePinned { sum_of_matched } => {
+                        let should_alert = (now - self.last_balance_pinned_alert) >= 3600.0;
+                        if should_alert {
+                            self.last_balance_pinned_alert = now;
                             let body = format!(
-                                "[API-CHANGE {}] CLOB rejected an order with what looks like a schema/contract change. \
-                                code={} message={}. \
-                                Check Polymarket py-clob-client repo / changelog for breaking changes \
-                                and update the order payload before re-enabling live execution.",
-                                category, code, snippet
+                                "[CLOB] sum_of_matched_orders={} pinned (available_balance=0). \
+                                Free placeable balance is zero — pausing execution until server resets. \
+                                See rs-clob-client-v2 #36.",
+                                sum_of_matched
                             );
                             tracing::error!("{}", body);
                             let _ = self.notifier.send(&NotifyEvent::Error { message: body });
                         }
+                        // Record as a "revert" in the fill tracker so the revert-rate
+                        // circuit breaker accumulates evidence alongside on-chain reverts.
+                        self.revert_tracker.record(FillOutcome::Reverted, now);
+                        if let Some((rate_pct, confirmed, reverted)) = self.revert_tracker.trip_signal() {
+                            let threshold = self.revert_tracker.threshold_pct() * 100.0;
+                            if let Some(msg) = self.circuit_breaker.check_revert_critical(
+                                rate_pct, confirmed, reverted, threshold, now,
+                            ) {
+                                tracing::error!("[CB] Revert-rate trip: {}", msg);
+                                let _ = self.notifier.send(&NotifyEvent::Error {
+                                    message: format!("[CB TRIPPED] {}", msg),
+                                });
+                            }
+                        }
                     }
+
+                    _ => {}
                 }
             }
         }

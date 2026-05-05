@@ -395,9 +395,12 @@ impl TradingEngine {
     }
 
     /// Periodic maintenance for the tiered WS system.
-    pub fn tiered_periodic_maintenance(&self) {
-        if let Some(ref tiered) = *self.ws_tiered.lock() {
-            tiered.periodic_maintenance();
+    /// Returns `true` if a silent-freeze was detected on this tick (#7).
+    pub fn tiered_periodic_maintenance(&self, now: f64) -> bool {
+        if let Some(ref mut tiered) = *self.ws_tiered.lock() {
+            tiered.periodic_maintenance(now)
+        } else {
+            false
         }
     }
 

@@ -73,6 +73,13 @@ impl RoundingConfig {
         (size * scale).round() / scale
     }
 
+    /// Floor a size/quantity to the configured precision (never exceeds raw value).
+    /// Used for FAK BUY orders to avoid overspending USDC notional (issue #13).
+    pub fn round_size_floor(&self, size: f64) -> f64 {
+        let scale = 10f64.powi(self.size_decimals as i32);
+        (size * scale).floor() / scale
+    }
+
     /// Round an amount (price × size) to the configured precision.
     pub fn round_amount(&self, amount: f64) -> f64 {
         let scale = 10f64.powi(self.amount_decimals as i32);

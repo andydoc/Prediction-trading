@@ -52,6 +52,13 @@ pub enum TripReason {
     GasCritical {
         message: String,
     },
+    /// On-chain revert rate exceeded threshold in rolling window (issue #4 / py-clob-client #338).
+    RevertRate {
+        rate_pct: f64,
+        confirmed: u32,
+        reverted: u32,
+        threshold_pct: f64,
+    },
 }
 
 impl std::fmt::Display for TripReason {
@@ -69,6 +76,10 @@ impl std::fmt::Display for TripReason {
             }
             TripReason::GasCritical { message } => {
                 write!(f, "{}", message)
+            }
+            TripReason::RevertRate { rate_pct, confirmed, reverted, threshold_pct } => {
+                write!(f, "On-chain revert rate {:.1}% ({} reverts / {} total) exceeds {:.1}% threshold",
+                    rate_pct, reverted, confirmed + reverted, threshold_pct)
             }
         }
     }
@@ -257,6 +268,28 @@ impl CircuitBreaker {
         self.geoblock_recovery_streak = 0;
     }
 
+    /// Trip from an elevated on-chain revert rate (issue #4 / py-clob-client #338).
+    /// The caller owns a `RevertRateTracker` and calls this when the tracker fires.
+    /// Returns the trip message if it just tripped, None if already tripped or disabled.
+    pub fn check_revert_critical(
+        &mut self,
+        rate_pct: f64,
+        confirmed: u32,
+        reverted: u32,
+        threshold_pct: f64,
+        now: f64,
+    ) -> Option<String> {
+        if !self.config.enabled || self.tripped {
+            return None;
+        }
+        self.tripped = true;
+        let reason = TripReason::RevertRate { rate_pct, confirmed, reverted, threshold_pct };
+        let msg = reason.to_string();
+        self.trip_reason = Some(reason);
+        self.trip_timestamp = Some(now);
+        Some(msg)
+    }
+
     /// Current drawdown from peak as a fraction (0.0 = no drawdown).
     pub fn current_drawdown(&self, total_value: f64) -> f64 {
         if self.peak_total_value > 0.0 {
@@ -282,6 +315,71 @@ impl CircuitBreaker {
             self.error_timestamps.pop_front();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// RevertRateTracker — rolling-window on-chain revert monitor (issue #4)
+// ---------------------------------------------------------------------------
+
+/// Outcome of a single settled trade (post-match).
+#[derive(Debug, Clone, Copy)]
+pub enum FillOutcome {
+    Confirmed,
+    Reverted,
+}
+
+/// Tracks on-chain revert rate over a rolling window of recent fills.
+///
+/// `matchOrders` V2 reverts ~35% on profitable orders (py-clob-client #338).
+/// When the rolling revert rate exceeds `threshold_pct` and we have at least
+/// `min_fills` data points, the tracker signals that the circuit breaker
+/// should be armed.
+pub struct RevertRateTracker {
+    /// Rolling window: (unix_secs, is_revert). Capped at `window_size` entries.
+    window: VecDeque<(f64, bool)>,
+    window_size: usize,
+    /// Minimum fills before we draw any conclusions.
+    min_fills: usize,
+    /// Trip threshold as a fraction (e.g. 0.35 = 35%).
+    threshold_pct: f64,
+}
+
+impl RevertRateTracker {
+    pub fn new(window_size: usize, min_fills: usize, threshold_pct: f64) -> Self {
+        Self {
+            window: VecDeque::new(),
+            window_size,
+            min_fills,
+            threshold_pct,
+        }
+    }
+
+    /// Record a settled fill outcome.
+    pub fn record(&mut self, outcome: FillOutcome, ts: f64) {
+        if self.window.len() >= self.window_size {
+            self.window.pop_front();
+        }
+        self.window.push_back((ts, matches!(outcome, FillOutcome::Reverted)));
+    }
+
+    /// Returns `Some((rate_pct, confirmed, reverted))` if the window is full
+    /// enough and the revert rate exceeds the threshold; `None` otherwise.
+    pub fn trip_signal(&self) -> Option<(f64, u32, u32)> {
+        let total = self.window.len();
+        if total < self.min_fills {
+            return None;
+        }
+        let reverted = self.window.iter().filter(|(_, r)| *r).count() as u32;
+        let confirmed = (total as u32).saturating_sub(reverted);
+        let rate = reverted as f64 / total as f64;
+        if rate >= self.threshold_pct {
+            Some((rate * 100.0, confirmed, reverted))
+        } else {
+            None
+        }
+    }
+
+    pub fn threshold_pct(&self) -> f64 { self.threshold_pct }
 }
 
 #[cfg(test)]

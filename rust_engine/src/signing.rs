@@ -381,6 +381,10 @@ impl OrderSigner {
             Ok(creds)
         } else {
             let body = resp.text().unwrap_or_default();
+            // Cloudflare challenge on /auth/derive-api-key → transient, caller should retry
+            if is_cloudflare_html(&body) {
+                return Err(format!("derive-api-key CF-challenge ({}): transient HTML response", status));
+            }
             Err(format!("derive-api-key failed ({}): {}", status, body))
         }
     }
@@ -406,6 +410,10 @@ impl OrderSigner {
             Ok(creds)
         } else {
             let body = resp.text().unwrap_or_default();
+            // Cloudflare challenge on /auth/api-key → transient, caller should retry
+            if is_cloudflare_html(&body) {
+                return Err(format!("create-api-key CF-challenge ({}): transient HTML response", status));
+            }
             Err(format!("create-api-key failed ({}): {}", status, body))
         }
     }
@@ -521,10 +529,22 @@ impl ClobAuth {
 
 /// Generate a random salt for order uniqueness.
 /// Must fit in JavaScript's Number.MAX_SAFE_INTEGER (2^53 - 1) for CLOB API compatibility.
+/// Uses OsRng (system entropy) — not SmallRng — so salts are cryptographically unpredictable
+/// across restarts (audit item #23: python-order-utils uses random.random which is non-crypto).
 pub fn random_salt() -> U256 {
     use rand::Rng;
-    let val: u64 = rand::thread_rng().gen_range(0..=(1u64 << 53) - 1);
+    use rand::rngs::OsRng;
+    let val: u64 = OsRng.gen_range(0..=(1u64 << 53) - 1);
     U256::from(val)
+}
+
+/// Detect a Cloudflare challenge/block page masquerading as an API response.
+/// The CLOB occasionally returns `text/html` on the `/auth/api-key` path
+/// (py-clob-client-v2 #41/#38). Any caller that gets an unexpected HTML body
+/// from a JSON endpoint should treat it as a transient geoblock, not a hard error.
+pub fn is_cloudflare_html(body: &str) -> bool {
+    let t = body.trim_start();
+    t.starts_with("<!DOCTYPE") || t.starts_with("<html") || t.starts_with("<!doctype")
 }
 
 /// Convert a human price (0.0 - 1.0) and size (in USDC) to maker/taker amounts.
