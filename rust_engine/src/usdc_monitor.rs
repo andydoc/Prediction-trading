@@ -139,14 +139,31 @@ impl UsdcMonitor {
         }
     }
 
-    /// Query CLOB `/balance-allowance?asset_type=COLLATERAL` with L2 HMAC auth.
-    /// Returns USDC balance in the Polymarket exchange (6 decimal places).
+    /// Query CLOB `/balance-allowance` with L2 HMAC auth. Returns the
+    /// venue's pUSD COLLATERAL balance (6-decimal raw → dollars).
+    ///
+    /// **INC-021 V2 update**: V2 added a required `signature_type` query
+    /// parameter (per `py_clob_client_v2/client.py::get_balance_allowance`).
+    /// Without it the endpoint returns `401 Unauthorized` even with valid
+    /// L2 HMAC headers — that was the source of the recurring `CLOB balance
+    /// query failed, falling back to on-chain` warnings post-V2 cutover.
+    /// The HMAC signs the bare path `/balance-allowance` (no query string);
+    /// only the URL gets the query params.
     fn query_clob_balance(&self, client: &Client, auth: &ClobAuth) -> Result<f64, String> {
-        let path = "/balance-allowance?asset_type=COLLATERAL";
-        let url = format!("{}{}", self.config.clob_host.trim_end_matches('/'), path);
-        let headers = auth.build_headers("GET", path, None);
+        // signature_type for the EOA wallet is 0 (V2 SignatureTypeV2.EOA).
+        // POLY_PROXY=1 / POLY_GNOSIS_SAFE=2 / POLY_1271=3 are server-derived
+        // wallet types we don't use.
+        const SIGNATURE_TYPE_EOA: u8 = 0;
+        let hmac_path = "/balance-allowance";
+        let url_with_query = format!(
+            "{}{}?signature_type={}&asset_type=COLLATERAL",
+            self.config.clob_host.trim_end_matches('/'),
+            hmac_path,
+            SIGNATURE_TYPE_EOA,
+        );
+        let headers = auth.build_headers("GET", hmac_path, None);
 
-        let mut req = client.get(&url);
+        let mut req = client.get(&url_with_query);
         for (k, v) in &headers {
             req = req.header(k, v);
         }
