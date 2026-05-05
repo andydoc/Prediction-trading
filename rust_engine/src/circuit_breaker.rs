@@ -83,6 +83,13 @@ pub struct CircuitBreaker {
     peak_total_value: f64,
     error_timestamps: VecDeque<f64>,
     last_successful_api_ts: f64,
+    /// INC-021 follow-up: count consecutive successful unauthenticated CLOB
+    /// `/time` responses while the breaker is tripped on a geoblock signal.
+    /// After `geoblock_recovery_threshold` successes, auto-untrip — covers
+    /// the transient WAF/CDN 403 case observed 2026-05-03 20:44 UTC where a
+    /// single /time 403 locked the bot out for 3 days despite the IP being
+    /// fine the entire time.
+    geoblock_recovery_streak: u32,
 }
 
 impl CircuitBreaker {
@@ -98,6 +105,7 @@ impl CircuitBreaker {
             peak_total_value: initial_value,
             error_timestamps: VecDeque::new(),
             last_successful_api_ts: now,
+            geoblock_recovery_streak: 0,
         }
     }
 
@@ -202,6 +210,51 @@ impl CircuitBreaker {
         self.trip_reason = Some(TripReason::GasCritical { message: msg.clone() });
         self.trip_timestamp = Some(now);
         Some(msg)
+    }
+
+    /// INC-021 follow-up: auto-recover from a transient geoblock trip.
+    ///
+    /// Call this each time the unauthenticated `/time` probe returns 200.
+    /// If the breaker is currently tripped with a `Geoblock:` reason and the
+    /// success streak reaches `threshold`, the breaker automatically untrips.
+    /// Returns `Some(message)` on the recovery tick, `None` otherwise.
+    ///
+    /// Any non-Geoblock trip (drawdown, gas critical, error burst) is left
+    /// alone — operator must reset those manually.
+    pub fn record_geoblock_probe_success(&mut self, threshold: u32) -> Option<String> {
+        if !self.tripped { return None; }
+        let is_geoblock = matches!(
+            &self.trip_reason,
+            Some(TripReason::GasCritical { message }) if message.starts_with("Geoblock:")
+        );
+        if !is_geoblock { return None; }
+
+        self.geoblock_recovery_streak = self.geoblock_recovery_streak.saturating_add(1);
+        if self.geoblock_recovery_streak >= threshold {
+            self.tripped = false;
+            self.trip_reason = None;
+            self.trip_timestamp = None;
+            self.geoblock_recovery_streak = 0;
+            // Nudge the API-success clock so the API-unreachable check doesn't
+            // immediately re-trip on stale state.
+            self.last_successful_api_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            Some(format!(
+                "auto-recovered from geoblock after {} consecutive /time 200 responses",
+                threshold
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// INC-021 follow-up: reset the geoblock recovery streak. Called when the
+    /// /time probe returns non-200 — any failure during the streak invalidates
+    /// the recovery and forces it to start over.
+    pub fn record_geoblock_probe_failure(&mut self) {
+        self.geoblock_recovery_streak = 0;
     }
 
     /// Current drawdown from peak as a fraction (0.0 = no drawdown).

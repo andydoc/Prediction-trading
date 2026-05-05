@@ -2186,13 +2186,23 @@ impl Orchestrator {
             }
             self.last_usdc_check = now;
 
-            // R4: Geoblock check — piggyback on USDC check interval
+            // R4: Geoblock check — piggyback on USDC check interval.
+            //
+            // INC-021 follow-up (post 2026-05-03 transient): on a 200 response
+            // while the breaker is tripped on a Geoblock reason, count toward
+            // auto-recovery. After `GEOBLOCK_RECOVERY_THRESHOLD` consecutive
+            // 200s the breaker untrips automatically — covers transient
+            // Cloudflare/WAF 403 spikes that locked the bot out for 3 days.
+            // Hard trips (drawdown, gas critical, error burst) require manual
+            // reset and are not affected.
+            const GEOBLOCK_RECOVERY_THRESHOLD: u32 = 5;
             match self.engine.http_client.get("https://clob.polymarket.com/time")
                 .timeout(std::time::Duration::from_secs(10))
                 .send()
             {
                 Ok(resp) if resp.status().as_u16() == 403 => {
                     tracing::error!("GEOBLOCK DETECTED: CLOB API returned 403 Forbidden");
+                    self.circuit_breaker.record_geoblock_probe_failure();
                     let _ = self.notifier.send(&NotifyEvent::Error {
                         message: "GEOBLOCK: CLOB API returned 403 — VPS IP may be blocked".into(),
                     });
@@ -2203,9 +2213,21 @@ impl Orchestrator {
                         let _ = self.notifier.send(&NotifyEvent::CircuitBreaker { reason: trip_msg });
                     }
                 }
-                Ok(_) => {} // 200 OK — not geoblocked
+                Ok(_) => {
+                    // 200 OK. If the CB is tripped on a transient geoblock, count
+                    // toward auto-recovery. Otherwise no-op.
+                    if let Some(recovery_msg) = self.circuit_breaker.record_geoblock_probe_success(GEOBLOCK_RECOVERY_THRESHOLD) {
+                        tracing::warn!("CIRCUIT BREAKER {}", recovery_msg);
+                        let _ = self.notifier.send(&NotifyEvent::Error {
+                            message: format!("[CIRCUIT BREAKER] {}", recovery_msg),
+                        });
+                    }
+                }
                 Err(e) => {
                     tracing::debug!("CLOB geoblock check failed (network): {}", e);
+                    // Network errors don't increment the recovery streak — but
+                    // they also shouldn't reset it (could be temporary DNS,
+                    // connectivity flicker). Leave streak unchanged.
                 }
             }
         }
