@@ -386,6 +386,107 @@ phantom-payout reversal sanity check.
 
 ---
 
+### INC-021 follow-up (2026-05-05): transient /time 403 → 3-day CB lockout, auto-recovery added
+
+After the V2 onboarding completed 2026-05-02 with a clean armed engine, the
+bot ran without trading for 3 days because of a single CDN-side 403 hit on
+`clob.polymarket.com/time` at **2026-05-03 20:44:26 UTC**. The circuit
+breaker tripped on a `Geoblock:` reason and stayed tripped indefinitely —
+there was no auto-recovery for transient WAF/CDN spikes.
+
+**Detection**: operator asked "there was a clob 403 error a couple of days
+ago — was it geoblocking?". Journal grep showed:
+
+```
+20:44:20  WARN  CLOB balance query failed, falling back to on-chain: CLOB balance returned 403 Forbidden
+20:44:26  ERROR GEOBLOCK DETECTED: CLOB API returned 403 Forbidden
+20:44:27  ERROR CIRCUIT BREAKER TRIPPED: Geoblock: CLOB API 403 Forbidden
+20:44:27  DEBUG Notification sent: [dublin] [ERROR] GEOBLOCK: CLOB API returned 403 — VPS IP
+... (3,814 "Circuit breaker TRIPPED" heartbeats over the next ~3 days) ...
+```
+
+Two distinct probes hit 403 in the same 6 seconds:
+1. usdc_monitor's `GET /balance-allowance?asset_type=COLLATERAL` (auth)
+2. orchestrator's `GET /time` (unauth) — the CB-tripping probe
+
+**Was it actually a geoblock?** No. Tested 2026-05-05 06:08 UTC from Dublin:
+
+| Endpoint | Then | Now |
+|---|---|---|
+| `clob/` (root, unauth) | unknown | 200 |
+| `clob/time` (unauth — the actual probe) | 403 (single hit) | 200 (5/5 probes) |
+| `clob/markets` (unauth) | unknown | 200 |
+| `clob/data/orders` (auth) | 401 | 401 |
+| `clob/balance-allowance` (auth) | 403 | 401 |
+| `gamma-api/markets` | unknown | 200 |
+| `polymarket.com/` | unknown | 200 |
+
+A real geoblock returns 403 on **all** endpoints (CDN-level rule). We saw
+403 on `/time` (one probe, one second) followed by 200 ever since. That's
+a transient Cloudflare/WAF spike, not an IP block.
+
+**Why the bot couldn't recover on its own**: `CircuitBreaker::check_gas_critical`
+trips with no auto-untrip path. `record_api_success` clears the
+API-unreachable timer but does not re-evaluate `tripped`. The bot kept
+running, kept ticking iterations (5.3M iters between trip and recovery),
+but `is_trading_allowed()` returned `false` for the entire 3-day window.
+
+**Fix (commit `bad286b`)**:
+
+- `CircuitBreaker::record_geoblock_probe_success(threshold)` increments a
+  `geoblock_recovery_streak` counter when the breaker is currently tripped
+  on a `Geoblock:` reason. After `threshold` consecutive successes
+  (default 5 ≈ 5 min at the USDC monitor cadence) the breaker auto-untrips
+  with a Telegram notification. Other trip reasons (drawdown, gas critical,
+  error burst) are unaffected — those reflect real loss/failure conditions
+  and require manual operator reset.
+- `CircuitBreaker::record_geoblock_probe_failure()` resets the streak to 0
+  on any 403 recurrence — recovery has to be uninterrupted.
+- Orchestrator's geoblock probe block (`orchestrator.rs:~2189`) wires both
+  calls. Network errors leave the streak unchanged (no signal either way).
+- 120/120 tests still pass.
+
+**Tactical recovery actions today**:
+1. Stopped service, force-create-API-key flag set
+2. Restart cleared CB (in-memory state)
+3. **Polymarket rejected create_api_key with `400 Could not create api key`**
+   — the endpoint is idempotent on wallet→key (already issued
+   `c5a8fcd5-da7d-c6bc-0489-c22b21f2fb2c` on 2026-05-01). Bot fell back to
+   cached creds in `secrets.yaml` (the same key, which was working in the
+   May 1-2 D2 probes). Force-key override removed after.
+4. Confirmed running clean: PID 261037, iter 1+, $7.23 pUSD, CB clear.
+
+**Eval count tangent (operator question)**: only 2 evaluated_opportunities
+rows since the May 2 00:08 restart, both rejected (`no_book`, then
+`negRisk_cap_full`). The strategy-tracker `evals_seen=1` per-portfolio
+shows only the no_book opp (passed quality, reached the tracker, all 6
+shadows rejected on per-strategy gates). The `negRisk_cap_full` was an
+orchestrator-side rejection that bypassed the tracker entirely. Both
+counts are internally consistent. **The low count is itself suspicious**
+— a tripped CB likely short-circuits `try_enter_or_replace` before any
+logging happens, so opportunities went uncounted. Eval volume should
+normalise now that the CB is clear.
+
+**Lessons**:
+
+- "Tripped forever" is not a safe default for CDN/WAF events. The bot's
+  initial design treated geoblock as a permanent state requiring operator
+  reset (modeled on INC-012 Frankfurt termination, which WAS permanent at
+  the country level). Transient WAF spikes are a different class — they
+  resolve themselves within minutes. The CB should reflect that
+  difference per trip-reason.
+- Telegram alert wording matters. The bot sent
+  `[ERROR] GEOBLOCK: CLOB API returned 403 — VPS IP may be blocked` on
+  the single 403. The "may be blocked" hedge is correct, but the
+  unconditional 3-day lockout doesn't match the hedge. Auto-recovery
+  closes that gap.
+- Verify the geoblock claim against multiple endpoints before trusting
+  the alert. A real geoblock fails everything; a transient fails a single
+  probe. The runbook (`OPS_GEOBLOCK_RUNBOOK.md`) prescribes exactly that
+  diagnosis loop, and it's what unblocked the situation here.
+
+---
+
 ### INC-020: Proactive Exits Did Not Submit Real CLOB Sells — Phantom-Proceeds Latent Bug (2026-04-27)
 
 **Severity**: CRITICAL (would have caused immediate accounting/wallet divergence on first live arb post-INC-019 fix)

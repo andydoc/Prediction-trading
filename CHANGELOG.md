@@ -7,6 +7,33 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [Unreleased] — 2026-05-05 — INC-021 follow-up (CB auto-recovery)
+
+### Fixed
+- **CircuitBreaker auto-recovery from transient geoblock 403 (`bad286b`)**.
+  A single `/time` 403 on 2026-05-03 20:44 (Cloudflare/WAF spike) tripped
+  the CB on a `Geoblock:` reason and locked the bot out of trading for
+  3 days even though `/time` returned 200 the entire window after.
+  `CircuitBreaker::record_geoblock_probe_success(threshold)` now counts
+  consecutive `/time` 200s and auto-untrips after threshold (default 5
+  ≈ 5 min at USDC monitor cadence) when the trip reason starts with
+  `Geoblock:`. Other trip reasons (drawdown, gas critical, error burst)
+  remain manual-reset because they reflect real loss/failure.
+  `record_geoblock_probe_failure()` resets the streak on any 403
+  recurrence — recovery must be uninterrupted. Orchestrator wires both
+  calls into the geoblock probe block.
+
+### Operational
+- Force-create-API-key (`TRADER_FORCE_NEW_CLOB_KEY=1`) returns
+  `400 Could not create api key` on Polymarket V2 — the endpoint is
+  idempotent on wallet→key. The bot falls back to cached creds. The
+  override is now informational rather than corrective; documenting in
+  case operators try it.
+- 3-day no-trade window post 2026-05-03 traced to the CB trip, not to
+  any V2 schema/auth issue. Recovery via restart (in-memory CB state).
+
+---
+
 ## [Unreleased] — 2026-04-29 → 2026-05-02 — INC-021 Polymarket V2 cutover
 
 ### Fixed (CRITICAL)
