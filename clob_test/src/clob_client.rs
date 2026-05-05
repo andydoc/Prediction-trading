@@ -202,12 +202,15 @@ impl ClobClient {
 
         tracing::info!("Gamma API returned {} markets (neg_risk={})", markets.len(), want_neg_risk);
 
-        // Sort by volume descending for liquidity, require $1M+ volume for deep books
+        // Sort by volume descending for liquidity, require $1M+ volume for deep books.
+        // INC-021: also filter on neg_risk client-side because Gamma's `?negRisk=...`
+        // query parameter is loose and routinely returns mixed results.
         let min_volume = 1_000_000.0;
         let mut sorted: Vec<&GammaMarket> = markets.iter()
             .filter(|m| !m.condition_id.is_empty()
                 && m.clob_token_ids.len() >= 2
-                && m.volume_num >= min_volume)
+                && m.volume_num >= min_volume
+                && m.neg_risk == want_neg_risk)
             .collect();
         sorted.sort_by(|a, b| b.volume_num.partial_cmp(&a.volume_num).unwrap_or(std::cmp::Ordering::Equal));
 
