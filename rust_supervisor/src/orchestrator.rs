@@ -2936,18 +2936,24 @@ impl Orchestrator {
                             continue;
                         } else {
                             let result = executor.execute_arb_batch(&pos.position_id, &legs);
-                            // Update per-leg fill_status from CLOB response.
+                            // Update per-leg fill_status AND token_id from CLOB response.
+                            // token_id must be persisted now so the reconciler can correlate
+                            // DB legs to CLOB fills — absence of token_id caused INC-D9 false
+                            // auto-rollback (empty token_id → all legs MissingOnVenue).
                             // Rejected legs → Rejected immediately; accepted → Pending until WS confirms.
                             {
                                 use rust_engine::position::LegFillStatus;
                                 let mut pm = self.engine.positions.lock();
-                                for ((market_id, ..), leg_result) in legs.iter().zip(result.legs.iter()) {
+                                for ((market_id, token_id, ..), leg_result) in legs.iter().zip(result.legs.iter()) {
                                     let status = if matches!(leg_result, rust_engine::executor::OrderResult::Accepted(_)) {
                                         LegFillStatus::Pending
                                     } else {
                                         LegFillStatus::Rejected
                                     };
                                     pm.update_leg_fill_status(&pos.position_id, market_id, 0.0, status);
+                                    if !token_id.is_empty() {
+                                        pm.update_leg_token_id(&pos.position_id, market_id, token_id);
+                                    }
                                 }
                             }
                             let accepted_count = result.legs.iter()
@@ -3294,17 +3300,20 @@ impl Orchestrator {
                                         }
                                         if !legs.is_empty() {
                                             let result = executor.execute_arb_batch(&pos.position_id, &legs);
-                                            // Update per-leg fill_status from CLOB response.
+                                            // Update per-leg fill_status AND token_id (INC-D9 fix: same as new-entry path).
                                             {
                                                 use rust_engine::position::LegFillStatus;
                                                 let mut pm = self.engine.positions.lock();
-                                                for ((market_id, ..), leg_result) in legs.iter().zip(result.legs.iter()) {
+                                                for ((market_id, token_id, ..), leg_result) in legs.iter().zip(result.legs.iter()) {
                                                     let status = if matches!(leg_result, rust_engine::executor::OrderResult::Accepted(_)) {
                                                         LegFillStatus::Pending
                                                     } else {
                                                         LegFillStatus::Rejected
                                                     };
                                                     pm.update_leg_fill_status(&pos.position_id, market_id, 0.0, status);
+                                                    if !token_id.is_empty() {
+                                                        pm.update_leg_token_id(&pos.position_id, market_id, token_id);
+                                                    }
                                                 }
                                             }
                                             let accepted_count = result.legs.iter()

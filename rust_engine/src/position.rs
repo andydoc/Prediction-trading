@@ -813,6 +813,25 @@ impl PositionManager {
         false
     }
 
+    /// Write the on-chain token_id into a leg so the reconciler can correlate
+    /// DB positions to CLOB fills.  Must be called immediately after execute_arb
+    /// returns, before the first periodic state save.
+    /// Returns true if the position + leg were found.
+    pub fn update_leg_token_id(
+        &mut self,
+        position_id: &str,
+        market_id: &str,
+        token_id: &str,
+    ) -> bool {
+        if let Some(pos) = self.open_positions.get_mut(position_id) {
+            if let Some(leg) = pos.markets.get_mut(market_id) {
+                leg.token_id = token_id.to_string();
+                return true;
+            }
+        }
+        false
+    }
+
     /// Direct access to closed positions (no JSON serialization).
     pub fn closed_positions(&self) -> &[Position] {
         &self.closed_positions
