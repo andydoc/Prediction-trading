@@ -51,6 +51,22 @@ Bot showed `Capital=$77.89 positions=1` for ~55 minutes.
 | `rust_engine/src/executor.rs` | `[BATCH]` accepted-count now counts only `OrderResult::Accepted` |
 | `rust_engine/src/lib.rs` | `apply_reconciliation` auto-rolls back positions where all legs are `MissingOnVenue` with `actual_shares==0` |
 
+### Session-5 DB fixes (same day, post-restart)
+
+Two further issues discovered after the session-4 recovery:
+
+**1. USDC drift persisting across restarts**
+
+Root cause: the `AccountingLedger` is persisted as a full JSON blob in `checkpoints` (key=`accounting_ledger`), not reconstructed from the `journal` table on load. Session-4 DB surgery wrote reversal entries to `journal` only — the checkpoint blob retained `cash=$77.89`. Fixed by patching the checkpoint JSON directly: `cash` $77.89 → $97.37, `positions_deployed` $19.47 → $0, `fees_total` $0.0019 → $0. Also cleared stale holdings for phantom markets (1930074–1930076) and zeroed resolved G vs C holdings (2164700–2164702). Documented in OPS_RUNBOOK §10.
+
+**2. Virtual portfolio phantom positions (Strategies tab)**
+
+Root cause: when the real executor entered the Egyptian football FAK batch, the strategy tracker recorded virtual entries for all 6 shadow strategies simultaneously. When `apply_reconciliation` rolled back the real position, it did not notify the strategy tracker — virtual positions were never reversed. All 5 affected strategies (Shadow-A/B/C/D/F) showed 1 open phantom position and reduced capital.
+
+Fixed via `strategy_open_positions` DELETE + `strategy_portfolios.current_capital` restore (Python script run on VPS). All 6 strategies restored to $97.37, 0 open.
+
+**Known gap**: the strategy tracker has no hook into `apply_reconciliation` — if the reconciler rolls back a real position, virtual positions for the same constraint are not reversed. This should be addressed in the same session as item #6 (auto-unwind wiring).
+
 ---
 
 ## Outstanding items (in priority order)
