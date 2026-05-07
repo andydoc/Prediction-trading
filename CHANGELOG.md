@@ -7,6 +7,52 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [Unreleased] — 2026-05-07 (session 3) — monitor peak fix + dashboard cosmetics + VPS config hygiene
+
+### Fixed
+
+- **Phantom drawdown from startup sequencing (`orchestrator.rs`)**. The
+  `MonitorState` initialises `peak_value = 0.0`. Because the dashboard HTTP
+  server accepts connections before `load_state()` runs, one or more SSE ticks
+  fire while the PositionManager still reports `initial_capital` ($100 from
+  config) as `current_capital`. This seeds `peak_value = 100` in the monitor.
+  After state loads ($97.37), every subsequent tick shows 2.63% drawdown — a
+  phantom that never clears. Fix: `load_state()` now ends with
+  `self.engine.monitor.lock().peak_value = total_value`, overwriting any
+  pre-load taint.
+
+- **Total Value header red due to floating-point gap (`dashboard.html`)**. The
+  header coloured the value red when `total_value < init_cap`. Accumulated
+  floating-point rounding leaves `current_capital = 97.36805…` while the DB
+  stores `initial_capital = 97.37`, triggering the threshold on an exact `>=`
+  comparison. Fixed by using a $0.01 epsilon:
+  `total_value >= init_cap - 0.01 ? 'good' : 'bad'`.
+
+### Operations (VPS config — not in git)
+
+The following were patched directly into `/home/ubuntu/prediction-trader/config/config.yaml`
+because the service uses `-m live` without `-i live-d`, so the `live-d.yaml`
+instance overlay (which contains all these overrides) is never loaded:
+
+- **`websocket.tier_b_max_connections`**: 17 → 20. Eliminates the
+  `[WARN] 642 assets could not be subscribed (hit max_connections=17)` log line.
+- **`safety.usdc_monitor`** section added (was absent from base config). Enables
+  the on-chain USDC.e balance poller with `rpc_url: publicnode`, 300 s interval,
+  drift $1, warn <$15, critical <$5. Without this, the dashboard USDC (LIVE)
+  stat shows "loading…" indefinitely and `USDC=` never appears in log lines.
+- **`notifications.hostname`**: `laptop` → `dublin`. Stops Telegram messages
+  being tagged `[laptop]`.
+
+**Root cause / long-term fix**: all three discrepancies (and Strategy D
+parameters) live in `config/instances/live-d.yaml`. Adding `-i live-d` to the
+`ExecStart` in `/etc/systemd/system/prediction-trader.service` would load them
+automatically — but also activates Strategy D (`max_concurrent=8`,
+`capital_per_trade=30%`, `min_profit=4%`). Defer until ready to switch strategy;
+at that point replace the current `--set arbitrage.*` overrides with `-i live-d`
+and remove the manual patches from `config.yaml`.
+
+---
+
 ## [Unreleased] — 2026-05-07 (session 2) — audit remediation + per-leg fill tracking
 
 ### Fixed
