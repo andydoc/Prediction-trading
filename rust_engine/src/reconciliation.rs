@@ -263,16 +263,17 @@ pub fn detect_neg_risk_synthetics(
 // CLOB API query helpers
 // ---------------------------------------------------------------------------
 
-/// Query the CLOB API for user positions.
+/// Query the Data API for user positions.
 ///
-/// Requires CLOB API credentials via ClobAuth (HMAC-signed L2 headers).
+/// Requires CLOB API credentials via ClobAuth (wallet address is extracted from auth).
 /// Returns parsed venue positions or an error message.
 ///
-/// Endpoint: GET {clob_host}/positions
-/// Auth: POLY_API_KEY, POLY_TIMESTAMP, POLY_SIGNATURE, POLY_PASSPHRASE headers
+/// Endpoint: GET https://data-api.polymarket.com/positions?user={wallet}&sizeThreshold=0
+/// Note: `_clob_host` is retained in the signature for API uniformity but not used
+/// (the Data API endpoint is hardcoded — CLOB has no /positions endpoint).
 pub fn query_clob_positions(
     http_client: &reqwest::blocking::Client,
-    clob_host: &str,
+    _clob_host: &str,
     auth: Option<&crate::signing::ClobAuth>,
 ) -> Result<Vec<VenuePosition>, String> {
     let auth = match auth {

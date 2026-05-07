@@ -521,15 +521,6 @@ impl Default for ExecutorConfig {
 /// HTTP client timeout in seconds.
 const HTTP_TIMEOUT_SECS: u64 = 30;
 
-/// Format tick size for CLOB API (must be "0.1", "0.01", "0.001", or "0.0001").
-fn format_tick_size(tick: f64) -> String {
-    if (tick - 0.1).abs() < 1e-6 { "0.1".into() }
-    else if (tick - 0.01).abs() < 1e-6 { "0.01".into() }
-    else if (tick - 0.001).abs() < 1e-6 { "0.001".into() }
-    else if (tick - 0.0001).abs() < 1e-6 { "0.0001".into() }
-    else { "0.01".into() } // fallback
-}
-
 /// The live order executor. Constructs, signs, and submits orders to Polymarket CLOB.
 pub struct Executor {
     config: ExecutorConfig,
@@ -991,6 +982,21 @@ impl Executor {
             .filter(|o| !o.status.is_terminal())
             .cloned()
             .collect()
+    }
+
+    /// Find the internal trade_id for a given CLOB order_id.
+    /// Used by the WS user channel dispatcher to correlate incoming fill events.
+    pub fn find_trade_id_by_clob_order_id(&self, clob_order_id: &str) -> Option<String> {
+        self.tracked.lock()
+            .iter()
+            .find(|(_, o)| o.order_id == clob_order_id)
+            .map(|(trade_id, _)| trade_id.clone())
+    }
+
+    /// Get a snapshot clone of a tracked order by internal trade_id.
+    /// Used by the WS user channel dispatcher to supply order context to process_fill_event.
+    pub fn get_tracked_order_clone(&self, trade_id: &str) -> Option<TrackedOrder> {
+        self.tracked.lock().get(trade_id).cloned()
     }
 
     /// INC-021 bug 3: did this position get any real CLOB fills?

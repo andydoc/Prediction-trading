@@ -195,8 +195,6 @@ struct LiveTradingYaml {
     min_depth_per_leg: f64,
     #[serde(default = "default_080")]
     depth_haircut: f64,
-    #[serde(default = "default_070")]
-    min_profit_ratio: f64,
     // G7 / F-pre-7: pre-trade Gamma freshness check
     #[serde(default)]
     gamma_freshness_check: bool,
@@ -339,8 +337,6 @@ struct StateYaml {
 #[derive(serde::Deserialize, Default)]
 struct ConfigYaml {
     #[serde(default)]
-    mode: Option<String>,
-    #[serde(default)]
     arbitrage: ArbitrageYaml,
     #[serde(default)]
     engine: EngineYaml,
@@ -403,7 +399,6 @@ fn default_sports_ws_url() -> String { "wss://sports-api.polymarket.com/ws".into
 /// Orchestrator config (extracted from config.yaml).
 pub struct OrchestratorConfig {
     pub workspace: PathBuf,
-    pub mode: String,
     pub shadow_only: bool,
     pub dashboard_port: u16,
     pub dashboard_bind: String,
@@ -438,7 +433,6 @@ pub struct OrchestratorConfig {
     pub min_depth_per_leg: f64,
     pub depth_haircut: f64,
     pub max_book_staleness_secs: f64,
-    pub min_profit_ratio: f64,
 
     // G7 / F-pre-7: Gamma freshness check
     pub gamma_freshness_check: bool,
@@ -643,7 +637,6 @@ impl OrchestratorConfig {
 
         Self {
             workspace: workspace.to_path_buf(),
-            mode: cfg.mode.unwrap_or_else(|| "dual".into()),
             shadow_only: cfg.live_trading.shadow_only,
             dashboard_port: cfg.dashboard.port as u16,
             dashboard_bind: cfg.dashboard.bind_addr,
@@ -669,7 +662,6 @@ impl OrchestratorConfig {
             min_depth_per_leg: cfg.live_trading.min_depth_per_leg,
             depth_haircut: cfg.live_trading.depth_haircut,
             max_book_staleness_secs: cfg.engine.max_book_staleness_secs,
-            min_profit_ratio: cfg.live_trading.min_profit_ratio,
             gamma_freshness_check: cfg.live_trading.gamma_freshness_check,
             gamma_freshness_timeout_ms: cfg.live_trading.gamma_freshness_timeout_ms,
             gamma_freshness_abort_on_broken_filter: cfg.live_trading.gamma_freshness_abort_on_broken_filter,
@@ -859,6 +851,15 @@ pub struct Orchestrator {
 
     /// Timestamp of last BalancePinned alert (#1). Rate-limited to once/hour.
     last_balance_pinned_alert: f64,
+
+    /// WS user channel — receives real-time trade fill / order lifecycle events.
+    /// Some only in live mode (requires executor + clob_auth). Drives the
+    /// accounting suspense cycle and RevertRateTracker via dispatch_user_event.
+    user_channel: Option<rust_engine::ws_user::UserChannelClient>,
+
+    /// Tokio runtime that backs the user channel WS connection.
+    /// Must outlive user_channel; dropped after run() returns.
+    user_channel_rt: Option<tokio::runtime::Runtime>,
 }
 
 impl Orchestrator {
@@ -1089,6 +1090,29 @@ impl Orchestrator {
             None
         };
 
+        // WS user channel — real-time trade fill / order lifecycle events.
+        // Required for advancing the executor state machine (Submitted→Matched→Confirmed)
+        // and the accounting suspense cycle. Created now; started in run() after markets load.
+        let (user_channel, user_channel_rt) = if executor.is_some() && cfg.clob_auth.is_some() {
+            match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .thread_name("user-channel-ws")
+                .build()
+            {
+                Ok(rt) => {
+                    tracing::info!("[WS-user] Runtime ready — user channel will start after markets load");
+                    (Some(rust_engine::ws_user::UserChannelClient::new()), Some(rt))
+                }
+                Err(e) => {
+                    tracing::warn!("[WS-user] Failed to build tokio runtime: {} — user channel disabled", e);
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             cfg, engine,
             scanner: Arc::new(scanner),
@@ -1140,6 +1164,8 @@ impl Orchestrator {
             revert_tracker: rust_engine::circuit_breaker::RevertRateTracker::new(30, 10, 0.35),
             last_ws_freeze_alert: 0.0,
             last_balance_pinned_alert: 0.0,
+            user_channel,
+            user_channel_rt,
         })
     }
 
@@ -1203,6 +1229,18 @@ impl Orchestrator {
             tracing::info!("WS engine started");
         }
 
+        // 4b. Start WS user channel for real-time fill events.
+        // Subscribes with all currently known condition IDs; receives fill lifecycle
+        // events (MATCHED→MINED→CONFIRMED/FAILED) for our orders.
+        if let (Some(ref uc), Some(ref rt), Some(ref auth)) =
+            (&self.user_channel, &self.user_channel_rt, &self.cfg.clob_auth)
+        {
+            let market_ids: Vec<String> = self.engine.constraints.market_ids();
+            let n = market_ids.len();
+            uc.start(auth, market_ids, &rt.handle());
+            tracing::info!("[WS-user] User channel started ({} condition IDs subscribed)", n);
+        }
+
         // 5. Load state from SQLite
         self.load_state();
 
@@ -1212,7 +1250,9 @@ impl Orchestrator {
         // and never actually hit Data API. That left the bot blind to on-chain
         // holdings and is why both the D2 Spurs YES position and the INC-D9
         // Draw-NO position went unreconciled for days. Now passing real auth.
-        if self.engine.pm_open_count() > 0 {
+        // #5: gate widened so reconciliation runs even when PM is empty — orphan
+        // venue positions (dust shares, INC-D9) cannot be discovered otherwise.
+        if self.engine.pm_open_count() > 0 || (!self.cfg.shadow_only && self.cfg.clob_auth.is_some()) {
             let (report, venue) = self.engine.reconcile_startup_with_auth(
                 &self.cfg.clob_host,
                 self.cfg.clob_auth.as_ref(),
@@ -1472,6 +1512,10 @@ impl Orchestrator {
 
         // Shutdown — wait for any in-flight disk save, then do a final sync save
         tracing::info!("Orchestrator shutting down...");
+        if let Some(ref uc) = self.user_channel {
+            uc.stop();
+            tracing::info!("[WS-user] User channel stopped");
+        }
         self.engine.stop();
         if let Some(h) = self.disk_save_handle.take() {
             let _ = h.join();
@@ -1486,6 +1530,9 @@ impl Orchestrator {
 
     /// Single tick of the event loop.
     fn tick(&mut self, now: f64) -> Result<(), String> {
+        // --- Process WS user channel fill events ---
+        self.drain_user_events();
+
         // --- Process WS resolution events ---
         let resolved = self.engine.drain_resolved();
         if !resolved.is_empty() {
@@ -1681,7 +1728,7 @@ impl Orchestrator {
 
         // --- Monitor (proactive exits) ---
         if (now - self.last_monitor) >= self.cfg.monitor_interval {
-            if self.engine.pm_open_count() > 0 {
+            if self.engine.pm_open_count() > 0 || (!self.cfg.shadow_only && self.cfg.clob_auth.is_some()) {
                 self.check_proactive_exits();
             }
             self.last_monitor = now;
@@ -1862,7 +1909,7 @@ impl Orchestrator {
     fn do_periodic_tasks(&mut self, now: f64) {
         // --- Postponement check ---
         if (now - self.last_postponement_check) >= self.cfg.postponement_check_interval {
-            if self.engine.pm_open_count() > 0 && self.postponement_detector.is_some() {
+            if (self.engine.pm_open_count() > 0 || (!self.cfg.shadow_only && self.cfg.clob_auth.is_some())) && self.postponement_detector.is_some() {
                 self.check_postponements();
             }
             self.last_postponement_check = now;
@@ -1951,7 +1998,7 @@ impl Orchestrator {
 
         // --- API resolution poll (safety net for missed WS events) ---
         if (now - self.last_api_resolution_check) >= self.cfg.api_resolution_interval {
-            if self.engine.pm_open_count() > 0 {
+            if self.engine.pm_open_count() > 0 || (!self.cfg.shadow_only && self.cfg.clob_auth.is_some()) {
                 // Capture pid→constraint_id before API resolves them
                 let pid_to_cid: HashMap<String, String> = if self.strategy_tracker.is_some() {
                     let pm = self.engine.positions.lock();
@@ -2070,7 +2117,7 @@ impl Orchestrator {
         // 2026-05-07: same auth-plumbing fix as 5b — was calling the no-auth
         // variant which silently returned 0 venue positions every cycle.
         if (now - self.last_reconciliation) >= 300.0 {
-            if self.engine.pm_open_count() > 0 {
+            if self.engine.pm_open_count() > 0 || (!self.cfg.shadow_only && self.cfg.clob_auth.is_some()) {
                 let (report, venue) = self.engine.reconcile_periodic_with_auth(
                     &self.cfg.clob_host,
                     self.cfg.clob_auth.as_ref(),
@@ -2878,7 +2925,21 @@ impl Orchestrator {
                             self.engine.rollback_paper_entry(&pos.position_id);
                             continue;
                         } else {
-                            let result = executor.execute_arb(&pos.position_id, &legs);
+                            let result = executor.execute_arb_batch(&pos.position_id, &legs);
+                            // Update per-leg fill_status from CLOB response.
+                            // Rejected legs → Rejected immediately; accepted → Pending until WS confirms.
+                            {
+                                use rust_engine::position::LegFillStatus;
+                                let mut pm = self.engine.positions.lock();
+                                for ((market_id, ..), leg_result) in legs.iter().zip(result.legs.iter()) {
+                                    let status = if matches!(leg_result, rust_engine::executor::OrderResult::Accepted(_)) {
+                                        LegFillStatus::Pending
+                                    } else {
+                                        LegFillStatus::Rejected
+                                    };
+                                    pm.update_leg_fill_status(&pos.position_id, market_id, 0.0, status);
+                                }
+                            }
                             let accepted_count = result.legs.iter()
                                 .filter(|r| matches!(r, rust_engine::executor::OrderResult::Accepted(_)))
                                 .count();
@@ -3007,30 +3068,116 @@ impl Orchestrator {
 
                 if let Some((worst_pid, worst_score)) = worst {
                     if best_score > worst_score * PROACTIVE_EXIT_MULTIPLIER {
-                        // B1.1: Capture chain info from the position being replaced
-                        let (chain_info_owned, replace_exit_info): (Option<(String, u32, String)>, Option<(String, Vec<String>)>) = {
+                        // B1.1: Capture chain info, tiered-WS exit info, and per-leg data from
+                        // the position being replaced. All extracted under a single positions
+                        // lock so the position cannot be mutated between reads.
+                        let (chain_info_owned, replace_exit_info, replace_legs_pre):
+                            (Option<(String, u32, String)>, Option<(String, Vec<String>)>, Vec<(String, String, f64)>) = {
                             let pm = self.engine.positions.lock();
                             let chain = pm.get_position(&worst_pid).map(|p| {
                                 let chain_id = p.chain_id.clone().unwrap_or_else(|| worst_pid.clone());
                                 let next_gen = p.chain_generation + 1;
                                 (chain_id, next_gen, worst_pid.clone())
                             });
-                            let exit_info = if self.cfg.use_tiered_ws {
-                                pm.get_position(&worst_pid).map(|p| {
+                            let (exit_info, legs) = match pm.get_position(&worst_pid) {
+                                Some(p) => {
                                     let cid = p.metadata.get("constraint_id")
                                         .and_then(|v| v.as_str()).unwrap_or("").to_string();
                                     // P2: clone required — assets outlive the position lock
-                                    let assets: Vec<String> = p.markets.keys().cloned().collect();
-                                    (cid, assets)
-                                })
-                            } else {
-                                None
+                                    let ei = if self.cfg.use_tiered_ws {
+                                        Some((cid.clone(), p.markets.keys().cloned().collect::<Vec<_>>()))
+                                    } else { None };
+                                    let is_sell = p.metadata.get("is_sell")
+                                        .and_then(|v| v.as_bool()).unwrap_or(false);
+                                    let constraint_ref = if !cid.is_empty() {
+                                        self.engine.constraints.get(&cid)
+                                    } else { None };
+                                    let legs: Vec<(String, String, f64)> = p.markets.iter()
+                                        .map(|(mid, leg)| {
+                                            let tok = if !leg.token_id.is_empty() {
+                                                leg.token_id.clone()
+                                            } else if let Some(ref c) = constraint_ref {
+                                                c.markets.iter().find(|m| &m.market_id == mid)
+                                                    .map(|m| if is_sell { m.no_asset_id.clone() } else { m.yes_asset_id.clone() })
+                                                    .unwrap_or_default()
+                                            } else {
+                                                String::new()
+                                            };
+                                            (mid.clone(), tok, leg.shares)
+                                        }).collect();
+                                    (ei, legs)
+                                }
+                                None => (None, Vec::new()),
                             };
-                            (chain, exit_info)
+                            (chain, exit_info, legs)
                         };
 
-                        // Execute replacement
-                        if let Some((net, profit)) = self.engine.liquidate_position(&worst_pid, "replaced", &worst_bids) {
+                        // INC-020 fix (replacement path): mirror the proactive-exit live branch.
+                        // Previously called liquidate_position unconditionally — this phantom-
+                        // credited current_capital while the wallet still held the shares. Now
+                        // routes live exits through execute_position_exit / apply_exit_fills.
+                        let live_mode = !self.cfg.shadow_only && self.executor.is_some();
+                        let replace_outcome: Option<(f64, f64)> = if live_mode {
+                            let executor = self.executor.clone().expect("live_mode implies executor present");
+                            let mut exec_legs: Vec<(String, String, f64, f64)> = Vec::new();
+                            let mut skipped_min: Vec<String> = Vec::new();
+                            for (mid, tok, shares) in &replace_legs_pre {
+                                if *shares < 0.01 { skipped_min.push(mid.clone()); continue; }
+                                if tok.is_empty() {
+                                    tracing::warn!("REPLACE exit: leg {} has no token_id — skipping", truncate(mid, 30));
+                                    continue;
+                                }
+                                let bid = worst_bids.get(mid).copied().unwrap_or(0.0);
+                                if bid <= 0.0 {
+                                    tracing::warn!("REPLACE exit: leg {} has no bid — skipping", truncate(mid, 30));
+                                    continue;
+                                }
+                                exec_legs.push((mid.clone(), tok.clone(), bid, *shares));
+                            }
+                            if !skipped_min.is_empty() {
+                                tracing::info!("REPLACE exit: {} below-min legs skipped: {:?}", skipped_min.len(), skipped_min);
+                            }
+                            if exec_legs.is_empty() {
+                                tracing::warn!("REPLACE exit: no submittable legs for {} — replacement skipped",
+                                    truncate(&worst_pid, 40));
+                                None
+                            } else {
+                                let submit_result = self.engine.execute_position_exit(&executor, &worst_pid, &exec_legs);
+                                if !submit_result.all_accepted {
+                                    tracing::warn!("REPLACE exit: partial submission ({}/{} legs accepted)",
+                                        submit_result.legs.iter().filter(|r| matches!(r, rust_engine::executor::OrderResult::Accepted(_))).count(),
+                                        submit_result.legs.len());
+                                }
+                                self.alert_on_api_contract_rejection(&submit_result);
+                                // B4.5: race WS user channel + Data API for fill confirmation.
+                                let raw_fills = self.wait_for_exit_fills(&executor, &worst_pid, &exec_legs);
+                                if raw_fills.is_empty() {
+                                    tracing::warn!("REPLACE exit: no fills confirmed for {} — replacement skipped",
+                                        truncate(&worst_pid, 40));
+                                    None
+                                } else {
+                                    let exit_fills: Vec<rust_engine::position::ExitLegFill> = raw_fills.into_iter()
+                                        .map(|(mid, qty, price)| rust_engine::position::ExitLegFill {
+                                            market_id: mid,
+                                            filled_shares: qty,
+                                            avg_fill_price: price,
+                                        }).collect();
+                                    match self.engine.apply_exit_fills(&worst_pid, &exit_fills, "replaced") {
+                                            Some(outcome) => Some((outcome.net_proceeds, outcome.realised_profit)),
+                                            None => {
+                                                tracing::error!("REPLACE exit: apply_exit_fills returned None for {} — bookkeeping out of sync",
+                                                    truncate(&worst_pid, 40));
+                                                None
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // Shadow / paper-only: liquidate_position is correct since no real shares exist.
+                            self.engine.liquidate_position(&worst_pid, "replaced", &worst_bids)
+                        };
+                        if let Some((net, profit)) = replace_outcome {
                             // Tiered WS: move replaced position assets back to B if still hot
                             if let Some((cid, assets)) = replace_exit_info {
                                 let still_hot = self.last_constraint_to_assets.contains_key(&cid);
@@ -3137,7 +3284,20 @@ impl Orchestrator {
                                             });
                                         }
                                         if !legs.is_empty() {
-                                            let result = executor.execute_arb(&pos.position_id, &legs);
+                                            let result = executor.execute_arb_batch(&pos.position_id, &legs);
+                                            // Update per-leg fill_status from CLOB response.
+                                            {
+                                                use rust_engine::position::LegFillStatus;
+                                                let mut pm = self.engine.positions.lock();
+                                                for ((market_id, ..), leg_result) in legs.iter().zip(result.legs.iter()) {
+                                                    let status = if matches!(leg_result, rust_engine::executor::OrderResult::Accepted(_)) {
+                                                        LegFillStatus::Pending
+                                                    } else {
+                                                        LegFillStatus::Rejected
+                                                    };
+                                                    pm.update_leg_fill_status(&pos.position_id, market_id, 0.0, status);
+                                                }
+                                            }
                                             let accepted_count = result.legs.iter()
                                                 .filter(|r| matches!(r, rust_engine::executor::OrderResult::Accepted(_)))
                                                 .count();
@@ -3393,6 +3553,206 @@ impl Orchestrator {
         }
     }
 
+    /// Wait for FAK SELL fills after `execute_position_exit`.
+    ///
+    /// Races the WS user channel against the Data API (B4.5): first source to
+    /// confirm all expected fills wins. Returns `(market_id, shares, price)`
+    /// triples ready for `apply_exit_fills`.
+    ///
+    /// Falls back to the 6×500 ms executor poll when no user channel or auth
+    /// is available (shadow mode).
+    fn wait_for_exit_fills(
+        &self,
+        executor: &rust_engine::executor::Executor,
+        position_id: &str,
+        exec_legs: &[(String, String, f64, f64)], // (market_id, token_id, price, shares)
+    ) -> Vec<(String, f64, f64)> {  // (market_id, filled_shares, avg_price)
+        use std::time::Duration;
+        use std::collections::HashMap;
+
+        // Build token→market mapping and baseline sizes (shares we're selling).
+        let token_to_market: HashMap<String, String> = exec_legs.iter()
+            .map(|(mid, tok, _, _)| (tok.clone(), mid.clone()))
+            .collect();
+        let asset_ids: Vec<String> = exec_legs.iter()
+            .map(|(_, tok, _, _)| tok.clone())
+            .collect();
+        let baseline_sizes: HashMap<String, f64> = exec_legs.iter()
+            .map(|(_, tok, _, shares)| (tok.clone(), *shares))
+            .collect();
+
+        // Live path: race WS user channel + Data API (B4.5).
+        if let (Some(ref uc), Some(ref auth)) = (&self.user_channel, &self.cfg.clob_auth) {
+            let result = rust_engine::fill_confirmation::confirm_fills_parallel(
+                &uc.receiver,
+                &self.engine.http_client,
+                auth,
+                &asset_ids,
+                &baseline_sizes,
+                Duration::from_secs(8),   // WS timeout — FAK fills fast, 8 s is generous
+                Duration::from_secs(3),   // Data API poll interval
+                Duration::from_secs(30),  // Data API total timeout
+            );
+            tracing::info!("B4.5: {} fills confirmed via {:?} for {}",
+                result.fills.len(), result.primary_source, truncate(position_id, 30));
+            return result.fills.iter()
+                .filter_map(|f| {
+                    let mid = token_to_market.get(&f.asset_id)?.clone();
+                    Some((mid, f.shares, f.price))
+                })
+                .collect();
+        }
+
+        // Fallback: poll executor tracked orders (shadow mode / no WS channel).
+        let mut tracked: Vec<(String, f64, f64, bool)> = Vec::new();
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(500));
+            tracked = executor.sell_orders_for_position(position_id);
+            if !tracked.is_empty() && tracked.iter().all(|(_, _, _, term)| *term) {
+                break;
+            }
+        }
+        tracked.into_iter()
+            .filter(|(_, qty, _, _)| *qty > 0.0)
+            .map(|(mid, qty, price, _)| (mid, qty, price))
+            .collect()
+    }
+
+    /// Drain all pending events from the WS user channel and dispatch each one.
+    /// Called once per tick so fills are processed within ~50 ms of arrival.
+    fn drain_user_events(&mut self) {
+        // Collect without holding the borrow on self.user_channel so that
+        // dispatch_user_event can take &mut self freely.
+        let events: Vec<rust_engine::ws_user::UserEvent> = {
+            let Some(ref uc) = self.user_channel else { return };
+            let mut v = Vec::new();
+            while let Ok(e) = uc.receiver.try_recv() { v.push(e); }
+            v
+        };
+        for event in events {
+            self.dispatch_user_event(event);
+        }
+    }
+
+    /// Route a single WS user event to executor state machine + accounting suspense.
+    fn dispatch_user_event(&mut self, event: rust_engine::ws_user::UserEvent) {
+        use rust_engine::ws_user::UserEvent;
+        use rust_engine::executor::{TradeStatus, process_fill_event, FillAction};
+        use rust_engine::circuit_breaker::FillOutcome;
+
+        let now = now_secs();
+
+        match event {
+            UserEvent::Trade(te) => {
+                let new_status = match te.status.as_str() {
+                    "MATCHED"   => TradeStatus::Matched,
+                    "MINED"     => TradeStatus::Mined,
+                    "CONFIRMED" => TradeStatus::Confirmed,
+                    "RETRYING"  => TradeStatus::Retrying,
+                    "FAILED"    => TradeStatus::Failed,
+                    other => {
+                        tracing::debug!("[WS-user] unhandled trade status '{}' for order {}",
+                            other, truncate(&te.taker_order_id, 16));
+                        return;
+                    }
+                };
+
+                let executor = match self.executor.clone() {
+                    Some(e) => e,
+                    None => return,
+                };
+
+                let trade_id = match executor.find_trade_id_by_clob_order_id(&te.taker_order_id) {
+                    Some(id) => id,
+                    None => {
+                        tracing::debug!("[WS-user] event for unknown order {}... status={}",
+                            truncate(&te.taker_order_id, 16), te.status);
+                        return;
+                    }
+                };
+
+                let filled_qty = if te.size > 0.0 { Some(te.size) } else { None };
+                let avg_price  = if te.price > 0.0 { Some(te.price) } else { None };
+
+                if !executor.update_trade_status(&trade_id, new_status, filled_qty, avg_price) {
+                    return;
+                }
+
+                if let Some(order) = executor.get_tracked_order_clone(&trade_id) {
+                    let fill_action = process_fill_event(
+                        &self.engine.accounting,
+                        &trade_id,
+                        new_status,
+                        &order,
+                        false, // opposing-leg tracking wired in a follow-up
+                    );
+                    tracing::info!("[WS-user] order={} status={} → {:?}",
+                        truncate(&te.taker_order_id, 16), te.status, fill_action);
+
+                    match fill_action {
+                        FillAction::Confirmed => {
+                            self.revert_tracker.record(FillOutcome::Confirmed, now);
+                            // Update position leg: actual_shares = WS-confirmed fill quantity.
+                            {
+                                use rust_engine::position::LegFillStatus;
+                                self.engine.positions.lock().update_leg_fill_status(
+                                    &order.position_id,
+                                    &order.market_id,
+                                    order.filled_quantity,
+                                    LegFillStatus::Accepted,
+                                );
+                            }
+                            // Wire fill_quality::record_actual now that we have real fill data.
+                            if let Some(ref log) = self.fill_quality_log {
+                                log.record_actual(&rust_engine::fill_quality::ActualRecord {
+                                    kind: "actual",
+                                    ts: now,
+                                    opp_id: order.position_id.clone(),
+                                    actual_prices: serde_json::json!({
+                                        &order.market_id: order.avg_fill_price
+                                    }),
+                                    actual_filled_shares: serde_json::json!({
+                                        &order.market_id: order.filled_quantity
+                                    }),
+                                    actual_filled_usd: serde_json::json!({
+                                        &order.market_id: order.filled_quantity * order.avg_fill_price
+                                    }),
+                                    outcome: "complete".to_string(),
+                                });
+                            }
+                        }
+                        FillAction::Failed { .. } => {
+                            self.revert_tracker.record(FillOutcome::Reverted, now);
+                            // Mark position leg as rejected on chain revert.
+                            {
+                                use rust_engine::position::LegFillStatus;
+                                self.engine.positions.lock().update_leg_fill_status(
+                                    &order.position_id,
+                                    &order.market_id,
+                                    0.0,
+                                    LegFillStatus::Rejected,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            UserEvent::Order(oe) => {
+                if oe.event_subtype == "CANCELLATION" {
+                    let executor = match self.executor.clone() {
+                        Some(e) => e,
+                        None => return,
+                    };
+                    if let Some(trade_id) = executor.find_trade_id_by_clob_order_id(&oe.id) {
+                        executor.update_trade_status(&trade_id, TradeStatus::Cancelled, None, None);
+                        tracing::info!("[WS-user] order {}... cancelled", truncate(&oe.id, 16));
+                    }
+                }
+            }
+        }
+    }
+
     fn check_proactive_exits(&mut self) {
         let all_bids = self.collect_all_position_bids();
         let exits = self.engine.check_proactive_exits(&all_bids, PROACTIVE_EXIT_MULTIPLIER);
@@ -3509,40 +3869,22 @@ impl Orchestrator {
                 // INC-021: scan rejections for API-contract drift
                 self.alert_on_api_contract_rejection(&submit_result);
 
-                // Wait briefly for FAK fills to settle. FAK orders either fill
-                // (fully or partially) within milliseconds and the rest is
-                // auto-cancelled by the CLOB. WS fill events update tracked
-                // order state; we poll a few times to give them a chance.
-                let mut tracked_fills: Vec<(String, f64, f64, bool)> = Vec::new();
-                for _ in 0..6 {  // ~3 seconds total
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    tracked_fills = executor.sell_orders_for_position(&exit.position_id);
-                    if !tracked_fills.is_empty() && tracked_fills.iter().all(|(_, _, _, terminal)| *terminal) {
-                        break;
-                    }
-                }
+                // B4.5: race WS user channel + Data API for fill confirmation.
+                let raw_fills = self.wait_for_exit_fills(&executor, &exit.position_id, &exec_legs);
 
-                if tracked_fills.is_empty() {
-                    tracing::warn!("INC-020 exit: no tracked SELL orders found for {} — position holds, no bookkeeping update",
+                if raw_fills.is_empty() {
+                    tracing::warn!("INC-020 exit: no fills confirmed for {} — position holds, no bookkeeping update",
                         truncate(&exit.position_id, 40));
                     continue;
                 }
 
-                // Translate tracked fills into ExitLegFill records and apply.
-                let exit_fills: Vec<rust_engine::position::ExitLegFill> = tracked_fills.iter()
-                    .filter(|(_, qty, _, _)| *qty > 0.0)
-                    .map(|(mid, qty, price, _)| rust_engine::position::ExitLegFill {
-                        market_id: mid.clone(),
-                        filled_shares: *qty,
-                        avg_fill_price: *price,
+                let exit_fills: Vec<rust_engine::position::ExitLegFill> = raw_fills.into_iter()
+                    .map(|(mid, qty, price)| rust_engine::position::ExitLegFill {
+                        market_id: mid,
+                        filled_shares: qty,
+                        avg_fill_price: price,
                     })
                     .collect();
-
-                if exit_fills.is_empty() {
-                    tracing::warn!("INC-020 exit: zero fills on all submitted legs for {} — position holds",
-                        truncate(&exit.position_id, 40));
-                    continue;
-                }
 
                 match self.engine.apply_exit_fills(&exit.position_id, &exit_fills, "proactive_exit") {
                     Some(outcome) => (outcome.net_proceeds, outcome.realised_profit, outcome.closed),
@@ -3651,10 +3993,12 @@ impl Orchestrator {
                 None => continue,
             };
 
-            // Check if overdue (24h threshold)
+            // Only check positions overdue by at least postponement_rescore_days (default 14).
+            // Prevents expensive AI calls for markets that resolved slightly late.
+            let rescore_threshold_hours = (self.cfg.postponement_rescore_days as f64).max(1.0) * 24.0;
             if let Ok(ed) = chrono::NaiveDate::parse_from_str(&expected_date, "%Y-%m-%d") {
                 let hours_overdue = (now.date_naive() - ed).num_days() as f64 * 24.0;
-                if hours_overdue < 24.0 { continue; }
+                if hours_overdue < rescore_threshold_hours { continue; }
             } else {
                 continue;
             }

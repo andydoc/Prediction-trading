@@ -7,6 +7,94 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [Unreleased] — 2026-05-07 (session 2) — audit remediation + per-leg fill tracking
+
+### Fixed
+
+- **Replacement-liquidation phantom-credit (`orchestrator.rs:3113-3180`)**.
+  The replacement path at `orchestrator.rs:3033` still called
+  `engine.liquidate_position` unconditionally in live mode — credits
+  `current_capital += bid × shares` while the wallet still holds the
+  shares. Mirrored the INC-020 proactive-exit live branch: replacement
+  now calls `execute_position_exit` + `apply_exit_fills` in live mode,
+  falling back to paper `liquidate_position` in shadow. Pre-go-live
+  blocker for `max_concurrent > 1` — cleared; safe to raise back to 15.
+
+- **`pm_open_count > 0` gate widened (`orchestrator.rs`, 5 locations)**.
+  Reconciliation, proactive-exit, postponement-check, API-resolution-poll,
+  and periodic reconciliation were all gated on `pm_open_count > 0`. Orphan
+  venue positions (Spurs YES, INC-D9 Draw-NO) cannot be discovered when PM
+  is empty. Changed to `pm_open_count > 0 || (!shadow_only && clob_auth.is_some())`.
+
+- **Dead no-auth reconcile wrappers deleted (`lib.rs:1119, 1145`)**.
+  `reconcile_startup` / `reconcile_periodic` hardcoded `auth: None` →
+  `query_clob_positions` early-returned empty without querying Data API.
+  Zero callers after the `_with_auth` switch. Deleted to remove regression
+  foothold.
+
+- **Dead `OrchestratorConfig` fields removed (`orchestrator.rs`)**. `mode`
+  and `min_profit_ratio` set but never read by any logic — deleted from
+  raw config struct and parsed struct. `postponement_rescore_days` was also
+  dead (hardcoded 24 h in `check_postponements`); now wired: the function
+  respects the configured value (default 14 days) before calling the AI.
+
+- **Dead code swept (audit findings #13, #15, #16, #17)**:
+  - `position::update_leg_with_fill` (NT-1 predecessor, zero callers) deleted.
+  - `strategy_tracker::resolve` (non-`_with_db` variant, zero callers) deleted.
+  - `query_clob_positions` `_clob_host` parameter renamed; stale doc fixed.
+  - `executor::format_tick_size` dead helper deleted.
+
+### Added
+
+- **WS user channel wired to orchestrator (`orchestrator.rs`)**. A dedicated
+  `tokio::Runtime` (1 worker thread) drives `UserChannelClient` in the
+  background. Each tick, `drain_user_events()` polls `try_recv()` and calls
+  `dispatch_user_event()` which routes:
+  - `UserEvent::Trade` → `executor.find_trade_id_by_clob_order_id` →
+    `executor.update_trade_status` → `process_fill_event` (which handles the
+    full B3.2 suspense cycle: MATCHED → `enter_suspense`, CONFIRMED →
+    `confirm_from_suspense`, FAILED → `reverse_suspense`) →
+    `revert_tracker.record(Confirmed | Reverted)`.
+  - `UserEvent::Order { CANCELLATION }` → `update_trade_status(Cancelled)`.
+  - This single wire lights up INC-021 phantom-payout guard, INC-020
+    proactive-exit terminal detection, and the `RevertRateTracker`.
+  - `find_trade_id_by_clob_order_id` + `get_tracked_order_clone` added to
+    `Executor` (CLOB `taker_order_id` → internal `trade_id` lookup).
+
+- **Per-leg fill status on `MarketLeg` (`position.rs`)**. New fields:
+  - `intended_shares: f64` — model's expectation at `enter_position` time.
+  - `actual_shares: f64` — WS-confirmed fill quantity (updated via
+    `dispatch_user_event` on `FillAction::Confirmed`).
+  - `fill_status: LegFillStatus` — `pending | accepted | rejected`.
+  All three fields are `#[serde(default)]` for zero-migration-cost.
+  After `execute_arb_batch` (entry + replacement paths), rejected legs are
+  immediately stamped `Rejected`; accepted legs stay `Pending` until the
+  WS CONFIRMED event arrives. `fill_quality::record_actual` is now called
+  on every WS-confirmed fill.
+
+- **`ConstraintStore::market_ids()` (`eval.rs`)**. Thin accessor returning
+  condition IDs, used to seed the WS user-channel subscription at startup.
+
+- **`execute_arb_batch` wired as default (`orchestrator.rs`)**. Both entry
+  and replacement-entry CLOB submission paths now call `execute_arb_batch`
+  (single `POST /orders` array body) instead of sequential `execute_arb`.
+  Built-in fallback to sequential on >15 legs, HTTP non-2xx, or network
+  error. CHANGELOG entry for #11 is now accurate.
+
+- **B4.5 `confirm_fills_parallel` wired (`orchestrator.rs`)**. New
+  `wait_for_exit_fills` helper replaces both the proactive-exit and
+  replacement-exit 6×500ms executor-poll blocks:
+  - **Live path**: races WS user-channel receiver (clone; no competition
+    with `drain_user_events`) against Data API polling
+    (`poll_data_api_for_fills`). WS timeout 8 s; Data API poll interval 3 s;
+    total timeout 30 s. Catches the ~20% of trades where WS CONFIRMED never
+    arrives.
+  - **Shadow path**: unchanged 6×500ms executor poll (no real orders).
+  Without this, trades with WS dropout stayed in `Matched` forever; position
+  accounting required manual intervention. B4.5 audit finding cleared.
+
+---
+
 ## [Unreleased] — 2026-05-07 — INC-D9 (partial-fill stranded inventory) + reconciliation auth bug + audit
 
 ### Fixed

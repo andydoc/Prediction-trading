@@ -1114,21 +1114,6 @@ impl TradingEngine {
         )
     }
 
-    /// Startup reconciliation without auth (shadow mode).
-    /// Automatically applies reconciliation adjustments when discrepancies found.
-    pub fn reconcile_startup(&self, escalation_threshold: f64) -> reconciliation::ReconciliationReport {
-        let (report, venue) = self.reconcile_startup_with_auth(
-            "https://clob.polymarket.com", None, escalation_threshold,
-        );
-        if !report.passed && !venue.is_empty() {
-            let adjustments = self.apply_reconciliation(&report, &venue);
-            for adj in &adjustments {
-                tracing::info!("B4.1 startup auto-adjustment: {}", adj);
-            }
-        }
-        report
-    }
-
     /// Run periodic reconciliation (B4.0).
     /// Called on interval from the orchestrator tick loop.
     pub fn reconcile_periodic_with_auth(
@@ -1138,21 +1123,6 @@ impl TradingEngine {
         reconciliation::reconcile_periodic(
             &positions, &self.http_client, clob_host, auth, escalation_threshold,
         )
-    }
-
-    /// Periodic reconciliation without auth (shadow mode).
-    /// Automatically applies reconciliation adjustments when discrepancies found.
-    pub fn reconcile_periodic(&self, escalation_threshold: f64) -> reconciliation::ReconciliationReport {
-        let (report, venue) = self.reconcile_periodic_with_auth(
-            "https://clob.polymarket.com", None, escalation_threshold,
-        );
-        if !report.passed && !venue.is_empty() {
-            let adjustments = self.apply_reconciliation(&report, &venue);
-            for adj in &adjustments {
-                tracing::info!("B4.0 periodic auto-adjustment: {}", adj);
-            }
-        }
-        report
     }
 
     /// Apply reconciliation results: update internal state to match venue (source of truth).

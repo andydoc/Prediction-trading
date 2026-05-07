@@ -75,6 +75,11 @@ impl ConstraintStore {
     pub fn all(&self) -> Vec<Constraint> {
         self.constraints.iter().map(|r| r.value().clone()).collect()
     }
+
+    /// Return all constraint/condition IDs (market IDs).
+    pub fn market_ids(&self) -> Vec<String> {
+        self.constraints.iter().map(|r| r.key().clone()).collect()
+    }
 }
 
 impl Default for ConstraintStore {

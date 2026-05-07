@@ -1154,6 +1154,8 @@ fn build_positions_from_strategy_closed(strat_summary: &Value) -> Vec<crate::pos
                     name: name.clone(),
                     entry_price: 0.0, bet_amount: capital, shares: 0.0,
                     outcome: String::new(), token_id: String::new(),
+                    intended_shares: 0.0, actual_shares: 0.0,
+                    fill_status: crate::position::LegFillStatus::Pending,
                 });
                 let pos = crate::position::Position {
                     position_id: format!("strat_closed_{}", positions.len()),

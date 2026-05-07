@@ -24,6 +24,19 @@ fn parse_trade_side(method: &str) -> TradeSide {
 /// Minimum absolute profit to classify as win/loss (below this = break-even).
 const WIN_LOSS_THRESHOLD: f64 = 0.001;
 
+/// Per-leg CLOB fill lifecycle state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LegFillStatus {
+    /// Order not yet submitted (paper / shadow mode) or awaiting WS confirmation.
+    #[default]
+    Pending,
+    /// CLOB accepted the order and WS confirmed a fill.
+    Accepted,
+    /// CLOB rejected the order or fill failed on-chain.
+    Rejected,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketLeg {
     pub name: String,
@@ -36,6 +49,15 @@ pub struct MarketLeg {
     /// Used by D6 helper to sell positions without needing gamma API lookup.
     #[serde(default)]
     pub token_id: String,
+    /// Shares the model expected to buy (set at enter_position time, invariant).
+    #[serde(default)]
+    pub intended_shares: f64,
+    /// Shares actually confirmed by CLOB fills (updated via WS events).
+    #[serde(default)]
+    pub actual_shares: f64,
+    /// CLOB fill lifecycle state for this leg.
+    #[serde(default)]
+    pub fill_status: LegFillStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,28 +231,6 @@ impl PositionManager {
         self.open_positions.values().map(|p| p.total_capital).sum()
     }
 
-    /// NT-1: Update a position's market leg with actual fill data (price & shares).
-    /// Called after fill confirmation to close the gap between estimated and actual execution.
-    pub fn update_leg_with_fill(&mut self, position_id: &str, asset_id: &str, fill_price: f64, fill_shares: f64) {
-        if let Some(pos) = self.open_positions.get_mut(position_id) {
-            for leg in pos.markets.values_mut() {
-                if leg.token_id == asset_id {
-                    let old_price = leg.entry_price;
-                    let old_shares = leg.shares;
-                    leg.entry_price = fill_price;
-                    leg.shares = fill_shares;
-                    tracing::debug!("NT-1: {} leg {} updated: price {:.4}→{:.4}, shares {:.2}→{:.2}",
-                        position_id, asset_id, old_price, fill_price, old_shares, fill_shares);
-                    return;
-                }
-            }
-            // R3: Warn when no leg matches the fill asset
-            tracing::warn!("NT-1: No matching leg for fill: pos={} asset={}", position_id, asset_id);
-        } else {
-            tracing::warn!("NT-1: Position not found for fill update: pos={}", position_id);
-        }
-    }
-
     pub fn closed_count(&self) -> usize {
         self.closed_positions.len()
     }
@@ -286,6 +286,9 @@ impl PositionManager {
                 outcome: outcome.to_string(),
                 shares,
                 token_id: String::new(), // Populated later by fill_tracker
+                intended_shares: shares,
+                actual_shares: 0.0,
+                fill_status: LegFillStatus::Pending,
             });
         }
 
@@ -789,6 +792,25 @@ impl PositionManager {
 
     pub fn open_positions_mut(&mut self) -> &mut HashMap<String, Position> {
         &mut self.open_positions
+    }
+
+    /// Update a leg's fill status and confirmed share count.
+    /// Returns true if the position + leg were found.
+    pub fn update_leg_fill_status(
+        &mut self,
+        position_id: &str,
+        market_id: &str,
+        actual_shares: f64,
+        status: LegFillStatus,
+    ) -> bool {
+        if let Some(pos) = self.open_positions.get_mut(position_id) {
+            if let Some(leg) = pos.markets.get_mut(market_id) {
+                leg.actual_shares = actual_shares;
+                leg.fill_status = status;
+                return true;
+            }
+        }
+        false
     }
 
     /// Direct access to closed positions (no JSON serialization).

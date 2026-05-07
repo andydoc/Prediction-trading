@@ -620,22 +620,6 @@ impl StrategyTracker {
         }
     }
 
-    /// Forward a resolution event to all virtual portfolios.
-    /// Called when a real position resolves (WS or API).
-    pub fn resolve(&mut self, constraint_id: &str, winning_market_id: &str) {
-        for portfolio in &mut self.portfolios {
-            if portfolio.open_positions.contains_key(constraint_id) {
-                if let Some(closed) = portfolio.resolve(constraint_id, winning_market_id) {
-                    tracing::debug!(
-                        "Strategy {} resolved {}: profit={:.2} ({:.1}%)",
-                        portfolio.config.name, &constraint_id[..8.min(constraint_id.len())],
-                        closed.actual_profit, closed.actual_profit_pct,
-                    );
-                }
-            }
-        }
-    }
-
     /// Prune closed positions older than 30 days from all portfolios.
     pub fn prune_old_closed(&mut self) {
         let now = std::time::SystemTime::now()
