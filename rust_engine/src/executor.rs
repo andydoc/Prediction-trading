@@ -1472,8 +1472,10 @@ impl Executor {
                         }
                     }
 
+                    let accepted_count = results.iter()
+                        .filter(|r| matches!(r, OrderResult::Accepted(_))).count();
                     tracing::info!("[BATCH] Arb {} submitted: {}/{} legs accepted",
-                        position_id, results.len(), legs.len());
+                        position_id, accepted_count, legs.len());
 
                     ArbExecutionResult { legs: results, all_accepted, dry_run: false }
                 } else {

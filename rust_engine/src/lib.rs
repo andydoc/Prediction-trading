@@ -1199,7 +1199,6 @@ impl TradingEngine {
                         "MissingOnVenue {}: position exists internally but not on exchange (stale)",
                         &market_id[..market_id.len().min(20)]
                     ));
-                    // Don't auto-close — flag for manual review
                 }
                 reconciliation::DiscrepancyKind::PositionMissingInternal => {
                     let market_id = d.market_id.clone().unwrap_or_default();
@@ -1211,6 +1210,42 @@ impl TradingEngine {
                     // Don't auto-adopt — flag for manual review
                 }
                 _ => {}
+            }
+        }
+
+        // Auto-rollback positions where every leg is MissingOnVenue and
+        // actual_shares == 0 on all legs. This handles FAK orders that the CLOB
+        // accepted (success=true, valid orderID) but immediately cancelled with
+        // no fills — the batch executor counts them as "accepted" so the
+        // orchestrator doesn't roll back at submit time, but the position is
+        // provably phantom: no real wallet holdings, no CLOB record.
+        let missing_on_venue_positions: std::collections::HashSet<String> = report
+            .discrepancies
+            .iter()
+            .filter(|d| d.kind == reconciliation::DiscrepancyKind::PositionMissingOnVenue)
+            .filter_map(|d| d.position_id.clone())
+            .collect();
+
+        for pid in &missing_on_venue_positions {
+            let all_legs_zero = {
+                let pm = self.positions.lock();
+                pm.open_positions().get(pid).map(|pos| {
+                    pos.markets.values().all(|leg| leg.actual_shares <= 0.0)
+                }).unwrap_or(false)
+            };
+            if all_legs_zero {
+                tracing::warn!("[RECON] Auto-rolling back phantom position {} (all legs MissingOnVenue, actual_shares=0)", pid);
+                let mut acct = self.accounting.lock();
+                let reversed = acct.reverse_buy_by_position(pid, "recon: all legs MissingOnVenue, 0 actual_shares");
+                drop(acct);
+                let mut pm = self.positions.lock();
+                if let Some(pos) = pm.open_positions_mut().remove(pid) {
+                    pm.refund_capital(pos.total_capital);
+                    adjustments.push(format!(
+                        "AutoRollback {}: phantom position closed, ${:.2} capital restored (${:.2} ledger reversed)",
+                        &pid[..pid.len().min(30)], pos.total_capital, reversed
+                    ));
+                }
             }
         }
 
