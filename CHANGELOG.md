@@ -7,6 +7,40 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [Unreleased] — 2026-05-07 (session 4) — phantom position recovery + FAK batch fix + recon auto-rollback
+
+### Fixed
+
+- **Phantom position from FAK batch with 0 fills (`executor.rs`, `lib.rs`)**. A
+  3-leg arb on an Egyptian football market (Tala'ea El Gaish vs Ghazl El Mahalla)
+  submitted via the CLOB batch endpoint at 14:34:44. The CLOB accepted all 3
+  orders (returned `success=true` with valid `orderID`s) then immediately
+  cancelled them (FAK with no available liquidity). On-chain USDC unchanged
+  ($97.37) but internal accounting committed $19.47. Two root-cause bugs:
+
+  1. **`[BATCH]` accepted-count log bug** (`executor.rs:1475`): `results.len()`
+     counts all outcomes (accepted + rejected). Even if every leg was rejected
+     the log printed `"3/3 legs accepted"`. Fixed by counting only
+     `OrderResult::Accepted` variants.
+
+  2. **Reconciliation did not auto-rollback phantom positions** (`lib.rs`): the
+     `apply_reconciliation` handler for `PositionMissingOnVenue` logged "flag for
+     manual review" but took no action. The position stayed open for ~1 hour,
+     emitting USDC drift warnings every 5 minutes. Fixed by adding a post-loop
+     sweep: if all legs of a position are `MissingOnVenue` AND all have
+     `actual_shares == 0`, the reconciler calls `rollback_paper_entry` logic
+     inline — removes from `open_positions`, restores capital via `refund_capital`,
+     reverses accounting journal entries via `reverse_buy_by_position`.
+
+- **In-flight DB recovery** (operator action — not in code). The bot was stopped
+  and a Python script (`/tmp/phantom_recovery.py`) applied the equivalent of
+  `rollback_paper_entry` directly to the SQLite state DB: added 7 reversal
+  journal entries (credit Position ×3, credit Fees ×3, debit Cash ×1) and
+  updated `scalars.current_capital` from 77.89 → 97.37. Restarted; `State loaded:
+  $97.37 capital, 0 open, 1 closed` confirmed clean.
+
+---
+
 ## [Unreleased] — 2026-05-07 (session 3) — monitor peak fix + dashboard cosmetics + VPS config hygiene
 
 ### Fixed
