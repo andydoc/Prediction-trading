@@ -97,7 +97,7 @@ Fixed via `strategy_open_positions` DELETE + `strategy_portfolios.current_capita
 
 | # | Item | Priority | Notes |
 |---|------|----------|-------|
-| **#6** | Full auto-unwind: wire `evaluate_arb_fills` → `execute_position_exit` in partial-submit branch | HIGH | Replace CB-trip bridge. Wait until WS passive monitor has a few days of data. |
+| **#6** | Full auto-unwind: wire `evaluate_arb_fills` → `execute_position_exit` in partial-submit branch | HIGH | Replace CB-trip bridge. Wait until WS passive monitor has a few days of data. At the same point, wire strategy tracker rollback: when `apply_reconciliation` rolls back a real position, call `tracker.rollback_virtual_position(constraint_id)` so virtual portfolios are kept in sync. |
 | **#5b** | Dashboard: render red brackets where `fill_status != accepted` or `intended_shares != actual_shares` | LOW | JS-only change. Per-leg data is in the position JSON. |
 
 ---
