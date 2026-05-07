@@ -203,6 +203,7 @@ safety:
 dashboard:
   port: 5558
   bind_addr: 127.0.0.1
+  strategies_note: "Milestone F — live trading (Dublin VPS, Strategy C, $97.37 initial capital). Virtual portfolios track alternative parameter sets. Best values highlighted green. Click strategy to expand positions."
 notifications:
   hostname: laptop
   enabled: true

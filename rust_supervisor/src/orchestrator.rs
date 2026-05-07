@@ -217,6 +217,8 @@ struct DashboardYaml {
     port: u64,
     #[serde(default = "default_localhost")]
     bind_addr: String,
+    #[serde(default)]
+    strategies_note: String,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -402,6 +404,7 @@ pub struct OrchestratorConfig {
     pub shadow_only: bool,
     pub dashboard_port: u16,
     pub dashboard_bind: String,
+    pub strategies_note: String,
 
     // Arbitrage
     pub max_positions: usize,
@@ -640,6 +643,7 @@ impl OrchestratorConfig {
             shadow_only: cfg.live_trading.shadow_only,
             dashboard_port: cfg.dashboard.port as u16,
             dashboard_bind: cfg.dashboard.bind_addr,
+            strategies_note: cfg.dashboard.strategies_note,
             max_positions: cfg.arbitrage.max_concurrent_positions as usize,
             max_days_entry: cfg.arbitrage.max_days_to_resolution as u32,
             max_days_replace: cfg.arbitrage.max_days_to_replacement as u32,
@@ -1174,7 +1178,7 @@ impl Orchestrator {
         tracing::info!("Orchestrator starting...");
 
         // 0. Start dashboard server IMMEDIATELY so it's reachable during init
-        self.engine.start_dashboard(self.cfg.dashboard_port, &self.cfg.dashboard_bind);
+        self.engine.start_dashboard(self.cfg.dashboard_port, &self.cfg.dashboard_bind, &self.cfg.strategies_note);
         tracing::info!("Dashboard server started on port {} (splash screen ready)", self.cfg.dashboard_port);
 
         // 1. Load markets: cache-first, then refresh

@@ -57,6 +57,8 @@ pub struct DashboardState {
     pub shadow_only: Arc<AtomicBool>,
     /// Strategy tracker summary JSON — updated by orchestrator
     pub strategy_summary: Arc<Mutex<Value>>,
+    /// Operator-configurable footer note for the Strategies tab (dashboard.strategies_note in config.yaml)
+    pub strategies_note: String,
 }
 
 /// Metrics updated by the Rust orchestrator each stats cycle.
@@ -191,6 +193,7 @@ async fn handle_sse(
             if !strat.is_null() {
                 let end_ts = s.engine_metrics.lock().test_period_end_ts;
                 if end_ts > 0.0 { strat["test_period_end_ts"] = json!(end_ts); }
+                strat["note"] = json!(s.strategies_note.clone());
                 yield Ok(sse::Event::default().event("strategies").data(
                     serde_json::to_string(&strat).unwrap_or_default()));
             }
@@ -237,6 +240,7 @@ async fn handle_sse(
                     if end_ts > 0.0 {
                         strat["test_period_end_ts"] = json!(end_ts);
                     }
+                    strat["note"] = json!(s.strategies_note.clone());
                     yield Ok(sse::Event::default().event("strategies").data(
                         serde_json::to_string(&strat).unwrap_or_default()));
                 }

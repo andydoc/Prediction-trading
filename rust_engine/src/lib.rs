@@ -273,7 +273,7 @@ impl TradingEngine {
     /// If asset_ids is empty, only starts the dashboard (useful when tiered WS is active).
     /// Start the dashboard HTTP server immediately (before WS or any other init).
     /// This ensures the dashboard is reachable as soon as the process starts.
-    pub fn start_dashboard(&self, dashboard_port: u16, dashboard_bind: &str) {
+    pub fn start_dashboard(&self, dashboard_port: u16, dashboard_bind: &str, strategies_note: &str) {
         if dashboard_port > 0 {
             let dash_state = DashboardState {
                 positions: Arc::clone(&self.positions),
@@ -292,6 +292,7 @@ impl TradingEngine {
                 kill_switch: Arc::clone(&self.kill_switch),
                 shadow_only: Arc::clone(&self.shadow_only),
                 strategy_summary: Arc::clone(&self.strategy_summary),
+                strategies_note: strategies_note.to_string(),
             };
             let bind_addr = dashboard_bind.to_string();
             self.runtime.spawn(async move {
