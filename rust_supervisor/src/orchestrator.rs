@@ -3172,7 +3172,6 @@ impl Orchestrator {
                                         }
                                     }
                                 }
-                            }
                         } else {
                             // Shadow / paper-only: liquidate_position is correct since no real shares exist.
                             self.engine.liquidate_position(&worst_pid, "replaced", &worst_bids)
