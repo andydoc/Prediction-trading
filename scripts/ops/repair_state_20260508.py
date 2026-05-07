@@ -2,80 +2,60 @@
 """
 Repair DB state after partial-fill incident (2026-05-08).
 
+Post-unwind state (4 Crunchyroll legs + Spurs + Nagasaki + Takeshita + Yamashiro
+all sold via manual_unwind_v2.py --auto --yes).
+
 Changes:
-1. Fix Crunchyroll arb position: populate token_ids for 3 filled legs,
-   set actual_shares, set fill_status=accepted/cancelled appropriately.
-2. Add position record for El Hodood Draw NO (trade-2, from journal).
-3. Fix accounting checkpoint: cash=on-chain USDC ($80.16),
-   deployed=sum of cost bases for tracked open positions,
-   holdings populated with correct token_ids.
-4. Fix scalars: current_capital=$97.37 (total portfolio value unchanged).
+1. Mark Crunchyroll arb position CLOSED (all legs unwound on-chain).
+2. Add/update El Hodood position record (OPEN, held pending exit).
+3. Fix accounting checkpoint: cash=post-unwind CLOB pUSD balance ($86.60),
+   deployed=El Hodood cost basis only ($7.302), holdings={hodood_token_id}.
+4. Fix scalars: current_capital=$97.37 (cash + deployed, total unchanged).
+
+El Hodood: 7.2 shares of "Draw NO" token, cost $7.302 ($1.014/share).
+True breakeven is impossible (max payout $1/share < cost); exit intent is
+sell-at-best-bid when CLOB bids appear (see metadata.exit_intent).
 """
 import sqlite3, json, time
 
 DB = '/home/ubuntu/prediction-trader/data/state_rust.db'
-ON_CHAIN_USDC = 80.16
+
+# Post-unwind CLOB pUSD balance (from /balance-allowance, 2026-05-08)
+CLOB_USDC = 86.599794
 
 # ---------------------------------------------------------------------------
-# Position data from Polymarket Data API / journal
+# Position identifiers
 # ---------------------------------------------------------------------------
 
 CRUNCHYROLL_PID = 'paper_1778190634.257736_mutex_0xf7677b65d7bc3187034c89f4dc4a3b'
-CRUNCHYROLL_LEG_FILLS = {
-    # market_id: (token_id, actual_shares, fill_status)
-    '1834533': ('82724943425600151029939281806822319359475765380323844283886329142061964392665', 4.1222, 'accepted'),
-    '1834532': ('50044145130319219674999172614005136782999664814951249895410854425222125982484', 4.1222, 'accepted'),
-    '1834530': ('82389438372188201312360823731909997627694063888783766735886884183469631603599', 4.1176, 'accepted'),
-    '1834531': ('', 0.0, 'cancelled'),   # Suganuma -- CLOB accepted but 0 fills
-    '1834529': ('', 0.0, 'cancelled'),   # Fudesaka  -- CLOB accepted but 0 fills
-    '1834534': ('', 0.0, 'rejected'),    # Iino      -- rejected for min size (already correct)
-}
 
-CRUNCHYROLL_COSTS = {
-    '1834533': 3.705189941867185,
-    '1834532': 3.705189941867185,
-    '1834530': 3.4993460562078957,
-    '1834531': 3.581683610471612,
-    '1834529': 4.034540158922045,
-    '1834534': 0.9468818740327247,
-}
-CRUNCHYROLL_FILLED_COST = sum(CRUNCHYROLL_COSTS[mid] for mid in ['1834533','1834532','1834530'])
-
-# El Hodood (trade 2) -- reconstructed from journal
-HODOOD_PID       = 'paper_1778164484.3062873_mutex_0xce9f2b128e0b4d1d7b921e24a566cb'
-HODOOD_TOKEN_ID  = '52318778167875974510372552758260515387718779455072251133050352396429657843717'
-HODOOD_SHARES    = 7.2
-HODOOD_BET       = 7.302603945000002   # from journal (leg 1 of trade 2)
-HODOOD_MARKET    = 'hodood_draw_no'    # synthetic market key (no Gamma market_id available)
-HODOOD_COND      = '0xdb2cae6b3169273e9358fccd78061b7274fe45f9fa28bf6104d3244730dc15eb'
+HODOOD_PID      = 'paper_1778164484.3062873_mutex_0xce9f2b128e0b4d1d7b921e24a566cb'
+HODOOD_TOKEN_ID = '52318778167875974510372552758260515387718779455072251133050352396429657843717'
+HODOOD_SHARES   = 7.2
+HODOOD_BET      = 7.302603945000002   # from journal (leg 1 of trade 2)
+HODOOD_MARKET   = 'hodood_draw_no'
+HODOOD_COND     = '0xdb2cae6b3169273e9358fccd78061b7274fe45f9fa28bf6104d3244730dc15eb'
 
 conn = sqlite3.connect(DB)
 
 # ---------------------------------------------------------------------------
-# 1. Fix Crunchyroll position
+# 1. Close Crunchyroll position (all legs unwound on-chain)
 # ---------------------------------------------------------------------------
 row = conn.execute("SELECT data FROM positions WHERE position_id=?", (CRUNCHYROLL_PID,)).fetchone()
-pos = json.loads(row[0])
-
-for mid, (tok, shares, status) in CRUNCHYROLL_LEG_FILLS.items():
-    if mid in pos['markets']:
-        leg = pos['markets'][mid]
-        if tok:
-            leg['token_id'] = tok
-        leg['actual_shares'] = shares
-        leg['fill_status'] = status
-        if shares > 0:
-            leg['shares'] = shares
-
-pos['status'] = 'open'
-
-conn.execute("UPDATE positions SET data=?, status='open' WHERE position_id=?",
-             (json.dumps(pos), CRUNCHYROLL_PID))
-print(f'[1] Fixed Crunchyroll position: token_ids + actual_shares set on 3 filled legs')
-print(f'    Suganuma/Fudesaka => cancelled, Iino => rejected')
+if row:
+    pos = json.loads(row[0])
+    pos['status'] = 'closed'
+    pos['close_timestamp'] = str(time.time())
+    pos['metadata'] = pos.get('metadata', {})
+    pos['metadata']['close_reason'] = 'manual_unwind_incident_20260508'
+    conn.execute("UPDATE positions SET data=?, status='closed' WHERE position_id=?",
+                 (json.dumps(pos), CRUNCHYROLL_PID))
+    print('[1] Crunchyroll position marked CLOSED (unwound on-chain)')
+else:
+    print('[1] Crunchyroll position not found — skipping')
 
 # ---------------------------------------------------------------------------
-# 2. Add (or update) El Hodood position record
+# 2. Add (or update) El Hodood position record — OPEN, pending exit
 # ---------------------------------------------------------------------------
 hodood_pos = {
     'position_id': HODOOD_PID,
@@ -100,7 +80,7 @@ hodood_pos = {
     'entry_timestamp': '1778164484.306287',
     'entry_prices': {HODOOD_MARKET: 0.14},
     'status': 'open',
-    'last_check': '1778164484.306287',
+    'last_check': str(time.time()),
     'price_drift': {},
     'resolved_at': None,
     'close_timestamp': None,
@@ -115,8 +95,14 @@ hodood_pos = {
         'strategy': 'arb_sell',
         'is_sell': True,
         'end_date_ts': 0.0,
-        'note': 'Reconstructed 2026-05-08 after partial reconciliation incident',
         'condition_id': HODOOD_COND,
+        'note': 'Reconstructed 2026-05-08 after partial reconciliation incident',
+        # Exit intent: sell at best available bid as soon as CLOB bids exist.
+        # True breakeven ($1.014/share) exceeds max payout ($1.00/share).
+        # Run: python3 scripts/ops/manual_unwind_v2.py --token-id <ID> --shares 7.2 --neg-risk
+        'exit_intent': 'sell_at_best_bid',
+        'exit_token_id': HODOOD_TOKEN_ID,
+        'exit_shares': HODOOD_SHARES,
     },
     'chain_id': None,
     'chain_generation': 0,
@@ -127,11 +113,11 @@ existing = conn.execute("SELECT 1 FROM positions WHERE position_id=?", (HODOOD_P
 if existing:
     conn.execute("UPDATE positions SET data=?, status='open' WHERE position_id=?",
                  (json.dumps(hodood_pos), HODOOD_PID))
-    print(f'[2] Updated El Hodood position (already existed)')
+    print('[2] El Hodood position UPDATED (open, exit_intent=sell_at_best_bid)')
 else:
     conn.execute("INSERT INTO positions (position_id, status, data, opened_at) VALUES (?,?,?,?)",
                  (HODOOD_PID, 'open', json.dumps(hodood_pos), '1778164484.306287'))
-    print(f'[2] Created El Hodood position record')
+    print('[2] El Hodood position CREATED (open, exit_intent=sell_at_best_bid)')
 
 # ---------------------------------------------------------------------------
 # 3. Fix accounting checkpoint
@@ -140,27 +126,18 @@ row = conn.execute("SELECT data FROM checkpoints WHERE key='accounting_ledger'")
 ledger = json.loads(row[0])
 
 print(f'\n[3] Accounting BEFORE:')
-print(f'    cash={ledger["cash"]:.4f}, deployed={ledger["positions_deployed"]:.4f}, fees={ledger["fees_total"]:.6f}')
+print(f'    cash={ledger.get("cash",0):.4f}  deployed={ledger.get("positions_deployed",0):.4f}')
 
-ledger['cash'] = ON_CHAIN_USDC
-total_deployed = CRUNCHYROLL_FILLED_COST + HODOOD_BET
-ledger['positions_deployed'] = total_deployed
-
-# Holdings keyed by token_id
-h = {}
-h[HODOOD_TOKEN_ID] = {'quantity': HODOOD_SHARES, 'cost_basis': HODOOD_BET}
-h['82724943425600151029939281806822319359475765380323844283886329142061964392665'] = \
-    {'quantity': 4.1222, 'cost_basis': CRUNCHYROLL_COSTS['1834533']}
-h['50044145130319219674999172614005136782999664814951249895410854425222125982484'] = \
-    {'quantity': 4.1222, 'cost_basis': CRUNCHYROLL_COSTS['1834532']}
-h['82389438372188201312360823731909997627694063888783766735886884183469631603599'] = \
-    {'quantity': 4.1176, 'cost_basis': CRUNCHYROLL_COSTS['1834530']}
-ledger['holdings'] = h
+ledger['cash'] = CLOB_USDC
+ledger['positions_deployed'] = HODOOD_BET
+ledger['holdings'] = {
+    HODOOD_TOKEN_ID: {'quantity': HODOOD_SHARES, 'cost_basis': HODOOD_BET}
+}
 
 print(f'\n[3] Accounting AFTER:')
-print(f'    cash={ledger["cash"]:.4f}, deployed={ledger["positions_deployed"]:.4f}')
-print(f'    cash+deployed={ledger["cash"]+ledger["positions_deployed"]:.4f}  (initial=$97.37, delta explains Spurs legacy position)')
-print(f'    holdings: {len(h)} entries')
+print(f'    cash={ledger["cash"]:.6f}  deployed={ledger["positions_deployed"]:.6f}')
+print(f'    total={ledger["cash"]+ledger["positions_deployed"]:.4f}')
+print(f'    holdings: {len(ledger["holdings"])} entry (El Hodood only)')
 
 conn.execute("UPDATE checkpoints SET data=?, updated_at=? WHERE key='accounting_ledger'",
              (json.dumps(ledger), str(time.time())))
@@ -168,10 +145,13 @@ conn.execute("UPDATE checkpoints SET data=?, updated_at=? WHERE key='accounting_
 # ---------------------------------------------------------------------------
 # 4. Fix scalars
 # ---------------------------------------------------------------------------
-conn.execute("UPDATE scalars SET value=97.37 WHERE key='current_capital'")
-conn.execute("UPDATE scalars SET value=97.37 WHERE key='initial_capital'")
-print(f'\n[4] scalars.current_capital=$97.37 (total portfolio value)')
+total = CLOB_USDC + HODOOD_BET
+conn.execute("UPDATE scalars SET value=? WHERE key='current_capital'", (round(total, 4),))
+# initial_capital reflects original deposit — do NOT change
+print(f'\n[4] scalars.current_capital={total:.4f} (cash {CLOB_USDC:.4f} + deployed {HODOOD_BET:.4f})')
 
 conn.commit()
 conn.close()
-print('\n=== Repair complete. Run: sudo systemctl start prediction-trader ===')
+print('\n=== Repair complete ===')
+print(f'El Hodood exit: run manual_unwind_v2.py --token-id {HODOOD_TOKEN_ID} --shares {HODOOD_SHARES} --neg-risk')
+print('Then: sudo systemctl start prediction-trader')
