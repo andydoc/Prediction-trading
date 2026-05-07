@@ -251,7 +251,66 @@ Returns hex wei (1 POL = 1e18 wei).
 | `.bak` backup | Created before every `load_from_disk()` |
 | Graceful shutdown | Final state flush before exit |
 
-**Schema tables**: `scalars`, `positions`, `delay_p95`, `daily_reports`.
+**Schema tables**: `scalars`, `positions`, `delay_p95`, `daily_reports`, `journal`, `checkpoints`.
+
+**Accounting dual-persistence (critical for DB surgery):**
+
+The `AccountingLedger` is stored in **two independent layers** that must both be kept in sync:
+
+| Layer | Table | What it stores | Loaded on restart? |
+|-------|-------|----------------|--------------------|
+| **Checkpoint JSON** | `checkpoints` (key=`accounting_ledger`) | Complete `AccountingLedger` struct as JSON — includes running balances (`cash`, `positions_deployed`, `fees_total`) and in-memory `entries` Vec | **Yes — this is the authoritative state** |
+| **Journal audit trail** | `journal` | Individual `JournalEntry` rows flushed for auditing | No — not replayed on load |
+
+**The journal table is append-only audit history. It does NOT drive running balances on restart.**
+Running balances (`cash`, `positions_deployed`, `fees_total`) are loaded exclusively from the checkpoint JSON blob.
+
+Any DB surgery that modifies financial state must patch **both**:
+1. `scalars` table — `current_capital` (PositionManager capital)
+2. `checkpoints` table — `accounting_ledger` JSON blob (`cash`, `positions_deployed`, `fees_total` fields)
+
+Adding entries only to `journal` leaves `cash` stale across restarts (INC-D9, 2026-05-07).
+
+**DB surgery template — reverse a phantom/stuck position:**
+```python
+import sqlite3, json
+
+DB = "/home/ubuntu/prediction-trader/data/state_rust.db"
+# STOP the service before running this script.
+
+conn = sqlite3.connect(DB)
+
+# 1. Fix PositionManager capital
+phantom_capital = 19.47   # replace with actual amount
+phantom_fees    = 0.00195 # replace with actual fees
+
+conn.execute("UPDATE scalars SET value = value + ? WHERE key = 'current_capital'",
+             (phantom_capital + phantom_fees,))
+
+# 2. Fix AccountingLedger checkpoint
+row = conn.execute("SELECT data FROM checkpoints WHERE key='accounting_ledger'").fetchone()
+ledger = json.loads(row[0])
+
+ledger['cash']               += (phantom_capital + phantom_fees)
+ledger['positions_deployed']  = max(0.0, ledger['positions_deployed'] - phantom_capital)
+ledger['fees_total']          = max(0.0, ledger['fees_total'] - phantom_fees)
+
+# Also remove phantom holdings if present
+for mkt_id in ['MARKET_ID_1', 'MARKET_ID_2', 'MARKET_ID_3']:
+    ledger.get('holdings', {}).pop(mkt_id, None)
+
+conn.execute(
+    "INSERT OR REPLACE INTO checkpoints (key, data, updated_at) VALUES (?, ?, datetime('now'))",
+    ('accounting_ledger', json.dumps(ledger))
+)
+
+# 3. (Optional) Add reversal entries to journal for audit trail
+# These do NOT affect running balances — audit only.
+
+conn.commit()
+conn.close()
+print(f"Done. New cash={ledger['cash']:.4f}, deployed={ledger['positions_deployed']:.4f}")
+```
 
 **Manual backup (pre-maintenance):**
 ```bash
