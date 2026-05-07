@@ -2565,6 +2565,12 @@ impl Orchestrator {
         // Reset API success timestamp so we don't false-trip on startup
         self.circuit_breaker.record_api_success(now_secs());
 
+        // Reset monitor peak to the true post-load total value. Without this,
+        // any dashboard ticks that fired during startup (when the PM was
+        // initialised from config initial_capital before DB state loaded) leave
+        // a phantom high-water mark that produces false drawdown readings.
+        self.engine.monitor.lock().peak_value = total_value;
+
         let snap = self.engine.dashboard_snapshot();
         tracing::info!("State loaded: ${:.2} capital, {} open, {} closed (CB peak=${:.2})",
             snap.current_capital, snap.open_count, snap.closed_count,
