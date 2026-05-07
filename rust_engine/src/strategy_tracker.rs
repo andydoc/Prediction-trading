@@ -197,8 +197,14 @@ impl VirtualPortfolio {
         }
 
         // Gate 5: Capital available
+        // 2026-05-07: lowered floor from $10 → $3 so shadow strategies can track
+        // entries at the small-bankroll regime ($30-$50 pUSD pool). Previously
+        // every shadow rejected every opportunity because trade_size never
+        // cleared $10 (Strategy D 30% of $32.22 = $9.67, just under). Live FAK
+        // floor is enforced by the executor's tick-rounding + CLOB's own minimum
+        // notional (~$1), so $3 is conservative for shadow tracking purposes.
         let trade_size = self.compute_trade_size();
-        if trade_size < 10.0 || self.current_capital < trade_size {
+        if trade_size < 3.0 || self.current_capital < trade_size {
             return false;
         }
 
@@ -223,7 +229,8 @@ impl VirtualPortfolio {
     /// Enter a virtual position from an opportunity.
     fn enter(&mut self, opp: &Opportunity) {
         let trade_size = self.compute_trade_size().min(self.current_capital);
-        if trade_size < 10.0 { return; }
+        // Match the floor in passes_gates() — see note there.
+        if trade_size < 3.0 { return; }
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

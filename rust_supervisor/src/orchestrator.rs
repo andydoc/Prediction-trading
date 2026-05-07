@@ -1207,11 +1207,26 @@ impl Orchestrator {
         self.load_state();
 
         // 5b. B4.1: Startup reconciliation — compare loaded positions against venue
+        // 2026-05-07: previously called `reconcile_startup` which hardcoded
+        // `auth: None`, causing `query_clob_positions` to early-return Ok(empty)
+        // and never actually hit Data API. That left the bot blind to on-chain
+        // holdings and is why both the D2 Spurs YES position and the INC-D9
+        // Draw-NO position went unreconciled for days. Now passing real auth.
         if self.engine.pm_open_count() > 0 {
-            let report = self.engine.reconcile_startup(self.cfg.min_trade_size);
+            let (report, venue) = self.engine.reconcile_startup_with_auth(
+                &self.cfg.clob_host,
+                self.cfg.clob_auth.as_ref(),
+                self.cfg.min_trade_size,
+            );
             if !report.passed {
                 tracing::warn!("B4.1 startup reconciliation found {} critical discrepancies",
                     report.critical_count());
+                if !venue.is_empty() {
+                    let adjustments = self.engine.apply_reconciliation(&report, &venue);
+                    for adj in &adjustments {
+                        tracing::info!("B4.1 startup auto-adjustment: {}", adj);
+                    }
+                }
             }
         }
 
@@ -2052,12 +2067,24 @@ impl Orchestrator {
         }
 
         // --- B4.0: Periodic reconciliation (every 5 min) ---
+        // 2026-05-07: same auth-plumbing fix as 5b — was calling the no-auth
+        // variant which silently returned 0 venue positions every cycle.
         if (now - self.last_reconciliation) >= 300.0 {
             if self.engine.pm_open_count() > 0 {
-                let report = self.engine.reconcile_periodic(self.cfg.min_trade_size);
+                let (report, venue) = self.engine.reconcile_periodic_with_auth(
+                    &self.cfg.clob_host,
+                    self.cfg.clob_auth.as_ref(),
+                    self.cfg.min_trade_size,
+                );
                 if !report.passed {
                     tracing::warn!("B4.0 reconciliation: {} critical, {} warnings",
                         report.critical_count(), report.warning_count());
+                    if !venue.is_empty() {
+                        let adjustments = self.engine.apply_reconciliation(&report, &venue);
+                        for adj in &adjustments {
+                            tracing::info!("B4.0 periodic auto-adjustment: {}", adj);
+                        }
+                    }
                 }
             }
             self.last_reconciliation = now;
@@ -2868,10 +2895,35 @@ impl Orchestrator {
                                 self.engine.rollback_paper_entry(&pos.position_id);
                                 continue;
                             } else if !result.all_accepted {
-                                tracing::warn!(
-                                    "[G1] Partial submit on {}: {}/{} legs accepted. Fill tracker will decide unwind via evaluate_arb_fills.",
+                                // INC-D9 (2026-05-07): full auto-unwind
+                                // (`evaluate_arb_fills` → `execute_position_exit`)
+                                // is built but unwired in production. Until the
+                                // proper plumbing ships (per-leg fill_status on
+                                // Position + WS-confirmed fills + accounting
+                                // reconciliation), partial submits strand the
+                                // filled-leg inventory and corrupt the engine's
+                                // capital accounting (intent vs actual). The
+                                // safest bridge until then is: trip the CB so
+                                // we stop opening new positions, alert the
+                                // operator, and require manual unwind via
+                                // scripts/ops/manual_unwind_v2.py.
+                                tracing::error!(
+                                    "[G1] Partial submit on {}: {}/{} legs accepted — TRIPPING CB. \
+                                     Inventory is stranded; manual unwind required.",
                                     pos.position_id, accepted_count, legs.len()
                                 );
+                                let trip_msg = format!(
+                                    "PartialFill: {} of {} legs accepted on position {} — \
+                                     stranded inventory; run scripts/ops/manual_unwind_v2.py to recover, \
+                                     then restart bot to clear CB.",
+                                    accepted_count, legs.len(), pos.position_id
+                                );
+                                if let Some(msg) = self.circuit_breaker
+                                    .check_gas_critical(&trip_msg, now_secs())
+                                {
+                                    tracing::error!("CIRCUIT BREAKER TRIPPED: {}", msg);
+                                    let _ = self.notifier.send(&NotifyEvent::CircuitBreaker { reason: msg });
+                                }
                             } else {
                                 tracing::info!("[G1] Live orders submitted on {}: {} legs", pos.position_id, legs.len());
                             }

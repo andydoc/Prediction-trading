@@ -7,6 +7,83 @@ Versioning: `vMAJOR.MINOR.PATCH` with zero-padded two-digit minor and patch.
 
 ---
 
+## [Unreleased] — 2026-05-07 — INC-D9 (partial-fill stranded inventory) + reconciliation auth bug + audit
+
+### Fixed
+- **Partial-fill safety net (`orchestrator.rs:2870-2898`)**. A multi-leg arb on
+  Germany v Curaçao filled 1/3 legs ($2.21 stranded in Draw-NO) while
+  accounting debited the full $5 intent. The orchestrator's partial-submit
+  branch only logged a warning. It now trips the CB via
+  `check_gas_critical("PartialFill: …")` and Telegrams the operator,
+  preventing further entries until the operator runs the new
+  `scripts/ops/manual_unwind_v2.py` and restarts. Bridge until the full
+  auto-unwind (`evaluate_arb_fills` → `execute_position_exit`) ships.
+- **Strategy tracker `< $10` trade-size floor (`strategy_tracker.rs:201, 226`)**.
+  Lowered to `< $3`. At small bankrolls (<$50), no shadow strategy could ever
+  clear the floor — every opportunity was rejected by every portfolio. The
+  CLOB / executor enforce the real minimum (~$1 notional + tick rounding),
+  so $3 is conservative for shadow virtual portfolios.
+- **Reconciliation now actually queries Data API (`orchestrator.rs:1209, 2054`)**.
+  `reconcile_startup` and `reconcile_periodic` (no-auth wrappers in
+  `lib.rs:1119, 1145`) hardcode `auth: None`, which causes
+  `query_clob_positions` to early-return `Ok(Vec::new())` without ever
+  hitting Data API. `query_clob_positions_fresh` then loops 4× each seeing
+  0, "stabilises" on 0, no-op. Switched to `_with_auth` variants and
+  inlined the auto-apply that was buried in the wrappers. This is why
+  the D2 Spurs YES (12.37 shares ≈ $0.49) had been undetected since
+  2026-05-01 and why INC-D9's Draw-NO leg was invisible to reconciliation.
+
+### Added
+- **`scripts/ops/manual_unwind_v2.py`**. Operator tool for clearing stranded
+  inventory after a partial-fill CB trip. Hand-rolled V2 EIP-712 + L2 HMAC
+  (py-clob-client v0.34.6 still hardcodes V1 contract addresses, so its
+  `post_order` returns `400 order_version_mismatch`). Three modes: `--list`
+  (Data API holdings), `--auto` (per-token interactive confirmation),
+  single-token `--token-id <decimal> --shares <float>`. Proven on the
+  Draw-NO recovery: SELL 2.57 sh @ $0.92 → +$0.16 vs entry, tx
+  `0xdae306811b4287f00ccda07514c2a3bf195aee73656f70a01c52225561808365`.
+
+### Operations
+- Capital topped up: wrapped remaining USDC.e (~$65) → pUSD via
+  `wrap_usdce_to_pusd.py`. Total pUSD now **$97.37** (from $7.23 at session
+  start; $25 wrap earlier today + $65 wrap later + $0.14 unwind profit).
+- Live execution switched to **Strategy C** parameters via systemd
+  CLI overrides: `min_profit_threshold=0.03`, `capital_per_trade_pct=0.20`,
+  `max_concurrent_positions=1` (rolled back from 15 — see Audit below),
+  `min_trade_size=5.0`. Strategy D (30 % capital, 8 concurrent, 4-20 %
+  profit) deferred until bankroll ≥ $100.
+- DB re-synced post-unwind: `current_capital` / `initial_capital` /
+  `cb_peak_total_value` / strategy_portfolios all set to $97.37.
+  `total_actual_profit=0.14`, `total_trades=1`, `winning_trades=1`.
+  Accounting ledger checkpoint dropped (rebuilt fresh from $97.37).
+
+### Audit (2026-05-07, agent task `a51ed9d0fd91ab977`)
+- **17 stale / unwired code paths surfaced.** 7 HIGH severity. Two systemic
+  root causes:
+  - **The WS user channel is not connected to the orchestrator.**
+    `UserChannelClient` only runs in `clob_test/` test harnesses. Live
+    orders never advance `Submitted → Matched → Confirmed`. INC-021
+    phantom-payout reversal fires unconditionally on every resolution
+    (looks for `Confirmed` state that never gets set). INC-020 proactive-
+    exit polls for terminal status that never comes → silent
+    "position holds, no bookkeeping update". `RevertRateTracker` records
+    reverts but never confirmed fills → trip threshold meaningless.
+    B3.2 suspense subsystem and B4.5 parallel fill confirmation both have
+    zero production callers despite being claimed as shipped.
+  - **INC-020 was incompletely applied.** Replacement path at
+    `orchestrator.rs:3033` still calls `engine.liquidate_position`
+    regardless of mode → phantom-credits accounting on every replacement
+    while wallet still holds the shares. Pre-go-live blocker for any
+    `max_concurrent > 1`.
+- **`max_concurrent` rolled back from 15 → 1** as a safety move until
+  item #4 (replacement-liquidation) and the WS user-channel wiring are
+  shipped. Replacements only fire when slots are full + better opp
+  arrives + cooldown elapsed; with max=1 the buggy path is barely
+  exercised.
+- Full audit table preserved in `INCIDENT_LOG.md` under INC-D9 follow-up.
+
+---
+
 ## [Unreleased] — 2026-05-05 — INC-021 follow-up (CB auto-recovery)
 
 ### Fixed

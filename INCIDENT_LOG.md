@@ -4,6 +4,125 @@ Operational incidents for the Prediction Market Arbitrage System. Most recent fi
 
 ---
 
+### INC-D9: Partial-Fill Stranded Inventory + Reconciliation Auth Bug (2026-05-07)
+
+**Severity**: HIGH (real money stranded; reconciliation silently no-op for 6+ days)
+**Status**: RESOLVED — manual unwind successful (+$0.14 net), three code fixes shipped, three deeper plumbing items deferred to a follow-up reset.
+
+**Trigger**: Operator noticed the Strategies tab showed `0 evals seen` and `0% accept` while the Positions tab showed an active 3-leg `mutex_sell_all` arb on Germany v Curaçao that had been entered hours earlier. Investigation surfaced three interlocking bugs.
+
+**Bug 1 — Partial fill silently corrupts accounting**
+
+A 3-leg `mutex_sell_all` was attempted at 08:02 UTC. The CLOB filled the middle-priced leg (Draw NO @ $0.86, the only one with NO-side liquidity) and rejected the two extreme-probability legs ($0.13 Germany NO, $0.96 Curaçao NO) with `no orders found to match`. The orchestrator's partial-submit branch (`orchestrator.rs:2870-2877`) just logged a warning — the position was recorded as if fully entered, accounting debited the full $5 intent, but only $2.21 actually left the wallet. Result:
+
+- on-chain `pUSD = $30.00`, accounting `cash = $27.22` → **$2.78 drift**
+- dashboard "Deployed %" showed 15.5 % (= $5/$32.22) instead of true 6.86 % (= $2.21/$32.22)
+- realized P&L untracked because the engine had no concept of "this leg filled, those didn't"
+
+The aspirational log line `"Fill tracker will decide unwind via evaluate_arb_fills"` was misleading — `evaluate_arb_fills` exists in `executor.rs:1194` and `PartialFillAction::Unwind` is fully defined, but the production orchestrator **never calls them**. Only `clob_test/src/tests/d9_partial_fill.rs` exercises them. Per the v0.18.x notes, B3.6 was "code-complete but never tested against real CLOB" — D9 finally fired in production with real money.
+
+**Bug 2 — `passes_gates` $10 trade-size floor**
+
+Every shadow strategy was rejecting every opportunity with `0/8 accept`. Root cause: `strategy_tracker.rs:201` had a hardcoded `if trade_size < 10.0 { return false; }` — at $32.22 capital, even Strategy D's 30 %-per-trade only computed $9.67, just under the floor. None of the 6 shadows could clear it. Compounding: the persisted `strategy_portfolios.current_capital` was still $7.23 from before the wrap (we'd updated engine scalars but not strategy ones). At $7.23 × 30 % = $2.17, no strategy would ever clear $10 even theoretically.
+
+**Bug 3 — Reconciliation silently called the no-auth code path for weeks**
+
+The orchestrator at lines 1211 and 2057 called `self.engine.reconcile_startup(...)` and `self.engine.reconcile_periodic(...)` — wrapper helpers in `lib.rs:1119, 1145` that hardcode `auth: None` for the underlying `query_clob_positions` call. With `auth: None`, `reconciliation.rs:278-284` early-returns `Ok(Vec::new())` **without ever hitting Data API**, then `query_clob_positions_fresh` loops 4 times each seeing 0 positions and "stabilising" on 0. Every reconciliation cycle since the V2 cutover (2026-04-28) was a no-op. This is also why the D2 leftover Spurs YES position (12.37 shares ≈ $0.49) had been undetected since 2026-05-01.
+
+**Forensic snapshot**: 2.5728 shares of Draw-NO confirmed via `CTF.balanceOf(addr, 70361345...671216)` on chain, $2.22 of pUSD outflow matching the single-leg cost of $0.86 × 2.57 = $2.21.
+
+**Timeline (UTC 2026-05-07)**:
+
+| Time | Event |
+|---|---|
+| 08:02:21 | `[ENTRY] paper_1778140940...mutex_0xdecd...` fires on Germany v Curaçao 3-leg sell-all. CLOB returns 1/3 accepted. Bot logs warning, continues. Drift starts. |
+| 08:14 | Operator queries dashboard, notes "Deployed 15.5 %" suspicious; investigation begins. |
+| 08:30 | Confirmed via on-chain `CTF.balanceOf` that lone filled leg = 2.5728 Draw-NO @ $0.86. Determined `evaluate_arb_fills` is unwired. |
+| 09:02 | First unwind attempt via `py-clob-client v0.34.6` returns `HTTP 400 order_version_mismatch` — the pip-released SDK still hardcodes V1 exchange addresses. |
+| 09:08 | Hand-rolled V2 EIP-712 signing + L2 HMAC unwind succeeds: SELL 2.57 shares @ $0.92, taking amount $2.3644. Tx `0xdae306811b4287f00ccda07514c2a3bf195aee73656f70a01c52225561808365`. **+$0.16 vs entry**, market moved in our favor. |
+| 09:15 | DB cleanup: position deleted, scalars synced, accounting checkpoint dropped, strategy capitals reset. |
+| 09:35 | All three code fixes (CB-trip on partial, $10 floor → $3, reconciliation auth plumbed) built and deployed. |
+| 09:40 | Wrapped remaining $65 USDC.e → pUSD ($97.37 total). Switched live to **Strategy C** (20 % capital, 15 concurrent, 3-25 % profit). |
+
+**Fixes shipped this session**:
+
+1. **`strategy_tracker.rs:201, 226`** — lowered hardcoded `< 10.0` floor to `< 3.0`. At small bankrolls the live FAK floor (executor tick-rounding + CLOB ~$1 minimum) is the real constraint; $3 is conservative for shadow virtual portfolios.
+2. **`orchestrator.rs:2870-2898`** — partial-submit branch now trips the circuit breaker via `circuit_breaker.check_gas_critical(...)` with a `PartialFill:` prefixed message and Telegrams the operator. The bot stops entering new positions until the operator runs `scripts/ops/manual_unwind_v2.py` and restarts. This is the **bridge** until full auto-unwind is wired.
+3. **`orchestrator.rs:1209-1230, 2054-2078`** — switched from `reconcile_startup` / `reconcile_periodic` (no-auth) to `_with_auth` variants, passing `self.cfg.clob_auth.as_ref()`. Reconciliation now actually queries Data API. Also inlined the auto-apply that was previously buried in the no-auth wrapper.
+4. **`scripts/ops/manual_unwind_v2.py`** — new operator tool. Hand-rolled V2 EIP-712 + L2 HMAC for one-shot SELL orders. Three modes: `--list` (Data API holdings), `--auto` (interactive per-token confirmation), single-token `--token-id <decimal> --shares <float>`. Used during this incident to recover the Draw-NO leg.
+
+**Known dust** (cosmetic, not worth recovering):
+- 0.0028 Draw-NO shares (~$0.003) — left after 2-decimal share quantization
+- 12.37 Spurs YES shares (~$0.49) — leftover from D2 V2 onboarding test on 2026-05-01
+
+**Deferred to a follow-up reset** (acknowledged complexity; CB-trip is the safety net):
+
+- **Per-leg `fill_status` on Position struct** (`accepted | rejected | pending` + `actual_shares` vs `intended_shares`). Touches `Position` JSON schema, `executor.rs::execute_arb_batch` return shape, dashboard rendering. Needs careful migration since position records are persisted across restarts.
+- **Wire actual fill amounts into the accounting ledger** (debit only what filled; refund unfilled-leg capital via a synthetic `position_open_partial_refund` entry). Eliminates drift at source instead of after-the-fact reconciliation.
+- **Full auto-unwind**: on partial submit, wait briefly for WS user-channel fill confirmations, then call `evaluate_arb_fills(position_id, min_profit_threshold)`. If `Unwind`: build legs from `TrackedOrder` data, call `execute_position_exit`, then `apply_exit_fills` to close the position cleanly.
+- **Dashboard partial-fill rendering**: render `actual_shares` in green and `(intended)` in red brackets where they differ; Realized P&L should reflect partial-leg unwinds too.
+
+**Lessons**:
+
+- Aspirational log strings ("Fill tracker will decide unwind via X") that imply behavior the code doesn't implement are dangerous — they make us *feel* the path is wired when it isn't. We should grep these out periodically.
+- "Wrapper that auto-passes None" plus "early-return on None" is a footgun pattern. Any helper with both `_with_auth` and `_no_auth` shapes needs to be reviewed: which paths use which, and is the no-auth path actually correct (vs. an oversight)?
+- py-clob-client lags Polymarket's V2 by an unknown margin. v0.34.6 still uses V1 contracts. Tools that depend on the pip release for V2 features are blocked until they catch up.
+
+---
+
+#### INC-D9 follow-up audit: 17 stale / unwired code paths surfaced (2026-05-07)
+
+After the reconciliation auth bug was fixed, a full codebase audit was run to find other helpers of the same shape. **17 findings**, most of them tracing to two systemic root causes. Sorted by severity below; full table preserved for cross-reference.
+
+**Root cause A — WS user channel is not connected to the live orchestrator.** `UserChannelClient` is only consumed in `clob_test/src/fill_tracker.rs` and `clob_test/src/bin/clob_test_helper.rs` (test harnesses). The running supervisor has *no consumer* of `UserEvent::Trade`, so nothing calls `update_trade_status`, nothing promotes orders `Submitted → Matched → Confirmed`, and every downstream feature that reads `TradeStatus` is silently inert. Audit items #1, #2, #3, #6, #7, #9, #10, #14 all collapse to this single missing wire.
+
+**Root cause B — INC-020 (paper-credit-while-real-shares-held) was incompletely applied.** The proactive-exit fix at `orchestrator.rs:3466` is correct. The *replacement* path at `orchestrator.rs:3033` calls `engine.liquidate_position` unconditionally — paper bookkeeping that credits `current_capital` from `bid × shares` regardless of mode. With Strategy C now running at `max_concurrent_positions=15`, replacements will fire and silently double-count proceeds (real shares stay in wallet, accounting credits as if sold). **This is a pre-go-live blocker.**
+
+**HIGH-severity items**:
+
+| # | File:Line | Issue |
+|---|---|---|
+| 1 | `executor.rs:946,1577` | `update_trade_status`, `process_fill_event` defined and tested, **zero production callers**. State machine never advances. |
+| 2 | `executor.rs:1006` + `orchestrator.rs:1983-1993` | INC-021 phantom-payout reversal looks for `TradeStatus::Confirmed` — never set in live → phantom-payout fires unconditionally on every resolution. |
+| 3 | `orchestrator.rs:3517-3553` | INC-020 proactive-exit live path polls for terminal status that never gets set; loop always exits with `terminal=false, filled=0`; bookkeeping silently never updates after live exit. |
+| 4 | `orchestrator.rs:3033` | **Replacement liquidation** still calls `engine.liquidate_position` regardless of mode. Mirror of INC-020 bug, missed in fix. **Pre-go-live blocker for any `max_concurrent > 1`.** |
+| 5 | `orchestrator.rs:1215, 1684, 1865, 1954, 2073` | Reconciliation, proactive-exit, postponement, API-resolution-poll all gated on `pm_open_count() > 0`. Orphan venue positions (which reconciliation is meant to detect) cannot be discovered when PM is empty. The Spurs YES (D2 leftover, $0.49 since 2026-05-01) is the canonical example. |
+| 6 | `executor.rs:1194` (`evaluate_arb_fills`) + orchestrator partial-submit branch | INC-D9 itself — code complete + tested, never called from production. (We added the CB-trip safety net this session.) |
+| 7 | `circuit_breaker::RevertRateTracker` + `orchestrator.rs:3376` | Reverts are recorded; `FillOutcome::Confirmed` is never recorded anywhere. Trip threshold is meaningless — would fire at 100 % rate as soon as 10 reverts accumulate. |
+
+**MEDIUM-severity items**:
+
+| # | File:Line | Issue |
+|---|---|---|
+| 8 | `lib.rs:1119, 1145` | The original buggy `reconcile_startup` / `reconcile_periodic` no-auth wrappers are still `pub`-exported with zero callers — regression foothold. Should be deleted. |
+| 9 | `fill_confirmation.rs:180` | B4.5 "Parallel WS + Data API fill confirmation" — entire module has zero callers. Documented in CHANGELOG / ARCHITECTURE / ROADMAP as a shipped feature. |
+| 10 | `accounting.rs:591,644,689,702` | B3.2 suspense subsystem (`enter_suspense`, `confirm_from_suspense`, `mark_suspense_retrying`, `reverse_suspense`) — exercised only by unit tests, zero production callers. The "ghost-fill defence-in-depth" claim in `docs/POLYMARKET_ISSUE_WATCHLIST.md:59` is **false**. |
+| 11 | `executor.rs:1211` | B3.7 batch-order submission has zero callers anywhere. `execute_arb` is sequential and never falls back. Documented as shipped. |
+| 12 | `orchestrator.rs:404-468` | `OrchestratorConfig` fields `mode`, `min_profit_ratio`, `postponement_rescore_days` are dead (build warns). Operators tuning them in `config.yaml` see no effect. |
+| 13 | `position.rs:214` (`update_leg_with_fill`) | Predecessor of `apply_exit_fills`, NT-1-tagged, zero callers anywhere. Delete. |
+| 14 | `fill_quality.rs:115` (`record_actual`) | `record_intent` is wired; `record_actual` has zero callers. The whole intent-vs-actual point of the log is unrealisable. |
+
+**LOW-severity items**: #15 test-only `resolve` / `prune_old_closed` in strategy_tracker (production uses `_with_db`); #16 dead `clob_host` parameter in `query_clob_positions` (function actually hits data-api); #17 dead `format_tick_size` helper.
+
+**Implications for the live Strategy-C run started this session**:
+
+- `max_concurrent_positions = 15` with item #4 unfixed means **any replacement event will phantom-credit accounting**. Replacements fire on the cooldown timer when the bot wants to swap a held position for a higher-scoring one. With 15 slots, replacements are likely.
+- Phantom-payout reversal (#2) is unconditional — every resolution will trigger `reverse_phantom_payout` to "undo" a payout that was never actually credited. Effect on books TBD; could double-debit on a real fill if the WS wire-up later promotes one to `Confirmed`.
+- Proactive exits (#3) silently swallow live-mode bookkeeping. We could close a position on the venue but not in our books, drift creeps up.
+- The B3.2 suspense subsystem we cite in the watchlist as a "ghost-fill mitigation" doesn't exist in production.
+
+**Recommended ordering for pre-go-live remediation**:
+
+1. **Item #4 (replacement liquidation)** — 20-line change to mirror the INC-020 proactive-exit branch. Safe to ship today. Without this, any `max_concurrent > 1` is unsafe for Strategy C/D.
+2. **Item #5 (`pm_open_count > 0` gate)** — change to `pm_open_count > 0 OR (!shadow_only && clob_auth.is_some())` so reconciliation can still detect orphans when PM is empty. Cheap.
+3. **Item #8** — delete the dead no-auth wrappers in `lib.rs`. Trivial.
+4. **Items #1, #3, #6, #7, #9, #10, #14** all converge on **wiring the WS user channel into the orchestrator**. This is one substantial feature (1-2 days of careful work) that lights up the entire fill-confirmation / state-machine / accounting / revert-tracker stack. Until it ships, the bot is blind to actual fills and treats every event as "trust HTTP response only".
+5. **Items #11, #12, #13, #15, #16, #17** — cleanup; can ship any time.
+
+Until #4 is fixed, the operationally safest live posture is `max_concurrent_positions = 1` (replacement path barely exercises). Audit raw output preserved at agent task ID `a51ed9d0fd91ab977`.
+
+---
+
 ### INC-021: Polymarket CLOB Schema Mismatch — Live Halted, Six Bugs Surfaced (2026-04-29)
 
 **Severity**: HIGH (live execution non-functional, phantom accounting accumulating)
