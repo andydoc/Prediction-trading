@@ -9,6 +9,25 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
 
+/// Deserialize `Option<f64>` tolerating values that were accidentally serialised
+/// as JSON strings (e.g. `"1778198185.42"` instead of `1778198185.42`).
+/// Accepts: JSON null → None, JSON number → Some(f64), JSON string → parse.
+fn deserialize_opt_f64_or_string<'de, D>(d: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v = serde_json::Value::deserialize(d)?;
+    match v {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(n) => Ok(n.as_f64()),
+        serde_json::Value::String(s) => s.parse::<f64>()
+            .map(Some)
+            .map_err(|_| D::Error::custom(format!("expected float, got string {:?}", s))),
+        other => Err(D::Error::custom(format!("expected float or null, got {:?}", other))),
+    }
+}
+
 fn now_ts() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
 }
@@ -78,6 +97,7 @@ pub struct Position {
 
     // Resolution
     pub resolved_at: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_f64_or_string")]
     pub close_timestamp: Option<f64>,  // Unix ts
     pub winning_market: Option<String>,
     pub actual_payout: f64,
