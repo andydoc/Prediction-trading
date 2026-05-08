@@ -2555,10 +2555,13 @@ impl Orchestrator {
                     tracing::info!("Accounting ledger restored from checkpoint");
                 }
                 Err(e) => {
-                    // Checkpoint format mismatch (e.g. schema evolution) — rebuild from PM state
-                    // so accounting.cash reflects reality rather than defaulting to initial_capital.
-                    // PM.current_capital() = cash available (excludes deployed capital).
-                    let pm_cash = self.engine.positions.lock().current_capital();
+                    // Checkpoint format mismatch (e.g. schema evolution) — rebuild from PM state.
+                    // accounting.cash = USDC portion only = total_value - deployed_capital.
+                    // (deployed_capital is in CTF tokens on-chain, not USDC.)
+                    let pm_cash = {
+                        let pm = self.engine.positions.lock();
+                        pm.current_capital() - pm.deployed_capital()
+                    };
                     let mut acct = self.engine.accounting.lock();
                     acct.reset_cash_to(pm_cash, fee_rate);
                     tracing::warn!(
