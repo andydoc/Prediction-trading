@@ -393,12 +393,18 @@ impl PositionManager {
 
         let payout = if is_sell {
             // SELL arb: bought NO on all markets. Winner's NO loses, rest pay $1/share.
+            // Prefer leg.shares (actual on-chain count) over bet_amount/no_price which
+            // can disagree for reconstructed or neg-risk positions.
             let mut pay = 0.0;
             for (mid, leg) in &position.markets {
                 if mid != winning_market_id {
-                    let no_price = 1.0 - leg.entry_price;
-                    if no_price > 0.0 {
-                        pay += leg.bet_amount / no_price;  // shares_NO * $1
+                    if leg.shares > 0.0 {
+                        pay += leg.shares;  // shares_NO * $1 per share
+                    } else {
+                        let no_price = 1.0 - leg.entry_price;
+                        if no_price > 0.0 {
+                            pay += leg.bet_amount / no_price;
+                        }
                     }
                 }
             }

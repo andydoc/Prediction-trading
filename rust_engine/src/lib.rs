@@ -927,6 +927,48 @@ impl TradingEngine {
         self.positions.lock().import_positions_json(open_json, closed_json, capital, initial_capital);
     }
 
+    /// True when `mid` is an operator-assigned synthetic ID, not a real Polymarket market ID.
+    /// Real IDs are either all-numeric ("1834529") or hex condition IDs ("0x...66chars").
+    /// Synthetic IDs (e.g. "hodood_draw_no") cannot be looked up on Gamma/CLOB by market_id.
+    pub fn is_synthetic_market_id(mid: &str) -> bool {
+        if mid.chars().all(|c| c.is_ascii_digit()) { return false; }
+        if mid.starts_with("0x") && mid.len() == 66
+            && mid[2..].chars().all(|c| c.is_ascii_hexdigit()) { return false; }
+        true
+    }
+
+    /// Resolve a market via the CLOB API using its condition_id.
+    /// Used as a fallback when market_id is synthetic and Gamma lookup would fail.
+    /// Returns Some("yes"|"no") when closed and a clear winner exists, None otherwise.
+    fn check_market_resolution_clob(&self, condition_id: &str) -> Option<String> {
+        let url = format!("https://clob.polymarket.com/markets/{}", condition_id);
+        match self.http_client.get(&url).send() {
+            Ok(resp) => {
+                if let Ok(mdata) = resp.json::<serde_json::Value>() {
+                    if !mdata["closed"].as_bool().unwrap_or(false) {
+                        return None; // not yet settled
+                    }
+                    if let Some(tokens) = mdata["tokens"].as_array() {
+                        for token in tokens {
+                            if token["winner"].as_bool().unwrap_or(false) {
+                                let outcome = token["outcome"].as_str()
+                                    .unwrap_or("").to_lowercase();
+                                if outcome == "yes" || outcome == "no" {
+                                    return Some(outcome);
+                                }
+                            }
+                        }
+                    }
+                    None
+                } else { None }
+            }
+            Err(e) => {
+                tracing::debug!("CLOB resolution check failed for {}: {}", condition_id, e);
+                None
+            }
+        }
+    }
+
     /// Check Polymarket API for missed resolutions (catches WS gaps).
     /// Query Gamma API for a single market's resolution status.
     /// Returns Some(("yes"|"no", uma_status)) if definitively resolved, None otherwise.
@@ -1022,20 +1064,67 @@ impl TradingEngine {
     }
 
     pub fn check_api_resolutions(&self) -> (Vec<ApiResolution>, Vec<DisputeInfo>) {
-        // Collect position IDs and their market IDs under the lock, then release
-        let position_data: Vec<(String, Vec<String>)> = {
+        // Collect position IDs, market IDs, and condition_id fallback (for synthetic market_ids).
+        let position_data: Vec<(String, Vec<String>, Option<String>)> = {
             let pm = self.positions.lock();
             if pm.open_count() == 0 {
                 return (Vec::new(), Vec::new());
             }
             pm.open_positions().values()
-                .map(|p| (p.position_id.clone(), p.markets.keys().cloned().collect()))
+                .map(|p| {
+                    let market_ids = p.markets.keys().cloned().collect();
+                    let condition_id = p.metadata.get("condition_id")
+                        .and_then(|v| v.as_str()).map(|s| s.to_string());
+                    (p.position_id.clone(), market_ids, condition_id)
+                })
                 .collect()
         };
 
         tracing::info!("Checking API resolution for {} open positions...", position_data.len());
 
-        let (results, disputes) = self.check_constraints_resolution(&position_data, "Position");
+        // Split positions: those with only real market IDs go through Gamma;
+        // those with synthetic market IDs use the CLOB condition_id fallback.
+        let mut normal: Vec<(String, Vec<String>)> = Vec::new();
+        let mut synthetic_resolved: Vec<(String, String)> = Vec::new();
+
+        for (pid, mids, cond_id) in &position_data {
+            let has_synthetic = mids.iter().any(|m| Self::is_synthetic_market_id(m));
+            if !has_synthetic {
+                normal.push((pid.clone(), mids.clone()));
+                continue;
+            }
+            tracing::warn!("Position {} has synthetic market_id(s) {:?} — using CLOB condition_id fallback",
+                &pid[..pid.len().min(40)], mids);
+            match cond_id {
+                Some(cid) => {
+                    match self.check_market_resolution_clob(cid) {
+                        Some(outcome) => {
+                            // Single-leg synthetic positions: "yes" means the one market won,
+                            // "no" means NONE won (e.g. sell-all NO tokens all pay out).
+                            let winning_mid = if outcome == "yes" {
+                                mids.first().cloned().unwrap_or_else(|| "NONE".to_string())
+                            } else {
+                                "NONE".to_string()
+                            };
+                            tracing::info!("CLOB resolution: {} → outcome={} winner={}",
+                                &pid[..pid.len().min(40)], outcome, winning_mid);
+                            synthetic_resolved.push((pid.clone(), winning_mid));
+                        }
+                        None => {
+                            tracing::info!("CLOB resolution: {} → market not yet settled (condition={})",
+                                &pid[..pid.len().min(40)], cid);
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!("Position {} has synthetic market_ids but no condition_id in metadata \
+                        — resolution impossible until condition_id is added", &pid[..pid.len().min(40)]);
+                }
+            }
+        }
+
+        let (gamma_results, disputes) = self.check_constraints_resolution(&normal, "Position");
+        let results: Vec<(String, String)> = gamma_results.into_iter().chain(synthetic_resolved).collect();
 
         // Apply all resolutions in a single lock acquisition
         let mut final_results = Vec::new();

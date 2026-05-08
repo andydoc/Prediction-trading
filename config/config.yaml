@@ -91,7 +91,7 @@ engine:
   stale_asset_threshold_seconds: 30
   max_book_staleness_secs: 30
   closed_position_retention_days: 90
-  api_resolution_interval_seconds: 300
+  api_resolution_interval_seconds: 60
   latency_instrumentation: true
 market_data:
   enabled_markets:

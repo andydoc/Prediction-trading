@@ -1260,6 +1260,32 @@ impl Orchestrator {
         // 5. Load state from SQLite
         self.load_state();
 
+        // 5a. Warn about open positions with synthetic market_ids.
+        // Synthetic IDs (e.g. "hodood_draw_no") can't be resolved via Gamma API.
+        // Resolution falls back to CLOB using metadata.condition_id. Log a clear
+        // warning at startup so any such position is immediately visible in logs.
+        {
+            let pm = self.engine.positions.lock();
+            for pos in pm.open_positions().values() {
+                let synthetic_mids: Vec<&str> = pos.markets.keys()
+                    .filter(|m| rust_engine::TradingEngine::is_synthetic_market_id(m))
+                    .map(|s| s.as_str())
+                    .collect();
+                if !synthetic_mids.is_empty() {
+                    let cond = pos.metadata.get("condition_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<missing>");
+                    tracing::warn!(
+                        "SYNTHETIC MARKET_ID: position {} has non-resolvable market_id(s) {:?}. \
+                         Resolution will use CLOB fallback with condition_id={}",
+                        &pos.position_id[..pos.position_id.len().min(40)],
+                        synthetic_mids,
+                        cond,
+                    );
+                }
+            }
+        }
+
         // 5b. B4.1: Startup reconciliation — compare loaded positions against venue
         // 2026-05-07: previously called `reconcile_startup` which hardcoded
         // `auth: None`, causing `query_clob_positions` to early-return Ok(empty)
