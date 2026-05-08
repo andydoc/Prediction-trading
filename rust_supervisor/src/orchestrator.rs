@@ -2556,12 +2556,9 @@ impl Orchestrator {
                 }
                 Err(e) => {
                     // Checkpoint format mismatch (e.g. schema evolution) — rebuild from PM state.
-                    // accounting.cash = USDC portion only = total_value - deployed_capital.
-                    // (deployed_capital is in CTF tokens on-chain, not USDC.)
-                    let pm_cash = {
-                        let pm = self.engine.positions.lock();
-                        pm.current_capital() - pm.deployed_capital()
-                    };
+                    // PM.current_capital() IS the free cash (excludes deployed capital);
+                    // it matches what accounting.cash should hold.
+                    let pm_cash = self.engine.positions.lock().current_capital();
                     let mut acct = self.engine.accounting.lock();
                     acct.reset_cash_to(pm_cash, fee_rate);
                     tracing::warn!(
