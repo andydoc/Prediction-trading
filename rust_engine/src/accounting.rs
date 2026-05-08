@@ -153,6 +153,16 @@ impl AccountingLedger {
         ledger
     }
 
+    /// Reset cash to a known value derived from external source (PM state).
+    /// Used when the persisted checkpoint cannot be deserialised (schema mismatch)
+    /// so accounting cash reflects current reality instead of defaulting to
+    /// initial_capital.  Does NOT touch positions_deployed or holdings — caller
+    /// should only use this as a fallback when no better data is available.
+    pub fn reset_cash_to(&mut self, cash: f64, taker_fee_rate: f64) {
+        self.cash = cash;
+        self.taker_fee_rate = taker_fee_rate;
+    }
+
     /// Check if a trade ID has already been recorded (dedup guard).
     pub fn is_trade_recorded(&self, trade_id: &str) -> bool {
         self.recorded_trade_ids.contains(trade_id)

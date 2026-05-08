@@ -122,35 +122,60 @@ pub struct VenuePosition {
 /// Compare internal open positions against venue-reported positions.
 ///
 /// Returns a ReconciliationReport with any discrepancies.
-/// Internal positions are (position_id, market_id, shares).
-/// Venue positions are grouped by market_id.
+/// Internal positions are (position_id, market_id, token_id, shares).
+/// Matching is attempted first by market_id (= condition_id from venue), then
+/// by token_id / asset_id as a fallback.  This is necessary because positions
+/// entered with a synthetic market_id (e.g. operator-reconstructed records)
+/// won't match on market_id but their token_id IS the venue's asset_id.
 pub fn compare_positions(
-    internal: &[(String, String, f64)], // (position_id, market_id, shares)
+    internal: &[(String, String, String, f64)], // (position_id, market_id, token_id, shares)
     venue: &[VenuePosition],
     escalation_threshold: f64,
     is_startup: bool,
 ) -> ReconciliationReport {
     let mut report = ReconciliationReport::new(is_startup);
 
-    // Build venue lookup: market_id → total size
+    // Build venue lookups: market_id (= condition_id) → size, asset_id → size
     let mut venue_by_market: HashMap<String, f64> = HashMap::new();
+    let mut venue_by_asset: HashMap<String, f64> = HashMap::new();
     for vp in venue {
         *venue_by_market.entry(vp.market_id.clone()).or_default() += vp.size;
+        *venue_by_asset.entry(vp.asset_id.clone()).or_default() += vp.size;
     }
 
-    // Build internal lookup: market_id → (position_id, total shares)
-    let mut internal_by_market: HashMap<String, (String, f64)> = HashMap::new();
-    for (pid, mid, shares) in internal {
-        let entry = internal_by_market.entry(mid.clone()).or_insert_with(|| (pid.clone(), 0.0));
-        entry.1 += shares;
+    // Build internal lookup: market_id → (position_id, token_id, total shares)
+    let mut internal_by_market: HashMap<String, (String, String, f64)> = HashMap::new();
+    for (pid, mid, tok, shares) in internal {
+        let entry = internal_by_market
+            .entry(mid.clone())
+            .or_insert_with(|| (pid.clone(), tok.clone(), 0.0));
+        entry.2 += shares;
     }
+
+    // Track which venue markets were matched (so we can report unmatched ones).
+    let mut matched_venue_markets: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Check internal positions against venue
-    for (mid, (pid, internal_shares)) in &internal_by_market {
+    for (mid, (pid, token_id, internal_shares)) in &internal_by_market {
         report.positions_checked += 1;
 
-        match venue_by_market.get(mid) {
-            Some(&venue_shares) => {
+        // Primary lookup: by market_id (venue uses condition_id as market_id).
+        // Fallback: by token_id == asset_id (catches reconstructed positions with
+        // synthetic market_ids that don't match any condition_id).
+        let venue_shares_opt = venue_by_market.get(mid).copied().or_else(|| {
+            if !token_id.is_empty() { venue_by_asset.get(token_id).copied() } else { None }
+        });
+        let matched_key = if venue_by_market.contains_key(mid) {
+            Some(mid.clone())
+        } else if !token_id.is_empty() && venue_by_asset.contains_key(token_id) {
+            Some(token_id.clone()) // the asset_id we matched on
+        } else {
+            None
+        };
+
+        match venue_shares_opt {
+            Some(venue_shares) => {
+                if let Some(k) = matched_key { matched_venue_markets.insert(k); }
                 let diff = (internal_shares - venue_shares).abs();
                 if diff < 0.01 {
                     report.positions_matched += 1;
@@ -192,9 +217,13 @@ pub fn compare_positions(
         }
     }
 
-    // Check venue positions not tracked internally
+    // Check venue positions not tracked internally.
+    // Skip markets/assets that were already matched via the token_id fallback path.
     for (mid, &venue_shares) in &venue_by_market {
-        if !internal_by_market.contains_key(mid) && venue_shares > 0.01 {
+        let asset_id = venue.iter().find(|v| &v.market_id == mid).map(|v| v.asset_id.as_str()).unwrap_or("");
+        let already_matched = matched_venue_markets.contains(mid)
+            || (!asset_id.is_empty() && matched_venue_markets.contains(asset_id));
+        if !already_matched && !internal_by_market.contains_key(mid) && venue_shares > 0.01 {
             report.add(Discrepancy {
                 kind: DiscrepancyKind::PositionMissingInternal,
                 severity: Severity::Warning,
@@ -501,8 +530,8 @@ mod tests {
     #[test]
     fn test_compare_positions_all_match() {
         let internal = vec![
-            ("pos1".into(), "mkt1".into(), 100.0),
-            ("pos2".into(), "mkt2".into(), 50.0),
+            ("pos1".into(), "mkt1".into(), "".into(), 100.0),
+            ("pos2".into(), "mkt2".into(), "".into(), 50.0),
         ];
         let venue = vec![
             VenuePosition { asset_id: "a1".into(), market_id: "mkt1".into(), size: 100.0, avg_price: 0.5, side: "BUY".into(), condition_id: "c1".into() },
@@ -516,7 +545,7 @@ mod tests {
 
     #[test]
     fn test_compare_positions_quantity_mismatch() {
-        let internal = vec![("pos1".into(), "mkt1".into(), 100.0)];
+        let internal = vec![("pos1".into(), "mkt1".into(), "".into(), 100.0)];
         let venue = vec![
             VenuePosition { asset_id: "a1".into(), market_id: "mkt1".into(), size: 95.0, avg_price: 0.5, side: "BUY".into(), condition_id: "c1".into() },
         ];
@@ -527,7 +556,7 @@ mod tests {
 
     #[test]
     fn test_compare_positions_missing_on_venue() {
-        let internal = vec![("pos1".into(), "mkt1".into(), 100.0)];
+        let internal = vec![("pos1".into(), "mkt1".into(), "".into(), 100.0)];
         let venue: Vec<VenuePosition> = vec![];
         let report = compare_positions(&internal, &venue, 1.0, false);
         assert!(!report.passed);
@@ -536,13 +565,39 @@ mod tests {
 
     #[test]
     fn test_compare_positions_missing_internal() {
-        let internal: Vec<(String, String, f64)> = vec![];
+        let internal: Vec<(String, String, String, f64)> = vec![];
         let venue = vec![
             VenuePosition { asset_id: "a1".into(), market_id: "mkt1".into(), size: 50.0, avg_price: 0.5, side: "BUY".into(), condition_id: "c1".into() },
         ];
         let report = compare_positions(&internal, &venue, 1.0, false);
         assert!(report.passed); // Warning, not critical
         assert_eq!(report.discrepancies[0].kind, DiscrepancyKind::PositionMissingInternal);
+    }
+
+    #[test]
+    fn test_compare_positions_token_id_fallback() {
+        // Simulate a reconstructed position with synthetic market_id but real token_id.
+        // The venue returns the position keyed by condition_id (not the synthetic market_id).
+        // The token_id == asset_id so the fallback path should find it and NOT raise MissingOnVenue.
+        let asset_id = "52318778167875974510372552758260515387718779455072251133050352396429657843717";
+        let condition_id = "0xdb2cae6b3169273e9358fccd78061b7274fe45f9fa28bf6104d3244730dc15eb";
+        let internal = vec![
+            ("pos1".into(), "hodood_draw_no".into(), asset_id.to_string(), 7.2),
+        ];
+        let venue = vec![
+            VenuePosition {
+                asset_id: asset_id.into(),
+                market_id: condition_id.into(), // reconciler sets market_id = condition_id
+                size: 7.2,
+                avg_price: 0.14,
+                side: "BUY".into(),
+                condition_id: condition_id.into(),
+            },
+        ];
+        let report = compare_positions(&internal, &venue, 1.0, false);
+        assert!(report.passed, "token_id fallback should match the position; discrepancies: {:?}", report.discrepancies);
+        assert_eq!(report.positions_matched, 1);
+        assert_eq!(report.discrepancies.len(), 0);
     }
 
     #[test]

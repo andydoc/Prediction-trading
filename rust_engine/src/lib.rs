@@ -1091,13 +1091,20 @@ impl TradingEngine {
     // === Reconciliation (B4.0/B4.1/B4.2) ===
 
     /// Extract open position data for reconciliation comparison.
-    /// Returns Vec<(position_id, market_id, shares)> — one entry per leg.
-    fn extract_position_data(&self) -> Vec<(String, String, f64)> {
+    /// Returns Vec<(position_id, market_id, token_id, shares)> — one entry per leg.
+    /// token_id is the on-chain asset_id used as a fallback match key when the
+    /// market_id is synthetic (e.g. operator-reconstructed positions).
+    fn extract_position_data(&self) -> Vec<(String, String, String, f64)> {
         let pm = self.positions.lock();
         let mut data = Vec::new();
         for p in pm.open_positions().values() {
             for (market_id, leg) in &p.markets {
-                data.push((p.position_id.clone(), market_id.clone(), leg.shares));
+                data.push((
+                    p.position_id.clone(),
+                    market_id.clone(),
+                    leg.token_id.clone(), // may be empty for legacy positions
+                    leg.shares,
+                ));
             }
         }
         data
