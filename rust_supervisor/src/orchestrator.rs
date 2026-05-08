@@ -70,6 +70,10 @@ static FALLBACK_P95: LazyLock<HashMap<String, f64>> = LazyLock::new(|| {
 const MAX_LATENCY_SAMPLES: usize = 200;
 /// Proactive exit multiplier — sell if net_proceeds >= this × resolution_payout.
 const PROACTIVE_EXIT_MULTIPLIER: f64 = 1.2;
+/// After a REPLACE exit attempt yields 0 fills (CLOB rejection / no bids),
+/// suppress that position from replacement evaluation for this many seconds.
+/// Prevents repeated sell orders on illiquid tokens (e.g. El Hodood Draw NO).
+const REPLACE_EXIT_COOLDOWN_SECS: f64 = 1800.0; // 30 minutes
 
 /// INC-021: how long an API-contract / API-drift alert stays deduped.
 /// 24h × 3600s. After this window the same signature fires another Telegram
@@ -864,6 +868,13 @@ pub struct Orchestrator {
     /// Tokio runtime that backs the user channel WS connection.
     /// Must outlive user_channel; dropped after run() returns.
     user_channel_rt: Option<tokio::runtime::Runtime>,
+
+    /// Per-position REPLACE exit cooldown timestamps.
+    /// After a replacement exit attempt yields 0 fills (CLOB rejection / no bids),
+    /// the position is suppressed from replacement evaluation for
+    /// REPLACE_EXIT_COOLDOWN_SECS to avoid flooding the CLOB with
+    /// repeat sell orders that will never fill.
+    replace_exit_cooldowns: HashMap<String, f64>,
 }
 
 impl Orchestrator {
@@ -1170,6 +1181,7 @@ impl Orchestrator {
             last_balance_pinned_alert: 0.0,
             user_channel,
             user_channel_rt,
+            replace_exit_cooldowns: HashMap::new(),
         })
     }
 
@@ -3063,6 +3075,21 @@ impl Orchestrator {
                             tracing::debug!("SKIP replacement for {} — UMA dispute active", truncate(pid, 20));
                             continue;
                         }
+                        // REPLACE exit cooldown: skip if last attempt yielded 0 fills recently
+                        {
+                            let now_ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs_f64();
+                            if let Some(&last_fail) = self.replace_exit_cooldowns.get(pid) {
+                                if now_ts - last_fail < REPLACE_EXIT_COOLDOWN_SECS {
+                                    tracing::debug!("SKIP replacement for {} — exit cooldown ({:.0}s remaining)",
+                                        truncate(pid, 20),
+                                        REPLACE_EXIT_COOLDOWN_SECS - (now_ts - last_fail));
+                                    continue;
+                                }
+                            }
+                        }
                         let bids = self.get_position_bids_typed(pos);
                         let repl_profit = best_opp.expected_profit;
 
@@ -3179,8 +3206,13 @@ impl Orchestrator {
                                 // B4.5: race WS user channel + Data API for fill confirmation.
                                 let raw_fills = self.wait_for_exit_fills(&executor, &worst_pid, &exec_legs);
                                 if raw_fills.is_empty() {
-                                    tracing::warn!("REPLACE exit: no fills confirmed for {} — replacement skipped",
-                                        truncate(&worst_pid, 40));
+                                    tracing::warn!("REPLACE exit: no fills confirmed for {} — replacement skipped (cooldown {}s)",
+                                        truncate(&worst_pid, 40), REPLACE_EXIT_COOLDOWN_SECS as u64);
+                                    let now_ts = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs_f64();
+                                    self.replace_exit_cooldowns.insert(worst_pid.clone(), now_ts);
                                     None
                                 } else {
                                     let exit_fills: Vec<rust_engine::position::ExitLegFill> = raw_fills.into_iter()
