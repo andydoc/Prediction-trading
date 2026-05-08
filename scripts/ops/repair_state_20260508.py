@@ -45,7 +45,7 @@ row = conn.execute("SELECT data FROM positions WHERE position_id=?", (CRUNCHYROL
 if row:
     pos = json.loads(row[0])
     pos['status'] = 'closed'
-    pos['close_timestamp'] = str(time.time())
+    pos['close_timestamp'] = time.time()  # float, not str — Rust Option<f64>
     pos['metadata'] = pos.get('metadata', {})
     pos['metadata']['close_reason'] = 'manual_unwind_incident_20260508'
     conn.execute("UPDATE positions SET data=?, status='closed' WHERE position_id=?",
