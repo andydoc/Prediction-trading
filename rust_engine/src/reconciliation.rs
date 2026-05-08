@@ -419,7 +419,7 @@ pub fn query_clob_positions_fresh(
 /// Returns both the report AND the venue positions so the caller can
 /// pass them to `apply_reconciliation()`.
 pub fn reconcile_startup(
-    open_positions: &[(String, String, f64)], // (position_id, market_id, shares)
+    open_positions: &[(String, String, String, f64)], // (position_id, market_id, token_id, shares)
     http_client: &reqwest::blocking::Client,
     clob_host: &str,
     auth: Option<&crate::signing::ClobAuth>,
@@ -478,7 +478,7 @@ pub fn reconcile_startup(
 /// Called on interval from the orchestrator tick loop.
 /// Same as startup but with additional disputed market detection.
 pub fn reconcile_periodic(
-    open_positions: &[(String, String, f64)],
+    open_positions: &[(String, String, String, f64)],
     http_client: &reqwest::blocking::Client,
     clob_host: &str,
     auth: Option<&crate::signing::ClobAuth>,
