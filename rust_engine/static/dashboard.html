@@ -855,7 +855,7 @@ function renderStrategies(d) {
   });
   h += '</div>';
 
-  if (summary.note) h += '<p style="color:#444;font-size:11px;margin-top:10px">' + summary.note + '</p>';
+  if (d.note) h += '<p style="color:#444;font-size:11px;margin-top:10px">' + esc(d.note) + '</p>';
   el.innerHTML = h;
 }
 function toggleStratRow(idx) {
