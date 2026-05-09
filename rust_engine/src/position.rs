@@ -394,7 +394,8 @@ impl PositionManager {
         // This handles reconstructed positions that lack a "method" field.
         let is_sell = if parse_trade_side(method) == TradeSide::Sell {
             true
-        } else if method.is_empty() || parse_trade_side(method) == TradeSide::Unknown {
+        } else if method.is_empty() {
+            // method not set (reconstructed/repair-script position) — check metadata fallbacks
             position.metadata.get("is_sell")
                 .and_then(|v| v.as_bool())
                 .unwrap_or_else(|| {
@@ -404,7 +405,7 @@ impl PositionManager {
                         .unwrap_or(false)
                 })
         } else {
-            false
+            false  // method explicitly set to a non-sell value
         };
 
         let payout = if is_sell {
