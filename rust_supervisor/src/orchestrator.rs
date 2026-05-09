@@ -2068,8 +2068,25 @@ impl Orchestrator {
                         // already booked the credit, so we reverse it here.
                         // Shadow-only mode skips this (paper accounting is
                         // the model in shadow).
+                        // Exception: positions with metadata["phantom_check_exempt"] = true
+                        // were entered via repair scripts or external execution paths that
+                        // bypass the executor's fill tracker. Their payout is real.
                         if !self.cfg.shadow_only {
-                            let has_real = self.executor.as_ref()
+                            let is_exempt = {
+                                let pm = self.engine.positions.lock();
+                                // Check both open and closed positions (position just moved to closed)
+                                let exempt_from_open = pm.open_positions().get(&r.position_id)
+                                    .and_then(|p| p.metadata.get("phantom_check_exempt"))
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let exempt_from_closed = pm.closed_positions().iter()
+                                    .find(|p| p.position_id == r.position_id)
+                                    .and_then(|p| p.metadata.get("phantom_check_exempt"))
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                exempt_from_open || exempt_from_closed
+                            };
+                            let has_real = is_exempt || self.executor.as_ref()
                                 .map(|e| e.position_has_confirmed_fills(&r.position_id))
                                 .unwrap_or(false);
                             if !has_real {
@@ -2677,13 +2694,30 @@ impl Orchestrator {
 
         // Safety guard: refuse to wipe all positions if DB had some but runtime has none.
         // This prevents accidental state loss from a bad restart or missed load_state.
+        // Exception: positions that appear in PM's closed_positions were legitimately closed
+        // (e.g. by close_on_resolution) since the last save cycle — allow the save to proceed
+        // so the closure gets written to SQLite.
         if live_ids.is_empty() && !db_open_ids.is_empty() {
-            tracing::error!(
-                "STATE GUARD: refusing to delete {} open positions (runtime has 0). \
-                 Skipping save to prevent state loss. Check load_state or .db.bak backup.",
+            let pm_closed_ids: HashSet<&str> = closed_rows_data.iter()
+                .map(|(id, _, _, _)| id.as_str())
+                .collect();
+            let genuinely_missing: Vec<&String> = db_open_ids.iter()
+                .filter(|id| !pm_closed_ids.contains(id.as_str()))
+                .collect();
+            if !genuinely_missing.is_empty() {
+                tracing::error!(
+                    "STATE GUARD: refusing to delete {} open position(s) (runtime has 0). \
+                     Skipping save to prevent state loss. Check load_state or .db.bak backup.",
+                    genuinely_missing.len()
+                );
+                return;
+            }
+            // All "missing" positions are in PM's closed set — they were legitimately closed
+            // since the last save. Proceed so the closure gets written to SQLite.
+            tracing::info!(
+                "STATE GUARD: {} open position(s) moved to closed since last save — proceeding",
                 db_open_ids.len()
             );
-            return;
         }
 
         for stale_id in db_open_ids.difference(&live_ids) {

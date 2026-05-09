@@ -389,7 +389,23 @@ impl PositionManager {
 
         let method = position.metadata.get("method")
             .and_then(|v| v.as_str()).unwrap_or("");
-        let is_sell = parse_trade_side(method) == TradeSide::Sell;
+        // Primary: parse method field ("sell"/"buy"). Fallback: check metadata["is_sell"] (bool)
+        // set by repair scripts, then metadata["strategy"] containing "sell".
+        // This handles reconstructed positions that lack a "method" field.
+        let is_sell = if parse_trade_side(method) == TradeSide::Sell {
+            true
+        } else if method.is_empty() || parse_trade_side(method) == TradeSide::Unknown {
+            position.metadata.get("is_sell")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| {
+                    position.metadata.get("strategy")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("sell"))
+                        .unwrap_or(false)
+                })
+        } else {
+            false
+        };
 
         let payout = if is_sell {
             // SELL arb: bought NO on all markets. Winner's NO loses, rest pay $1/share.
