@@ -907,4 +907,46 @@ impl StrategyTracker {
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
         db.prune_strategy_closed_positions(now - 30.0 * 86400.0);
     }
+
+    /// Reverse a virtual entry as if it never happened — used when the live
+    /// reconciler determines a real position was phantom (all legs MissingOnVenue,
+    /// auto-rolled back). Refunds capital, releases exposure, decrements
+    /// total_entered. Does NOT add to closed_positions or move win/loss counters.
+    /// Persists per-portfolio summary + open_positions snapshot to SQLite.
+    pub fn rollback_entry_with_db(&mut self, constraint_id: &str, db: &StateDB) {
+        for portfolio in &mut self.portfolios {
+            if let Some(vp) = portfolio.open_positions.remove(constraint_id) {
+                portfolio.current_capital += vp.capital_deployed;
+                portfolio.total_entered = portfolio.total_entered.saturating_sub(1);
+
+                let n_markets = vp.market_ids.len().max(1) as f64;
+                let per_market = vp.capital_deployed / n_markets;
+                for mid in &vp.market_ids {
+                    if let Some(exp) = portfolio.market_exposure.get_mut(mid) {
+                        *exp = (*exp - per_market).max(0.0);
+                        if *exp < 0.01 {
+                            portfolio.market_exposure.remove(mid);
+                        }
+                    }
+                }
+
+                tracing::warn!(
+                    "Strategy {} ROLLBACK entry {}: ${:.2} capital restored (live reconciler reverted real entry)",
+                    portfolio.config.name,
+                    &constraint_id[..16.min(constraint_id.len())],
+                    vp.capital_deployed,
+                );
+
+                db.save_strategy_portfolio(
+                    &portfolio.config.name, portfolio.current_capital,
+                    portfolio.total_entered, portfolio.total_wins, portfolio.total_losses,
+                    portfolio.evals_seen, portfolio.evals_rejected,
+                );
+                let open_rows: Vec<(String, String)> = portfolio.open_positions.iter()
+                    .filter_map(|(cid, vp)| serde_json::to_string(vp).ok().map(|j| (cid.clone(), j)))
+                    .collect();
+                db.save_strategy_open_positions(&portfolio.config.name, &open_rows);
+            }
+        }
+    }
 }

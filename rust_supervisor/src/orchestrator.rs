@@ -1304,9 +1304,17 @@ impl Orchestrator {
                 tracing::warn!("B4.1 startup reconciliation found {} critical discrepancies",
                     report.critical_count());
                 if !venue.is_empty() {
-                    let adjustments = self.engine.apply_reconciliation(&report, &venue);
+                    let mut rolled_back_cids: Vec<String> = Vec::new();
+                    let adjustments = self.engine.apply_reconciliation_with_rollback_out(
+                        &report, &venue, &mut rolled_back_cids,
+                    );
                     for adj in &adjustments {
                         tracing::info!("B4.1 startup auto-adjustment: {}", adj);
+                    }
+                    if let Some(ref mut tracker) = self.strategy_tracker {
+                        for cid in &rolled_back_cids {
+                            tracker.rollback_entry_with_db(cid, &self.state_db);
+                        }
                     }
                 }
             }
@@ -2186,9 +2194,17 @@ impl Orchestrator {
                     tracing::warn!("B4.0 reconciliation: {} critical, {} warnings",
                         report.critical_count(), report.warning_count());
                     if !venue.is_empty() {
-                        let adjustments = self.engine.apply_reconciliation(&report, &venue);
+                        let mut rolled_back_cids: Vec<String> = Vec::new();
+                        let adjustments = self.engine.apply_reconciliation_with_rollback_out(
+                            &report, &venue, &mut rolled_back_cids,
+                        );
                         for adj in &adjustments {
                             tracing::info!("B4.0 periodic auto-adjustment: {}", adj);
+                        }
+                        if let Some(ref mut tracker) = self.strategy_tracker {
+                            for cid in &rolled_back_cids {
+                                tracker.rollback_entry_with_db(cid, &self.state_db);
+                            }
                         }
                     }
                 }

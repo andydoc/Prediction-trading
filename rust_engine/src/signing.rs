@@ -565,9 +565,14 @@ pub fn is_cloudflare_html(body: &str) -> bool {
 ///   BUY:  makerAmount = USDC (max `amount_decimals`), takerAmount = shares (max 2 decimals)
 ///   SELL: makerAmount = shares (max 2 decimals), takerAmount = USDC (max `amount_decimals`)
 ///
-/// **FAK (market) orders — precision is swapped:**
+/// **FAK (market) orders:**
 ///   BUY:  makerAmount = USDC (max 2 decimals), takerAmount = shares (max `amount_decimals`)
-///   SELL: makerAmount = shares (max `amount_decimals`), takerAmount = USDC (max 2 decimals)
+///   SELL: makerAmount = shares (max 2 decimals), takerAmount = USDC (max `amount_decimals`)
+///         — same as GTC SELL. CLOB enforces "sell orders maker max 2 decimals,
+///         taker max `amount_decimals`" regardless of order type (verified on
+///         partial-fill incidents 2026-05-07 INC-D9 and 2026-05-09 SAKAMOTO DAYS,
+///         CLOB error: "invalid amounts, the sell orders maker amount supports
+///         a max accuracy of 2 decimals, taker amount a max of 4 decimals").
 ///
 /// `amount_decimals` comes from the tick size rounding config (e.g., 5 for 0.001 tick).
 pub fn compute_amounts(price: f64, size_usd: f64, side: Side, amount_decimals: u32) -> (U256, U256) {
@@ -582,11 +587,12 @@ pub fn compute_amounts_for_order_type(
     let size_round = 100.0f64;  // 2 decimal places
     let amt_round = 10f64.powi(amount_decimals as i32);
 
-    // For market (FAK) orders, the precision rules are swapped vs limit (GTC).
-    let (usdc_round, shares_round) = if is_market_order {
-        (size_round, amt_round)   // FAK: USDC=2dec, shares=amount_decimals
+    // Precision rules: BUY swaps for FAK; SELL uses the same (maker=shares 2dec, taker=USDC amt_dec)
+    // regardless of order type — see docstring.
+    let (usdc_round, shares_round) = if is_market_order && side == Side::Buy {
+        (size_round, amt_round)   // FAK BUY: USDC=2dec, shares=amount_decimals
     } else {
-        (amt_round, size_round)   // GTC: USDC=amount_decimals, shares=2dec
+        (amt_round, size_round)   // GTC any, FAK SELL: USDC=amount_decimals, shares=2dec
     };
 
     match side {
@@ -828,10 +834,13 @@ mod tests {
         assert!(!maker.is_zero(), "{label}: maker is zero");
         assert!(!taker.is_zero(), "{label}: taker is zero");
 
-        let (usdc_max_dec, shares_max_dec) = if is_market {
-            (2, amount_decimals) // FAK: USDC=2, shares=amount_decimals
+        // BUY: FAK swaps (USDC=2, shares=amount_decimals); GTC: USDC=amount_decimals, shares=2.
+        // SELL: same rules for FAK and GTC (USDC=amount_decimals, shares=2) — verified by CLOB
+        //       rejection on FAK SELL with maker (shares) > 2 decimals.
+        let (usdc_max_dec, shares_max_dec) = if is_market && side == Side::Buy {
+            (2, amount_decimals)
         } else {
-            (amount_decimals, 2) // GTC: USDC=amount_decimals, shares=2
+            (amount_decimals, 2)
         };
 
         match side {

@@ -1229,11 +1229,33 @@ impl TradingEngine {
     /// - PositionMissingOnVenue: mark position stale
     /// - PositionMissingInternal: log orphan (venue has it, we don't)
     ///
-    /// Returns descriptions of adjustments made.
+    /// Returns descriptions of adjustments made. Also fills `rolled_back_cids`
+    /// with the `constraint_id` of every position that was auto-rolled back as
+    /// phantom (all legs MissingOnVenue, actual_shares=0) — used by the
+    /// supervisor to propagate the rollback to the strategy tracker.
+    pub fn apply_reconciliation_with_rollback_out(
+        &self,
+        report: &reconciliation::ReconciliationReport,
+        venue_positions: &[reconciliation::VenuePosition],
+        rolled_back_cids: &mut Vec<String>,
+    ) -> Vec<String> {
+        self.apply_reconciliation_inner(report, venue_positions, Some(rolled_back_cids))
+    }
+
+    /// Backwards-compatible wrapper (callers that don't need rollback IDs).
     pub fn apply_reconciliation(
         &self,
         report: &reconciliation::ReconciliationReport,
         venue_positions: &[reconciliation::VenuePosition],
+    ) -> Vec<String> {
+        self.apply_reconciliation_inner(report, venue_positions, None)
+    }
+
+    fn apply_reconciliation_inner(
+        &self,
+        report: &reconciliation::ReconciliationReport,
+        venue_positions: &[reconciliation::VenuePosition],
+        mut rolled_back_cids: Option<&mut Vec<String>>,
     ) -> Vec<String> {
         let mut adjustments = Vec::new();
 
@@ -1338,6 +1360,13 @@ impl TradingEngine {
                 let mut pm = self.positions.lock();
                 if let Some(pos) = pm.open_positions_mut().remove(pid) {
                     pm.refund_capital(pos.total_capital);
+                    if let Some(cids) = rolled_back_cids.as_deref_mut() {
+                        if let Some(cid) = pos.metadata.get("constraint_id")
+                            .and_then(|v| v.as_str())
+                        {
+                            cids.push(cid.to_string());
+                        }
+                    }
                     adjustments.push(format!(
                         "AutoRollback {}: phantom position closed, ${:.2} capital restored (${:.2} ledger reversed)",
                         &pid[..pid.len().min(30)], pos.total_capital, reversed
