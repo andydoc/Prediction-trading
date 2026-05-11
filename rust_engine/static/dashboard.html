@@ -76,6 +76,10 @@
   .val-tag { font-size: 0.68em; margin-left: 3px; padding: 1px 3px; border-radius: 3px; vertical-align: middle; }
   .vtick { color: #4c4; background: #1a2e1a; border: 1px solid #2a4a2a; }
   .vapi { color: #888; background: #1e1e1e; border: 1px solid #333; }
+  .reason-tag { font-size: 0.7em; margin-left: 6px; padding: 1px 6px; border-radius: 3px; vertical-align: middle; letter-spacing: 0.4px; }
+  .reason-incident { color: #fa0; background: #2e2200; border: 1px solid #5a4400; }
+  .reason-replaced { color: #0af; background: #001a2e; border: 1px solid #00345a; }
+  .reason-proactive { color: #aaa; background: #1a1a1a; border: 1px solid #333; }
   .pl-indent { padding-left: 25px; }
   .scenario-header { margin-top: 6px; font-size: 11px; }
   .scenario-line { font-size: 11px; }
@@ -689,7 +693,20 @@ function renderClosed(d) {
       } else {
         h += '<tr class="'+cls2+'">';
       }
-      h += '<td title="'+esc((r.full_names||[]).join(' | '))+'">'+esc(r.name)+'</td>';
+      var reasonBadge = '';
+      var cr = r.close_reason || '';
+      if (cr && cr !== 'resolved' && cr !== 'expired') {
+        if (cr.indexOf('manual_unwind') === 0 || cr.indexOf('incident') >= 0) {
+          reasonBadge = ' <span class="reason-tag reason-incident" title="'+esc(cr)+'">INCIDENT</span>';
+        } else if (cr === 'replaced') {
+          reasonBadge = ' <span class="reason-tag reason-replaced">REPLACED</span>';
+        } else if (cr === 'proactive_exit') {
+          reasonBadge = ' <span class="reason-tag reason-proactive">PROACTIVE</span>';
+        } else {
+          reasonBadge = ' <span class="reason-tag reason-proactive" title="'+esc(cr)+'">'+esc(cr.toUpperCase())+'</span>';
+        }
+      }
+      h += '<td title="'+esc((r.full_names||[]).join(' | '))+'">'+esc(r.name)+reasonBadge+'</td>';
       h += '<td>'+esc(r.strategy||'?')+'</td>';
       h += '<td>$'+r.deployed.toFixed(2)+'</td>';
       h += '<td>'+(pct>=0?'+':'')+pct.toFixed(1)+'%</td>';

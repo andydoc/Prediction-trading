@@ -1246,6 +1246,7 @@ fn build_closed_from_strategies(strat_summary: &Value) -> Value {
             "hold": hold_str, "closed_at": close_dt,
             "strategy": strat_label,
             "legs": [], "full_names": [e.name],
+            "close_reason": e.close_reason.clone().unwrap_or_else(|| "resolved".to_string()),
             "_sort_ts": e.close_ts, "_hold_secs": e.hold_secs,
         });
         let reason = e.close_reason.as_deref().unwrap_or("proactive_exit");
@@ -1346,6 +1347,7 @@ fn build_closed(s: &DashboardState) -> Value {
             "pnl": pnl_r, "pnl_pct": pnl_pct, "hold": hold_str,
             "closed_at": close_dt_str, "strategy": fmt_strategy(strategy, method),
             "legs": legs, "full_names": full_names,
+            "close_reason": reason,
             "_sort_ts": close_ts, "_hold_secs": hold_secs,
         });
 
