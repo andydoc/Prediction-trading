@@ -2710,15 +2710,17 @@ impl Orchestrator {
 
         // Safety guard: refuse to wipe all positions if DB had some but runtime has none.
         // This prevents accidental state loss from a bad restart or missed load_state.
-        // Exception: positions that appear in PM's closed_positions were legitimately closed
-        // (e.g. by close_on_resolution) since the last save cycle — allow the save to proceed
-        // so the closure gets written to SQLite.
+        // Exceptions (intentional removal — proceed with save):
+        //   1. Position appears in PM's closed_positions (legitimate close, e.g. close_on_resolution)
+        //   2. Position is in engine.auto_rolled_back (reconciler-driven phantom rollback)
         if live_ids.is_empty() && !db_open_ids.is_empty() {
             let pm_closed_ids: HashSet<&str> = closed_rows_data.iter()
                 .map(|(id, _, _, _)| id.as_str())
                 .collect();
+            let rolled_back_ids: HashSet<String> = self.engine.auto_rolled_back.lock().clone();
             let genuinely_missing: Vec<&String> = db_open_ids.iter()
-                .filter(|id| !pm_closed_ids.contains(id.as_str()))
+                .filter(|id| !pm_closed_ids.contains(id.as_str())
+                          && !rolled_back_ids.contains(id.as_str()))
                 .collect();
             if !genuinely_missing.is_empty() {
                 tracing::error!(
@@ -2728,11 +2730,11 @@ impl Orchestrator {
                 );
                 return;
             }
-            // All "missing" positions are in PM's closed set — they were legitimately closed
-            // since the last save. Proceed so the closure gets written to SQLite.
+            let rolled_back_in_db = db_open_ids.iter().filter(|id| rolled_back_ids.contains(id.as_str())).count();
+            let closed_in_db = db_open_ids.len() - rolled_back_in_db;
             tracing::info!(
-                "STATE GUARD: {} open position(s) moved to closed since last save — proceeding",
-                db_open_ids.len()
+                "STATE GUARD: {} closed + {} auto-rolled-back since last save — proceeding",
+                closed_in_db, rolled_back_in_db
             );
         }
 

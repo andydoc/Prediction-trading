@@ -123,6 +123,10 @@ pub struct TradingEngine {
     pub strategy_summary: Arc<parking_lot::Mutex<serde_json::Value>>,
     /// Double-entry accounting ledger — tracks all cash movements independently.
     pub accounting: Arc<parking_lot::Mutex<accounting::AccountingLedger>>,
+    /// Position IDs the reconciler auto-rolled back as phantom this session.
+    /// Save_state's STATE GUARD checks this set so it knows the runtime
+    /// is intentionally empty and a deletion is safe.
+    pub auto_rolled_back: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl TradingEngine {
@@ -253,6 +257,7 @@ impl TradingEngine {
             shadow_only,
             strategy_summary: Arc::new(parking_lot::Mutex::new(serde_json::Value::Null)),
             accounting: Arc::new(parking_lot::Mutex::new(accounting::AccountingLedger::new(0.0, 0.0))),
+            auto_rolled_back: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
         })
     }
 
@@ -1367,6 +1372,9 @@ impl TradingEngine {
                             cids.push(cid.to_string());
                         }
                     }
+                    // Record so STATE GUARD knows this is an intentional removal,
+                    // not a state-loss bug.
+                    self.auto_rolled_back.lock().insert(pid.clone());
                     adjustments.push(format!(
                         "AutoRollback {}: phantom position closed, ${:.2} capital restored (${:.2} ledger reversed)",
                         &pid[..pid.len().min(30)], pos.total_capital, reversed
