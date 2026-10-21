@@ -1,0 +1,36 @@
+name: Dependency audit
+
+# Added by the Oct 2026 CI sweep, after rateedge's "Dependency audit" step.
+# Fails on a known advisory in any dependency, dev tools included (npm and pnpm
+# fail at high or critical; pip-audit and cargo-audit have no severity filter,
+# so any advisory fails). Runs on push, on PRs, and weekly, so an advisory
+# published against an unchanged tree still turns this red. Dependabot
+# (.github/dependabot.yml) opens the upgrade PRs; this says one is needed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deps-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # cargo audit reads Cargo.lock; make one if the repo does not commit it.
+      - run: '[ -f Cargo.lock ] || cargo generate-lockfile'
+      - run: cargo audit
