@@ -1,0 +1,28 @@
+# Added by the Oct 2026 CI sweep, modelled on rateedge's config.
+# Dependabot opens monthly upgrade PRs. Minor and patch bumps are grouped into
+# one PR per ecosystem so a solo maintainer is not asked to review a dozen.
+# Package majors are left out on purpose: they change APIs and are upgraded
+# deliberately (the ignore does not apply to security updates). GitHub Actions
+# majors ARE included: that is how moves like checkout v4 -> v7 arrive.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
