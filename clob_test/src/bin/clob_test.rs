@@ -123,7 +123,7 @@ fn main() {
 
     // Start dashboard
     if cli.dashboard_port > 0 {
-        engine.start_dashboard(cli.dashboard_port, "0.0.0.0");
+        engine.start_dashboard(cli.dashboard_port, "0.0.0.0", "");
         tracing::info!("Dashboard: http://localhost:{}", cli.dashboard_port);
     }
 
