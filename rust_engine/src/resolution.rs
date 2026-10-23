@@ -6,11 +6,11 @@
 /// Schema:
 ///   resolution_cache(group_id TEXT PK, data TEXT JSON, cached_at REAL)
 use rusqlite::params;
-use parking_lot::Mutex;
-use secrecy::{ExposeSecret, SecretString};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use crate::cached_db::CachedSqliteDB;
+use crate::model_route::{ModelRequest, ModelRouter};
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -156,51 +156,8 @@ fn fetch_market_description(
     Some((question, description, end_date))
 }
 
-/// Send a pre-built Anthropic API request and parse the response.
-/// Used by validate() which builds the request under the API key lock scope.
-fn send_anthropic_request(
-    request: reqwest::blocking::RequestBuilder,
-) -> Option<ValidationResult> {
-    let resp = match request.send() {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("[rust_rv] Anthropic API request failed: {}", e);
-            return None;
-        }
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        let snippet = text.get(..500).unwrap_or(&text);
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            tracing::warn!("[rust_rv] Anthropic API rate-limited (429): {}", snippet);
-        } else {
-            tracing::error!("[rust_rv] Anthropic API returned {}: {}", status, snippet);
-        }
-        return None;
-    }
-
-    let data: serde_json::Value = match resp.json() {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("[rust_rv] Failed to parse Anthropic response: {}", e);
-            return None;
-        }
-    };
-
-    // Extract text from content blocks
-    let mut text = String::new();
-    if let Some(content) = data.get("content").and_then(|v| v.as_array()) {
-        for block in content {
-            if block.get("type").and_then(|v| v.as_str()) == Some("text") {
-                if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                    text.push_str(t);
-                }
-            }
-        }
-    }
-
+/// Parse the model's text reply into a ValidationResult (code fences tolerated).
+fn parse_validation_text(text: &str) -> Option<ValidationResult> {
     let mut text = text.trim().to_string();
 
     // Strip markdown code fences
@@ -316,7 +273,7 @@ pub struct ResolutionValidator {
     cache: ResolutionCache,
     client: reqwest::blocking::Client,
     config: ValidatorConfig,
-    api_key: Mutex<SecretString>,
+    router: Arc<ModelRouter>,
     prompt_template: String,
 }
 
@@ -326,7 +283,7 @@ impl ResolutionValidator {
     /// Reads config/prompts.yaml and config/config.yaml from workspace.
     /// Opens (or creates) SQLite cache at {workspace}/data/resolution_cache.db.
     /// Loads existing cache from disk on startup.
-    pub fn new(workspace: &str, api_key: &str) -> Result<Self, String> {
+    pub fn new(workspace: &str, router: Arc<ModelRouter>) -> Result<Self, String> {
         let prompt_template = load_prompt_template(workspace);
         if prompt_template.is_empty() {
             return Err("Failed to load resolution_validation prompt template".into());
@@ -356,7 +313,7 @@ impl ResolutionValidator {
             cache,
             client,
             config,
-            api_key: Mutex::new(SecretString::from(api_key.to_string())),
+            router,
             prompt_template,
         })
     }
@@ -381,30 +338,31 @@ impl ResolutionValidator {
         // 3. Format prompt
         let prompt = format_prompt(&self.prompt_template, &question, &description, &end_date);
 
-        // 4. Call Anthropic API — build request under lock to avoid heap-copying the secret key
-        let request = {
-            let key = self.api_key.lock();
-            let body = serde_json::json!({
-                "model": self.config.model,
-                "max_tokens": self.config.max_tokens,
-                "messages": [{"role": "user", "content": prompt}]
-            });
-            self.client
-                .post(&self.config.api_url)
-                .header("Content-Type", "application/json")
-                .header("x-api-key", key.expose_secret())
-                .header("anthropic-version", &self.config.api_version)
-                .timeout(Duration::from_secs(30))
-                .json(&body)
+        // 4. Call the model: own API key first, claude-gateway second (see model_route)
+        let req = ModelRequest {
+            feature: "resolution",
+            model: &self.config.model,
+            max_tokens: self.config.max_tokens,
+            user: &prompt,
+            web_search: false,
+            api_url: &self.config.api_url,
+            api_version: &self.config.api_version,
+            api_timeout: Duration::from_secs(30),
         };
-        // Lock dropped here, request is built
-        match send_anthropic_request(request) {
+        let completion = match self.router.complete(&self.client, &req) {
+            Some(c) => c,
+            None => {
+                tracing::error!("[rust_rv] validation failed for {}: no model route answered", group_id);
+                return None;
+            }
+        };
+        match parse_validation_text(&completion.text_parts.concat()) {
             Some(vr) => {
                 self.cache.save(group_id, &vr);
                 Some(vr)
             }
             None => {
-                tracing::error!("[rust_rv] validation failed for {}: call_anthropic returned None", group_id);
+                tracing::error!("[rust_rv] validation failed for {}: reply (route={}) did not parse", group_id, completion.route.as_str());
                 None
             }
         }
@@ -422,6 +380,6 @@ impl ResolutionValidator {
 
     /// Update API key at runtime.
     pub fn set_api_key(&self, api_key: &str) {
-        *self.api_key.lock() = SecretString::from(api_key.to_string());
+        self.router.set_api_key(api_key);
     }
 }
