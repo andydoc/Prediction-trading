@@ -18,6 +18,7 @@ use rust_engine::detect::{DetectableMarket, DetectionConfig};
 use rust_engine::eval::Opportunity;
 use rust_engine::notify::{Notifier, NotifyConfig, NotifyEvent};
 use rust_engine::position;
+use rust_engine::model_route::ModelRouter;
 use rust_engine::resolution::ResolutionValidator;
 use rust_engine::postponement::PostponementDetector;
 use rust_engine::scanner::MarketScanner;
@@ -463,6 +464,11 @@ pub struct OrchestratorConfig {
     // AI
     pub resolution_validation_enabled: bool,
     pub anthropic_api_key: String,
+    /// claude-gateway (subscription route): secrets claude_gateway.url / .secret, else env CLAUDE_GATEWAY_URL / _SECRET.
+    pub claude_gateway_url: String,
+    pub claude_gateway_secret: String,
+    /// Dev switch PT_MODEL_ROUTE=gateway|cli forces the gateway route.
+    pub model_route_force_gateway: bool,
     pub postponement_enabled: bool,
     pub postponement_check_interval: f64,
     pub postponement_rescore_days: u32,
@@ -554,6 +560,21 @@ impl OrchestratorConfig {
             .map(|s| s.to_string())
             .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
             .unwrap_or_default();
+
+        // claude-gateway: the subscription route used when no API key is set, or after an API failure
+        let claude_gateway_url = secrets.pointer("/claude_gateway/url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("CLAUDE_GATEWAY_URL").ok())
+            .unwrap_or_default();
+        let claude_gateway_secret = secrets.pointer("/claude_gateway/secret")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("CLAUDE_GATEWAY_SECRET").ok())
+            .unwrap_or_default();
+        let model_route_force_gateway = rust_engine::model_route::force_gateway_from(
+            std::env::var(rust_engine::model_route::ROUTE_ENV).ok().as_deref(),
+        );
 
         // Derive wallet address from private key in secrets
         let gas_wallet_address = {
@@ -685,6 +706,9 @@ impl OrchestratorConfig {
 
             resolution_validation_enabled: cfg.arbitrage.resolution_validation.enabled,
             anthropic_api_key: api_key,
+            claude_gateway_url,
+            claude_gateway_secret,
+            model_route_force_gateway,
             postponement_enabled: cfg.ai.postponement.enabled,
             postponement_check_interval: cfg.ai.postponement.check_interval_hours * 3600.0,
             postponement_rescore_days: cfg.ai.postponement.postponement_rescore_days as u32,
@@ -898,8 +922,21 @@ impl Orchestrator {
             &cfg.state_db_path.to_string_lossy(),
         )?;
 
-        let resolution_validator = if cfg.resolution_validation_enabled && !cfg.anthropic_api_key.is_empty() {
-            match ResolutionValidator::new(&ws, &cfg.anthropic_api_key) {
+        // One router for both model features: own API key first, claude-gateway second;
+        // a missing key never disables a feature (it only needs ANY route).
+        let model_router = Arc::new(ModelRouter::new(
+            &cfg.anthropic_api_key,
+            &cfg.claude_gateway_url,
+            &cfg.claude_gateway_secret,
+            cfg.model_route_force_gateway,
+        ));
+        tracing::info!("Model routing: {}", model_router.describe());
+        if !model_router.any_route() && (cfg.resolution_validation_enabled || cfg.postponement_enabled) {
+            tracing::error!("Model routing: no route (no ANTHROPIC_API_KEY and no claude_gateway secret); resolution validation and postponement detection are OFF");
+        }
+
+        let resolution_validator = if cfg.resolution_validation_enabled && model_router.any_route() {
+            match ResolutionValidator::new(&ws, Arc::clone(&model_router)) {
                 Ok(rv) => Some(rv),
                 Err(e) => {
                     tracing::warn!("Resolution validator init failed: {}", e);
@@ -910,8 +947,8 @@ impl Orchestrator {
             None
         };
 
-        let postponement_detector = if cfg.postponement_enabled && !cfg.anthropic_api_key.is_empty() {
-            match PostponementDetector::new(&ws, &cfg.anthropic_api_key) {
+        let postponement_detector = if cfg.postponement_enabled && model_router.any_route() {
+            match PostponementDetector::new(&ws, Arc::clone(&model_router)) {
                 Ok(pd) => Some(pd),
                 Err(e) => {
                     tracing::warn!("Postponement detector init failed: {}", e);

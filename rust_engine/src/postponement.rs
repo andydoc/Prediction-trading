@@ -10,10 +10,11 @@
 ///   postponement_cache(position_id TEXT PK, data TEXT JSON, cached_at REAL)
 use rusqlite::params;
 use parking_lot::Mutex;
-use secrecy::{ExposeSecret, SecretString};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use crate::cached_db::CachedSqliteDB;
+use crate::model_route::{ModelRequest, ModelRouter};
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -146,7 +147,9 @@ impl PostponementCache {
 // ---------------------------------------------------------------------------
 
 fn call_anthropic_with_search(
-    request: reqwest::blocking::RequestBuilder,
+    router: &ModelRouter,
+    client: &reqwest::blocking::Client,
+    req: &ModelRequest<'_>,
     last_api_call: &Mutex<Instant>,
     rate_limit_secs: f64,
 ) -> Option<PostponementResult> {
@@ -164,52 +167,12 @@ fn call_anthropic_with_search(
     // Update last call time before sending
     *last_api_call.lock() = Instant::now();
 
-    let resp = match request.send() {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("Postponement API request failed: {}", e);
-            return None;
-        }
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        tracing::warn!("Postponement API returned {}: {}",
-            status, text.get(..200).unwrap_or(&text));
-        return None;
-    }
-
-    let data: serde_json::Value = match resp.json() {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("Failed to parse postponement API response: {}", e);
-            return None;
-        }
-    };
-
-    // Extract text blocks and count web_search_tool_result blocks
-    let mut text_parts = Vec::new();
-    let mut search_count: u32 = 0;
-    if let Some(content) = data.get("content").and_then(|v| v.as_array()) {
-        for block in content {
-            match block.get("type").and_then(|v| v.as_str()) {
-                Some("text") => {
-                    if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                        text_parts.push(t.to_string());
-                    }
-                }
-                Some("web_search_tool_result") => {
-                    search_count += 1;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let full_text = text_parts.join("\n");
-    tracing::info!("Postponement API: {} web searches, {} chars response",
-        search_count, full_text.len());
+    // Own API key first, claude-gateway (webSearch) second; the route is logged by model_route.
+    let completion = router.complete(client, req)?;
+    let search_count = completion.search_count;
+    let full_text = completion.text_parts.join("\n");
+    tracing::info!("Postponement model reply (route={}): {} web searches, {} chars response",
+        completion.route.as_str(), search_count, full_text.len());
 
     // Extract JSON from response
     let mut result = extract_json(&full_text)?;
@@ -449,7 +412,7 @@ pub struct PostponementDetector {
     cache: PostponementCache,
     client: reqwest::blocking::Client,
     config: PostponementConfig,
-    api_key: Mutex<SecretString>,
+    router: Arc<ModelRouter>,
     prompt_template: String,
     retry_prompt_template: String,
     last_api_call: Mutex<Instant>,
@@ -460,7 +423,7 @@ impl PostponementDetector {
     ///
     /// Reads config/prompts.yaml and config/config.yaml from workspace.
     /// Opens (or creates) SQLite cache at {workspace}/data/postponement_cache.db.
-    pub fn new(workspace: &str, api_key: &str) -> Result<Self, String> {
+    pub fn new(workspace: &str, router: Arc<ModelRouter>) -> Result<Self, String> {
         let (prompt_template, retry_prompt_template) = load_prompts(workspace);
         if prompt_template.is_empty() {
             return Err(
@@ -491,7 +454,7 @@ impl PostponementDetector {
             cache,
             client,
             config,
-            api_key: Mutex::new(SecretString::from(api_key.to_string())),
+            router,
             prompt_template,
             retry_prompt_template,
             last_api_call: Mutex::new(Instant::now() - Duration::from_secs(120)),
@@ -530,9 +493,8 @@ impl PostponementDetector {
         let prompt = format_prompt(
             &self.prompt_template, market_names, original_date, &today, days_overdue,
         );
-        let request = self.build_request(&prompt);
         let mut result = call_anthropic_with_search(
-            request, &self.last_api_call, self.config.rate_limit_secs,
+            &self.router, &self.client, &self.model_request(&prompt), &self.last_api_call, self.config.rate_limit_secs,
         )?;
 
         // Attempt 2: if postponed but no date found
@@ -545,9 +507,8 @@ impl PostponementDetector {
             let retry_prompt = format_retry_prompt(
                 &self.retry_prompt_template, &result, market_names, original_date, &today,
             );
-            let retry_request = self.build_request(&retry_prompt);
             if let Some(result2) = call_anthropic_with_search(
-                retry_request, &self.last_api_call, self.config.rate_limit_secs,
+                &self.router, &self.client, &self.model_request(&retry_prompt), &self.last_api_call, self.config.rate_limit_secs,
             ) {
                 if result2.new_date.is_some() {
                     tracing::info!("  Attempt 2 found date: {}",
@@ -621,25 +582,20 @@ impl PostponementDetector {
 
     /// Update API key at runtime.
     pub fn set_api_key(&self, api_key: &str) {
-        *self.api_key.lock() = SecretString::from(api_key.to_string());
+        self.router.set_api_key(api_key);
     }
 
-    /// Build an Anthropic API request under the API key lock scope.
-    /// Returns a RequestBuilder with headers set — lock is dropped after this returns.
-    fn build_request(&self, prompt: &str) -> reqwest::blocking::RequestBuilder {
-        let key = self.api_key.lock();
-        let body = serde_json::json!({
-            "model": self.config.model,
-            "max_tokens": self.config.max_tokens,
-            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-            "messages": [{"role": "user", "content": prompt}]
-        });
-        self.client
-            .post(&self.config.api_url)
-            .header("Content-Type", "application/json")
-            .header("x-api-key", key.expose_secret())
-            .header("anthropic-version", &self.config.api_version)
-            .timeout(Duration::from_secs(90))
-            .json(&body)
+    /// Model request for the shared router (own key first, claude-gateway second).
+    fn model_request<'a>(&'a self, prompt: &'a str) -> ModelRequest<'a> {
+        ModelRequest {
+            feature: "postponement",
+            model: &self.config.model,
+            max_tokens: self.config.max_tokens,
+            user: prompt,
+            web_search: true,
+            api_url: &self.config.api_url,
+            api_version: &self.config.api_version,
+            api_timeout: Duration::from_secs(90),
+        }
     }
 }

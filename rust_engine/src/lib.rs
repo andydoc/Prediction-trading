@@ -30,6 +30,7 @@ pub mod ws_tier_c;
 pub mod ws_tiered;
 pub mod ws_user;
 pub mod dashboard;
+pub mod model_route;
 pub mod resolution;
 pub mod postponement;
 pub mod scanner;
