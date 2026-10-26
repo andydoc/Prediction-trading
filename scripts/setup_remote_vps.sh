@@ -1,11 +1,11 @@
 #!/bin/bash
 # ============================================================================
 # VPS Remote Setup Script — run from your WSL terminal
-# Usage: bash setup_remote_vps.sh
+# Usage: VPS_IP=<host> bash setup_remote_vps.sh
 # ============================================================================
 set -euo pipefail
 
-VPS_IP="193.23.127.99"
+VPS_IP="${VPS_IP:?set VPS_IP to the target host}"
 VPS_USER="root"
 
 echo "============================================"

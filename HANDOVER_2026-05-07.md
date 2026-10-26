@@ -6,7 +6,7 @@ Self-contained briefing for the next session. Read top-to-bottom.
 
 ## Where the bot is right now
 
-**Dublin VPS** (`38.180.151.102`, SSH `ssh dublin` or `ssh dublin-ubuntu`):
+**Dublin VPS** (`[dublin-vps-ip]`, SSH `ssh dublin` or `ssh dublin-ubuntu`):
 
 | Field | Value |
 |---|---|

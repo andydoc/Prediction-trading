@@ -20,7 +20,7 @@ A senior developer built an automated prediction market arbitrage system under p
 - **Implementer**: AI-assisted (Claude). Spec structured as task breakdowns with acceptance criteria.
 - **Risk appetite**: 10% drawdown circuit breaker. $1,000 initial shadow capital. Go live after 2 weeks of profitable shadow trading with $1,000.
 - **Timeline**: No rush. Get it right. Shadow mode runs indefinitely until solid.
-- **Production target**: VPS only (Dublin, Interxion DC, 38.180.151.102, always-on, 4 vCPU, **8 GB RAM**, 25 GB NVMe). Laptop is dev-only. *(Madrid VPS used for Milestone D integration testing; migrated to Dublin for lower latency before go-live.)*
+- **Production target**: VPS only (Dublin, [dublin-vps-ip], always-on, 4 vCPU, **8 GB RAM**, 25 GB NVMe). Laptop is dev-only. *(Madrid VPS used for Milestone D integration testing; migrated to Dublin for lower latency before go-live.)*
 - **Rust port**: Complete before go-live. Single compiled binary is the target state before real money flows.
 - **Notifications**: Telegram (primary), with generic webhook fallback (WhatsApp, ntfy.sh, Discord). Not email.
 - **Shadow strategy**: Run 6 parallel shadow accounts with different parameter combinations (including a fast-market instance for 5-15 min crypto price predictions) to optimise strategy before committing real money.
@@ -61,7 +61,7 @@ Automated detection and execution of guaranteed-profit arbitrage on Polymarket p
 
 **Target state (pre go-live)**: Add LiveExecutor with Rust EIP-712 signing (Milestone B). No Python runtime dependency.
 
-**Deployment**: Dublin VPS (38.180.151.102) — 4 vCPU, 8 GB RAM, 25 GB NVMe, Ubuntu 24.04, systemd
+**Deployment**: Dublin VPS ([dublin-vps-ip]) — 4 vCPU, 8 GB RAM, 25 GB NVMe, Ubuntu 24.04, systemd
 
 ### 2.5 Trading Modes
 | Mode | Behaviour |
@@ -386,7 +386,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 **Goal**: Prove the full execution path works against the real Polymarket CLOB. Place, fill, cancel, and reconcile real micro-orders. This is a focused, short milestone (target: 1 week) that validates everything built in Milestone B before committing to the 14-day shadow validation.
 
 **Funds required**: ~$50 USDC.e deposited to the trading wallet + ~5 POL for gas.
-**VPS**: is*hosting Madrid (176.97.72.199) — interim. Dublin (Interxion DC, 0.83ms latency) planned when capacity available.
+**VPS**: [vps-provider] Madrid ([madrid-vps-ip]) — interim. Dublin (0.83ms latency) planned when capacity available.
 **First real CLOB order**: 2026-03-20 from Madrid VPS.
 **Test harness**: `clob-test` binary with `--skip-tests` flag for selective reruns.
 
@@ -595,7 +595,7 @@ The following should be noted but NOT implemented now:
 |---|------|-----------|--------|------------|-------|
 | R1 | CLOB API changes break execution | Medium | High | Version-pin API client. Monitor Polymarket changelog. | |
 | R2 | Arb math edge case causes loss | **Medium** | High | Polytope completeness guards (0.90 sum). AI resolution validator. Pre-trade Gamma API freshness check (F-gate 6). | **Upgraded from Low**: INC-001 — $10 loss from incomplete mutex group. Already happened once. |
-| R3 | VPS goes down | Low | Medium | Systemd auto-restart. ZAP 3-month login reminder. | |
+| R3 | VPS goes down | Low | Medium | Systemd auto-restart. provider 3-month login reminder. | |
 | R4 | VPS geoblocked by Polymarket | **Medium** | High | Geoblock health check script (`scripts/geoblock_check.sh`, 15-min cron). Tested runbook for jurisdiction migration (F-gate 5). Allowed: Ireland, Spain, Czech Republic. | **Upgraded from Low**: INC-012 — German VPS 403'd. Already happened. Renamed from "blocks automated trading" to focus on actual risk vector. |
 | R5 | Capital locked in postponed events | Medium | **Medium** | AI postponement detector identifies and rescores. Track capital velocity metric (F-gate 4). Max 20% exposure per event category. | **Impact upgraded from Low**: INC-006 locked 20% of capital for 55 days. Duration risk is structural. |
 | R6 | Thin order books at scale | High | Medium | Depth gating (B1.0). Start with $1k, not $10k. Pre-go-live gate: exercise depth-gated rejection against real CLOB in acceptance tests. | |

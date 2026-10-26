@@ -27,7 +27,7 @@ live_trading:
   # approvals set on CTF Exchange, NegRisk Exchange, NegRisk Adapter. Bankroll
   # (~$100 USDC.e) transferred to rotated wallet.
   # 2026-04-22 ~22:00 UTC: Madrid VPS terminated by provider (missed payment).
-  # Rebuild underway on Dublin VPS (38.180.151.102). Wallet blockchain state
+  # Rebuild underway on Dublin VPS. Wallet blockchain state
   # (balance + approvals) persists; CLOB L2 creds will auto-derive on first boot
   # via create_or_derive_api_key against the fresh EOA signature.
   # 2026-04-23 06:38 UTC: First boot on Dublin — DISARMED for validation.

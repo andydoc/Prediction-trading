@@ -6,12 +6,20 @@
 
 ---
 
-## 1. VPS Details
+> **Status (2026-10-26): no active deployment.** The bot is not running on any server at present.
+> None of the known VPS hosts (Dublin `[dublin-vps-ip]`, Madrid `[madrid-vps-ip]`, or any other host in the operator's SSH config) accepts SSH connections, as checked on 2026-10-21 and 2026-10-26.
+> Everything below describes past deployments and is kept for reference. Before redeploying, provision or restore a host and update section 1.
+> The last live deployment was the **Dublin** VPS (systemd unit `prediction-trader.service`, live mode, from 2026-05-07); its build and restart procedure is in `HANDOVER_2026-05-07d.md` ("Restart + deploy procedure").
+> Do not use `scripts/restart.sh` on a live host as-is: it stops the bot before building and, without `--mode live`, restarts in shadow mode.
+
+---
+
+## 1. VPS Details (historical: Madrid, superseded by Dublin, now inactive)
 
 | Item | Value |
 |------|-------|
-| Provider | is*hosting (Madrid, Spain) — interim. Dublin (Interxion DC) planned when capacity available. |
-| IP | `176.97.72.199` |
+| Provider | [vps-provider] (Madrid, Spain) — interim. Dublin planned when capacity available. |
+| IP | `[madrid-vps-ip]` |
 | SSH | `ssh madrid-ubuntu` (ubuntu user) or `ssh madrid` (root) |
 | Specs | 4 vCPU, 8 GB RAM, 25 GB NVMe, Ubuntu 24.04 |
 | Workspace | `/home/ubuntu/prediction-trader` |
@@ -24,7 +32,7 @@ ssh madrid-ubuntu 'systemctl status prediction-trader'
 ssh madrid-ubuntu 'tail -50 /home/ubuntu/prediction-trader/logs/supervisor-*.log'
 ```
 
-**Host migration note**: Madrid is a temporary location. is*hosting offered free migration to Dublin (lower latency: 0.83ms to clob.polymarket.com) when capacity is available.
+**Host migration note**: Madrid is a temporary location. [vps-provider] offered free migration to Dublin (lower latency: 0.83ms to clob.polymarket.com) when capacity is available.
 
 ---
 
@@ -353,7 +361,7 @@ cp -p data/state_rust.db data/state_rust.db.pre-maintenance-$(date +%s)
 
 **Monthly**:
 - Verify POL gas balance
-- Check is*hosting dashboard / billing
+- Check [vps-provider] dashboard / billing
 
 ---
 

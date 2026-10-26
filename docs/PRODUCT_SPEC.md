@@ -20,7 +20,7 @@ A senior developer built an automated prediction market arbitrage system under p
 - **Implementer**: AI-assisted (Claude). Spec structured as task breakdowns with acceptance criteria.
 - **Risk appetite**: 10% drawdown circuit breaker. $1,000 initial shadow capital. Go live after 2 weeks of profitable shadow trading with $1,000.
 - **Timeline**: No rush. Get it right. Shadow mode runs indefinitely until solid.
-- **Production target**: VPS only (ZAP-Hosting, Germany, always-on, 4 vCPU, **8 GB RAM**, 25 GB NVMe). Laptop is dev-only.
+- **Production target**: VPS only ([vps-provider], Germany, always-on, 4 vCPU, **8 GB RAM**, 25 GB NVMe). Laptop is dev-only.
 - **Rust port**: Complete before go-live. Single compiled binary is the target state before real money flows.
 - **Notifications**: WhatsApp (not OpenClaw, not email).
 - **Shadow strategy**: Run 5 parallel shadow accounts with different parameter combinations to optimise % capital per position and max concurrent positions before committing real money.
@@ -311,7 +311,7 @@ Convention: **0 means "no filter / disabled"** for any threshold parameter. This
 | ⬚ **C4: Daily P&L report** | Automated daily summary at midnight UTC: entries, exits, fees, net P&L, capital utilisation %, drawdown from peak. Sent via WhatsApp. Also persisted to SQLite for historical queries. |
 | ⬚ **C4.1: Seamless position close transition** | Eliminate 5s visual gap where a closing position disappears from open before appearing in closed. Buffer removal client-side until the closed entry arrives in the next SSE push. |
 | ✅ **C4.2: Proactive near-resolution exit** | When a held position's liquidation value exceeds 1.2× its resolution payout, sell early. Checks all open positions every `monitor_interval` seconds using live bid prices from the order book. Implemented in `orchestrator::check_proactive_exits()` using `PROACTIVE_EXIT_MULTIPLIER = 1.2`. WhatsApp notification sent on each exit. |
-| ⬚ **C5: Create OPS_RUNBOOK.md** | VPS details, SSH access, systemd commands, log locations, dashboard URLs, monitoring commands, backup procedures, the 3 rationalised scripts and their usage, circuit breaker recovery procedure, kill switch procedure, WhatsApp setup, ZAP-Hosting 3-month login reminder. |
+| ⬚ **C5: Create OPS_RUNBOOK.md** | VPS details, SSH access, systemd commands, log locations, dashboard URLs, monitoring commands, backup procedures, the 3 rationalised scripts and their usage, circuit breaker recovery procedure, kill switch procedure, WhatsApp setup, [vps-provider] 3-month login reminder. |
 | ⬚ **C6: Create USER_GUIDE.md** | Product overview, prerequisites, setup from scratch, starting/stopping (rationalised scripts), monitoring (dashboard), mode switching, recovery after crash, go-live checklist, glossary. Includes: all supervisor CLI flags (`--mode`, `--set key=value`, `--dry-run` for config verification, `--port`, `--log-level`), Windows Task Scheduler setup for auto-start on reboot (VBS → SILENT.bat → start.sh → Rust supervisor), copying START_TRADER_SILENT.bat to `C:\Users\<user>\ai-workspace\`, Linux systemd setup via `setup_vps.sh`. Written so a new operator can run the system without having built it. |
 | ⬚ **C7: Retire PROGRESS_ROADMAP.md** | Copy to Archive then in live version replace contents with a brief note listing the 6 replacement documents and their purposes. Do not delete (preserves git history). |
 
@@ -485,7 +485,7 @@ The following should be noted but NOT implemented now:
 |------|-----------|--------|------------|
 | CLOB API changes break execution | Medium | High | Version-pin API client. Monitor Polymarket changelog. |
 | Arb math edge case causes loss | Low | High | 100% win rate on 3 resolved arbs. Polytope completeness guards in place. |
-| VPS goes down | Low | Medium | Systemd auto-restart. ZAP 3-month login reminder. |
+| VPS goes down | Low | Medium | Systemd auto-restart. provider 3-month login reminder. |
 | Polymarket blocks automated trading | Low | High | ToS review. FAK orders look like normal trading. No market manipulation. |
 | Capital locked in postponed events | Medium | Low | AI postponement detector identifies and rescores. Capital velocity impact only. |
 | Thin order books at scale | High | Medium | Depth gating (Milestone F). Start with $1k, not $10k. |
