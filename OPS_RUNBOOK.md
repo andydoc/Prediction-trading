@@ -6,7 +6,15 @@
 
 ---
 
-## 1. VPS Details
+> **Status (2026-10-26): no active deployment.** The bot is not running on any server at present.
+> None of the known VPS hosts (Dublin `38.180.151.102`, Madrid `176.97.72.199`, or any other host in the operator's SSH config) accepts SSH connections, as checked on 2026-10-21 and 2026-10-26.
+> Everything below describes past deployments and is kept for reference. Before redeploying, provision or restore a host and update section 1.
+> The last live deployment was the **Dublin** VPS (systemd unit `prediction-trader.service`, live mode, from 2026-05-07); its build and restart procedure is in `HANDOVER_2026-05-07d.md` ("Restart + deploy procedure").
+> Do not use `scripts/restart.sh` on a live host as-is: it stops the bot before building and, without `--mode live`, restarts in shadow mode.
+
+---
+
+## 1. VPS Details (historical: Madrid, superseded by Dublin, now inactive)
 
 | Item | Value |
 |------|-------|
