@@ -6,7 +6,7 @@ Self-contained briefing for the next session. Supersedes `HANDOVER_2026-05-07b.m
 
 ## Where the bot is right now
 
-**Dublin VPS** (`38.180.151.102`, SSH `ssh dublin`):
+**Dublin VPS** (`[dublin-vps-ip]`, SSH `ssh dublin`):
 
 | Field | Value |
 |---|---|

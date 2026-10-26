@@ -209,7 +209,7 @@ and remove the manual patches from `config.yaml`.
   (Data API holdings), `--auto` (per-token interactive confirmation),
   single-token `--token-id <decimal> --shares <float>`. Proven on the
   Draw-NO recovery: SELL 2.57 sh @ $0.92 → +$0.16 vs entry, tx
-  `0xdae306811b4287f00ccda07514c2a3bf195aee73656f70a01c52225561808365`.
+  `[redacted-tx]`.
 
 ### Operations
 - Capital topped up: wrapped remaining USDC.e (~$65) → pUSD via
@@ -354,7 +354,7 @@ and remove the manual patches from `config.yaml`.
 
 - Wallet onboarded for V2 via `wrap_usdce_to_pusd.py` + one-off
   `setApprovalForAll(CTF, NegRiskAdapter, true)` tx
-  (`0xef63925b811bab373cf0487ac5ef9de5d1346918444f260deba7fe332dd3dc8d`).
+  (`[redacted-tx]`).
   First successful V2 BUY: `0x99270c39…6f21a` (D2 probe at 23:40 UTC,
   GTC SPURS YES @ $0.01, cancelled cleanly). First successful V2 SELL:
   `0x4d99ecf5…66c033b` (12.31 SPURS YES → $1.94 pUSD, 23:52 UTC).
@@ -1445,7 +1445,7 @@ E4 14-day shadow run started 2026-03-24 14:16 UTC. After 16 hours, zero opportun
 - `scripts/debug/update_delay_table.py` — weekly updater
 
 ### Changed
-- Deployed to ZAP-Hosting Lifetime VPS (193.23.127.99), $100 fresh shadow capital, systemd auto-restart
+- Deployed to [vps-provider] Lifetime VPS ([old-vps-ip]), $100 fresh shadow capital, systemd auto-restart
 - Harvested 512,894 resolved markets from Gamma API for delay analysis
 
 ---

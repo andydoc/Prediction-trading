@@ -63,7 +63,7 @@ ARCHITECTURE.md, ROADMAP.md (this file).
 |--------|-------|
 | ✅ Complete | 9/9 |
 
-**VPS**: is*hosting Madrid (176.97.72.199). Interim location — Dublin (Interxion DC, 0.83ms latency) planned when capacity available.
+**VPS**: [vps-provider] Madrid ([madrid-vps-ip]). Interim location — Dublin (0.83ms latency) planned when capacity available.
 **Funds**: ~$50 USDC.e deposited, wallet 0x21f1...fb1.
 **First real CLOB order**: 2026-03-20 from Madrid VPS.
 

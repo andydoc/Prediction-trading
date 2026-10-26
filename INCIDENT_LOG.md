@@ -39,7 +39,7 @@ The orchestrator at lines 1211 and 2057 called `self.engine.reconcile_startup(..
 | 08:14 | Operator queries dashboard, notes "Deployed 15.5 %" suspicious; investigation begins. |
 | 08:30 | Confirmed via on-chain `CTF.balanceOf` that lone filled leg = 2.5728 Draw-NO @ $0.86. Determined `evaluate_arb_fills` is unwired. |
 | 09:02 | First unwind attempt via `py-clob-client v0.34.6` returns `HTTP 400 order_version_mismatch` — the pip-released SDK still hardcodes V1 exchange addresses. |
-| 09:08 | Hand-rolled V2 EIP-712 signing + L2 HMAC unwind succeeds: SELL 2.57 shares @ $0.92, taking amount $2.3644. Tx `0xdae306811b4287f00ccda07514c2a3bf195aee73656f70a01c52225561808365`. **+$0.16 vs entry**, market moved in our favor. |
+| 09:08 | Hand-rolled V2 EIP-712 signing + L2 HMAC unwind succeeds: SELL 2.57 shares @ $0.92, taking amount $2.3644. Tx `[redacted-tx]`. **+$0.16 vs entry**, market moved in our favor. |
 | 09:15 | DB cleanup: position deleted, scalars synced, accounting checkpoint dropped, strategy capitals reset. |
 | 09:35 | All three code fixes (CB-trip on partial, $10 floor → $3, reconciliation auth plumbed) built and deployed. |
 | 09:40 | Wrapped remaining $65 USDC.e → pUSD ($97.37 total). Switched live to **Strategy C** (20 % capital, 15 concurrent, 3-25 % profit). |
@@ -330,7 +330,7 @@ HTTP 400 {"error":"not enough balance / allowance: the balance is not enough -> 
 | **pUSD ("Polymarket USD")** | `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB` | py-clob-client-v2 1.0.1rc1 `config.py` `collateral` field |
 | USDC.e (our monitor checks this) | `0x2791bca1f2de4661ed88a30c99a7a9449aa84174` | Polygon canonical USDC.e |
 
-The wallet `0x37B2c35944aF8bE382F5Efc18a4555E1eE25A105` has $100.02 USDC.e
+The wallet `[bot-wallet]` has $100.02 USDC.e
 but **0.00 pUSD**. Every V2 BUY checks pUSD balance/allowance, sees 0,
 and rejects. This explains 100% of the V2 failures since the schema port
 landed.
@@ -394,10 +394,10 @@ After fixing signatureType (`1` → `0`), reverting the spurious negRisk domain
 name, wrapping USDC.e → pUSD via KyberSwap, and setting all 6 V2 allowances,
 both BUY and SELL paths are validated end-to-end on Polymarket V2.
 
-**First successful V2 order**: `0x99270c39556857e8f3c6d73bb28bf878ee7379faf5cbb2ee400c10528ad6f21a`
+**First successful V2 order**: `[redacted-tx]`
 (GTC BUY 1.62 SPURS YES @ $0.01, placed 2026-05-01 23:40:38 UTC, cancelled
 ~5s later). **First successful V2 SELL**:
-`0x4d99ecf57d51b8532a3df03ce54524710335eb1754963303821eaec3066c033b` (12.31
+`[redacted-tx]` (12.31
 shares of SPURS YES → $1.94 pUSD, 23:52:36 UTC).
 
 #### Why every prior attempt failed (V1 → V2 migration cliff)
@@ -444,7 +444,7 @@ per boot.
 
 #### Final V2-ready state (Dublin, 2026-05-02)
 
-Wallet `0x37B2c35944aF8bE382F5Efc18a4555E1eE25A105`:
+Wallet `[bot-wallet]`:
 
 - **USDC.e**: $95.02 (operator reserve)
 - **pUSD**: $2.24 (depleted from probe testing — top up via wrap script if needed)
@@ -1031,15 +1031,15 @@ gates matter.
 **Severity**: MEDIUM
 **Status**: ✅ Resolved (interim)
 
-**Summary**: Migrated VPS from ZAP-Hosting Germany (193.23.127.99) to is*hosting Madrid (176.97.72.199) because Germany is geoblocked from Polymarket CLOB API.
+**Summary**: Migrated VPS from [vps-provider] Germany ([old-vps-ip]) to [vps-provider] Madrid ([madrid-vps-ip]) because Germany is geoblocked from Polymarket CLOB API.
 
 **Root Cause**: Polymarket blocks 33 countries from CLOB API access, including Germany, UK, Netherlands. All CLOB order submissions returned 403 Forbidden from the Germany VPS.
 
 **Resolution**:
-- Contracted is*hosting for a Madrid VPS (Spain is not geoblocked)
-- Dublin (Interxion DC) was first choice (0.83ms latency to CLOB) but had no capacity
+- Contracted [vps-provider] for a Madrid VPS (Spain is not geoblocked)
+- Dublin was first choice (0.83ms latency to CLOB) but had no capacity
 - Host company offered free migration to Dublin when capacity becomes available
-- IP address: 176.97.72.199 (same for both Madrid and eventual Dublin)
+- IP address: [madrid-vps-ip] (same for both Madrid and eventual Dublin)
 
 **Lessons Learned**:
 - Always verify CLOB API geoblocking before provisioning VPS: `curl -I https://clob.polymarket.com`

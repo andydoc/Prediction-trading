@@ -96,8 +96,8 @@ machine — the kill switch is there for a reason.
 
 ### Pre-requisites (one-time, before any incident)
 
-1. **Spare provider account** with capacity in an allowed region (ZAP for
-   Madrid, IS*hosting for Dublin currently). Pre-pay credit on file.
+1. **Spare provider account** with capacity in an allowed region, with
+   pre-paid credit.
 2. **Local SSH key** added to provider's web console for instant root access.
 3. **State backup script** runs nightly: `scripts/backup_state.sh` rsyncs
    `/home/ubuntu/prediction-trader/data/` to a non-VPS location (laptop or

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Dublin VPS Setup Script
-# Run as root on a fresh Ubuntu 24 instance from is*hosting (Dublin/Interxion)
+# Run as root on a fresh Ubuntu 24 instance (Dublin)
 #
 # Usage:
 #   ssh root@<DUBLIN_IP> 'bash -s' < scripts/setup-dublin-vps.sh
